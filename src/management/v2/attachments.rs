@@ -32,6 +32,7 @@
 //! `unsupported_media_type` (`details.supported`).
 
 use std::net::TcpStream;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -84,7 +85,41 @@ pub(crate) fn percent_decode(encoded: &str) -> Option<String> {
 }
 
 pub fn is_attachments_path(path: &str) -> bool {
-    session_id_from_path(path).is_some()
+    session_id_from_path(path).is_some() || read_path(path).is_some()
+}
+
+/// The attachment id is the digest returned by POST, without a filename extension.
+pub fn read_path(path: &str) -> Option<(String, String)> {
+    let (session, digest) = path.strip_prefix("/v2/sessions/")?.split_once("/attachments/")?;
+    let session = session_id_from_path(&format!("/v2/sessions/{session}/attachments"))?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| (session, digest.to_owned()))
+}
+
+fn read_attachment(root: &Path, session: &str, digest: &str) -> Option<(&'static str, Vec<u8>)> {
+    // Read only content-addressed files under this session. Reject changed files,
+    // links and oversized files rather than treating the id as an arbitrary path.
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    for &(mime, ext) in SUPPORTED_TYPES {
+        let file = root.join(session_dir_name(session)).join(format!("{digest}.{ext}"));
+        if crate::artifacts::paths::validate_local_path(&file).is_err() { continue; }
+        let ordinary = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            #[cfg(windows)]
+            { use std::os::windows::fs::MetadataExt; !metadata.file_type().is_symlink() && metadata.file_attributes() & 0x400 == 0 }
+            #[cfg(not(windows))]
+            { !metadata.file_type().is_symlink() }
+        });
+        if !ordinary(&file) || !ordinary(file.parent()?) { continue; }
+        let Ok(handle) = std::fs::File::open(&file) else { continue; };
+        let mut bytes = Vec::new();
+        if handle.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
+            || bytes.len() > 16 * 1024 * 1024 || !bytes_match(mime, &bytes)
+            || hex(&Sha256::digest(&bytes)) != digest { continue; }
+        return Some((mime, bytes));
+    }
+    None
 }
 
 /// Directory name for a session: the id itself when it is a plain file
@@ -361,6 +396,17 @@ pub fn handle(
     context: ManagementRequestContext,
 ) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if let Some((session, digest)) = read_path(path) {
+        if request.method != "GET" {
+            return error(stream, UploadError::new(405, "Method Not Allowed", "method_not_allowed", "use GET"));
+        }
+        // Like /blobs/, the access gate already checks a member's session read
+        // grant. Owners may also read retained attachments of archived sessions.
+        return match read_attachment(&attachments_root()?, &session, &digest) {
+            Some((mime, bytes)) => crate::http::server::write_http_response(stream, 200, "OK", mime, &bytes),
+            None => error(stream, UploadError::new(404, "Not Found", "attachment_not_found", "attachment unavailable for this session")),
+        };
+    }
     let Some(cutex_session_id) = session_id_from_path(path) else {
         return error(stream, UploadError::new(404, "Not Found", "not_found", "unknown route"));
     };
@@ -484,6 +530,23 @@ mod tests {
         std::env::temp_dir()
             .join(format!("cutex-attachments-{}", uuid::Uuid::new_v4()))
             .join("attachments")
+    }
+
+    #[test]
+    fn attachment_reads_are_session_bound_and_content_addressed() {
+        let root = temp_root();
+        let (_, upload) = store_upload(&root, "cutex.a", Some("image/png"), PNG, AttachmentSettings::default()).unwrap();
+        let id = upload["attachmentId"].as_str().unwrap();
+        assert_eq!(read_attachment(&root, "cutex.a", id), Some(("image/png", PNG.to_vec())));
+        assert!(read_attachment(&root, "cutex.b", id).is_none());
+        assert_eq!(read_path(&format!("/v2/sessions/cutex%2Ea/attachments/{id}")), Some(("cutex.a".into(), id.into())));
+        for path in ["../config", "", "AA", "a%2fb", "a/extra"] {
+            assert!(read_path(&format!("/v2/sessions/cutex.a/attachments/{path}")).is_none());
+        }
+        assert!(read_path(&format!("/v2/sessions/a%2fb/attachments/{id}")).is_none());
+        std::fs::write(upload["path"].as_str().unwrap(), b"changed").unwrap();
+        assert!(read_attachment(&root, "cutex.a", id).is_none());
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[cfg(windows)]

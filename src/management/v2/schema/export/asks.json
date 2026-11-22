@@ -147,6 +147,19 @@
           "type": "string",
           "description": "queued | admitted | running | pendingReview | interrupted | answered | failed | rejected | cancelled | …"
         },
+        "continuationWait": {
+          "$comment": "r290 P14",
+          "description": "Non-null for an open yielded delegation: show this waiting phase instead of running and its ended attempt duration. nextWakeAt is a planned UTC timer time, not a deadline; render in the owner's locale. Older hosts omit this field.",
+          "type": ["object", "null"],
+          "required": ["state", "kind", "since", "nextWakeAt"],
+          "additionalProperties": false,
+          "properties": {
+            "state": {"type": "string", "enum": ["waiting", "ready", "limited"]},
+            "kind": {"type": "string", "enum": ["after", "children", "jobs"]},
+            "since": {"type": ["string", "null"]},
+            "nextWakeAt": {"type": ["string", "null"]}
+          }
+        },
         "hold": {
           "type": [
             "object",
@@ -191,6 +204,7 @@
           ],
           "description": "completed | accepted | abandoned | stopped | cancelled | superseded"
         },
+        "followUpEnded": {"type": "boolean", "description": "Owner ended tracking without asserting execution stopped."},
         "queuePosition": {
           "type": [
             "integer",
@@ -213,7 +227,8 @@
           "type": [
             "object",
             "null"
-          ]
+          ],
+          "properties": {"stopDeadline": {"type": ["string", "null"]}, "stopUnconfirmed": {"type": "boolean"}, "steps": {"type": ["object", "null"], "properties": {"done": {"type": "integer", "minimum": 0}, "total": {"type": "integer", "minimum": 0}, "currentStep": {"type": ["string", "null"]}}}, "lastProgressAt": {"type": ["string", "null"]}}
         },
         "closedAt": {
           "type": [

@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn remote_tools_require_an_enabled_source_and_offer_no_marking() {
-        for capabilities in [json!({}), json!({"sources":[]})] {
+        for capabilities in [json!({}), json!({"sources":[]}), json!({"humanOperations":["query","closeFollowUp"]})] {
             let names: Vec<Value> = tools(&capabilities)
                 .iter()
                 .map(|t| t["name"].clone())

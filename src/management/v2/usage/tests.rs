@@ -614,6 +614,7 @@ fn pending_entries_recover_after_interrupted_append_and_reader_deduplicates() {
         model_context_window: None,
         compaction_count: None,
         model_requests: None,
+        background_tokens: None, // r290 P8: no background breakdown for this source.
         tokens: TokenUsageBreakdown {
             total_tokens: 10,
             input_tokens: 8,
@@ -765,4 +766,46 @@ fn claude_adapter_usage_counts_the_cumulative_delta_not_context_occupancy() {
     assert_eq!(samples[0].tokens.cached_input_tokens, 300);
     assert_eq!(samples[0].tokens.output_tokens, 20);
     assert_eq!(samples[0].model_requests, Some(2), "the turn's SDK steps are kept");
+}
+
+#[test]
+fn claude_background_subagent_part_of_a_delta_is_kept_once_reported() {
+    let root = TestRoot::new("claude-background");
+    let claude = |event_id: &str, sequence: u64, total: Value, background: Option<Value>| {
+        let mut params = token_params(total, None, "turn-a");
+        if let Some(background) = background {
+            params["tokenUsage"]["backgroundTotal"] = background;
+        }
+        let mut event = envelope(event_id, sequence, 1, "2026-10-30T13:00:00Z", "thread/tokenUsage/updated", params);
+        event.schema = Some(crate::management::v2::model::AppServerSchema {
+            protocol: "claude-app-server-subset".to_string(),
+            major_version: 1,
+            version: "0.8.6+cutex".to_string(),
+            sha256: "0".repeat(64),
+            channel: crate::management::v2::model::AppServerSchemaChannel::Experimental,
+            capabilities: json!({}),
+            extensions: vec!["claude-runtime-v1".to_string()],
+        });
+        event
+    };
+    let record = |event| record_usage_event_at(root.path(), &event, Some("claude")).expect("record");
+    // An older adapter set the baseline: the next delta's background part is unknown.
+    record(claude("bg-1", 1, breakdown(1_000, 900, 800, 0, 100, 0), None));
+    record(claude("bg-2", 2, breakdown(2_000, 1_800, 1_600, 0, 200, 0), Some(breakdown(500, 450, 400, 0, 50, 0))));
+    // From then on each delta carries the same delta of the background total.
+    record(claude("bg-3", 3, breakdown(3_000, 2_700, 2_400, 0, 300, 0), Some(breakdown(1_300, 1_170, 1_040, 0, 130, 0))));
+    // A background total that went backwards (restart) is not split.
+    record(claude("bg-4", 4, breakdown(3_500, 3_100, 2_700, 0, 400, 0), Some(breakdown(10, 9, 8, 0, 1, 0))));
+
+    let ledger = store::load_usage_ledger_at(root.path()).expect("load ledger");
+    let samples = usage_samples(&ledger);
+    assert_eq!(samples.len(), 3);
+    assert_eq!(samples[0].background_tokens, None);
+    let background = samples[1].background_tokens.as_ref().expect("background part");
+    assert_eq!((background.cached_input_tokens, background.output_tokens), (640, 80));
+    assert_eq!(samples[2].background_tokens, None);
+    // Rows without a background part keep the old encoding.
+    let encoded = serde_json::to_string(&samples[0]).unwrap();
+    assert!(!encoded.contains("backgroundTokens"));
+    assert!(serde_json::to_string(&samples[1]).unwrap().contains("\"backgroundTokens\""));
 }

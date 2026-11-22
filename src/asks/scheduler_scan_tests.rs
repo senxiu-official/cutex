@@ -31,7 +31,7 @@ fn scan_fixture(world: &mut FakeWorld, runtime: &FakeRuntime, store: &AskStore,
                 if paused { state.asks.get_mut(&id).unwrap().hold = Some(Hold::Paused { by: PausedBy::Owner }); }
             }
             if paused {
-                state.pauses.insert(target.clone(), AdmissionPause {
+                state.pauses.insert(target.clone(), AdmissionPause { stop_answer_authorized: false,
                     cutex_session_id: target.clone(), by: PausedBy::Owner, since: now_rfc3339(now),
                     origin: Some(crate::asks::control::ORIGIN_OWNER_PAUSE.into()), stop_hold: false, runtime_generation: None,
                 });
@@ -242,7 +242,7 @@ fn concurrent_resume_only_delays_one_pass_and_runtime_restart_clears_gate() {
         ask.execution = ExecutionState::Queued;
         ask.attempts.clear();
         ask.hold = Some(Hold::HeldByRuntime { native: Some(crate::asks::control::NATIVE_GATE_CLOSED.into()) });
-        state.pauses.insert(target.clone(), AdmissionPause {
+        state.pauses.insert(target.clone(), AdmissionPause { stop_answer_authorized: false,
             cutex_session_id: target.clone(), by: PausedBy::Owner, since: now_rfc3339(now),
             origin: Some(crate::asks::control::ORIGIN_RUNTIME_GATE.into()), stop_hold: true, runtime_generation: Some(1),
         });

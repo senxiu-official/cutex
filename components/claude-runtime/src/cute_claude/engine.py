@@ -53,7 +53,7 @@ class Engine:
         return "\n\n".join(frame for _, frame in taken)
 
     def wake(self, tid: str) -> None:
-        if not self.closing and tid not in self.workers and not self.store.thread(tid)["halted"]:
+        if not self.closing and tid not in self.workers and (not self.store.thread(tid)["halted"] or self.store.stop_answer_pending(tid)):
             self.workers[tid] = asyncio.create_task(self._worker(tid), name=f"claude-turn:{tid}")
 
     async def interrupt(self, tid: str, turn_id: str) -> None:

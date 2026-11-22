@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(decide(&state, &eligible, &ask, false, 6, &offline), WakeDecision::Never("ownerStopped"));
         note_owner_runtime_action(&mut state, TARGET, false);
         assert_eq!(decide(&state, &eligible, &ask, false, 6, &offline), relaunch, "owner online again: eligible");
-        state.pauses.insert(TARGET.into(), AdmissionPause {
+        state.pauses.insert(TARGET.into(), AdmissionPause { stop_answer_authorized: false,
             cutex_session_id: TARGET.into(), by: PausedBy::Owner,
             since: now_rfc3339(now), origin: Some("ownerPause".into()), stop_hold: false, runtime_generation: None,
         });

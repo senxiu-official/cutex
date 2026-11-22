@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -26,10 +26,16 @@ pub mod permission_rules;
 pub mod code_sources;
 pub mod skill_catalog;
 pub mod side;
+mod start_refusal;
+#[cfg(target_os = "linux")]
+mod linux_scope;
+pub use start_refusal::{ClaudeStartRefusal, SCHEMA_START_REFUSAL_CODE, SCHEMA_START_REFUSAL_DETAIL, is_schema_start_refusal};
+pub(crate) use start_refusal::hold_schema_refusal;
 #[cfg(test)]
 #[path = "claude_occurrence_extra_tests.rs"]
 mod occurrence_extra_tests;
 pub mod structure;
+pub(crate) mod process_receipt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -219,11 +225,15 @@ impl ClaudeArchiveRuntime {
     pub fn stop_and_verify(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
         let session = Self::reviewed_session(record)?;
         let Some(pid) = self.adapter_pid else {
+            #[cfg(target_os = "linux")]
+            linux_scope::stop(record, session)?;
             return self.verify_offline(record);
         };
         let Some(started_at) = self
             .adapter_started_at
         else {
+            #[cfg(target_os = "linux")]
+            linux_scope::stop(record, session)?;
             return self.verify_offline(record);
         };
         ensure!(
@@ -234,6 +244,8 @@ impl ClaudeArchiveRuntime {
             Ok(connected) => connected,
             Err(error) => {
                 if Self::adapter_occurrence_exited(pid, started_at)? {
+                    #[cfg(target_os = "linux")]
+                    linux_scope::stop(record, session)?;
                     return self.verify_offline(record);
                 }
                 return Err(error).context("Claude adapter is alive but unreachable");
@@ -269,6 +281,8 @@ impl ClaudeArchiveRuntime {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        #[cfg(target_os = "linux")]
+        linux_scope::stop(record, session)?;
         ensure!(connect(session).is_err(), "Claude adapter endpoint remained reachable");
         let _ = &self.controller_lock;
         Ok(())
@@ -276,6 +290,8 @@ impl ClaudeArchiveRuntime {
 
     pub fn verify_offline(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
         let session = Self::reviewed_session(record)?;
+        #[cfg(target_os = "linux")]
+        linux_scope::verify_empty(record, session)?;
         ensure!(
             connect(session).is_err(),
             "Claude adapter endpoint remained reachable"
@@ -583,6 +599,8 @@ fn connect_with(session: &ClaudeSession, interactive: bool) -> anyhow::Result<(A
 fn connect_with_request_timeout(session: &ClaudeSession, interactive: bool, request_timeout: Duration) -> anyhow::Result<(AppServerClient, Ready)> {
     let ready: Ready =
         serde_json::from_slice(&std::fs::read(session.state_dir.join("server.json"))?)?;
+    #[cfg(target_os = "linux")]
+    linux_scope::verify_adapter(session, ready.pid)?;
     let token = std::fs::read_to_string(session.state_dir.join("rpc-token"))?;
     let mut options = AppServerClientOptions::new(AppServerEndpoint::LoopbackWebSocket {
         url: ready.endpoint.clone(),
@@ -665,7 +683,22 @@ pub fn safety_blocks(id: &str) -> anyhow::Result<Vec<Value>> {
 
 /// Applies the profile's native runtime overrides and returns its
 /// AskUserQuestion mode and file checkpointing policy (default on).
-fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command) -> anyhow::Result<(AgentTurnQuestions, bool)> {
+// r290 P13: selected and pinned adapters must explicitly understand percent-only settings.
+pub fn selected_model_context_supported() -> bool {
+    ClaudeDeployment::selected().is_ok_and(|deployment|
+        adapter_features(&deployment.adapter_source)["modelContextSettingsV1"] == true)
+}
+
+fn validate_model_context_adapter(root: Option<crate::profiles::claude_compaction::ClaudeCompaction>,
+    models: Option<&crate::profiles::claude_compaction::ModelTable>, source: &Path) -> anyhow::Result<()> {
+    let needs_v1 = root.is_some_and(|value| value.auto_compact_window.is_none())
+        || models.is_some_and(|models| models.values().any(|value| value.auto_compact_window.is_none()));
+    ensure!(!needs_v1 || adapter_features(source)["modelContextSettingsV1"] == true,
+        "percent-only compaction requires a Claude adapter with modelContextSettingsV1; update the selected or pinned adapter");
+    Ok(())
+}
+
+fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command, adapter_source: &Path) -> anyhow::Result<(AgentTurnQuestions, bool)> {
     let default_checkpointing = crate::profiles::settings_api::DEFAULT_CLAUDE_FILE_CHECKPOINTING;
     let Some(name) = record.profile.as_deref() else { return Ok((AgentTurnQuestions::default(), default_checkpointing)); };
     let accounts: crate::profiles::model::AccountsStore = serde_json::from_slice(
@@ -674,12 +707,17 @@ fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command) -> 
         .context("Claude launch profile missing")?;
     let questions = account.options.agent_turn_questions.unwrap_or_default();
     let checkpointing = account.options.claude_file_checkpointing.unwrap_or(default_checkpointing);
+    // r290 P13: validate the actual pinned adapter, not the selected deployment.
+    let root = crate::profiles::claude_compaction::read_id(&account.id)?;
+    let models = crate::profiles::claude_compaction::read_models_id(&account.id)?;
+    validate_model_context_adapter(root, models.as_ref(), adapter_source)?;
     // claude-compaction: `claude-runtime.json` (profiles/claude_compaction.rs).
-    if let Some(settings) = crate::profiles::claude_compaction::read_id(&account.id)? {
-        command.envs(settings.envs());
+    if let Some(settings) = root {
+        // r290 P13
+        settings.apply_env(command);
     }
     // claude-compaction-models: the per-model table for the adapter (claude-r24+; older ones ignore it).
-    if let Some(table) = crate::profiles::claude_compaction::read_models_id(&account.id)? {
+    if let Some(table) = models {
         command.env(crate::profiles::claude_compaction::MODELS_ENV,
             crate::profiles::claude_compaction::models_json(&table).to_string());
     }
@@ -832,6 +870,8 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
         "existing Claude adapter is alive but unreachable; no duplicate server was started");
     ensure!(same_adapter_claim(&self::record(&record.cutex_session_id)?, record),
         "Claude occurrence changed before adapter replacement; reload this session");
+    #[cfg(target_os = "linux")]
+    linux_scope::verify_empty(record, session)?;
     session.deployment.validate()?;
     let mcp = std::env::current_exe()?.with_file_name(if cfg!(windows) { "cutex-mcp.exe" } else { "cutex-mcp" });
     ensure!(mcp.is_file(), "Cutex MCP executable missing: {}", mcp.display());
@@ -849,6 +889,7 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
         .create(true)
         .append(true)
         .open(session.state_dir.join("adapter.stderr.log"))?;
+    let stderr_start = log.metadata()?.len();
     let mut command = Command::new(&session.deployment.python);
     // A different profile also resets an interactive model override when the
     // two profiles happen to have the same default model. A normal restart
@@ -865,7 +906,7 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     // session) is not a profile change: never reset a hand-picked model then.
     command.env("CUTEX_CLAUDE_RESET_LAUNCH_MODEL", if record.profile.is_some()
         && previous_profile.as_ref().is_some_and(|previous| previous != &profile_launch) { "1" } else { "0" });
-    let (agent_turn_questions, checkpointing) = apply_profile_runtime(record, &mut command)?;
+    let (agent_turn_questions, checkpointing) = apply_profile_runtime(record, &mut command, &session.deployment.adapter_source)?;
     // proxy-modes: the Profile's effective proxy (loopback always in NO_PROXY).
     command.envs(crate::config::proxy_outbound::claude_runtime_proxy_envs(record.profile.as_deref())?);
     command
@@ -894,7 +935,7 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
         .arg(&session.deployment.claude_home)
         .env("PYTHONPATH", session.deployment.adapter_source.join("src"))
         .current_dir(&record.cwd);
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     if let Some(effort) = session.effort {
         command.arg("--effort").arg(effort.as_str());
@@ -960,6 +1001,8 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     if let Some(path) = write_system_append(record, session, &features)? {
         command.arg("--system-append-file").arg(path);
     }
+    #[cfg(target_os = "linux")]
+    let (mut command, scope_start_lease) = linux_scope::prepare_command(record, session, command, log)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -985,9 +1028,18 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     };
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
+    #[cfg(target_os = "linux")]
+    drop(scope_start_lease);
+    let launched_process = process_receipt::ProcessIdentity::read(child.id());
     let deadline = Instant::now() + Duration::from_secs(20);
     let result = loop {
         if let Some(status) = child.try_wait()? {
+            if !status.success() && start_refusal::schema_refusal_in_stderr(&log_path, stderr_start) {
+                crate::asks::store::AskStore::open_default()?.with_state(|state| {
+                    hold_schema_refusal(state, &record.cutex_session_id, record.runtime_generation, Utc::now());
+                })?;
+                break Err(ClaudeStartRefusal.into());
+            }
             break Err(anyhow::anyhow!(
                 "Claude adapter exited {status}; see {}",
                 session.state_dir.join("adapter.stderr.log").display()
@@ -1005,6 +1057,24 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    if let Ok((_, ready)) = &result {
+        let receipt = process_receipt::retry_once(|| {
+            let process = launched_process.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            #[cfg(target_os = "linux")]
+            let process = {
+                // systemd-run can still be executing when spawn returns. It
+                // execs the adapter at the same PID and birth time.
+                let launched = process_receipt::ProcessIdentity::read(process.pid)?;
+                ensure!(launched.started_at == process.started_at, "Claude launch occurrence changed");
+                launched
+            };
+            process_receipt::record(&session.state_dir, &session.deployment, process.clone(), ready.pid)
+        });
+        if let Err(error) = receipt {
+            // The adapter is already serving. Missing evidence keeps prune fail closed.
+            eprintln!("claude: process receipt unavailable for {}: {error:#}", record.cutex_session_id);
+        }
+    }
     // A CLI may exit while the adapter stays alive. In the long-lived management
     // process this waiter also reaps the child; it never kills it on TUI detach.
     std::thread::spawn(move || {
@@ -1208,11 +1278,13 @@ pub fn status(id: &str) -> anyhow::Result<Value> {
         return Ok(json!({"threadId":session.thread_id,"state":"offline"}));
     }
     let (client, _) = connect(session)?;
-    let status = client.handle().request(
+    let mut status = client.handle().request(
         "claude/runtime/status",
         json!({"threadId":session.thread_id}),
     )?;
     validate_status(session, &status)?;
+    status["processReceiptWarning"] = json!(record.runtime_pid.and_then(|pid|
+        process_receipt::warning(&session.state_dir, pid)));
     Ok(status)
 }
 
@@ -1232,6 +1304,15 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
     crate::session::runtime_stop::RequestedStop::run(id, record.runtime_generation, || {
     let session = record.claude_session.as_ref().unwrap();
     if record.runtime_pid.is_none() {
+        #[cfg(target_os = "linux")]
+        linux_scope::stop(&record, session)?;
+        // r290 P9: a repeated explicit stop supersedes an earlier kit restore,
+        // even though there is no remaining process or generation to change.
+        crate::session::store::update_session_row(&cutex_sessions_path()?, id, |current| {
+            ensure!(same_adapter_claim(current, &record), "Claude occurrence changed during close");
+            current.updated_at = Utc::now().to_rfc3339();
+            Ok(())
+        })?.context("Claude session disappeared during close")?;
         return Ok(json!({"threadId":session.thread_id,"state":"offline"}));
     }
     let (client, ready) = match connect(session) {
@@ -1241,6 +1322,8 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
             // restart): nothing is left to stop, so the close settles its
             // stale claim like a confirmed close instead of failing (offline,
             // profile switch, archive and delete all stop through here).
+            #[cfg(target_os = "linux")]
+            linux_scope::stop(&record, session)?;
             if clear_dead_adapter_claim(
                 &cutex_sessions_path()?,
                 id,
@@ -1256,6 +1339,12 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
             return Err(error);
         }
     };
+    #[cfg(target_os = "linux")]
+    let scoped_adapter = linux_scope::recorded(&record, session)?;
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = &scoped_adapter {
+        let _ = scope.is_empty()?;
+    }
     let status = client.handle().request(
         "claude/runtime/close",
         json!({"threadId":session.thread_id}),
@@ -1265,6 +1354,20 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         status["processExitConfirmed"] == true || status["state"] == "offline",
         "Claude child exit is unconfirmed; retained runtime binding"
     );
+    #[cfg(target_os = "linux")]
+    if scoped_adapter.is_some() {
+        let shutdown = client.handle().request("claude/server/shutdown", json!({"runtimeId":ready.runtime_id}));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::platform::process::process_is_running(ready.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        linux_scope::stop(&record, session)?;
+        ensure!(clear_ended_claim(&cutex_sessions_path()?, &record)?, "Claude occurrence changed during close; reload this session");
+        if let Err(error) = shutdown {
+            eprintln!("Claude adapter shutdown RPC ended before scope stop: {error}");
+        }
+        return Ok(status);
+    }
     ensure!(clear_ended_claim(&cutex_sessions_path()?, &record)?, "Claude occurrence changed during close; reload this session");
     client.handle().request("claude/server/shutdown", json!({"runtimeId":ready.runtime_id}))?;
     Ok(status)
@@ -1289,6 +1392,12 @@ pub(crate) fn clear_dead_adapter_claim(
     };
     if pid == 0 || (running(pid) && !claim_predates_boot(observed).unwrap_or(false)) {
         return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(session) = observed.claude_session.as_ref() {
+        if !linux_scope::is_empty(observed, session)? {
+            return Ok(false);
+        }
     }
     with_locked_session_rows(path, |rows| {
         let Some(current) = rows.session(id) else {
@@ -2001,6 +2110,44 @@ mod tests {
         }
     }
 
+    // r290 P13
+    #[test]
+    fn context_percent_only_requires_actual_adapter_marker() {
+        let _home=crate::profiles::lifecycle::tests::TestHome::new();
+        let source=crate::config::paths::home_dir().unwrap().join("adapter-context");
+        std::fs::create_dir_all(source.join("src/cute_claude")).unwrap();
+        let percent=crate::profiles::claude_compaction::ClaudeCompaction {auto_compact_window:None,auto_compact_percent:75};
+        assert!(validate_model_context_adapter(Some(percent),None,&source).is_err());
+        let fixed=crate::profiles::claude_compaction::ClaudeCompaction {auto_compact_window:Some(533000),auto_compact_percent:75};
+        validate_model_context_adapter(Some(fixed),None,&source).unwrap();
+        std::fs::write(source.join("src/cute_claude/features.json"),r#"{"version":1,"features":{"modelContextSettingsV1":true}}"#).unwrap();
+        validate_model_context_adapter(Some(percent),None,&source).unwrap();
+        let models=[("opus".into(),percent)].into();
+        validate_model_context_adapter(None,Some(&models),&source).unwrap();
+        std::fs::write(source.join("src/cute_claude/features.json"),r#"{"version":1,"features":{}}"#).unwrap();
+        assert!(validate_model_context_adapter(None,Some(&models),&source).is_err());
+        let root=crate::config::paths::home_dir().unwrap();
+        let executable=root.join("fixture-executable"); std::fs::write(&executable,b"fixture data, never executed").unwrap();
+        std::fs::create_dir_all(source.join("scripts")).unwrap();
+        std::fs::write(source.join("scripts/connect_tui.py"),b"# fixture").unwrap();
+        std::fs::write(source.join("src/cute_claude/__main__.py"),b"# fixture").unwrap();
+        let claude_home=root.join("claude-login");std::fs::create_dir_all(&claude_home).unwrap();
+        ClaudeDeployment {python:executable.clone(),adapter_source:source.clone(),claude_cli:executable.clone(),
+            claude_home,tui_binary:executable}.install().unwrap();
+        assert!(!selected_model_context_supported());
+        use crate::profiles::{lifecycle::{create_profile,NewProfile,NewProfileKind},settings_api::{update_profile,ProfileApiPatch}};
+        let account=create_profile(&NewProfile {name:"Claude percent".into(),kind:NewProfileKind::Claude,
+            preset:None,base_url:None,model:None,api_key:None}).unwrap();
+        let patch=ProfileApiPatch {claude_compaction:crate::config::global_settings::ConfigValueUpdate::Set(percent),..Default::default()};
+        assert!(update_profile(&account.id,&patch).is_err());
+        assert_eq!(crate::profiles::model_context::support(&account)["reason"],"claudeModelContextSettingsV1Required");
+        std::fs::write(source.join("src/cute_claude/features.json"),r#"{"version":1,"features":{"modelContextSettingsV1":true}}"#).unwrap();
+        assert!(selected_model_context_supported());
+        assert_eq!(crate::profiles::model_context::support(&account)["supported"],true);
+        update_profile(&account.id,&patch).unwrap();
+        assert_eq!(crate::profiles::claude_compaction::read_id(&account.id).unwrap(),Some(percent));
+    }
+
     #[test]
     fn profile_compaction_validates_and_passes_native_environment() {
         use crate::profiles::claude_compaction::ClaudeCompaction;
@@ -2014,7 +2161,7 @@ mod tests {
         assert_eq!(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "300000");
         assert_eq!(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "80");
         for (window,percent) in [(99999,80),(1000001,80),(300000,0),(300000,101)] {
-            assert!(ClaudeCompaction { auto_compact_window:window, auto_compact_percent:percent }.validate().is_err());
+            assert!(ClaudeCompaction { auto_compact_window:Some(window), auto_compact_percent:percent }.validate().is_err());
         }
     }
 

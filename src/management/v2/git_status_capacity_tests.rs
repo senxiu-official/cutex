@@ -94,3 +94,71 @@ fn git_status_failed_leader_releases_waiters_and_scan_capacity() {
     assert_eq!(coordinator.diagnostics()["scansActive"], 0);
     assert_eq!(coordinator.diagnostics()["scansWaiting"], 0);
 }
+
+#[test]
+fn git_status_dirty_scan_returns_to_all_waiters_then_coalesces_successor() {
+    let coordinator = Arc::new(Coordinator::new());
+    let gate = Arc::new(Gate::default());
+    let c = coordinator.clone(); let g = gate.clone();
+    let owner = std::thread::spawn(move || c.get(key("changing-root", true), || {
+        g.wait(); Ok(serde_json::json!({"files":["snapshot"]}))
+    }).unwrap());
+    eventually(|| coordinator.diagnostics()["scansActive"] == 1);
+    let waiters = (0..4).map(|_| {
+        let c = coordinator.clone();
+        std::thread::spawn(move || c.get(key("changing-root", true), || panic!("one flight")).unwrap())
+    }).collect::<Vec<_>>();
+    eventually(|| coordinator.coalesced.load(Ordering::Relaxed) == 4);
+    coordinator.invalidate(Path::new("changing-root"));
+    gate.release();
+    let first = owner.join().unwrap();
+    assert_eq!(first["possiblyStale"], true);
+    for waiter in waiters { assert!(Arc::ptr_eq(&first, &waiter.join().unwrap())); }
+    assert_eq!(coordinator.scans.load(Ordering::Relaxed), 1);
+    let second = coordinator.get(key("changing-root", true), || Ok(serde_json::json!({"fresh":true}))).unwrap();
+    assert_eq!(second["fresh"], true);
+    assert!(second.get("possiblyStale").is_none());
+    assert_eq!(coordinator.scans.load(Ordering::Relaxed), 2);
+    assert!(Arc::ptr_eq(&second, &coordinator.get(key("changing-root", true), || panic!("reuse successor")).unwrap()));
+}
+
+#[test]
+fn git_status_scan_owner_and_joiner_survive_short_admission_budget() {
+    let coordinator = Arc::new(Coordinator::new());
+    let c = coordinator.clone();
+    let owner = std::thread::spawn(move || c.get(key("slow-root", true), || {
+        std::thread::sleep(WAIT + Duration::from_millis(250));
+        Ok(serde_json::json!({"snapshot":true}))
+    }).unwrap());
+    eventually(|| coordinator.diagnostics()["scansActive"] == 1);
+    coordinator.invalidate(Path::new("slow-root"));
+    let follower = coordinator.get(key("slow-root", true), || panic!("must share running scan")).unwrap();
+    let owner = owner.join().unwrap();
+    assert!(Arc::ptr_eq(&owner, &follower));
+    assert_eq!(follower["snapshot"], true);
+    assert_eq!(coordinator.diagnostics()["joinersWaiting"], 0);
+    assert_eq!(coordinator.diagnostics()["scansActive"], 0);
+}
+
+#[test]
+fn git_status_joiners_share_existing_waiter_limit_and_release_it() {
+    let coordinator = Arc::new(Coordinator::new());
+    let gate = Arc::new(Gate::default());
+    let c = coordinator.clone(); let g = gate.clone();
+    let owner = std::thread::spawn(move || c.get(key("bounded-joiners", true), || {
+        g.wait(); Ok(serde_json::json!({"shared":true}))
+    }).unwrap());
+    eventually(|| coordinator.diagnostics()["scansActive"] == 1);
+    let joiners = (0..QUEUED).map(|_| {
+        let c = coordinator.clone();
+        std::thread::spawn(move || c.get(key("bounded-joiners", true), || panic!("one scan")).unwrap())
+    }).collect::<Vec<_>>();
+    eventually(|| coordinator.diagnostics()["joinersWaiting"] == QUEUED);
+    let started = Instant::now();
+    assert_eq!(coordinator.get(key("bounded-joiners", true), || panic!("full")).unwrap_err().code, "git_status_busy");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    gate.release();
+    let result = owner.join().unwrap();
+    for joiner in joiners { assert!(Arc::ptr_eq(&result, &joiner.join().unwrap())); }
+    assert_eq!(coordinator.diagnostics()["joinersWaiting"], 0);
+}

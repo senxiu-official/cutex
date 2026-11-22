@@ -70,6 +70,7 @@ def tool_timeout(name: str, wait: int | None, default: float | None) -> float | 
 
 def load(registry, descriptor: Path) -> None:
     config = json.loads(descriptor.read_text())
+    registry.parent_agent_name = config.get('parentName')
     executable = str(Path(config['executable']).resolve(strict=True))
     binding_path = descriptor.parent / 'cutex-mcp-binding.json'
     wait = approval_wait_secs(config)
@@ -81,6 +82,12 @@ def load(registry, descriptor: Path) -> None:
             if binding['threadId'] != context.thread_id:
                 raise ValueError('Cutex MCP thread binding mismatch')
             env = dict(os.environ)
+            # Only the authenticated native hook can populate this context.
+            # Never inherit an ambient child marker for a parent invocation.
+            env.pop('CUTEX_MCP_CHILD_ID', None)
+            child_id = getattr(context, 'native_subagent_id', None)
+            if child_id is not None:
+                env['CUTEX_MCP_CHILD_ID'] = child_id
             env.update({
                 'CUTEX_AGENT_ID': binding['runtimeAgentId'],
                 'CUTEX_RUNTIME_GENERATION': str(binding['generation']),

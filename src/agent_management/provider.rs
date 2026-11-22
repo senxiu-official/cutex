@@ -4808,10 +4808,8 @@ fn managed_spec_mismatch(
         Some("reasoning")
     } else if observation.permissions != spec.permissions {
         Some("permissions")
-    } else if observation.approval_policy != spec.approval_policy {
-        Some("approval_policy")
-    } else if observation.sandbox_mode != spec.sandbox_mode {
-        Some("sandbox_mode")
+    } else if let Some(field) = spec.codex_policy_mismatch(&observation.approval_policy, &observation.sandbox_mode) {
+        Some(field)
     } else if !groups_match {
         Some("groups")
     } else {
@@ -5457,8 +5455,7 @@ mod tests {
                 || agent.model != spec.model
                 || agent.reasoning != spec.reasoning
                 || agent.permissions != spec.permissions
-                || agent.approval_policy != spec.approval_policy
-                || agent.sandbox_mode != spec.sandbox_mode
+                || spec.codex_policy_mismatch(&agent.approval_policy, &agent.sandbox_mode).is_some()
             {
                 return Err(LifecycleFailure::definite(
                     "runtime_recovery_spec_mismatch",
@@ -6587,6 +6584,9 @@ mod tests {
     fn automatic_managed_online_uses_typed_recovery_and_preserves_identity() {
         let _home = crate::config::paths::test_home_env_lock();
         let root = root("automatic-managed-online");
+        let _instance = crate::config::instance::scoped_test_selection(
+            crate::config::instance::Selection::Custom(root.join("instance")),
+        );
         let provider = AgentManagementProvider::open(&root).unwrap();
         bind(&provider,"bind","cutex.director",None);
         let lifecycle = FakeLifecycle::default();
@@ -6616,7 +6616,7 @@ mod tests {
         asks.with_state(|state| { state.owner_offline.insert(agent.cutex_session_id.as_str().to_string()); }).unwrap();
         let before=lifecycle.state.lock().unwrap().log.clone();
         let blocked=provider.execute(&invocation("cutex.director"),&online,&lifecycle);
-        assert!(matches!(blocked.outcome,AgentManagementOutcome::NoWrite {ref detail,..} if detail.starts_with("ownerStopped")));
+        assert!(matches!(blocked.outcome,AgentManagementOutcome::NoWrite {ref detail,..} if detail.starts_with("ownerStopped")), "{blocked:?}");
         assert_eq!(lifecycle.state.lock().unwrap().log,before);
         assert!(!provider.store.snapshot().unwrap().actions.contains_key(&online.action_id));
         asks.with_state(|state| { state.owner_offline.remove(agent.cutex_session_id.as_str());
@@ -6966,6 +6966,40 @@ mod tests {
             .agent_bus_endpoint_ids
             .push("runtime:unexpected:2".to_string());
         assert!(validate_ready(&agent, &extra_endpoint).is_err());
+    }
+
+    #[test]
+    fn managed_claude_uses_its_own_permission_mode_for_recovery_and_readiness() {
+        let mut agent = ManagedAgentRecord {
+            project_id: Some(project()),
+            created_by_director_session: None,
+            created_by_operator_session: None,
+            cutex_session_id: session("cutex.worker"),
+            native_session_id: "native-worker".into(),
+            spec: spec("worker"),
+            created_at: now(),
+            retired_at: None,
+        };
+        agent.spec.runtime_backend = "claude_subscription".into();
+        agent.spec.approval_policy.clear();
+        agent.spec.sandbox_mode.clear();
+
+        let mut observed = ready_observation(&agent);
+        observed.approval_policy = "never".into();
+        observed.sandbox_mode = "danger-full-access".into();
+        validate_recovery_spec(&agent, &observed).unwrap();
+        validate_managed_observation_identity(&agent, &observed).unwrap();
+        validate_ready(&agent, &observed).unwrap();
+
+        // A backend mismatch cannot opt a Native runtime into these rules.
+        observed.runtime_backend = "host".into();
+        assert!(validate_recovery_spec(&agent, &observed).unwrap_err().to_string().contains("mismatch: runtime_backend"));
+        agent.spec.runtime_backend = "host".into();
+        agent.spec.approval_policy = "on-request".into();
+        agent.spec.sandbox_mode = "workspace-write".into();
+        assert!(validate_recovery_spec(&agent, &observed).unwrap_err().to_string().contains("mismatch: approval_policy"));
+        observed.approval_policy = agent.spec.approval_policy.clone();
+        assert!(validate_recovery_spec(&agent, &observed).unwrap_err().to_string().contains("mismatch: sandbox_mode"));
     }
 
     #[test]
@@ -7823,6 +7857,7 @@ mod tests {
                 launched_profile: None,
                 launched_profile_id: None,
                 launch_profile_source: None,
+                linux_scope: false,
                 auth_token_path: None,
                 diagnostic_journal_path: String::new(),
                 schema_version: "test".into(),

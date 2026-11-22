@@ -635,6 +635,7 @@ pub fn start(id: &str) -> anyhow::Result<CutexSessionRecord> {
         launched_profile: None,
         launched_profile_id: None,
         launch_profile_source: None,
+        linux_scope: false,
         auth_token_path: Some(
             endpoint_dir
                 .join("rpc-token")
@@ -746,6 +747,8 @@ pub fn close(id: &str, expected_generation: u64) -> anyhow::Result<()> {
             current.app_server_runtime = None;
             current.runtime_pid = None;
             current.current_runtime_agent_id = None;
+            // r290 P9: repeated owner stops invalidate an older kit restore.
+            current.updated_at = chrono::Utc::now().to_rfc3339();
             rows.commit().map(drop)
         },
     )

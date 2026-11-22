@@ -142,13 +142,16 @@ pub enum JobState {
     Cancelled,
     Interrupted,
     LaunchUnknown,
+    /// Includes unrecognized future wire states; never implies process exit.
+    #[serde(other)]
+    Unconfirmed,
 }
 
 impl JobState {
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Exited | Self::Failed | Self::Cancelled | Self::Interrupted | Self::LaunchUnknown
+            Self::Exited | Self::Failed | Self::Cancelled | Self::Interrupted | Self::LaunchUnknown | Self::Unconfirmed
         )
     }
 }
@@ -209,6 +212,11 @@ pub struct FrozenCompletionRequestV2 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobRecord {
+    /// Execution admission remains in flight independently of tracking state.
+    #[serde(default)]
+    pub launch_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_ended: Option<FollowUpEnded>,
     /// Live Linux observation, checked against the recorded process birth.
     /// This is not a durable job state or a terminal outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +246,22 @@ pub struct JobRecord {
     pub output_reference: String,
     #[serde(default)]
     pub completion_delivery: CompletionDeliverySummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FollowUpEnded {
+    pub expected_revision: u64,
+    pub reason: String,
+    pub at_epoch_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloseFollowUpParams {
+    pub job_id: String,
+    pub expected_revision: u64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

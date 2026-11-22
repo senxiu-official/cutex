@@ -451,6 +451,7 @@ mod tests {
             launched_profile: Some("deepseek".to_string()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: Some("/tmp/cutex-archive-test/token".to_string()),
             diagnostic_journal_path: "/tmp/cutex-archive-test/journal.jsonl".to_string(),
             schema_version: "v2".to_string(),

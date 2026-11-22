@@ -36,7 +36,134 @@ const MAX_LIMIT: usize = 500;
 const BOOTSTRAP_RECORDS: usize = 50;
 
 pub fn is_path(path: &str) -> bool {
-    path.split('?').next() == Some(PATH)
+    path.split('?').next() == Some(PATH) || direct_route(path).is_some()
+}
+
+fn direct_route(path: &str) -> Option<(String, String)> {
+    let rest = path
+        .split('?')
+        .next()?
+        .strip_prefix("/v2/owner-notifications/")?;
+    let (id, action) = rest.split_once('/')?;
+    let id = super::attachments::percent_decode(id)?;
+    if id.is_empty()
+        || id.len() > 128
+        || id.contains(['/', '\\'])
+        || id.chars().any(char::is_control)
+        || !matches!(action, "ack" | "dismiss" | "delete" | "safety-dismiss")
+    {
+        return None;
+    }
+    Some((id, action.into()))
+}
+
+/// Record identity, rather than session visibility, selects the mutation.
+pub fn direct_action(
+    store: &OwnerNotifyStore,
+    id: &str,
+    action: &str,
+) -> Result<Value, UserInputExecutionError> {
+    let record = store
+        .get(id)
+        .map_err(unavailable)?
+        .ok_or_else(|| error("notification_not_found", "notification not found", false))?;
+    let now = chrono::Utc::now();
+    let value = match action {
+        "ack" | "dismiss" => {
+            let result = store
+                .edit_record(id, |state| {
+                    if action == "ack" {
+                        state.acknowledge(&record.agent_id, id, now)
+                    } else {
+                        state.dismiss(&record.agent_id, id, now)
+                    }
+                })
+                .map_err(unavailable)?
+                .map_err(owner_error)?;
+            json!({"notification":result.0,"changed":result.1})
+        }
+        "delete" => {
+            json!({"notification":store.edit_record(id,|state|state.delete(&record.agent_id,id)).map_err(unavailable)?.map_err(owner_error)?,"deleted":true})
+        }
+        _ => {
+            return Err(error(
+                "invalid_request",
+                "unsupported notification action",
+                false,
+            ))
+        }
+    };
+    publish_pending_notices(store);
+    Ok(value)
+}
+
+fn handle_direct(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    id: &str,
+    action: &str,
+) -> anyhow::Result<()> {
+    if request.method != "POST" {
+        return super::server::write_v2_error(
+            stream,
+            405,
+            "Method Not Allowed",
+            "method_not_allowed",
+            "use POST",
+            false,
+            json!({}),
+        );
+    }
+    if !request.body.is_empty()
+        && serde_json::from_slice::<Value>(&request.body).ok() != Some(json!({}))
+    {
+        return super::server::write_v2_error(
+            stream,
+            400,
+            "Bad Request",
+            "invalid_request",
+            "body must be empty or {}",
+            false,
+            json!({}),
+        );
+    }
+    let result = if action == "safety-dismiss" {
+        super::safety_checks::dismiss_owner_notification(
+            Some(HumanManagementPrincipal::authenticated()),
+            id,
+        )
+    } else {
+        store().and_then(|store| direct_action(&store, id, action))
+    };
+    match result {
+        Ok(value) => write_json_response(stream, 200, "OK", &value),
+        Err(error) => {
+            let status = if error.code == "notification_not_found"
+                || error.code == "safety_block_not_found"
+            {
+                404
+            } else if error.retryable {
+                503
+            } else {
+                409
+            };
+            super::server::write_v2_error(
+                stream,
+                status,
+                if status == 404 {
+                    "Not Found"
+                } else if status == 503 {
+                    "Service Unavailable"
+                } else {
+                    "Conflict"
+                },
+                &error.code,
+                &error.message,
+                error.retryable,
+                error.details,
+            )
+        }
+    }
 }
 
 pub fn is_command(method: &str) -> bool {
@@ -154,6 +281,7 @@ pub fn pending_records() -> Vec<OwnerNotification> {
 
 /// `GET /v2/owner-notifications`.
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+    if let Some((id,action))=direct_route(&request.path) {return handle_direct(stream,request,&id,&action);}
     if request.method != "GET" {
         return super::server::write_v2_error(stream, 405, "Method Not Allowed", "method_not_allowed",
             "use GET for /v2/owner-notifications", false, json!({}));
@@ -352,6 +480,33 @@ mod tests {
                 )
             })
             .unwrap()
+    }
+
+    #[test]
+    fn direct_owner_actions_do_not_resolve_deleted_agent() {
+        let (store, dir) = temp();
+        let record = create(&store, "cutex.deleted-agent", true);
+        assert_eq!(
+            direct_route(&format!("{}/{}/ack", PATH, record.notification_id)),
+            Some((record.notification_id.clone(), "ack".into()))
+        );
+        let first = direct_action(&store, &record.notification_id, "ack").unwrap();
+        assert_eq!(first["changed"], true);
+        assert_eq!(
+            direct_action(&store, &record.notification_id, "ack").unwrap()["changed"],
+            false
+        );
+        assert_eq!(
+            direct_action(&store, &record.notification_id, "dismiss").unwrap()["changed"],
+            true
+        );
+        assert_eq!(
+            direct_action(&store, &record.notification_id, "delete").unwrap()["deleted"],
+            true
+        );
+        assert!(store.get(&record.notification_id).unwrap().is_none());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn request(method: &str, params: Value) -> ValidatedCutexRequest {

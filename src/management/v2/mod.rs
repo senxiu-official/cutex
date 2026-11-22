@@ -23,6 +23,8 @@ pub mod claude_plan;
 pub mod claude_token_usage;
 pub mod session_skills;
 pub mod alarms_api;
+// r290 P5 schedules.
+pub mod schedules_api;
 pub mod session_deltas;
 pub mod sessions_watch;
 pub mod journal_watch;
@@ -33,6 +35,7 @@ pub mod approval_rules;
 pub mod artifact_store;
 pub mod asks;
 pub mod delegations;
+pub mod project_action_receipts; // r290 P10 (A1)
 mod delegation_tree;
 pub mod documents;
 pub mod files_revert;
@@ -52,6 +55,7 @@ pub mod contract_validation;
 mod human_config;
 pub(crate) mod human_jobs;
 pub use human_jobs::prime_capabilities as prime_job_capabilities;
+pub use human_jobs::query_job_for_await;
 mod inbound_mail;
 mod nci_verification;
 pub mod integration_events;
@@ -174,3 +178,6 @@ pub(crate) mod storage_cleanup;
 mod storage_cleanup_fs;
 mod storage_cleanup_homes;
 mod storage_cleanup_catalog;
+
+// r290 P6
+pub mod board;

@@ -156,3 +156,23 @@ async def test_tombstone_survives_writer_restart_with_delayed_ack_and_permanent_
         assert reopened.db.execute('SELECT count(*) FROM turns').fetchone()[0] == 1
     finally:
         reopened.close()
+
+
+async def test_recovered_empty_probe_is_pending_not_a_closed_gate(h):
+    tid = await h.thread()
+    service = install(h, subscription=True)
+    value = envelope(tid)
+    await invoke(service,h,'submit',value,after=False)
+    record = h.store.claim(tid)
+    h.store.defer_silent_input(tid,record['turn_id'],{'count':0,'probeCount':1,'held':False,'windowStarted':0,'notBefore':10})
+    # Store boot fences claim until native lease/history and pause replay validate.
+    h.store.db.execute('UPDATE threads SET halted=1 WHERE id=?',(tid,))
+    h.store.recovered_probes[tid]=record['turn_id']
+    params={**binding(tid),'messages':[{'messageId':value['message']['id'],'semanticSha256':value['semanticSha256']}]}
+    status=(await invoke(service,h,'status',params))['statuses'][0]
+    assert status['deliveryState']=='pending' and status['receipt'] is None
+    assert status['processing']['state']=='pending' and status['processing']['reason'] is None
+    # Failure to prove recovery must still expose the actual interruption hold.
+    h.store.recovered_probes.pop(tid)
+    status=(await invoke(service,h,'status',params))['statuses'][0]
+    assert status['processing']['state']=='held' and status['processing']['reason']=='interrupted'

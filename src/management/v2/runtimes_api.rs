@@ -11,23 +11,39 @@
 //!           latest?, missing?, agents: [{cutexSessionId, name}], agentCount }
 //! ```
 //!
-//! - `native`: one entry per native version in the version registry
+//! - `native`: one entry per exact executable SHA in the version registry
 //!   (`runtime_artifacts` / `runtime_paths`), plus one per pinned executable
 //!   the registry does not know (`version` absent). `selected`: the version of
 //!   the selected runtime package's exact executable SHA; absent deployment
 //!   selects nothing, and an unregistered SHA selects an unknown entry.
 //!   `latest`: the registry's latest runtime. Agents: all durable
-//!   explicit-launch records whose bundle manifest pins that executable.
+//!   roster-backed persistent records whose bundle manifest pins that executable.
 //! - `claude`: one entry per Claude runtime directory (`claude-r5`, …) used
 //!   by the selected deployment or any durable Claude session, including retired rows.
+//! - Hidden local-only, ephemeral and orphan session rows are excluded.
+//!   `activeAgentCount` includes offline agents; `archivedAgentCount` counts
+//!   retired durable agents. Their sum is `agentCount`, independently of list caps.
 //! - `agents` is capped at [`MAX_AGENTS`] per entry; `agentCount` is exact.
 //! - Paths are reduced to `<release dir>/<file>` (`path`) and directory names;
 //!   no tokens, no auth or home paths.
 //!
 //! Computed per request from existing stores (session store, version
-//! registry, bundle manifests, Claude deployment); no threads, no polling.
+//! registry, bundle manifests, Claude deployment). Historical executable bytes
+//! are verified by one bounded worker; summary never requests that inventory.
 
-use std::collections::{BTreeMap, HashMap};
+#[path = "runtime_digest_inventory.rs"]
+mod digests;
+
+/// Start the advisory inventory without waiting for registry or executable I/O.
+pub fn start_inventory() {
+    digests::start();
+}
+
+pub(super) fn maintain_runtime_inventory(work: Box<dyn FnOnce() + Send>) -> bool {
+    digests::maintain(work)
+}
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::TcpStream;
 use std::path::Path;
 
@@ -77,6 +93,10 @@ pub struct Entry {
     pub missing: bool,
     pub agents: Vec<AgentRef>,
     pub agent_count: usize,
+    pub active_agent_count: usize,
+    pub archived_agent_count: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub verification_pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_managed: Option<bool>,
     #[serde(skip_serializing_if = "is_zero")]
@@ -88,8 +108,9 @@ pub struct Entry {
 fn is_zero(value: &usize) -> bool { *value == 0 }
 
 impl Entry {
-    fn add_agent(&mut self, agent: AgentRef) {
+    fn add_agent(&mut self, agent: AgentRef, archived: bool) {
         self.agent_count += 1;
+        if archived { self.archived_agent_count += 1; } else { self.active_agent_count += 1; }
         match agent.external_runtime_path {
             Some(true) => self.external_agent_count += 1,
             Some(false) => self.managed_agent_count += 1,
@@ -111,6 +132,10 @@ pub struct PinnedExecutable {
 /// Inputs of [`build`], gathered by the handler (or a test).
 pub struct Inputs<'a> {
     pub sessions: &'a CutexSessionStore,
+    /// Authoritative managed-agent roster, including archived identities.
+    pub managed_agent_ids: &'a HashSet<String>,
+    /// Current bytes, never a path-only version label.
+    pub executable_sha256: &'a dyn Fn(&str) -> Option<String>,
     pub registry: Option<&'a NativeVersionRegistry>,
     /// Executable of the selected runtime package.
     pub selected_native: Option<PinnedExecutable>,
@@ -175,58 +200,67 @@ pub struct Built {
 }
 
 pub fn build(inputs: &Inputs<'_>) -> Built {
-    // --- native: registry entries keyed by version
+    build_inventory(inputs, InventoryMode::Verified)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryMode { Verified, Pending, Summary }
+
+fn build_inventory(inputs: &Inputs<'_>, mode: InventoryMode) -> Built {
+    // Native build identity is the full SHA, never a version or directory label.
     let mut native: BTreeMap<String, Entry> = BTreeMap::new();
-    let mut sha_to_version: HashMap<String, String> = HashMap::new();
-    let latest = inputs.registry.map(|registry| registry.latest_runtime.version.clone());
+    let mut verified_shas = HashSet::new();
+    let latest = inputs.registry.map(|registry| registry.latest_runtime.version.as_str());
     if let Some(registry) = inputs.registry {
         for (sha, record) in &registry.runtime_artifacts {
-            sha_to_version.insert(sha.clone(), record.version.clone());
-            let entry = native.entry(record.version.clone()).or_default();
-            entry.sha256_prefix.get_or_insert_with(|| sha_prefix(sha));
+            native.insert(sha.clone(), Entry {
+                version: Some(record.version.clone()),
+                release: super::runtime_packages::native_release(Some(&record.version), None)
+                    .unwrap_or_else(|| record.version.clone()),
+                sha256_prefix: Some(sha_prefix(sha)),
+                latest: latest == Some(record.version.as_str()),
+                missing: true,
+                verification_pending: mode == InventoryMode::Pending,
+                ..Entry::default()
+            });
         }
-        for (path, record) in &registry.runtime_paths {
-            let entry = native.entry(record.version.clone()).or_default();
+        for path in registry.runtime_paths.keys().filter(|_| mode != InventoryMode::Summary) {
+            // Resolve current bytes; stale path labels cannot relabel replacements.
+            if mode == InventoryMode::Verified && !(inputs.exists)(path) { continue; }
+            let Some(sha) = (inputs.executable_sha256)(path) else { continue };
+            verified_shas.insert(sha.clone());
+            let Some(entry) = native.get_mut(&sha) else { continue };
             if entry.path.is_none() {
                 entry.path = short_path(path);
                 entry.release_dir = parent_name(path);
-                entry.missing = !(inputs.exists)(path);
-            } else if entry.missing && (inputs.exists)(path) {
-                entry.missing = false;
             }
+            entry.missing = false;
+            entry.verification_pending = false;
         }
-        native.entry(registry.latest_runtime.version.clone()).or_default();
     }
-    for (version, entry) in native.iter_mut() {
-        entry.version = Some(version.clone());
-        entry.release = crate::management::v2::runtime_packages::native_release(Some(version), entry.path.as_deref())
-            .unwrap_or_else(|| version.clone());
-        entry.latest = latest.as_deref() == Some(version.as_str());
-    }
-    let selected_version = inputs
-        .selected_native
-        .as_ref()
-        // Latest is release metadata, never evidence of the selected bytes.
-        .and_then(|pinned| sha_to_version.get(&pinned.sha256).cloned());
+    let selected_sha = inputs.selected_native.as_ref()
+        .filter(|pinned| native.contains_key(&pinned.sha256))
+        .map(|pinned| pinned.sha256.clone());
     // Executables the registry does not know, keyed by sha.
     let mut unknown: BTreeMap<String, Entry> = BTreeMap::new();
-    fn unknown_entry(unknown: &mut BTreeMap<String, Entry>, pinned: &PinnedExecutable, exists: &dyn Fn(&str) -> bool) -> String {
+    fn unknown_entry(unknown: &mut BTreeMap<String, Entry>, pinned: &PinnedExecutable, exists: &dyn Fn(&str) -> bool, unverified: bool) -> String {
         unknown
             .entry(pinned.sha256.clone())
             .or_insert_with(|| Entry {
-                release: crate::management::v2::runtime_packages::release_dir_label(&pinned.path)
-                    .unwrap_or_else(|| sha_prefix(&pinned.sha256)),
+                release: "unknown".to_string(),
                 path: short_path(&pinned.path),
                 release_dir: parent_name(&pinned.path),
                 sha256_prefix: Some(sha_prefix(&pinned.sha256)),
                 missing: !exists(&pinned.path),
+                verification_pending: unverified,
                 ..Entry::default()
             });
         pinned.sha256.clone()
     }
     let mut selected_unknown = None;
-    if let (Some(pinned), None) = (&inputs.selected_native, &selected_version) {
-        selected_unknown = Some(unknown_entry(&mut unknown, pinned, inputs.exists));
+    if let (Some(pinned), None) = (&inputs.selected_native, &selected_sha) {
+        selected_unknown = Some(unknown_entry(&mut unknown, pinned, inputs.exists,
+            mode == InventoryMode::Pending && !verified_shas.contains(&pinned.sha256)));
     }
 
     // --- agents
@@ -241,6 +275,11 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
             .then_with(|| a.cutex_session_id.cmp(&b.cutex_session_id))
     });
     for record in records {
+        if record.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
+            || !inputs.managed_agent_ids.contains(&record.cutex_session_id) {
+            continue;
+        }
+        let archived = record.archive_state == crate::session::model::CutexSessionArchiveState::Retired;
         if let Some(session) = &record.claude_session {
             let adapter = session.deployment.adapter_source.to_string_lossy().into_owned();
             let label = claude_runtime_label(&adapter);
@@ -249,7 +288,7 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
                 missing: !(inputs.exists)(&adapter),
                 ..Entry::default()
             });
-            entry.add_agent(agent_ref(record));
+            entry.add_agent(agent_ref(record), archived);
             continue;
         }
         let Some(contract) = &record.explicit_launch else {
@@ -266,30 +305,33 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
             // Unreadable manifest (deleted release): its own bucket.
             let key = format!("manifest:{}", contract.bundle_manifest.to_string_lossy());
             let entry = unknown.entry(key).or_insert_with(|| Entry {
-                release: crate::management::v2::runtime_packages::release_dir_label(
-                    &contract.bundle_manifest.to_string_lossy(),
-                )
-                .unwrap_or_else(|| "unknown".to_string()),
+                release: "unknown".to_string(),
                 release_dir: parent_name(&contract.bundle_manifest.to_string_lossy()),
                 missing: true,
+                verification_pending: mode == InventoryMode::Pending,
                 ..Entry::default()
             });
-            entry.add_agent(agent_ref(record));
+            entry.add_agent(agent_ref(record), archived);
             continue;
         };
         let mut agent = agent_ref(record);
         agent.external_runtime_path = inputs.managed_native_root
             .map(|root| !crate::launch::native_managed::is_inside(Path::new(&pinned.path), root));
-        match sha_to_version.get(&pinned.sha256) {
-            Some(version) => native.entry(version.clone()).or_default().add_agent(agent),
-            None => {
-                let key = unknown_entry(&mut unknown, &pinned, inputs.exists);
-                unknown.get_mut(&key).expect("inserted").add_agent(agent);
+        if let Some(entry) = native.get_mut(&pinned.sha256) {
+            if entry.path.is_none() || (entry.missing && (inputs.exists)(&pinned.path)) {
+                entry.path = short_path(&pinned.path);
+                entry.release_dir = parent_name(&pinned.path);
+                entry.missing = !(inputs.exists)(&pinned.path);
             }
+            entry.add_agent(agent, archived);
+        } else {
+            let key = unknown_entry(&mut unknown, &pinned, inputs.exists,
+                mode == InventoryMode::Pending && !verified_shas.contains(&pinned.sha256));
+            unknown.get_mut(&key).expect("inserted").add_agent(agent, archived);
         }
     }
-    if let Some(version) = &selected_version {
-        if let Some(entry) = native.get_mut(version) {
+    if let Some(sha) = &selected_sha {
+        if let Some(entry) = native.get_mut(sha) {
             entry.selected = true;
             entry.sha256_prefix = inputs.selected_native.as_ref().map(|pinned| sha_prefix(&pinned.sha256));
             if let Some(pinned) = &inputs.selected_native {
@@ -325,7 +367,8 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
 
     // Newest first: registry entries by version (descending), then unknown.
     let mut native: Vec<Entry> = native.into_values().filter(|entry|
-        entry.selected || entry.agent_count > 0 || (entry.path.is_some() && !entry.missing)).collect();
+        (mode == InventoryMode::Summary && entry.latest)
+            || entry.selected || entry.agent_count > 0 || (entry.path.is_some() && !entry.missing)).collect();
     native.sort_by(|a, b| natural_key(b.version.as_deref()).cmp(&natural_key(a.version.as_deref())));
     native.extend(unknown.into_values());
     let mut claude: Vec<Entry> = claude.into_values().collect();
@@ -390,6 +433,39 @@ fn cutex_view() -> Value {
     })
 }
 
+fn managed_agent_ids() -> anyhow::Result<HashSet<String>> {
+    let directory = crate::agent_management::AgentManagementStore::open_default()?
+        .directory_snapshot_shared()?;
+    Ok(directory.agents.keys().map(|id| id.as_str().to_string()).collect())
+}
+
+/// A damaged/unavailable roster must not hide installed runtimes. The fallback
+/// total describes durable persistent session rows, without claiming an exact
+/// roster-backed active/archive split.
+fn roster_or_session_ids(
+    sessions: &CutexSessionStore,
+    roster: anyhow::Result<HashSet<String>>,
+) -> (HashSet<String>, bool) {
+    match roster {
+        Ok(ids) => (ids, true),
+        Err(_) => (sessions.sessions.values()
+            .filter(|row| row.registration_class == crate::agent_bus::model::AgentRegistrationClass::Persistent)
+            .map(|row| row.cutex_session_id.clone()).collect(), false),
+    }
+}
+
+fn entries_wire(entries: &[Entry], roster_available: bool) -> Value {
+    let mut value = json!(entries);
+    if !roster_available {
+        for entry in value.as_array_mut().expect("entry array") {
+            let entry = entry.as_object_mut().expect("entry object");
+            entry.remove("activeAgentCount");
+            entry.remove("archivedAgentCount");
+        }
+    }
+    value
+}
+
 pub fn resource() -> anyhow::Result<Value> {
     let managed_root = crate::launch::native_managed::root()?;
     let sessions = crate::session::store::load_cutex_session_store()?;
@@ -399,7 +475,17 @@ pub fn resource() -> anyhow::Result<Value> {
         .flatten()
         .and_then(|deployment| read_manifest(&deployment.bundle_manifest));
     let exists = |path: &str| Path::new(path).exists();
-    let built = build(&Inputs {
+    let (managed_agent_ids, roster_available) = roster_or_session_ids(&sessions, managed_agent_ids());
+    let ready = |path: &str| {
+        match digests::ready(path) {
+            digests::Observation::Verified(sha) => Some(sha),
+            digests::Observation::Missing => None,
+            _ => None,
+        }
+    };
+    let built = build_inventory(&Inputs {
+        managed_agent_ids: &managed_agent_ids,
+        executable_sha256: &ready,
         sessions: &sessions,
         registry: registry.as_ref(),
         selected_native,
@@ -407,14 +493,14 @@ pub fn resource() -> anyhow::Result<Value> {
         read_manifest: &read_manifest,
         exists: &exists,
         managed_native_root: Some(&managed_root),
-    });
+    }, InventoryMode::Pending);
     Ok(json!({
         "contractVersion": 2,
         "hostId": crate::platform::host::current_host_name(),
         "generatedAt": chrono::Utc::now().to_rfc3339(),
         "cutex": cutex_view(),
-        "native": built.native,
-        "claude": built.claude,
+        "native": entries_wire(&built.native, roster_available),
+        "claude": entries_wire(&built.claude, roster_available),
         "unpinnedAgentCount": built.unpinned_agent_count,
     }))
 }
@@ -473,7 +559,10 @@ pub fn summary() -> anyhow::Result<Value> {
         .flatten()
         .and_then(|deployment| read_manifest(&deployment.bundle_manifest));
     let exists = |path: &str| Path::new(path).exists();
-    let built = build(&Inputs {
+    let (managed_agent_ids, _) = roster_or_session_ids(&sessions, managed_agent_ids());
+    let built = build_inventory(&Inputs {
+        managed_agent_ids: &managed_agent_ids,
+        executable_sha256: &|_| None,
         sessions: &sessions,
         registry: registry.as_ref(),
         selected_native,
@@ -481,7 +570,7 @@ pub fn summary() -> anyhow::Result<Value> {
         read_manifest: &read_manifest,
         exists: &exists,
         managed_native_root: Some(&managed_root),
-    });
+    }, InventoryMode::Summary);
     Ok(summary_from(&built))
 }
 

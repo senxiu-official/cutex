@@ -487,8 +487,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn context<T>(label: &str, f: impl FnOnce(&ToolContext<'_>) -> T) -> T {
-        let (world, _world_dir) = world(label);
         let (store, _store_dir) = temp_store(label);
+        let _instance = crate::config::instance::scoped_test_selection(
+            crate::config::instance::Selection::Custom(store.dir().join("instance")),
+        );
+        let (world, _world_dir) = world(label);
         let send = |_: &tools::TellSend<'_>| Ok(json!({"ok":true}));
         let chain = |_: &str, _: &str, _: &str| None;
         let clock = Utc::now;

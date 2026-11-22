@@ -3629,6 +3629,7 @@ requires_openai_auth = false
             launched_profile: None,
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: Some(token_path.display().to_string()),
             diagnostic_journal_path: temp_home
                 .join(".cutex")

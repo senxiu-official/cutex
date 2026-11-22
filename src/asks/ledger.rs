@@ -83,6 +83,12 @@ fn applied_version(record: Option<&InputRecord>) -> Option<u64> {
 /// the transition would leave on the record.
 fn with_source_version(next: &Next, current: Option<&InputRecord>, version: Option<u64>) -> Next {
     let mut next = next.clone();
+    // Closing a readable result only withdraws its panel surface. Keep the
+    // existing uncertainty reason while applying that same-state metadata.
+    if next.state == InputState::Uncertain && next.reason.is_none() {
+        next.reason = current.filter(|record| record.state == InputState::Uncertain)
+            .and_then(|record| record.reason.clone());
+    }
     // Private asks job convention: waiting without a reason is a hold-action
     // metadata update, not a scheduler decision. Resolve it under the same
     // revision CAS so a late store projection preserves `returned` (and any
@@ -676,11 +682,13 @@ pub fn delivery_job(
     before: Option<&DeliveryRecord>,
     delivery: &DeliveryRecord,
 ) -> Option<Job> {
+    let settled_pending = delivery.state == DeliveryState::Pending
+        && after_state.asks.get(&delivery.ask_id).is_some_and(|ask| super::delivery::settled_for_requester(ask));
     // A moved delivery has no prior projection in its new recipient. Preserve
     // its source state, but use the normal initial-admission path there.
     let before = before.filter(|previous|
         delivery_session(before_state,previous)==delivery_session(after_state,delivery));
-    if before.is_some_and(|before| delivery_session(before_state,before)==delivery_session(after_state,delivery) && before.state == delivery.state && before.passive == delivery.passive && before.owner_hold == delivery.owner_hold && before.owner_input_id == delivery.owner_input_id && before.settled_by == delivery.settled_by) {
+    if !settled_pending && before.is_some_and(|before| delivery_session(before_state,before)==delivery_session(after_state,delivery) && before.state == delivery.state && before.passive == delivery.passive && before.owner_hold == delivery.owner_hold && before.owner_input_id == delivery.owner_input_id && before.settled_by == delivery.settled_by) {
         return None;
     }
     let input = delivery_input(after_state, delivery).or_else(|| delivery_input(before_state, delivery))?;
@@ -697,8 +705,25 @@ pub fn delivery_job(
     // while it is pending, and the record a tool read creates is off the
     // panels from its first write.
     let read_by_tool = if delivery.passive { created.clone().surface(il::Surface::None) } else { created.clone() };
+    let withdraw = || [
+        step(waiting_metadata(created.clone()).surface(il::Surface::None), &[WAITING]),
+        step(n(Next::to(InputState::Uncertain)).surface(il::Surface::None), &[UNCERTAIN]),
+    ];
     let mut steps = Vec::new();
     match delivery.state {
+        // The requester closed the delegation, so this pending source will
+        // no longer be scheduled automatically. Withdraw its panel surface
+        // without finalizing the row: an explicit read/wait may still put it
+        // in context. Rebuild/drift replay the same metadata-only update.
+        DeliveryState::Pending if settled_pending => {
+            steps.extend(withdraw());
+        }
+        DeliveryState::QueuedAsEvent if super::returns::native_held(delivery).is_some() => {
+            let held=n(Next::waiting("nativeHeld")).details(json!({
+                "nativeReason":super::returns::native_held(delivery),"manualRetry":true}));
+            steps.push(step(held.clone(),&[ABSENT,WAITING]));
+            steps.push(step(held,&[SENDING]));
+        }
         // A discarded queued batch has no lease left to reconcile its other
         // members. Their explicit source marker makes uncertainty durable,
         // including ordinary `soon` events with no owner_input_id and a full
@@ -776,7 +801,9 @@ pub fn delivery_job(
                 steps.push(step(read_by_tool, &[ABSENT]));
                 steps.push(step(n(Next::in_context(Evidence::ReadByTool)), &[WAITING, UNCERTAIN, SENDING, ACCEPTED]));
             }
-            Some("closed") => steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN])),
+            // These source deliveries are already acknowledged, so neither
+            // an explicit read nor a wait can claim them later.
+            Some("closed" | "followUpEnded") => steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN])),
             Some("notices_read") => {
                 // A pending source can outpace a prior native projection in
                 // another process. Retire it without claiming model context.
@@ -806,8 +833,9 @@ pub fn delivery_job(
 // ---------------------------------------------------------------------------
 // The store hook
 
-/// Jobs for one committed AskStore write: only the asks and deliveries in
-/// its row changes are looked at (no scan, no history read).
+/// Jobs for one committed AskStore write. Closing an ask also projects its
+/// unchanged pending deliveries in one pass over the hot delivery map.
+/// Ordinary writes use only changed rows; no history or IO is read here.
 pub fn store_jobs(before: &AskState, after: &AskState, changes: &[crate::management::v2::hot_store::RowChange]) -> Vec<Job> {
     use crate::management::v2::hot_store::RowChange;
     // 054 §2.6 (C5): a lease taken, moved or released changes the session's
@@ -820,15 +848,22 @@ pub fn store_jobs(before: &AskState, after: &AskState, changes: &[crate::managem
         }
     }
     let mut jobs = Vec::new();
+    let mut settled_asks = std::collections::BTreeSet::new();
+    let mut changed_deliveries = std::collections::BTreeSet::new();
     for change in changes {
         let RowChange::Put { collection, key, .. } = change else { continue };
         match collection.as_str() {
             "asks" => {
                 if let Some(ask) = after.asks.get(key) {
+                    if super::delivery::settled_for_requester(ask)
+                        && !before.asks.get(key).is_some_and(|ask| super::delivery::settled_for_requester(ask)) {
+                        settled_asks.insert(key.clone());
+                    }
                     jobs.extend(request_job(before, after, before.asks.get(key).map(|ask| &**ask), ask));
                 }
             }
             "deliveries" => {
+                changed_deliveries.insert(key.clone());
                 if let Some(delivery) = after.deliveries.get(key) {
                     if let Some(previous)=before.deliveries.get(key) {
                         let old_session=delivery_session(before,previous);
@@ -845,6 +880,12 @@ pub fn store_jobs(before: &AskState, after: &AskState, changes: &[crate::managem
                 }
             }
             _ => {}
+        }
+    }
+    if !settled_asks.is_empty() {
+        for delivery in after.deliveries.values().filter(|delivery| delivery.state == DeliveryState::Pending
+            && settled_asks.contains(&delivery.ask_id) && !changed_deliveries.contains(&delivery.delivery_id)) {
+            jobs.extend(delivery_job(before, after, before.deliveries.get(&delivery.delivery_id), delivery));
         }
     }
     jobs

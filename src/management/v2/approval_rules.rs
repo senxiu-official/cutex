@@ -50,6 +50,18 @@ struct WriteBody {
     rule: ApprovalRuleDraft,
     #[serde(default)]
     confirmation_token: Option<String>,
+    // r290 P10 (B8): the owner resumed an unchanged paused rule (PATCH only).
+    #[serde(default)]
+    owner_resume: bool,
+}
+
+/// r290 P10 (B8): `ownerResume` is an owner gesture: the owner principal
+/// (root credential or owner client token) with full device scope. A
+/// narrowed device token or a shared-access user never skips the token.
+/// Agents never reach this root-only route.
+fn owner_gesture_allowed() -> bool {
+    crate::management::users::caller_is_owner()
+        && crate::management::listeners::current_client_token().is_none_or(|token| token.scope.is_full())
 }
 
 #[derive(Deserialize)]
@@ -181,6 +193,10 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
         }
         ("POST", Route::Collection) => {
             let input: WriteBody = match body(request) { Ok(value) => value, Err(message) => return invalid(stream, message) };
+            // r290 P10 (B8): a new rule always needs the typed token.
+            if input.owner_resume {
+                return invalid(stream, "ownerResume applies only to PATCH of an existing rule".into());
+            }
             match store.create_rule(input.expected_revision, input.rule, input.confirmation_token.as_deref(), now) {
                 Ok((revision, rule)) => { publish("created", Some(&rule.rule_id), revision); write_json_response(stream, 201, "Created", &json!({"revision":revision,"rule":rule})) },
                 Err(failure) => error(stream, failure),
@@ -188,7 +204,14 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
         }
         ("PATCH", Route::Rule(id)) => {
             let input: WriteBody = match body(request) { Ok(value) => value, Err(message) => return invalid(stream, message) };
-            match store.replace_rule(&id, input.expected_revision, input.rule, input.confirmation_token.as_deref(), now) {
+            // r290 P10 (B8): `ownerResume` only counts for a full-scope owner; any
+            // other caller (or a changed rule) still needs the typed token.
+            let replaced = if input.owner_resume && owner_gesture_allowed() {
+                store.replace_rule_owner_resume(&id, input.expected_revision, input.rule, input.confirmation_token.as_deref(), now)
+            } else {
+                store.replace_rule(&id, input.expected_revision, input.rule, input.confirmation_token.as_deref(), now)
+            };
+            match replaced {
                 Ok((revision, rule)) => { publish("updated", Some(&rule.rule_id), revision); write_json_response(stream, 200, "OK", &json!({"revision":revision,"rule":rule})) },
                 Err(failure) => error(stream, failure),
             }
@@ -239,5 +262,37 @@ mod tests {
         );
         assert!(parse_path("/v2/approval-rules/bad").is_none());
         assert!(!is_path("/v2/approvals"));
+    }
+
+    // r290 P10 (B8)
+    #[test]
+    fn owner_resume_gesture_counts_only_for_a_full_scope_owner() {
+        use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
+        use crate::management::listeners::set_current_client_token;
+        use crate::management::users::{set_current_principal, Principal};
+        let token = |scope| { let mut token = VerifiedClientToken::test_token("ct-test"); token.scope = scope; token };
+        set_current_principal(None);
+        set_current_client_token(None);
+        assert!(owner_gesture_allowed(), "root credential");
+        set_current_client_token(Some(token(DeviceScope::Full)));
+        assert!(owner_gesture_allowed(), "full-scope owner device");
+        for scope in [DeviceScope::Chat, DeviceScope::Read] {
+            set_current_client_token(Some(token(scope)));
+            assert!(!owner_gesture_allowed(), "narrowed device token");
+        }
+        set_current_client_token(Some(token(DeviceScope::Full)));
+        set_current_principal(Some(Principal::Pending));
+        assert!(!owner_gesture_allowed(), "not the owner");
+        set_current_principal(None);
+        set_current_client_token(None);
+    }
+
+    #[test]
+    fn owner_resume_is_a_patch_field_only() {
+        let body: WriteBody = serde_json::from_value(json!({
+            "expectedRevision": 1, "ownerResume": true,
+            "rule": { "subject": { "type": "agent", "cutexSessionId": "cutex.a" }, "kinds": ["managed_service"], "expiry": { "mode": "revoked" } },
+        })).unwrap();
+        assert!(body.owner_resume);
     }
 }

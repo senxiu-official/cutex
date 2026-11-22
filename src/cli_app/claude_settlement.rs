@@ -43,6 +43,13 @@ impl std::fmt::Display for Ineligible {
 }
 impl std::error::Error for Ineligible {}
 
+#[derive(Debug)]
+struct RuntimeGone;
+impl std::fmt::Display for RuntimeGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("runtime_gone") }
+}
+impl std::error::Error for RuntimeGone {}
+
 macro_rules! eligible_ensure {
     ($condition:expr, $reason:literal $(,)?) => {
         if !$condition {
@@ -53,6 +60,7 @@ macro_rules! eligible_ensure {
 
 fn classify(result: anyhow::Result<Observation>) -> anyhow::Result<Observation> {
     match result {
+        Err(error) if error.downcast_ref::<RuntimeGone>().is_some() => Ok(Observation::RuntimeGone),
         Err(error) if error.downcast_ref::<Ineligible>().is_some() => Ok(Observation::Ineligible),
         result => result,
     }
@@ -146,6 +154,30 @@ fn collect_connected(
     if !eligible(snapshot, envelope) && stale.is_none() {
         return Ok(Observation::Ineligible);
     }
+    let record = cutex::session::store::shared_session_row(&snapshot.to_cutex_session_id)?;
+    with_recipient(record.as_deref(), || collect_live(snapshot, deadline, repository, stale))
+}
+
+fn with_recipient(
+    record: Option<&cutex::session::model::CutexSessionRecord>,
+    observe: impl FnOnce() -> anyhow::Result<Observation>,
+) -> anyhow::Result<Observation> {
+    if record.is_none_or(|record| record.is_retired()) {
+        // Durable lifecycle evidence, not an inference from disconnection.
+        // It does not establish delivery, terminal execution, or no effects.
+        return Ok(Observation::RuntimeGone);
+    }
+    observe()
+}
+
+fn collect_live(
+    snapshot: &AgentBusMessageSnapshot,
+    deadline: Instant,
+    repository: &cutex::management::v2::agent_bus_state::AgentBusMessageRepository,
+    stale: Option<StaleAckEvidence>,
+) -> anyhow::Result<Observation> {
+    remaining(deadline)?;
+    let envelope = snapshot.external_input.as_ref().expect("eligible message has an envelope");
     // Deliberately do not call manager(), observe(), ensure(), or capability
     // recovery: only a manager/connection already installed by the observer.
     let manager = super::MANAGER
@@ -164,7 +196,8 @@ fn collect_connected(
         let record = store
             .sessions
             .get(&envelope.owner_id)
-            .context("Claude recipient missing")?;
+            .ok_or(RuntimeGone)?;
+        if record.is_retired() { return Err(RuntimeGone.into()); }
         eligible_ensure!(
             record.runtime_backend
                 == cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
@@ -850,6 +883,21 @@ fn collect_validated(
 mod tests {
     use super::*;
     use cutex::app_server::external_input::{Message, Source, SourceKind};
+
+    #[test]
+    fn retired_or_deleted_recipient_is_definitely_gone_without_observer_io() {
+        use cutex::session::model::{CutexSessionArchiveState, CutexSessionRecord};
+        assert!(matches!(with_recipient(None, || panic!("deleted recipient must not contact observer")).unwrap(), Observation::RuntimeGone));
+        let mut record = CutexSessionRecord::new_at("cutex.gone".into(), None, "host".into(), ".".into(), None, "2026-11-17T00:00:00Z".into()).unwrap();
+        record.archive_state = CutexSessionArchiveState::Retired;
+        assert!(matches!(with_recipient(Some(&record), || panic!("retired recipient must not contact observer")).unwrap(), Observation::RuntimeGone));
+        assert!(matches!(classify(Err(RuntimeGone.into())).unwrap(), Observation::RuntimeGone));
+        // Disconnection alone is not durable lifecycle evidence.
+        record.archive_state = CutexSessionArchiveState::Active;
+        record.current_runtime_agent_id = None;
+        let error = with_recipient(Some(&record), || anyhow::bail!("offline observation unavailable")).unwrap_err();
+        assert!(error.to_string().contains("offline"));
+    }
 
     fn stale_context() -> StaleAckEvidence {
         StaleAckEvidence {

@@ -20,6 +20,22 @@ use crate::management::v2::native_requests::canonical_request_sha256;
 const PENDING_REQUESTS_FILE_NAME: &str = "pending-server-requests.json";
 const PENDING_REQUESTS_LOCK_FILE_NAME: &str = "pending-server-requests.lock";
 
+pub fn session_id_from_path(path: &str) -> Option<String> {
+    let encoded = path.strip_prefix("/v2/sessions/")?.strip_suffix("/server-requests")?;
+    let decoded = super::attachments::percent_decode(encoded)?;
+    (!decoded.is_empty() && !decoded.contains('/') && !decoded.chars().any(char::is_control)).then_some(decoded)
+}
+
+/// Current, answerable requests only; no native history or model work.
+pub fn resource(session: &Value) -> anyhow::Result<Value> {
+    let id = session["cutexSessionId"].as_str().unwrap_or_default();
+    let generation = session.pointer("/runtime/runtimeGeneration").and_then(Value::as_u64).unwrap_or(0);
+    let live = session.pointer("/runtime/status").and_then(Value::as_str) == Some("online")
+        && session.pointer("/runtime/appServerConnected").and_then(Value::as_bool) == Some(true);
+    let requests = if live { snapshot(id, generation)? } else { Vec::new() };
+    Ok(json!({"contractVersion":2,"cutexSessionId":id,"runtimeGeneration":generation,"requests":requests}))
+}
+
 static PENDING_REQUESTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -600,6 +616,31 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lightweight_read_returns_live_generation_params_without_history() {
+        let id = format!("cutex.pending-read-{}", uuid::Uuid::new_v4());
+        let native = json!({"id":1,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"q","question":"Which?","options":[]}]}});
+        record_request(&id, 3, native.clone()).unwrap();
+        let mut session = json!({"cutexSessionId":id,"runtime":{"status":"online","appServerConnected":true,"runtimeGeneration":3}});
+        let result = resource(&session).unwrap();
+        assert_eq!(result["requests"], json!([{"runtimeGeneration":3,"native":native}]));
+        for status in ["offline", "error", "closing"] {
+            session["runtime"]["status"] = json!(status);
+            assert_eq!(resource(&session).unwrap()["requests"], json!([]));
+        }
+        session["runtime"]["status"] = json!("online");
+        session["runtime"]["appServerConnected"] = json!(false);
+        assert_eq!(resource(&session).unwrap()["requests"], json!([]));
+        session["runtime"]["appServerConnected"] = json!(true);
+        session["runtime"]["runtimeGeneration"] = json!(4);
+        assert_eq!(resource(&session).unwrap()["requests"], json!([]));
+        clear_session(&id).unwrap();
+        assert_eq!(session_id_from_path("/v2/sessions/cutex%2Ea/server-requests"), Some("cutex.a".into()));
+        for path in ["/v2/sessions//server-requests", "/v2/sessions/a%2fb/server-requests", "/v2/sessions/a/b/server-requests", "/v2/sessions/a/server-requests/extra"] {
+            assert!(session_id_from_path(path).is_none());
+        }
+    }
 
     #[test]
     fn invalid_question_answer_does_not_claim_or_resolve_the_request() {

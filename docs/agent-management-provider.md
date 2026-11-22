@@ -115,6 +115,64 @@ reused by its next runtime generation. An occurrence already running before
 this code is installed remains in its original cgroup until its next explicitly
 authorized launch or restart; installation does not migrate or restart it.
 
+Starting in cutex 0.2.5, the Linux stock Native and Claude adapter paths also use
+systemd user scopes. Stock records the boundary in its publication binding and
+releases its existing gate only after that binding is committed. The gated
+child then enters the scope and execs Native at the same PID. Claude records
+the intended scope before launch. Both scopes are separate from the launching
+service and use group-wide OOM handling.
+
+The scope budget variables are unset by default. If the owner opts in, the deployment
+must set the chosen variables in the environment of both the Management and
+Agent Bus systemd user units. Both daemons can launch Agents, and the limits
+apply to each newly created stock Native or Claude scope on Linux.
+
+| Variable | systemd property | Value |
+| --- | --- | --- |
+| CUTEX_LINUX_SCOPE_MEMORY_HIGH_BYTES | MemoryHigh | Positive decimal bytes |
+| CUTEX_LINUX_SCOPE_MEMORY_MAX_BYTES | MemoryMax | Positive decimal bytes |
+| CUTEX_LINUX_SCOPE_TASKS_MAX | TasksMax | Positive decimal task count, including threads |
+
+An unset variable leaves its property at the systemd default. The launchers
+apply the variables only when creating a scope. Invalid values fail the scoped
+start with the variable name in the error. Existing scopes keep their current
+budget until the Agent restarts. A scoped stop keeps its ownership record when
+the user manager cannot be reached. Restore that account's systemd user manager
+and retry the stop before starting or downgrading the Agent.
+
+Keep the current Cutex service units with `KillMode=process`. A daemon-only
+restart preserves Agent processes and allows Cutex to re-adopt them. To move
+an Agent already running in a service cgroup into its own scope, stop and
+start that Agent or restart it explicitly after upgrading. The transition can
+be staggered by Agent. Hosts where the Linux capability probe reports that
+scopes are unavailable continue with the logged direct fallback. A failed
+attempt to create a selected scope is a startup failure.
+
+Before returning to cutex 0.2.4, use cutex 0.2.5 to stop each live scoped stock Native
+or Claude occurrence while its owning daemons and user manager are still
+available. Verify that every recorded scope is empty or collected before
+switching binaries. Hold the rollback if a scoped stop or verification fails.
+An older backend can adopt the root and use its legacy process cleanup, which
+can miss descendants that have left the original process session.
+
+Use both durable state and the user manager to enumerate the drain set for
+each instance.
+
+- Include current and pending stock publication bindings with
+  `linux_scope: true`. Use the stock scope identity derived from the
+  Agent ID and the binding`s runtime directory.
+- Include Claude state directories with a `linux-process-scope.json`
+  receipt. It records the expected unit name and may exist during startup
+  before the adapter publishes its PID.
+- Under the service account, run
+  `systemctl --user list-units --type=scope --all --no-legend --plain "cutex-agent-*.scope"`.
+  Check each listed unit`s `Slice` with `systemctl --user show -p Slice --value`
+  and retain units in `cutex-agents.slice` or the named instance`s
+  `cutex-<instance>-agents.slice`, as appropriate. Reconcile these units
+  with the durable records and verify emptiness even if the runtime root
+  has exited. A populated scope without a matching record also blocks
+  rollback until it is accounted for and drained.
+
 On Windows every manager-owned app-server core (and every Claude adapter)
 starts in its own named Job object `Global\cutex-agent-<readable-id>-<identity>`
 (same label and identity digest as the Linux scope; current-user DACL;

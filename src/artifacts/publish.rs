@@ -101,6 +101,7 @@ pub fn read_content(resolved: &Resolved, settings: &ArtifactSettings, hash_exter
             return Ok((Content::Blob { bytes, sha256 }, sample));
         }
     }
+    let source_stamp = std::fs::File::open(&resolved.path).and_then(|file| super::raw::SourceStamp::of(&file)).map_err(cannot)?;
     let sha256 = if hash_external && resolved.bytes <= settings.hash_external_max_bytes {
         Some(hash_file(&resolved.path).map_err(cannot)?)
     } else {
@@ -110,7 +111,11 @@ pub fn read_content(resolved: &Resolved, settings: &ArtifactSettings, hash_exter
     if let Ok(file) = std::fs::File::open(&resolved.path) {
         let _ = file.take(8192).read_to_end(&mut sample);
     }
-    Ok((Content::External { sha256, bytes: resolved.bytes }, sample))
+    let after = std::fs::File::open(&resolved.path).and_then(|file| super::raw::SourceStamp::of(&file)).map_err(cannot)?;
+    if after != source_stamp || after.bytes != resolved.bytes || Some((after.modified_ns / 1_000_000) as i64) != resolved.mtime_ms {
+        return Err(PublishError::Invalid("the external source changed while publishing; retry".into()));
+    }
+    Ok((Content::External { sha256, bytes: resolved.bytes, source_stamp: Some(source_stamp) }, sample))
 }
 
 /// Git provenance of files, cached per directory and work tree.

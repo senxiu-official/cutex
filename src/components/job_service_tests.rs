@@ -352,6 +352,42 @@ fn select_restarts_selects_and_defers_while_jobs_run() {
 }
 
 #[test]
+fn ended_follow_up_process_blocks_restart_select_and_remove_until_natural_exit() {
+    let f = fixture();
+    let paths = Paths::current().unwrap();
+    let exec = FakeExec::default();
+    let h = handler();
+    h.prepare(&ctx(&f, &exec, V1, false)).unwrap();
+    h.select(&ctx(&f, &exec, V1, false)).unwrap();
+    let daemon = fake_daemon(&paths);
+    jobs(&paths, json!({"pending":{"state":"unconfirmed","launchPending":true}}));
+    assert_eq!(active_jobs(&paths).unwrap(), vec!["pending".to_string()]);
+    assert!(h.restart_gate(&f.layout).is_err());
+    let mut child = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null())
+        .spawn().unwrap();
+    let pid = child.id();
+    let birth = local_job_process_birth(pid).unwrap();
+    jobs(&paths, json!({
+        "job-local":{"state":"unconfirmed","processId":pid,"processStartTicks":birth},
+        "job-reused":{"state":"unconfirmed","processId":pid,"processStartTicks":birth+1},
+        "job-external":{"state":"unconfirmed","processId":pid,"processStartTicks":birth,"external":{"source":"nci"}},
+        "job-missing":{"state":"unconfirmed"}
+    }));
+    assert_eq!(active_jobs(&paths).unwrap(), vec!["job-local".to_string()]);
+    assert!(h.restart_gate(&f.layout).is_err());
+    exec.calls.lock().unwrap().clear();
+    assert_eq!(h.select(&ctx(&f, &exec, V2, false)).unwrap()["restartPending"], true);
+    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(code(&h.deselect(&ctx(&f, &exec, V2, false), false).unwrap_err()), "jobs_running");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    assert!(active_jobs(&paths).unwrap().is_empty());
+    assert!(h.restart_gate(&f.layout).is_ok());
+    stop_daemon(&paths, daemon);
+}
+
+#[test]
 fn a_service_cutex_did_not_install_is_external() {
     let f = fixture();
     let h = handler();

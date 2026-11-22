@@ -400,53 +400,68 @@ fn login_staging_guard_cleans_early_errors_and_nested_browser_cache() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "subprocess fixture for windows_login_job_releases_browser_locks_before_scratch_cleanup"]
+fn windows_login_job_process_fixture() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::process::CommandExt;
+
+    let Ok(mode) = std::env::var("CUTEX_TEST_KIMI_JOB_MODE") else { return };
+    let ready = PathBuf::from(std::env::var_os("CUTEX_TEST_KIMI_JOB_READY").unwrap());
+    if mode == "browser" {
+        let _lock = OpenOptions::new().create(true).truncate(true).read(true).write(true).share_mode(0)
+            .open(std::env::temp_dir().join("browser.db")).unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        loop { std::thread::park(); }
+    }
+
+    let mut browser = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "profiles::kimi_accounts::tests::windows_login_job_process_fixture", "--nocapture"])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .env("CUTEX_TEST_KIMI_JOB_MODE", "browser")
+        .spawn().unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(browser.try_wait().unwrap().is_none(), "browser fixture exited before acquiring its lock");
+        assert!(Instant::now() < until, "browser fixture did not acquire its lock");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match mode.as_str() {
+        "pending" => loop { std::thread::park(); },
+        "exited" => (), // Dropping Child leaves the browser in the login's job.
+        _ => panic!("unknown login fixture mode"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_login_job_releases_browser_locks_before_scratch_cleanup() {
     let _home = TestHome::new();
     let tools = TempDir::new();
     let account = add("Job cleanup", KimiRegion::MainlandCn).unwrap();
-    let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let helper = tools.path().join("browser.ps1");
-    std::fs::write(&helper, r#"
-param([string]$Ready)
-$lockPath=Join-Path $env:TEMP 'browser.db'
-$file=[System.IO.File]::Open($lockPath,'Create','ReadWrite','None')
-[System.IO.File]::WriteAllText($Ready,'ready')
-Start-Sleep -Seconds 60
-$file.Dispose()
-"#).unwrap();
-    let root = tools.path().join("login.ps1");
-    std::fs::write(&root, r#"
-param([string]$Helper,[string]$Ready,[string]$Mode)
-$ErrorActionPreference='Stop'
-$psi=[System.Diagnostics.ProcessStartInfo]::new()
-$psi.FileName=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
-$psi.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+$Helper+'" -Ready "'+$Ready+'"'
-$psi.UseShellExecute=$false
-$psi.CreateNoWindow=$true
-$p=[System.Diagnostics.Process]::Start($psi)
-$until=[DateTime]::UtcNow.AddSeconds(15)
-while (!(Test-Path -LiteralPath $Ready)) {
- if ([DateTime]::UtcNow -gt $until) { exit 2 }
- Start-Sleep -Milliseconds 20
-}
-if ($Mode -eq 'pending') { Start-Sleep -Seconds 60 }
-exit 0
-"#).unwrap();
+    // Launch native test helpers rather than two PowerShell engines: engine
+    // startup under CPU contention can exhaust the readiness budget before
+    // the helper reaches its file-open operation.
     for mode in ["pending", "exited"] {
         let ready = tools.path().join(format!("{mode}.ready"));
         let staging = homes_root().unwrap().join(STAGING_DIR).join(format!("kl-{mode}"));
-        let cli = crate::profiles::kimi::KimiCli { program: powershell.clone(), args: vec![
-            "-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), root.display().to_string(),
-            "-Helper".into(), helper.display().to_string(), "-Ready".into(), ready.display().to_string(), "-Mode".into(), mode.into(),
-        ], env: Vec::new() };
+        let cli = crate::profiles::kimi::KimiCli { program: std::env::current_exe().unwrap(), args: vec![
+            "--ignored".into(), "--exact".into(), "profiles::kimi_accounts::tests::windows_login_job_process_fixture".into(),
+            "--nocapture".into(), "--".into(), // spawn_login's CLI args become harmless exact-name filters.
+        ], env: vec![
+            ("CUTEX_TEST_KIMI_JOB_MODE".into(), mode.into()),
+            ("CUTEX_TEST_KIMI_JOB_READY".into(), ready.display().to_string()),
+        ] };
         let mut process = spawn_login(&cli, &account, LoginStaging(staging.clone())).unwrap();
         let until = Instant::now() + Duration::from_secs(20);
         while !ready.exists() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
         assert!(ready.exists(), "browser helper holds a real file lock");
-        assert!(OpenOptions::new().write(true).open(staging.join("tmp/browser.db")).is_err());
+        let locked = OpenOptions::new().write(true).open(staging.join("tmp/browser.db")).unwrap_err();
+        assert_eq!(locked.raw_os_error(), Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32));
         if mode == "exited" {
             while process.child.try_wait().unwrap().is_none() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
             assert!(process.child.try_wait().unwrap().unwrap().success());
+        } else {
+            assert!(process.child.try_wait().unwrap().is_none(), "pending login is still running");
         }
         assert!(crate::platform::windows_job::active_processes(&process.job).unwrap() >= 1);
         drop(process);

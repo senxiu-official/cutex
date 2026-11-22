@@ -136,6 +136,53 @@ fn notice_actions_are_read_derived_and_exact_previous_rows_remain_decodable() {
 }
 
 #[test]
+fn pre_native_stale_hold_has_release_but_native_unknown_does_not() {
+    let f = Fixture::new();
+    let stale = f.go("stale", Next::waiting("staleHeld").details(json!({"staleReleaseAllowed":true})).create(note(InputKind::AgentMessage, Timing::Passive))).unwrap();
+    assert!(stale.record.actions.contains(&Action::ReleaseHold));
+    let f = f.reopen();
+    assert!(f.ledger.get("s1", &["stale".into()]).unwrap().records[0].actions.contains(&Action::ReleaseHold));
+    let unsafe_row = f.go("unsafe", Next::waiting("staleHeld").create(note(InputKind::AgentMessage, Timing::Passive))).unwrap();
+    assert!(!unsafe_row.record.actions.contains(&Action::ReleaseHold));
+    for reason in ["interrupted", "request_uncertain", "context_missing"] {
+        let held = f.go(reason, Next::waiting("nativeHeld").details(json!({"nativeReason":reason}))
+            .create(note(InputKind::AgentMessage, Timing::Passive))).unwrap();
+        assert!(!held.record.actions.contains(&Action::ReleaseHold));
+    }
+}
+
+#[test]
+fn dispatch_stale_release_redrive_failure_is_committed_and_not_retryable() {
+    let _pin = pin_enabled(Some(true));
+    let source = super::super::agent_bus_state::agent_bus_message_repository().unwrap();
+    let id = format!("release-dispatch-{}", uuid::Uuid::new_v4());
+    let target = format!("cutex.{}", uuid::Uuid::new_v4());
+    let sender = format!("cutex.{}", uuid::Uuid::new_v4());
+    let canonical = serde_json::from_value(json!({"id":id,"kind":"message","from":sender,"to":"private-runtime",
+        "fromCutexSessionId":sender,"toCutexSessionId":target,"content":"private fixture","deliveryMode":"passive",
+        "triggerTurn":false,"createdAtEpochSecs":1,"senderKind":"agent"})).unwrap();
+    source.record_queued(super::super::agent_bus_state::AgentBusQueuedMessage {
+        owner_cutex_session_id:sender.clone(),message_id:id.clone(),from_cutex_session_id:Some(sender.clone()),
+        to_cutex_session_id:target.clone(),from_runtime_agent_id:None,to_runtime_agent_id:Some("private-runtime".into()),
+        delivery_mode:"passive".into(),content:"private fixture".into(),queued_at:Utc::now(),canonical_envelope:canonical,semantic_sha256:"a".repeat(64),
+    }).unwrap();
+    source.hold_stale_pending(&sender, &id, &"a".repeat(64), 3600, Utc::now()).unwrap();
+    let current = default_ledger().unwrap().get(&target, &[id.clone()]).unwrap().records.pop().unwrap();
+    assert!(current.actions.contains(&Action::ReleaseHold));
+    let params = json!({"inputId":id,"expectedRev":current.rev,"held":false});
+    let error = dispatch_with_redrive(&target, HOLD_METHOD, &params, true, || anyhow::bail!("fixture redrive transport unavailable")).unwrap_err();
+    assert_eq!(error.code, "bus_redrive_failed");
+    assert!(!error.retryable && !error.outcome_unknown);
+    assert_eq!(error.details["releaseRecorded"], true);
+    assert_eq!(error.details["recovery"], "automaticRedriveOrBusRecovery");
+    let row = source.snapshot_by_message_id(&id).unwrap().unwrap();
+    assert_eq!(row.state, "pending");
+    assert!(row.stale_release_authorized && row.external_input.is_none());
+    assert!(!default_ledger().unwrap().get(&target, &[id]).unwrap().records[0].actions.contains(&Action::ReleaseHold));
+    assert_eq!(dispatch_with_redrive(&target,HOLD_METHOD,&params,true,||panic!("do not repeat the committed release")).unwrap_err().code,"revision_conflict");
+}
+
+#[test]
 fn owner_carries_survive_delivery_transitions_and_reopen() {
     let f = Fixture::new();
     f.go("owner", Next::received().create(owner(Strategy::Auto))).unwrap();
@@ -1605,6 +1652,7 @@ fn rolled_back_terminal_projection_is_not_an_owner_disposition() {
 
 #[test]
 fn id_only_disposal_cleans_a_source_even_if_no_ledger_row_ever_existed() {
+    let worker_guard=super::super::input_disposal::test_worker_lock();
     let session=format!("source-only-{}",uuid::Uuid::new_v4());let id=format!("input-{}",uuid::Uuid::new_v4());
     let repository=super::super::user_input::user_input_repository().unwrap();
     let params=super::super::user_input::parse_user_input_submit_params(&json!({"clientUserMessageId":id,"strategy":"queue","origin":{"kind":"other","clientId":"disposal-test"},"input":[{"type":"text","text":"source body"}]})).unwrap();
@@ -1613,11 +1661,28 @@ fn id_only_disposal_cleans_a_source_even_if_no_ledger_row_ever_existed() {
     assert!(ledger.get(&session,&[id.clone()]).unwrap().records.is_empty());
     let path=super::super::input_disposal::default_ledger_path().unwrap();
     super::super::input_disposal::request_at(&path,&session,&id,Utc::now()).unwrap();
+    // Exercise the actual worker's test entry point, not a mocked source remover.
+    // The handshake exposes whether it is excluded or already owns the work.
+    let (attempted,waiting)=std::sync::mpsc::channel();
+    let (finished,completion)=std::sync::mpsc::channel();
+    let worker=std::thread::spawn(move || {
+        let result=super::super::input_disposal::test_worker_drain(|blocked|attempted.send(blocked).unwrap());
+        finished.send(result.map_err(|e|format!("{e:#}"))).unwrap();
+    });
+    let blocked=waiting.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    if !blocked {completion.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();}
     let (done,_)=capture_events(||super::super::input_disposal::drain_on(ledger,&path,|_|panic!("must not require a typed record or its payload")));
-    assert!(done.unwrap()>=1);
+    let done=done.unwrap();
     assert!(repository.list(&session).unwrap().1.is_empty());
     assert!(repository.enqueue(&session,"thread","replay",&params).is_err());
-    assert!(ledger.get(&session,&[id]).unwrap().records.is_empty(),"source-only cleanup must not fabricate ledger revisions");
+    assert!(ledger.get(&session,&[id.clone()]).unwrap().records.is_empty(),"source-only cleanup must not fabricate ledger revisions");
+    let applied=super::super::input_disposal::request_at(&path,&session,&id,Utc::now()).unwrap();
+    assert!(applied.applied_at.is_some(),"the logical identity has a durable applied receipt");
+    eprintln!("ID_ONLY_DISPOSAL_PROOF done={done} worker_blocked={blocked} source_rows=0 ledger_rows=0 applied=true replay_rejected=true");
+    drop(worker_guard);
+    if blocked {completion.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();}
+    worker.join().unwrap();
+    assert!(done>=1,"this fixture reserves the counted pass from the process-wide worker");
 }
 
 #[path="input_disposal_contract_tests.rs"]
@@ -1679,6 +1744,8 @@ fn r47_after_turn_note_remains_admitted_after_sixty_one_seconds() {
 
 #[test]
 fn r47_drain_once_reaches_real_settle_local_and_removes_owner_source() {
+    // This fixture owns the synchronous drain through its durable receipt assertion.
+    let _worker=super::super::input_disposal::test_worker_lock();
     let session=format!("drain-real-{}",uuid::Uuid::new_v4());let id="real-queued-owner";
     let repository=super::super::user_input::user_input_repository().unwrap();
     let params=super::super::user_input::parse_user_input_submit_params(&json!({"clientUserMessageId":id,"strategy":"queue","origin":{"kind":"other","clientId":"r47-real-cleanup"},"input":[{"type":"text","text":"private test"}]})).unwrap();

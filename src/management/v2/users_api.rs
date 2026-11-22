@@ -8,6 +8,28 @@
 //! - `DELETE /v2/users/{id}` → `{userId, deleted}`; 409 `user_in_use`
 //! - `PUT    /v2/users/token-bindings/{tokenId}` `{userId|null}`
 //! - `PUT    /v2/users/peer-bindings/{peerId}` `{userId}`
+//! - `PUT    /v2/users/{id}/projects/{projectId}` `{role: "viewer"|"collaborator"}`
+//!   → `{userId, projectId, role, changed, user, revision}` (capability
+//!   `user-project-roles`): grants one project with that role
+//!   (`grant.projectRoles`). `viewer`: the project's agents, history,
+//!   summaries, workspace files and artifacts, read-only; `collaborator`:
+//!   also send to the project's agents (scoped send rules). A project with a
+//!   role follows it for sending, whatever the grant's `send`.
+//! - `DELETE /v2/users/{id}/projects/{projectId}` → `{userId, projectId,
+//!   role: null, changed, user, revision}`: removes the role and the project
+//!   from an explicit `grant.projects` list. Takes effect on the user's next
+//!   request; open event streams end (`cutex/access/changed`).
+//! - `POST   /v2/users/{id}/tokens` `{label, scope?: "full"|"chat"|"read"}`
+//!   → 201 `{tokenId, label, token, createdAt, userId, pending: false, scope}`
+//!   (capability `user-token-issue`; as `cutex management client-token issue
+//!   --user {id} [--scope …]`). The secret `token` is returned once and never
+//!   again. Only a non-owner user (owner devices pair instead: 400
+//!   `owner_token_not_issued`); 404 `user_not_found`; 400 `invalid_label`
+//!   (1–60 characters, no control characters) / `invalid_scope`. Device
+//!   scope `full` only (as every owner mutation).
+//! - `DELETE /v2/users/{id}/tokens/{tokenId}` → `{tokenId, userId, revoked:
+//!   true}`; a token not bound to that user (or unknown): 404
+//!   `client_token_not_found`. Later requests with it get 401 at once.
 //! - `PATCH  /v2/users/settings` `{ownerRequiresApproval}`; turning approval
 //!   off (`false`) is a root-identity action (owner-local-only: the local or
 //!   an SSH-tunnelled desktop, see `users::request_is_owner_local`), else 403 `owner_local_only`
@@ -111,7 +133,7 @@ use std::net::TcpStream;
 use serde_json::{json, Value};
 
 use crate::http::server::{write_json_response, SimpleHttpRequest};
-use crate::management::client_tokens::{ClientTokenStore, ClientTokenSummary, TOKEN_ID_PREFIX};
+use crate::management::client_tokens::{ClientTokenStore, ClientTokenSummary, DeviceScope, TOKEN_ID_PREFIX};
 use crate::management::persons;
 use crate::management::user_home::{self, HomeStore};
 use crate::management::user_profiles::{self, ProfilePatch, ProfileStore};
@@ -197,6 +219,7 @@ fn error(stream: &mut TcpStream, error: UserError) -> anyhow::Result<()> {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        428 => "Precondition Required", // r290 P10 (B6)
         500 => "Internal Server Error",
         _ => "Service Unavailable",
     };
@@ -295,7 +318,13 @@ pub fn listing(store: &UserStore) -> Result<Value, UserError> {
         persons::State::default()
     });
     let token_ids: std::collections::HashSet<String> = tokens.iter().map(|t| t.token_id.clone()).collect();
-    let tokens: Vec<Value> = tokens.iter().map(|token| token_item(&state, &persons, token)).collect();
+    let mut tokens: Vec<Value> = tokens.iter().map(|token| token_item(&state, &persons, token)).collect();
+    // r290 P10 (B3): a device's relay certificate (expiry, renewable from, grace).
+    let certificates = crate::management::relay::device_certificate_views();
+    for token in &mut tokens {
+        let id = token["tokenId"].as_str().unwrap_or_default().to_string();
+        token["relayCertificate"] = certificates.get(&id).cloned().unwrap_or(Value::Null);
+    }
     let token_persons: serde_json::Map<String, Value> = persons
         .token_persons
         .iter()
@@ -365,8 +394,9 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
             .get("ownerRequiresApproval")
             .and_then(Value::as_bool)
             .ok_or_else(|| UserError::invalid("ownerRequiresApproval (boolean) is required"))?;
-        if !value && !users::request_is_owner_local() {
-            return Err(users::owner_local_only("disableOwnerApproval"));
+        if !value {
+            // r290 P10 (B6): a full-scope owner device needs a fresh confirm.
+            users::owner_widening_gate("disableOwnerApproval", request)?;
         }
         let settings = store.set_settings(value, &actor)?;
         return Ok((200, json!({ "settings": settings })));
@@ -433,6 +463,22 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
         bind_peer(store, peer_id, user, &actor)?;
         return Ok((200, json!({ "peerId": peer_id, "userId": user })));
     }
+    if let Some((id, rest)) = path
+        .strip_prefix("/v2/users/")
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(id, _)| users::valid_user_id(id))
+    {
+        match rest.split('/').collect::<Vec<_>>().as_slice() {
+            ["projects", project] if !project.is_empty() => {
+                return project_role(store, request, method, id, project, &actor);
+            }
+            ["tokens"] => return issue_user_token(store, request, method, id, &actor),
+            ["tokens", token_id] if !token_id.is_empty() => {
+                return revoke_user_token(store, method, id, token_id);
+            }
+            _ => {}
+        }
+    }
     if let Some(id) = path
         .strip_prefix("/v2/users/")
         .and_then(|rest| rest.strip_suffix(PERSON_KEYS_SUFFIX))
@@ -494,6 +540,121 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
             Ok((200, json!({ "userId": id, "deleted": true })))
         }
         _ => Err(UserError::new(405, "method_not_allowed", "unsupported method for this route")),
+    }
+}
+
+fn method_not_allowed() -> UserError {
+    UserError::new(405, "method_not_allowed", "unsupported method for this route")
+}
+
+/// `PUT|DELETE /v2/users/{id}/projects/{projectId}`.
+fn project_role(
+    store: &UserStore,
+    request: &SimpleHttpRequest,
+    method: &str,
+    id: &str,
+    project: &str,
+    actor: &str,
+) -> Result<(u16, Value), UserError> {
+    let role = match method {
+        "PUT" => {
+            let object = body(request)?;
+            only(&object, &["role"])?;
+            let role = object
+                .get("role")
+                .and_then(Value::as_str)
+                .and_then(users::ProjectRole::parse)
+                .ok_or_else(|| UserError::new(400, "invalid_role", "role must be \"viewer\" or \"collaborator\""))?;
+            Some(role)
+        }
+        "DELETE" => None,
+        _ => return Err(method_not_allowed()),
+    };
+    let (user, changed) = store.set_project_role(id, project, role, actor)?;
+    let revision = store.snapshot().map(|s| s.revision).unwrap_or_default();
+    Ok((200, json!({
+        "userId": id,
+        "projectId": project,
+        "role": role,
+        "changed": changed,
+        "user": user.view(),
+        "revision": revision,
+    })))
+}
+
+/// `POST /v2/users/{id}/tokens`: issue a client token bound to a named user.
+fn issue_user_token(
+    store: &UserStore,
+    request: &SimpleHttpRequest,
+    method: &str,
+    id: &str,
+    actor: &str,
+) -> Result<(u16, Value), UserError> {
+    if method != "POST" {
+        return Err(method_not_allowed());
+    }
+    let object = body(request)?;
+    only(&object, &["label", "scope"])?;
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty() && label.chars().count() <= 60 && !label.chars().any(char::is_control))
+        .ok_or_else(|| UserError::new(400, "invalid_label", "label (1-60 characters, no control characters) is required"))?;
+    let scope = match object.get("scope") {
+        None | Some(Value::Null) => DeviceScope::default(),
+        Some(value) => value
+            .as_str()
+            .and_then(DeviceScope::parse)
+            .ok_or_else(|| UserError::new(400, "invalid_scope", "scope must be \"full\", \"chat\" or \"read\""))?,
+    };
+    if id == users::OWNER {
+        return Err(UserError::new(
+            400,
+            "owner_token_not_issued",
+            "owner devices are added by pairing; issue tokens here for other users",
+        ));
+    }
+    let known = store
+        .snapshot()
+        .map_err(|e| UserError::new(503, "users_unavailable", format!("{e:#}")))?
+        .user(id)
+        .is_some();
+    if !known {
+        return Err(UserError::new(404, "user_not_found", "no user with this id"));
+    }
+    let issued = store
+        .tokens()
+        .issue_scoped(label, scope)
+        .map_err(|e| UserError::new(503, "client_tokens_unavailable", format!("{e:#}")))?;
+    if let Err(error) = store.bind_token(&issued.token_id, Some(id), actor) {
+        let _ = store.tokens().revoke(&issued.token_id);
+        return Err(error);
+    }
+    let mut value = serde_json::to_value(&issued).map_err(|e| UserError::new(500, "internal", e.to_string()))?;
+    value["userId"] = json!(id);
+    value["pending"] = json!(false);
+    value["scope"] = json!(scope);
+    Ok((201, value))
+}
+
+/// `DELETE /v2/users/{id}/tokens/{tokenId}`: revoke a token bound to that user.
+fn revoke_user_token(store: &UserStore, method: &str, id: &str, token_id: &str) -> Result<(u16, Value), UserError> {
+    if method != "DELETE" {
+        return Err(method_not_allowed());
+    }
+    let state = store
+        .snapshot()
+        .map_err(|e| UserError::new(503, "users_unavailable", format!("{e:#}")))?;
+    let bound = state.user_of_token(token_id).is_some_and(|user| user.id == id);
+    let not_found = || UserError::new(404, "client_token_not_found", "no client token of this user with this id");
+    if !bound {
+        return Err(not_found());
+    }
+    match store.tokens().revoke(token_id) {
+        Ok(true) => Ok((200, json!({ "tokenId": token_id, "userId": id, "revoked": true }))),
+        Ok(false) => Err(not_found()),
+        Err(e) => Err(UserError::new(503, "client_tokens_unavailable", format!("{e:#}"))),
     }
 }
 

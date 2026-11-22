@@ -17,6 +17,12 @@
 //! Failures: ≥ 5 from one source address in 10 minutes → 429
 //! `too_many_attempts`; ≥ 10 host-wide in 10 minutes → every live code is
 //! voided and pairing answers 429 `pairing_locked` until the window passes.
+//! r290 P10 (b): per source = an IPv4 address or an IPv6 /64. A code issued
+//! while the host-wide lock is on (always the owner's: owner-local or a
+//! confirmed owner device) lifts the lock and is never voided by a later
+//! one, so a remote party cannot keep the owner locked out; the per-source
+//! limit still applies to it. A separate ceiling of 100 failed guesses per
+//! host in 10 minutes also applies to override codes and source-less requests.
 
 use std::net::{IpAddr, TcpStream};
 use std::sync::Mutex;
@@ -41,6 +47,8 @@ pub const OWNER_CODE_TTL: Duration = Duration::from_secs(5 * 60);
 const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_FAILURES_PER_SOURCE: usize = 5;
 const MAX_FAILURES_HOST: usize = 10;
+/// Absolute guess budget, independent of soft-lock recovery by the owner.
+const MAX_FAILURES_HOST_HARD: usize = 100;
 const MAX_LIVE_CODES: usize = 20;
 const MAX_DEVICE_NAME_CHARS: usize = 60;
 const PLATFORMS: [&str; 4] = ["android", "ios", "web", "other"];
@@ -53,6 +61,24 @@ struct LiveCode {
     user: Option<String>,
     scope: DeviceScope,
     expires: Instant,
+    /// r290 P10 (b): issued while the host-wide lock was on (the owner's
+    /// override): a later host-wide lock never voids it; the per-source
+    /// limit still applies.
+    lock_override: bool,
+}
+
+/// r290 P10 (b): the per-source key: an IPv4 address, or an IPv6 /64 (one
+/// host usually holds a whole /64, so per-address IPv6 would be no limit).
+fn source_bucket(source: Option<IpAddr>) -> Option<IpAddr> {
+    source.map(|ip| match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(std::net::Ipv6Addr::from(segments))
+        }
+        IpAddr::V6(v6) => IpAddr::V4(v6.to_ipv4_mapped().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)),
+        other => other,
+    })
 }
 
 /// What a redeemed code carries.
@@ -77,6 +103,11 @@ pub struct PairingState {
 struct Inner {
     codes: Vec<LiveCode>,
     failures: Vec<(Instant, Option<IpAddr>)>,
+    /// r290 P10 (b): failures counting toward the host-wide lock (cleared
+    /// by an owner issue during a lock; `failures` keeps the per-source log).
+    host_failures: Vec<Instant>,
+    /// Not reset by issuing an override code or by the ordinary host lock.
+    host_budget_failures: Vec<Instant>,
     locked_until: Option<Instant>,
 }
 
@@ -186,6 +217,14 @@ impl PairingState {
         if inner.codes.len() >= MAX_LIVE_CODES {
             return None;
         }
+        // r290 P10 (b): every issue is the owner's (owner-local, or a
+        // confirmed owner device): it lifts a host-wide lock, and its code
+        // survives a later one. Per-source limits stay.
+        let lock_override = inner.locked_until.is_some_and(|until| until > now);
+        if lock_override {
+            inner.locked_until = None;
+            inner.host_failures.clear();
+        }
         let raw = random_code();
         inner.codes.push(LiveCode {
             hash: hash_code(&raw),
@@ -193,6 +232,7 @@ impl PairingState {
             user,
             scope,
             expires: now + ttl,
+            lock_override,
         });
         Some(IssuedCode {
             code: format!("{}-{}", &raw[..4], &raw[4..]),
@@ -229,18 +269,32 @@ impl PairingState {
         source: Option<IpAddr>,
         now: Instant,
     ) -> Result<Redeemed, PairError> {
+        let source = source_bucket(source); // r290 P10 (b)
         let mut inner = self.lock();
         inner.codes.retain(|code| code.expires > now);
         inner
             .failures
             .retain(|(at, _)| now.duration_since(*at) < FAILURE_WINDOW);
+        inner
+            .host_failures
+            .retain(|at| now.duration_since(*at) < FAILURE_WINDOW);
+        inner.host_budget_failures.retain(|at| now.duration_since(*at) < FAILURE_WINDOW);
+        if inner.host_budget_failures.len() >= MAX_FAILURES_HOST_HARD {
+            let oldest = inner.host_budget_failures[0];
+            return Err(PairError::Locked {
+                retry_after: FAILURE_WINDOW.saturating_sub(now.duration_since(oldest)).as_secs().max(1),
+            });
+        }
         if let Some(until) = inner.locked_until {
-            if until > now {
+            // r290 P10 (b): codes the owner issued during a lock stay redeemable.
+            if until > now && !inner.codes.iter().any(|code| code.lock_override) {
                 return Err(PairError::Locked {
                     retry_after: (until - now).as_secs().max(1),
                 });
             }
-            inner.locked_until = None;
+            if until <= now {
+                inner.locked_until = None;
+            }
         }
         let from_source = inner
             .failures
@@ -275,9 +329,14 @@ impl PairingState {
             }
             None => {
                 inner.failures.push((now, source));
-                if inner.failures.len() >= MAX_FAILURES_HOST {
-                    inner.codes.clear();
+                inner.host_failures.push(now);
+                inner.host_budget_failures.push(now);
+                if inner.host_failures.len() >= MAX_FAILURES_HOST {
+                    // r290 P10 (b): void the codes issued before the lock;
+                    // an owner's override code survives.
+                    inner.codes.retain(|code| code.lock_override);
                     inner.locked_until = Some(now + FAILURE_WINDOW);
+                    inner.host_failures.clear();
                 }
                 Err(PairError::InvalidCode)
             }
@@ -460,6 +519,11 @@ struct PairRequest {
     device_name: Option<String>,
     #[serde(default)]
     platform: Option<String>,
+    /// r290 P10 (a): the device token this phone held before (re-pairing
+    /// the same device): when it is a device token of the same user it is
+    /// revoked once the new one is issued and bound.
+    #[serde(default)]
+    previous_token: Option<String>,
 }
 
 /// `POST /v2/pair` (public).
@@ -540,7 +604,7 @@ pub(crate) fn handle_pair_with(
                 429,
                 "Too Many Requests",
                 "pairing_locked",
-                "pairing is locked after too many failed attempts; create a new code later",
+                "pairing is locked after too many failed attempts; a new code on the host lifts the ordinary lock, but an exhausted host guess budget must wait retryAfterSeconds",
                 true,
                 json!({ "retryAfterSeconds": retry_after }),
             )
@@ -578,6 +642,28 @@ pub(crate) fn handle_pair_with(
             }
         }
     });
+    // r290 P10 (a): re-pairing the same device replaces its old token: the
+    // presented previous device token (same user) is revoked once the new
+    // one is bound; if that revoke fails, the new token is revoked too.
+    let mut replaced: Option<String> = None;
+    let issued = issued.and_then(|(issued, device)| {
+        let Some(previous) = body.previous_token.as_deref() else { return Ok((issued, device)) };
+        let users = crate::management::users::UserStore::beside(store);
+        let same_user = |id: &str| users.snapshot().is_ok_and(|state| state.user_of_token(id).is_some_and(|u| u.id == user));
+        match store.device_of(previous) {
+            Ok(Some(old)) if old != issued.token_id && same_user(&old) => match store.revoke(&old) {
+                Ok(_) => {
+                    replaced = Some(old);
+                    Ok((issued, device))
+                }
+                Err(failure) => {
+                    let _ = store.revoke(&issued.token_id);
+                    Err(anyhow::anyhow!("revoke the replaced device: {failure:#}"))
+                }
+            },
+            _ => Ok((issued, device)),
+        }
+    });
     match issued {
         Ok((issued, device)) => {
             // owner-device-notice: an owner device is announced at once.
@@ -594,6 +680,8 @@ pub(crate) fn handle_pair_with(
                     "hostId": host,
                     "hostName": host,
                     "instanceId": crate::management::instance::instance_id(),
+                    // r290 P10 (a): the device token this pairing replaced (revoked).
+                    "replacedTokenId": replaced,
                 }),
             )
         }
@@ -719,6 +807,79 @@ mod tests {
         );
         let next = state.issue(None, after).unwrap();
         assert_eq!(state.redeem(&next.code, ip(3), after), Ok(None));
+    }
+
+    // r290 P10 (b)
+    #[test]
+    fn r290_p10_owner_code_lifts_the_host_lock_and_survives_a_relock() {
+        let state = PairingState::new();
+        let now = Instant::now();
+        let old = state.issue(None, now).unwrap();
+        // Two remote sources trip the host-wide lock (5 each).
+        for source in [ip(1), ip(2)] {
+            for _ in 0..MAX_FAILURES_PER_SOURCE {
+                assert_eq!(state.redeem("AAAA-AAAA", source, now), Err(PairError::InvalidCode));
+            }
+        }
+        assert!(matches!(state.redeem(&old.code, ip(9), now), Err(PairError::Locked { .. })));
+        // The owner issues a new code: the lock is lifted for it at once.
+        let fresh = state.issue(None, now).unwrap();
+        // More sources trip the lock again; the owner's code is not voided.
+        for source in [ip(3), ip(4)] {
+            for _ in 0..MAX_FAILURES_PER_SOURCE {
+                assert_eq!(state.redeem("AAAA-AAAA", source, now), Err(PairError::InvalidCode));
+            }
+        }
+        // A throttled source stays throttled even with the owner's code.
+        assert!(matches!(state.redeem(&fresh.code, ip(3), now), Err(PairError::TooManyAttempts { .. })));
+        assert_eq!(state.redeem(&fresh.code, ip(9), now), Ok(None));
+        // The pre-lock code was voided by the first lock.
+        assert!(state.redeem(&old.code, ip(9), now).is_err());
+        // With no owner code left, the lock answers again.
+        assert!(matches!(state.redeem("AAAA-AAAA", ip(10), now), Err(PairError::Locked { .. })));
+    }
+
+    #[test]
+    fn r290_p10_per_source_limit_groups_an_ipv6_slash_64() {
+        let state = PairingState::new();
+        let now = Instant::now();
+        let good = state.issue(None, now).unwrap();
+        let v6 = |last: u16| Some(IpAddr::from([0x2001, 0xdb8, 1, 2, 0, 0, 0, last]));
+        for n in 0..MAX_FAILURES_PER_SOURCE as u16 {
+            assert_eq!(state.redeem("AAAA-AAAA", v6(n + 1), now), Err(PairError::InvalidCode));
+        }
+        assert!(matches!(state.redeem(&good.code, v6(999), now), Err(PairError::TooManyAttempts { .. })));
+        let other = Some(IpAddr::from([0x2001, 0xdb8, 1, 3, 0, 0, 0, 1]));
+        assert_eq!(state.redeem(&good.code, other, now), Ok(None));
+    }
+
+    #[test]
+    fn owner_override_keeps_a_host_budget_for_distributed_and_source_less_guesses() {
+        for source_less in [false, true] {
+            let state = PairingState::new();
+            let now = Instant::now();
+            // Trip the ordinary lock, then issue the owner's recovery code.
+            for n in 0..MAX_FAILURES_HOST {
+                let source = if source_less { None } else { ip(n as u8 + 1) };
+                assert_eq!(state.redeem("AAAA-AAAA", source, now), Err(PairError::InvalidCode));
+            }
+            let good = state.issue(None, now).unwrap();
+            // Rotating sources (or omitting one) cannot buy unlimited guesses.
+            for n in MAX_FAILURES_HOST..MAX_FAILURES_HOST_HARD {
+                let source = if source_less { None } else { ip(n as u8 + 1) };
+                assert_eq!(state.redeem("AAAA-AAAA", source, now), Err(PairError::InvalidCode));
+            }
+            assert_eq!(state.redeem("AAAA-AAAA", None, now), Err(PairError::Locked { retry_after: 600 }));
+            assert!(matches!(state.redeem(&good.code, ip(200), now), Err(PairError::Locked { .. })));
+            // Fresh owner issuance does not reset the hard budget.
+            let another = state.issue(None, now).unwrap();
+            assert!(matches!(state.redeem(&another.code, None, now), Err(PairError::Locked { .. })));
+            assert_eq!(state.lock().host_budget_failures.len(), MAX_FAILURES_HOST_HARD);
+            // After the rolling window, a newly issued code works normally.
+            let after = now + FAILURE_WINDOW;
+            let fresh = state.issue(None, after).unwrap();
+            assert_eq!(state.redeem(&fresh.code, None, after), Ok(None));
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub const DELEGATION_CLOSE: &str = "delegation_close";
 pub const DELEGATION_NOTICES_READ: &str = "delegation_notices_read";
 pub const DELEGATION_READ: &str = "delegation_read";
 pub const DELEGATION_PROGRESS: &str = "delegation_progress";
+pub const DELEGATION_DELIVER: &str = "delegation_deliver"; // r290 P14
 pub const QUESTION_ANSWER: &str = "question_answer";
 pub const AGENT_TELL: &str = "agent_tell";
 pub const DELEGATION_AWAIT: &str = "delegation_await";
@@ -73,7 +74,7 @@ pub const TOOLS: &[&str] = &[
     DELEGATION_ROUTING,
     crate::agent_bus::mcp::action_receipts::TOOL,
     AGENT_LIST, AGENT_NAME_HISTORY, AGENT_DELEGATE, DELEGATION_WAIT, DELEGATION_STOP, DELEGATION_CLOSE, DELEGATION_READ,
-    DELEGATION_PROGRESS, QUESTION_ANSWER, AGENT_TELL, DELEGATION_AWAIT, DELEGATION_RESUME, DELEGATION_REOPEN,
+    DELEGATION_PROGRESS, DELEGATION_DELIVER, QUESTION_ANSWER, AGENT_TELL, DELEGATION_AWAIT, DELEGATION_RESUME, DELEGATION_REOPEN,
     READ_OVERLENGTH_CONTENT, DELEGATION_NOTICES_READ, DIRECTOR_HANDOVER_REVIEW, DIRECTOR_START_REVIEW, DIRECTOR_START_READ,
     AGENT_PAUSE, AGENT_RESUME,
 ];
@@ -222,9 +223,16 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
             }, "additionalProperties": false}}));
     }
     tools.extend([
+        // r290 P14
+        json!({"name": DELEGATION_DELIVER, "description": "(handler) Deliver the result of a specific open delegation you are handling that has ended its turn to wait. Name the delegation and give its complete result. You can deliver from any of your turns, including a background-task notification, owner message or alarm turn. This records its answer and cancels its pending continuation. A running or already resumed delegation cannot be delivered this way. Retry only with the same action_id.",
+            "inputSchema": {"type":"object","properties":{
+                "delegation":delegation_schema("The waiting delegation to deliver."),
+                "text":{"type":"string","minLength":1,"maxLength":65536,"description":"The complete result, kept as this delegation's answer."},
+                "action_id":action_schema()
+            },"required":["delegation","text"],"additionalProperties":false}}),
         json!({"name": AGENT_PAUSE, "description": "Pause a member of the project you currently direct. The admission gate is durable and immediate. A running tool finishes first. Runtimes with a tool gate pause at the next tool call; DSH and Kimi pause at turn end. All queued owner and agent input remains in place.",
             "inputSchema": {"type":"object","properties":{"target":{"type":"string","description":"Agent id or unique name in your project."},"action_id":action_schema()},"required":["target"],"additionalProperties":false}}),
-        json!({"name": AGENT_RESUME, "description": "Resume a member of the project you currently direct. Existing queued work drains in normal admission order.",
+        json!({"name": AGENT_RESUME, "description": "Resume a member of the project you currently direct, including a runtime gate closed by its failed turn. Existing queued work drains in normal admission order; failed inputs are not replayed. Explicit delegation-only and project pauses remain in place.",
             "inputSchema": {"type":"object","properties":{"target":{"type":"string","description":"Agent id or unique name in your project."},"action_id":action_schema()},"required":["target"],"additionalProperties":false}}),
         json!({"name": DELEGATION_STOP, "description": "(requester) Stop one of your delegations (it closes as stopped): dequeue it, interrupt the turn handling it without affecting the agent's other work (it ends with the partial message), or end its wait for jobs. Jobs it started keep running unless stop_jobs=true. Stopping only the handler's turn (the owner's stop) leaves the delegation open; cancelling one job (cutex_job cancel) wakes a handler waiting for it.",
             "inputSchema": {"type": "object", "properties": {
@@ -247,7 +255,8 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
                 "note": {"type": "string", "maxLength": 16000, "description": "What is missing or what to change (sent whole, up to 16000 characters, longer is refused; past 4000 characters the handler gets a preview plus a pointer to the full note)."},
                 "action_id": action_schema()
             }, "required": ["delegation", "note"], "additionalProperties": false}}),
-        json!({"name": DELEGATION_RESUME, "description": "(requester) Make the handler of a delegation that waits for jobs continue now (it gets a new turn for the delegation) instead of waiting for them.",
+        // r290 P7
+        json!({"name": DELEGATION_RESUME, "description": "(requester) Continue a delegation now after its handler turn failed, or while it waits for jobs. A queued delegation held by a failed-turn runtime gate requires the owner or current project Director to resume the target agent; this tool cannot release that gate.",
             "inputSchema": {"type": "object", "properties": {
                 "delegation": delegation_schema("Delegation id (delegation-…)."),
                 "note": {"type": "string", "maxLength": 16000, "description": "Why, or what to do with partial results (sent whole, up to 16000 characters, longer is refused)."},
@@ -314,6 +323,11 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
             tool["inputSchema"]["properties"]["targetScope"]=crate::agent_names::scope_schema();
         }
         if tool["name"] == DELEGATION_PROGRESS {
+            // r290 P6
+            tool["inputSchema"]["properties"]["steps"]=json!({"type":"object","properties":{
+                "done":{"type":"integer","minimum":0,"maximum":10000},"total":{"type":"integer","minimum":0,"maximum":10000},
+                "currentStep":{"type":"string","maxLength":300}},"required":["done","total"],"additionalProperties":false,
+                "description":"Structured steps for the current attempt (done <= total); never inferred from note text."});
             tool["inputSchema"]["properties"]["continuation"]=json!({"type":"object","properties":{
                 "expectedAttemptId":{"type":"string","description":"Copy the exact unshortened delegation-id#attempt token from this turn's delegation prompt; it is not a UUID."},"expectedRevision":{"type":"integer","minimum":1},
                 "note":{"type":"string"},"wake":{"oneOf":[
@@ -551,6 +565,7 @@ pub fn handle(ctx: &ToolContext<'_>, body: &[u8]) -> Value {
         DELEGATION_READ => delegation_read(ctx, arguments),
         READ_OVERLENGTH_CONTENT => read_overlength_content(ctx, arguments),
         DELEGATION_PROGRESS => delegation_progress(ctx, arguments, &action_id),
+        DELEGATION_DELIVER => super::deliver::handle(ctx, arguments, &action_id), // r290 P14
         QUESTION_ANSWER => super::questions::question_answer(ctx, arguments, &action_id),
         AGENT_TELL => agent_tell(ctx, arguments, &action_id),
         DELEGATION_AWAIT => delegation_await(ctx, arguments, &action_id),
@@ -1852,10 +1867,19 @@ pub(crate) fn close_in_state(
                     return Err(AskError::new("ask_not_found", "no such delegation of yours"));
                 }
             }
+            if outcome == "followUpEnded" && requester.is_some() {
+                return Err(AskError::new("owner_required", "only the owner may end follow-up"));
+            }
+            if !ask.is_open() && outcome == "followUpEnded" && ask.follow_up_ended {
+                let mut view = requester_view(state, &ask);
+                view["ok"] = json!(true);
+                view["stopping"] = json!(false);
+                return Ok(view);
+            }
             if !ask.is_open() {
                 return Err(AskError::new("ask_closed", "it is already closed").with(json!({"closed": ask.closed})));
             }
-            if ask.remote.is_some() {
+            if ask.remote.is_some() && outcome != "followUpEnded" {
                 if stop_jobs { return Err(AskError::new("remote_unsupported", "remote job cancellation is unavailable in P0")); }
                 let result = crate::peers::asks::queue_op(state,ask_id,outcome,now)?;
                 if let Some(requester) = requester { super::delivery::settle_for_ask(state, requester, ask_id, None, "closed", now); }
@@ -1863,6 +1887,25 @@ pub(crate) fn close_in_state(
             }
             let mut stopping = false;
             match outcome {
+                "followUpEnded" => {
+                    if stop_jobs { return Err(invalid("followUpEnded sends no runtime or job commands")); }
+                    state.update_ask(ask_id, now, |ask| {
+                        ask.follow_up_ended = true;
+                        ask.closed = Some(CloseOutcome::Stopped);
+                        ask.closed_at = Some(now_rfc3339(now));
+                        ask.hold = None; ask.awaiting = None; ask.resume = None;
+                        ask.bounded_continuation.cancel("follow_up_ended");
+                        if let Some(remote)=ask.remote.as_mut() { remote.sync.local_terminal=true; }
+                    });
+                    for question in state.questions.values_mut().filter(|q|q.ask_id==ask_id && q.state==QuestionState::Open) {
+                        question.state=QuestionState::Stale;
+                    }
+                    for delivery in state.deliveries.values_mut().filter(|d|d.ask_id==ask_id && d.state==DeliveryState::Pending) {
+                        delivery.state=DeliveryState::Acknowledged;
+                        delivery.settled_by=Some("followUpEnded".into());
+                        delivery.updated_at=now_rfc3339(now);
+                    }
+                }
                 "accepted" => {
                     if ask.review != Some(ReviewState::AwaitingAcceptance) {
                         return Err(AskError::new("ask_not_awaiting_acceptance", "only a delegation whose result waits for review can be accepted"));
@@ -1889,12 +1932,15 @@ pub(crate) fn close_in_state(
                         }
                         // Waiting for jobs, or woken and not admitted yet:
                         // no turn runs, so it closes at once (no answer).
-                        ExecutionState::Running if ask.is_waiting() || ask.resume_pending() => {
+                        ExecutionState::Running if ask.is_waiting() || ask.resume_pending()
+                            || super::stop_settlement::terminal_without_lease(state, &ask) => {
                             state.update_ask(ask_id, now, |ask| {
                                 ask.execution = ExecutionState::Interrupted;
                                 ask.hold = None;
                                 ask.awaiting = None;
                                 ask.resume = None;
+                                ask.bounded_continuation.cancel("requester_stop");
+                                if let Some(record) = ask.current_attempt_mut() { record.stop_requested = false; }
                                 if close == CloseOutcome::Abandoned && ask.options.review {
                                     ask.review = Some(ReviewState::Abandoned);
                                 }
@@ -1904,6 +1950,9 @@ pub(crate) fn close_in_state(
                         }
                         ExecutionState::Admitted | ExecutionState::Running => {
                             let attempt = ask.current_attempt().map(|attempt| attempt.n).unwrap_or(0);
+                            if ask.current_attempt().is_some_and(|record|record.stop_requested) {
+                                super::stop_settlement::ensure_deadline(state,ask_id,attempt,now);
+                            }
                             state.update_ask(ask_id, now, |ask| {
                                 if let Some(record) = ask.current_attempt_mut() {
                                     record.stop_requested = true;
@@ -1931,7 +1980,7 @@ pub(crate) fn close_in_state(
                         }
                     }
                 }
-                other => return Err(invalid(format!("outcome: stop, accepted or abandoned, not {other}"))),
+                other => return Err(invalid(format!("outcome: stop, accepted, abandoned or followUpEnded, not {other}"))),
             }
             // The requester decided: what is already waiting for it about
             // this ask is settled and never sent as an event afterwards.
@@ -2100,6 +2149,9 @@ struct ReadArgs {
 }
 
 fn delegation_read(ctx: &ToolContext<'_>, args: Value) -> Result<Value, AskError> {
+    delegation_read_with_receipt(ctx,args,true)
+}
+fn delegation_read_with_receipt(ctx: &ToolContext<'_>, args: Value, settle_receipt:bool) -> Result<Value, AskError> {
     let args: ReadArgs = parse(args)?;
     if crate::documents::is_document_id(&args.delegation) {
         return read_document(ctx, &args.delegation, args.cursor);
@@ -2140,7 +2192,7 @@ fn delegation_read(ctx: &ToolContext<'_>, args: Value) -> Result<Value, AskError
     let (text, cursor, next, total) = page_of(bytes);
     // The requester read this revision: its pending answer items up to it
     // (and the ask's state items) are settled, not sent again as an event.
-    if crate::director_address::is_controller(ask, ctx.caller) {
+    if settle_receipt && crate::director_address::is_controller(ask, ctx.caller) {
         let (ask_id, revision) = (ask.ask_id.clone(), answer.revision);
         ctx.store
             .with_state(|state| super::delivery::settle_for_ask(state, ctx.caller, &ask_id, Some(revision), "read", ctx.now))
@@ -2192,6 +2244,8 @@ fn read_overlength_content(ctx: &ToolContext<'_>, args: Value) -> Result<Value, 
 #[serde(deny_unknown_fields)]
 struct ReplyArgs {
     #[serde(default)]
+    steps: Option<StepProgress>,
+    #[serde(default)]
     delegation: Option<String>,
     text: String,
     #[serde(default)]
@@ -2212,7 +2266,8 @@ struct ProgressContinuationArgs {
 fn progress_with_continuation(ctx:&ToolContext<'_>,args:ReplyArgs,action_id:&str)->Result<Value,AskError> {
     use super::continuation::{self,DeclareRequest,Guards};
     let declaration=args.continuation.as_ref().expect("continuation branch");
-    let request=json!({"delegation":args.delegation,"text":args.text,"ack":args.ack,"continuation":declaration});
+    let mut request=json!({"delegation":args.delegation,"text":args.text,"ack":args.ack,"continuation":declaration});
+    if let Some(steps)=&args.steps {request["steps"]=json!(steps);}
     super::routing_policy::integration::with_authority(|snapshot| {
         let directory=ctx.world.directory()?;
         let controllers=super::routing_policy::integration::ControllerView::load(snapshot)?;
@@ -2256,12 +2311,13 @@ fn progress_with_continuation(ctx:&ToolContext<'_>,args:ReplyArgs,action_id:&str
                 if let Some(ack)=args.ack.as_deref() {
                     let ack_result=super::revisions::acknowledge(next,ctx.caller,&wanted,ack,&args.text,ctx.now)?;
                     result["acknowledgement"]=ack_result;
+                    if let Some(steps)=&args.steps {attach_progress_steps(next,&wanted,steps,&args.text,ctx.now);}
                 } else {
                     let text=args.text.trim().to_owned();
                     next.update_ask(&wanted,ctx.now,|ask|if let Some(attempt)=ask.current_attempt_mut() {
                         attempt.activity.line=Some(truncate_chars(&text,300));
                         attempt.activity.last_activity_at=Some(now_rfc3339(ctx.now));
-                        attempt.progress.push(ProgressNote{text:text.clone(),at:now_rfc3339(ctx.now)});
+                        attempt.progress.push(ProgressNote{text:text.clone(),at:now_rfc3339(ctx.now),steps:args.steps.clone()});
                         let excess=attempt.progress.len().saturating_sub(PROGRESS_KEEP);attempt.progress.drain(..excess);
                     });
                     next.notice("cutex/ask/progress",AskState::ask_sessions(&ask),json!({"askId":wanted,"text":text,"at":now_rfc3339(ctx.now)}));
@@ -2274,12 +2330,23 @@ fn progress_with_continuation(ctx:&ToolContext<'_>,args:ReplyArgs,action_id:&str
     })
 }
 
+// r290 P6: acknowledgements may also carry steps when this is the active attempt.
+fn attach_progress_steps(state:&mut AskState,id:&str,steps:&StepProgress,text:&str,now:DateTime<Utc>) {
+    state.update_ask(id,now,|ask|if let Some(attempt)=ask.current_attempt_mut() {
+        attempt.progress.push(ProgressNote{text:text.trim().into(),at:now_rfc3339(now),steps:Some(steps.clone())});
+        let excess=attempt.progress.len().saturating_sub(PROGRESS_KEEP);attempt.progress.drain(..excess);
+        attempt.activity.last_activity_at=Some(now_rfc3339(now));
+    });
+}
+
 fn delegation_progress(ctx: &ToolContext<'_>, args: Value, action_id: &str) -> Result<Value, AskError> {
     let args: ReplyArgs = parse(args)?;
+    if let Some(steps)=&args.steps {steps.validate()?;}
     super::awaits::check_len("text", args.text.trim(), super::awaits::PROGRESS_MAX_CHARS)?;
     if args.continuation.is_some() { return progress_with_continuation(ctx,args,action_id); }
     if let Some(ack) = args.ack.clone() {
-        let request = json!({"delegation": args.delegation, "text": args.text, "ack": ack});
+        let mut request = json!({"delegation": args.delegation, "text": args.text, "ack": ack});
+        if let Some(steps)=&args.steps {request["steps"]=json!(steps);}
         return once(ctx, DELEGATION_PROGRESS, action_id, &request, || {
             ctx.store
                 .with_records(&args.delegation.as_deref().into_iter().collect::<Vec<_>>(),|state| -> Result<Value, AskError> {
@@ -2297,12 +2364,18 @@ fn delegation_progress(ctx: &ToolContext<'_>, args: Value, action_id: &str) -> R
                             })
                             .ok_or_else(|| invalid("delegation: which delegation the revision belongs to"))?,
                     };
-                    super::revisions::acknowledge(state, ctx.caller, &wanted, &ack, &args.text, ctx.now)
+                    if args.steps.is_some() && running_ask_of(state,ctx.caller).as_deref()!=Some(wanted.as_str()) {
+                        return Err(AskError::new("ask_not_running","steps belong only to the current running attempt"));
+                    }
+                    let result=super::revisions::acknowledge(state, ctx.caller, &wanted, &ack, &args.text, ctx.now)?;
+                    if let Some(steps)=&args.steps {attach_progress_steps(state,&wanted,steps,&args.text,ctx.now);}
+                    Ok(result)
                 })
                 .map_err(store_error)?
         });
     }
-    let request = json!({"delegation": args.delegation, "text": args.text});
+    let mut request = json!({"delegation": args.delegation, "text": args.text});
+    if let Some(steps)=&args.steps {request["steps"]=json!(steps);}
     once(ctx, DELEGATION_PROGRESS, action_id, &request, || {
         ctx.store
             .with_records(&args.delegation.as_deref().into_iter().collect::<Vec<_>>(),|state| -> Result<Value, AskError> {
@@ -2339,7 +2412,7 @@ fn delegation_progress(ctx: &ToolContext<'_>, args: Value, action_id: &str) -> R
                     if let Some(attempt) = ask.current_attempt_mut() {
                         attempt.activity.line = Some(line.clone());
                         attempt.activity.last_activity_at = Some(now_rfc3339(ctx.now));
-                        attempt.progress.push(crate::asks::model::ProgressNote { text: text.clone(), at: now_rfc3339(ctx.now) });
+                        attempt.progress.push(crate::asks::model::ProgressNote { text: text.clone(), at: now_rfc3339(ctx.now),steps:args.steps.clone() });
                         let excess = attempt.progress.len().saturating_sub(crate::asks::model::PROGRESS_KEEP);
                         attempt.progress.drain(..excess);
                     }
@@ -3190,6 +3263,30 @@ mod director_tool_tests {
     }
 
     #[test]
+    fn board_progress_steps_are_durable_validated_and_action_idempotent() {
+        let f=Fixture::new();
+        let created=f.call(&f.director,3,AGENT_DELEGATE,json!({"target":f.caller,"text":"work"}),"board-task");assert_eq!(created["ok"],true,"{created}");
+        let id=f.ask_id("board-task");
+        f.store.with_state(|state| {
+            state.update_ask(&id,Utc::now(),|ask| {
+                ask.execution=ExecutionState::Running;let mut attempt=AttemptRecord::submitting(1,"board-native".into(),1,now_rfc3339(Utc::now()));
+                attempt.state=AttemptState::Running;attempt.turn_id=Some("board-turn".into());ask.attempts.push(attempt);
+            });
+            state.leases.insert(f.caller.clone(),AdmissionLease{cutex_session_id:f.caller.clone(),holder:LeaseHolder::Ask{ask_id:id.clone(),attempt:1},native_message_id:"board-native".into(),runtime_generation:1,turn_id:Some("board-turn".into()),since:now_rfc3339(Utc::now())});
+        }).unwrap();
+        let args=json!({"delegation":id,"text":"testing","steps":{"done":2,"total":5,"currentStep":"run checks"}});
+        let first=f.call(&f.caller,3,DELEGATION_PROGRESS,args.clone(),"board-progress");assert_eq!(first["ok"],true,"{first}");
+        assert_eq!(f.call(&f.caller,3,DELEGATION_PROGRESS,args.clone(),"board-progress"),first);
+        let state=f.store.snapshot().unwrap();let progress=&state.asks[&id].current_attempt().unwrap().progress;
+        assert_eq!(progress.len(),1);assert_eq!(progress[0].steps.as_ref().unwrap().done,2);
+        let mut bad=args.clone();bad["steps"]["done"]=json!(6);assert_eq!(f.call(&f.caller,3,DELEGATION_PROGRESS,bad,"board-bad")["code"],"invalid_arguments");
+        let mut changed=args;changed["steps"]["done"]=json!(3);assert_eq!(f.call(&f.caller,3,DELEGATION_PROGRESS,changed,"board-progress")["code"],"idempotency_conflict");
+        assert_eq!(f.store.snapshot().unwrap().asks[&id].current_attempt().unwrap().progress.len(),1);
+        let definition=definitions().into_iter().find(|v|v["name"]==DELEGATION_PROGRESS).unwrap();
+        assert!(definition["inputSchema"]["properties"]["steps"].is_object());
+    }
+
+    #[test]
     fn progress_continuation_uses_real_lease_and_rejects_forged_guards_or_new_generation() {
         let mut f=Fixture::new();
         let created=f.call(&f.director,3,AGENT_DELEGATE,json!({"target":f.caller,"text":"work"}),"progress-task");
@@ -3443,6 +3540,73 @@ mod director_tool_tests {
             &f.store.snapshot().unwrap(),
             &f.next,
         ));
+    }
+
+    #[test]
+    fn director_resumes_runtime_failure_gate_without_a_whole_agent_pause() {
+        let f = Fixture::new();
+        f.store.with_state(|state| {
+            crate::asks::control::runtime_gate_pause(state, &f.next, 1, Utc::now());
+        }).unwrap();
+        let denied = f.call(&f.caller, FACADE_AGENT_PAUSE, AGENT_RESUME,
+            json!({"target": f.next}), "unauthorized-runtime-resume");
+        assert_eq!(denied["ok"], false);
+        assert!(crate::asks::control::runtime_gate_closed(&f.store.snapshot().unwrap(), &f.next));
+        let resumed = f.call(&f.director, FACADE_AGENT_PAUSE, AGENT_RESUME,
+            json!({"target": f.next}), "director-runtime-resume");
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["changed"], true);
+        let state = f.store.snapshot().unwrap();
+        assert!(!crate::asks::control::runtime_gate_closed(&state, &f.next));
+        assert!(crate::asks::control::gate_resume_queued(&state, &f.next));
+    }
+
+    #[test]
+    fn requester_mcp_resume_cannot_release_a_queued_runtime_gate() {
+        let f = Fixture::new();
+        let created = f.call(&f.director, FACADE_AGENT_PAUSE, AGENT_DELEGATE,
+            json!({"target": f.caller, "text": "queued work"}), "requester-gate-queued");
+        assert_eq!(created["ok"], true, "{created}");
+        let id = f.ask_id("requester-gate-queued");
+        f.store.with_state(|state| {
+            crate::asks::control::runtime_gate_pause(state, &f.caller, 1, Utc::now());
+        }).unwrap();
+        let before = f.store.snapshot().unwrap().asks[&id].clone();
+        let denied = f.call(&f.director, FACADE_AGENT_PAUSE, DELEGATION_RESUME,
+            json!({"delegation": id}), "requester-cannot-release-target-gate");
+        assert_eq!(denied["ok"], false, "{denied}");
+        assert_eq!(denied["code"], "delegation_not_waiting", "{denied}");
+        let state = f.store.snapshot().unwrap();
+        assert_eq!(state.asks[&id], before);
+        assert!(crate::asks::control::runtime_gate_closed(&state, &f.caller));
+        assert!(state.commands.is_empty());
+        drop(state);
+        // The same caller has current Director authority, but must use the
+        // target-wide operation explicitly to acknowledge all queued work.
+        let resumed = f.call(&f.director, FACADE_AGENT_PAUSE, AGENT_RESUME,
+            json!({"target": f.caller}), "director-releases-target-gate");
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert!(crate::asks::control::gate_resume_queued(&f.store.snapshot().unwrap(), &f.caller));
+    }
+
+    #[test]
+    fn director_resume_preserves_owner_pause_added_after_runtime_failure() {
+        let f = Fixture::new();
+        f.store.with_state(|state| {
+            let now = Utc::now();
+            crate::asks::agent_pause::pause(state, &f.next, "owner", None, now);
+            crate::asks::control::runtime_gate_pause(state, &f.next, 1, now);
+            crate::asks::control::owner_pause(state, &f.next, now);
+        }).unwrap();
+        let resumed = f.call(&f.director, FACADE_AGENT_PAUSE, AGENT_RESUME,
+            json!({"target": f.next}), "director-resume-owner-pause-after-gate");
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["changed"], true);
+        let state = f.store.snapshot().unwrap();
+        assert!(state.presence[&f.next].agent_pause.is_none());
+        assert!(state.presence[&f.next].paused);
+        assert_eq!(state.pauses[&f.next].origin.as_deref(), Some(crate::asks::control::ORIGIN_OWNER_PAUSE));
+        assert!(state.commands.is_empty(), "authenticated Director must preserve explicit owner admission pause");
     }
 
     #[test]
@@ -4549,5 +4713,68 @@ pub(crate) mod tests {
         assert!(description.contains("Never lists native subagents from spawn_agent"), "{description}");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
+    }
+}
+
+/// Verified child reads skip facade/receipt writes and have no send capability.
+pub fn handle_native_child_read(ctx:&ToolContext<'_>,body:&[u8])->Value {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Read {tool:String,arguments:Value}
+    let request:Read=match serde_json::from_slice(body) {Ok(value)=>value,Err(_)=>return invalid("expected read tool and arguments").to_json()};
+    if !crate::agent_bus::native_subagent::allowed(&request.tool) {return crate::agent_bus::native_subagent::refusal();}
+    let args=match super::short_ids::normalize(ctx,&request.tool,request.arguments) {Ok(value)=>value,Err(error)=>return error.to_json()};
+    if let Err(error)=crate::agent_bus::native_subagent::validate_read(&request.tool,&args,ctx.caller,ctx.store) {
+        return json!({"ok":false,"status":"no_write","code":"native_subagent_read_only","detail":error.to_string()});
+    }
+    match request.tool.as_str() {
+        AGENT_LIST=>agent_list(ctx,args).unwrap_or_else(|error|error.to_json()),
+        AGENT_NAME_HISTORY=>agent_name_history(ctx,args).unwrap_or_else(|error|error.to_json()),
+        DELEGATION_READ=>delegation_read_with_receipt(ctx,args,false).unwrap_or_else(|error|error.to_json()),
+        "artifact_list"|"artifact_read"=>crate::artifacts::tools::handle_from_asks(ctx,&request.tool,args,"native-child-read",None),
+        "owner_pins"=>crate::owner_pins::tool::handle_from_asks(ctx,&request.tool,args,"native-child-read"),
+        _=>crate::agent_bus::native_subagent::refusal(),
+    }
+}
+
+#[cfg(test)]
+mod native_child_read_tests {
+    use super::*;
+    #[test] fn native_child_delegation_read_is_only_for_parent_requester() {
+        crate::asks::short_ids::tests::context("native-child-delegation",|ctx| {
+            let (own,foreign)=ctx.store.with_state(|state| {
+                let own=state.create_ask(crate::asks::store::tests::new_ask("child-own","own task"),ctx.now).unwrap().0.ask_id;
+                let mut request=crate::asks::store::tests::new_ask("child-foreign","foreign task");
+                request.requester=crate::asks::model::Requester::Agent {cutex_session_id:crate::asks::store::tests::TARGET.into(),name:None};
+                request.target_cutex_session_id=ctx.caller.into();
+                let foreign=state.create_ask(request,ctx.now).unwrap().0.ask_id;
+                let ask=state.asks[&own].clone();
+                state.answers.insert("child-answer".into(),crate::asks::model::AnswerRecord {
+                    answer_id:"child-answer".into(),ask_id:own.clone(),attempt:1,revision:1,
+                    status:crate::asks::model::AnswerStatus::Completed,artifact_id:None,bytes:0,metadata:Default::default(),
+                    created_at:ctx.now.to_rfc3339(),preview:None});
+                super::super::delivery::record_answer_delivery(state,&ask,"child-answer",ctx.now);
+                (own,foreign)
+            }).unwrap();
+            let read=|id:&str|handle_native_child_read(ctx,&serde_json::to_vec(&json!({"tool":"delegation_read","arguments":{"delegation":id}})).unwrap());
+            let before=serde_json::to_value(ctx.store.snapshot().unwrap()).unwrap();
+            assert_eq!(read(&own)["ok"],true);
+            assert_eq!(serde_json::to_value(ctx.store.snapshot().unwrap()).unwrap(),before,"child must not mark parent's result read");
+            assert_eq!(read(&foreign)["code"],"native_subagent_read_only");
+            assert_ne!(read("doc-not-a-delegation")["ok"],true);
+        });
+    }
+    #[test] fn child_reads_do_not_record_facade_or_send() {
+        crate::asks::short_ids::tests::context("native-child-read",|ctx| {
+            let before=serde_json::to_value(ctx.store.snapshot().unwrap()).unwrap();
+            let value=handle_native_child_read(ctx,&serde_json::to_vec(&json!({"tool":"agent_list","arguments":{}})).unwrap());
+            assert_eq!(value["ok"],true,"{value}");
+            let after=serde_json::to_value(ctx.store.snapshot().unwrap()).unwrap();
+            assert_eq!(before,after,"read must not record parent facade or receipts");
+            for name in ["agent_tell","agent_create","delegation_progress","service_register","owner_pin"] {
+                let result=handle_native_child_read(ctx,&serde_json::to_vec(&json!({"tool":name,"arguments":{}})).unwrap());
+                assert_eq!(result["code"],"native_subagent_read_only");
+            }
+        });
     }
 }

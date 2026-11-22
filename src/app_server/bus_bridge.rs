@@ -1003,6 +1003,9 @@ fn deliver_polled_messages_with(
         ..DeliverySweepOutcome::default()
     };
     let mut prepared = Vec::new();
+    crate::agent_bus::runtime_gate_notice::best_effort(|| {
+        crate::agent_bus::runtime_gate_notice::report_existing_holds(agent_bus_message_repository()?, &messages, cutex_session_id)
+    });
     for message in messages {
         let job_v2 = message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2);
         if job_v2 && !job_v2_model_text {
@@ -1149,6 +1152,7 @@ fn deliver_polled_messages_with(
                     continue;
                 }
             }
+            if starts_turn { super::pre_turn_notes::before_start(cutex_session_id, thread_id, None).attach_to_input(cutex_session_id,&message.id); }
             let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(cutex_session_id, "delivery", None));
             // 054 §2.9: native IO starts now (A2 submission next).
             agent_bus_message_repository()?.input_ledger_sending(cutex_session_id, &message.id);
@@ -1169,6 +1173,12 @@ fn deliver_polled_messages_with(
                     outcome.made_progress = true;
                 }
                 Err(error) => {
+                    let _ = agent_bus_message_repository()?.record_note_attempt(cutex_session_id, &message.id, Some(&format!("{error:#}")), "nativeReconciliation");
+                    if crate::app_server::external_input::busy_refusal_reason(&error).as_deref() == Some("gate_closed") {
+                        crate::agent_bus::runtime_gate_notice::best_effort(|| {
+                            crate::agent_bus::runtime_gate_notice::record_hold(agent_bus_message_repository()?, message, cutex_session_id, None)
+                        });
+                    }
                     mark_error(
                         status,
                         format!("A2 submission failed for {}: {error:#}", message.id),
@@ -2882,6 +2892,16 @@ mod tests {
     #[test]
     fn stable_recipient_digest_delivers_once_with_a4_and_one_ack() {
         if test_runs_in_private_home("app_server::bus_bridge::tests::stable_recipient_digest_delivers_once_with_a4_and_one_ack") { return; }
+        stable_recipient_delivery(false);
+    }
+
+    #[test]
+    fn notice_storage_failure_does_not_block_healthy_source_delivery() {
+        if test_runs_in_private_home("app_server::bus_bridge::tests::notice_storage_failure_does_not_block_healthy_source_delivery") { return; }
+        stable_recipient_delivery(true);
+    }
+
+    fn stable_recipient_delivery(fail_notice: bool) {
         let message_id = format!("recipient-consistency-{}", uuid::Uuid::new_v4());
         let mut message = test_message(AgentDeliveryMode::AfterTurn);
         message.id = message_id.clone();
@@ -2934,7 +2954,7 @@ mod tests {
         let status = test_status();
         let mut pending_acks = BTreeSet::new();
 
-        let outcome = deliver_polled_messages(
+        let deliver = || deliver_polled_messages(
             &bus,
             &submitter,
             &registration.id,
@@ -2946,6 +2966,9 @@ mod tests {
             &status,
         )
         .unwrap();
+        let outcome = if fail_notice {
+            crate::agent_bus::runtime_gate_notice::with_notice_failure(deliver)
+        } else { deliver() };
 
         assert!(outcome.made_progress);
         assert!(!outcome.retained_pending);

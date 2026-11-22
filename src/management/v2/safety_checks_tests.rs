@@ -3,6 +3,45 @@ use crate::owner_notify::store::State;
 
 const AGENT: &str = "cutex.agent-a";
 
+#[test]
+fn grant_nests_the_owner_route_lane_but_never_crosses_another_owner() {
+    let lane = std::sync::Arc::new(super::super::session_coordination::OperationLane::new());
+    let outer = lane.reserve().unwrap();
+    let nested = grant_reservation(&lane).expect("owner mutation route already owns this lane");
+    assert_eq!(outer.token(), nested.token());
+    let other = lane.clone();
+    assert!(std::thread::spawn(move || grant_reservation(&other).is_err()).join().unwrap());
+    drop(nested);
+    drop(outer);
+    assert!(grant_reservation(&lane).is_ok());
+}
+
+#[test]
+fn owner_can_dismiss_without_a_session_and_late_snapshot_cannot_reopen_it() {
+    let (store, dir) = temp();
+    observe(&store, BLOCKED_NOTIFICATION, wire("gone-block", "blocked"));
+    let id = record(&store, "gone-block").notification_id;
+    let first = dismiss_notification_with(&store, &id, Utc::now()).unwrap();
+    assert_eq!(first["block"]["state"], "dismissed");
+    assert_eq!(dismiss_notification_with(&store, &id, Utc::now()).unwrap(), first);
+    assert!(!observe(&store, UPDATED_NOTIFICATION, wire("gone-block", "blocked")));
+    assert!(!record(&store, "gone-block").pending());
+    let denied = dismiss_owner_notification(None, &id).unwrap_err();
+    assert_eq!(denied.code, "cutex_method_denied");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn retired_and_deleted_sessions_are_refused_before_grant_runtime_io() {
+    use crate::session::model::{CutexSessionArchiveState, CutexSessionRecord};
+    let refusal = grantable(None).unwrap_err();
+    assert!(matches!(refusal, RuntimeCallError::Refused {code,..} if code == "runtime_gone"));
+    let mut record = CutexSessionRecord::new_at(AGENT.into(), None, "host".into(), ".".into(), None, "2026-11-17T00:00:00Z".into()).unwrap();
+    assert!(grantable(Some(&record)).is_ok());
+    record.archive_state = CutexSessionArchiveState::Retired;
+    assert!(matches!(grantable(Some(&record)), Err(RuntimeCallError::Refused {code,..}) if code == "runtime_gone"));
+}
+
 fn temp() -> (OwnerNotifyStore, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("cutex-safety-checks-{}", uuid::Uuid::new_v4().simple()));
     (OwnerNotifyStore::at(dir.join("owner-notify")), dir)

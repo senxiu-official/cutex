@@ -24,6 +24,7 @@ pub mod host;
 pub mod paths;
 pub mod publish;
 pub mod read;
+pub mod raw;
 pub mod show;
 pub mod store;
 pub mod tools;

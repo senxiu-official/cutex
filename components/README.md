@@ -107,3 +107,9 @@ the previous versions again. Releases without a `components` section leave insta
 they are. `--from-source` (CLI only) builds from a checkout instead (`origin: source`).
 
 DSH and Kimi are optional source adapters. A backend update does not install their upstream CLIs or probe Node merely to update cutex. Follow the [DSH](dsh-runtime/README.md) and [Kimi](kimi-runtime/README.md) setup guides. Existing deployments and runtime pins remain unchanged until explicitly upgraded; there is no automatic uninstall.
+
+## Job Service 0.1.3 compatibility
+
+Job Service 0.1.3 can persist unconfirmed jobs when follow-up is ended. Job Service 0.1.2 cannot read that state. Retain an offline backup and do not downgrade the Job Service or restore older binaries over a store containing those records.
+
+Job Service 0.1.3 在结束后续处理时可持久保存 unconfirmed 作业。Job Service 0.1.2 无法读取该状态。请保留离线备份；包含这些记录后，不要降级 Job Service 或用旧二进制覆盖该存储。

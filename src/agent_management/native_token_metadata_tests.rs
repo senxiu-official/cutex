@@ -13,9 +13,10 @@ struct Fixture {
 }
 
 fn private_dir(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(unix)] std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(windows)] crate::platform::private_fs::secure_directory(path).unwrap();
 }
 
 fn write(path: &Path, value: &[u8]) {
@@ -31,20 +32,26 @@ fn bundle(home: &Path, bin: &Path) -> StockBundle {
         VerifiedFile { sha256: file_sha256(&path).unwrap(), path: path.canonicalize().unwrap() }
     };
     write(&home.join("config.toml"), b"model='gpt-5.6-sol'\n");
-    StockBundle {
+    let bundle = StockBundle {
         version: 4, upstream_commit: "synthetic".into(), native_patch_commit: None,
-        executable: file("codex-app-server", b"synthetic-server"), cli: None,
-        code_mode_host: file("codex-code-mode-host", b"synthetic-host"),
+        executable: file(if cfg!(windows) {"codex-app-server.exe"} else {"codex-app-server"}, b"synthetic-server"), cli: None,
+        code_mode_host: file(if cfg!(windows) {"codex-code-mode-host.exe"} else {"codex-code-mode-host"}, b"synthetic-host"),
         facade: file("cutex-mcp", b"synthetic-facade"), schema: file("schema.json", b"{}"),
         shared_config: VerifiedFile { path: home.join("config.toml").canonicalize().unwrap(),
             sha256: file_sha256(&home.join("config.toml")).unwrap() },
         launch_config_sha256: None,
-    }
+    };
+    // The executable is fixture data. Configuration validation can probe the
+    // selected bundle before a test installs its explicit capability result.
+    // Cache the baseline so Windows never tries to execute a text .exe file.
+    crate::profiles::model_variants::store_tests::set_context_support(&bundle, false);
+    bundle
 }
 
 impl Fixture {
     fn new() -> Self {
         let home = AutomaticStartHome::new();
+        private_dir(&home.root);
         let config = crate::config::paths::config_dir().unwrap();
         let profile_id = uuid::Uuid::new_v4().to_string();
         let profile = config.join("profiles").join(&profile_id);
@@ -166,4 +173,48 @@ fn native_login_metadata_import_materialize_preserves_native_bytes() {
     assert_eq!(std::fs::read(&files.auth_path).unwrap(),std::fs::read(&f.auth).unwrap());
     crate::launch::selected_profile::Config::parse("cutex_provider_mode='selected_profile_v2'\nmodel='gpt-5.6-sol'\nmodel_reasoning_effort='max'\n")
         .unwrap().review(&account.id,files.auth_path,None,None).unwrap();
+}
+
+#[test]
+fn p13_old_pin_refuses_start_but_upgrade_review_apply_succeeds() {
+    for settings in ["model_context_window=400000\n", "model_auto_compact_percent=75\n", "model_context_window=400000\nmodel_auto_compact_percent=75\n"] {
+        let f=Fixture::new();
+        let config=f.auth.parent().unwrap().join("config.toml");
+        let mut raw=std::fs::read_to_string(&config).unwrap();
+        raw.push_str("model_context_settings_v1=true\n");
+        raw.push_str(settings);
+        write(&config,raw.as_bytes());
+        let sessions=crate::session::store::load_cutex_session_store().unwrap();
+        let record=&sessions.sessions[f.id.as_str()];
+        let old=StockBundle::load(record.explicit_launch.as_ref().unwrap()).unwrap();
+        crate::profiles::model_variants::store_tests::set_context_support(&old,false);
+        let deployment=crate::launch::local_deployment::LocalDeployment::selected().unwrap().unwrap();
+        let selected:StockBundle=serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest).unwrap()).unwrap();
+        crate::profiles::model_variants::store_tests::set_context_support(&selected,true);
+        let projection=crate::launch::stock::current_configuration(record).unwrap().selected_projection.unwrap();
+        let native_home=&record.explicit_launch.as_ref().unwrap().native_home;
+        let error=crate::profiles::model_variants::projection_for_runtime(&projection,&old,native_home).unwrap_err();
+        assert!(error.to_string().contains("modelContextSettingsV2"),"{error:#}");
+        let review=f.provider.review_runtime_package_upgrade(&f.path,&f.id).unwrap();
+        // A newly invalid target model/effort configuration must still reject
+        // both review and apply, leaving the original pin available to repair.
+        let invalid=raw.replace("model_reasoning_effort='max'", "model_reasoning_effort='invalid-effort'");
+        write(&config,invalid.as_bytes());
+        let error=f.provider.review_runtime_package_upgrade(&f.path,&f.id).unwrap_err();
+        assert!(format!("{error:#}").contains("reasoning"),"{error:#}");
+        assert!(f.provider.apply_runtime_package_upgrade(&HumanManagementPrincipal::authenticated(),&f.path,
+            &AgentActionId::new("private-p13-invalid-effort").unwrap(),&review).is_err());
+        assert_eq!(crate::session::store::load_cutex_session_store().unwrap().sessions[f.id.as_str()].explicit_launch,
+            record.explicit_launch);
+        write(&config,raw.as_bytes());
+        f.provider.apply_runtime_package_upgrade(&HumanManagementPrincipal::authenticated(),&f.path,
+            &AgentActionId::new("private-p13-upgrade").unwrap(),&review).unwrap();
+        let sessions=crate::session::store::load_cutex_session_store().unwrap();
+        let record=&sessions.sessions[f.id.as_str()];
+        let new=StockBundle::load(record.explicit_launch.as_ref().unwrap()).unwrap();
+        let projection=crate::launch::stock::current_configuration(record).unwrap().selected_projection.unwrap();
+        assert!(crate::profiles::model_variants::projection_for_runtime(&projection,&new,native_home).is_ok());
+        assert_eq!(record.explicit_launch.as_ref().unwrap(),&review.target_contract);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(),raw,"upgrade never rewrites Profile limits");
+    }
 }

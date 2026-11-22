@@ -121,13 +121,27 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/sessions/s1/fs/file", Class::Scoped(WorkspaceRead)),
         ("GET", "/v2/sessions/s1/git/diff", Class::Scoped(WorkspaceRead)),
         ("POST", "/v2/sessions/s1/attachments", Class::Scoped(AttachmentUpload)),
+        ("GET", "/v2/sessions/s1/server-requests", Class::Scoped(ServerRequests)),
         ("POST", "/v2/clients/presence", Class::AnyPrincipal),
         ("GET", "/v2/clients", Class::AnyPrincipal),
         ("POST", "/v2/clients/inst-1/close", Class::AnyPrincipal),
         ("POST", "/v2/clients/inst-1/closing", Class::AnyPrincipal),
+        // r290 P1: artifacts of visible projects / agents, read-only.
+        ("GET", "/v2/artifact-store", Class::Scoped(ArtifactRead)),
+        ("GET", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef", Class::Scoped(ArtifactRead)),
+        ("GET", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef/versions/latest/content", Class::Scoped(ArtifactRead)),
+        ("GET", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef/versions/2/raw", Class::Scoped(ArtifactRead)),
+        ("HEAD", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef/versions/2/raw", Class::Scoped(ArtifactRead)),
+        ("GET", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef/diff", Class::Scoped(ArtifactRead)),
     ];
     for (method, path, class) in expected {
         assert_eq!(classify(method, path), Some(*class), "{method} {path}");
+    }
+    for (suffix, class) in [("media", SessionMedia), ("attachments", AttachmentRead), ("blobs", SessionBlob)] {
+        let path = format!("/v2/sessions/s1/{suffix}/{}", "a".repeat(64));
+        assert_eq!(classify("GET", &path), Some(Class::Scoped(class)));
+        assert_eq!(scope_need("GET", &path, &Value::Null, None, |_, _| None), ScopeNeed::Read);
+        assert_eq!(classify("POST", &path), Some(Class::OwnerOnly));
     }
     // Same paths with other methods, and neighbouring routes: the owner's.
     let owner_only = [
@@ -142,6 +156,18 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("POST", "/v2/capabilities"),
         ("GET", "/v2/asks/provenance"),
         ("GET", "/v2/artifacts/art-1"),
+        // r290 P1: artifact writes, host-wide artifact routes and the owner's user routes.
+        ("POST", "/v2/artifact-store"),
+        ("PATCH", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef"),
+        ("DELETE", "/v2/artifact-store/af-0123456789abcdef0123456789abcdef"),
+        ("POST", "/v2/artifact-store/resolve"),
+        ("GET", "/v2/artifact-store/usage"),
+        ("GET", "/v2/artifact-store/not-an-artifact"),
+        ("GET", "/v2/artifact-store-x"),
+        ("PUT", "/v2/users/u-0123456789ab/projects/p1"),
+        ("DELETE", "/v2/users/u-0123456789ab/projects/p1"),
+        ("POST", "/v2/users/u-0123456789ab/tokens"),
+        ("DELETE", "/v2/users/u-0123456789ab/tokens/mct-1"),
         ("POST", "/v2/pairing-codes"),
         ("GET", "/v2/pairing-codes"),
         ("GET", "/v2/users"),
@@ -224,7 +250,12 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("POST", "/v2/agent-management/explicit-launch"),
         ("GET", "/v2/agent-management/durable-candidates"),
         ("GET", "/v2/notes"),
-        ("GET", "/v2/artifact-store"),
+        // r290 P1: artifact writes and host-wide artifact routes stay the owner's.
+        ("POST", "/v2/artifact-store"),
+        ("PATCH", "/v2/artifact-store/af-00000000000000000000000000000000"),
+        ("DELETE", "/v2/artifact-store/af-00000000000000000000000000000000"),
+        ("GET", "/v2/artifact-store/usage"),
+        ("POST", "/v2/artifact-store/resolve"),
         ("GET", "/v2/health"),
         ("GET", "/v2"),
         ("GET", "/v2/clients/presence"),
@@ -369,7 +400,8 @@ fn delegation_commands_need_a_visible_related_ask() {
     state.questions.insert("q-1".into(), question("q-1", "ask-mine"));
     state.questions.insert("q-2".into(), question("q-2", "ask-other"));
     let scope = Scope::for_tests(Grant { send: true, ..Grant::default() }, &["a1", "a2"]);
-    let check = |params: Value, session: &str| match ask_command_target(&state, &params, session, &scope) {
+    let check = |params: Value, session: &str| match ask_command_target(&state,
+        if params.get("askId").is_some(){"cutex/ask/stop"}else{"cutex/ask/respond"}, &params, session, &scope) {
         AskTarget::Allowed => "allowed",
         AskTarget::Invalid => "invalid",
         AskTarget::Hidden(code) => code,
@@ -386,12 +418,17 @@ fn delegation_commands_need_a_visible_related_ask() {
     assert_eq!(check(json!({"questionId": "q-missing"}), "a1"), "question_not_found");
     assert_eq!(check(json!({}), "a1"), "invalid");
     assert_eq!(check(json!({"questionId": 5}), "a1"), "invalid");
+    for method in ["cutex/ask/stop","cutex/ask/close","cutex/ask/retry","cutex/ask/resume","cutex/ask/reopen"] {
+        assert!(matches!(ask_command_target(&state,method,&json!({"askId":"ask-other","questionId":"q-1"}),"a1",&scope),AskTarget::Hidden("ask_not_found")),"{method}");
+        assert!(matches!(ask_command_target(&state,method,&json!({"askId":"ask-mine","questionId":"q-2"}),"a1",&scope),AskTarget::Allowed),"{method}");
+    }
+    assert!(matches!(ask_command_target(&state,"cutex/ask/respond",&json!({"askId":"ask-mine","questionId":"q-2"}),"a1",&scope),AskTarget::Hidden("question_not_found")));
 }
 
 #[test]
 fn summary_and_project_filters_keep_only_the_grant() {
     let scope = Scope::for_tests(
-        Grant { projects: Projects::Only(vec!["p1".into()]), standalone_agents: vec!["solo".into()], send: false },
+        Grant { projects: Projects::Only(vec!["p1".into()]), standalone_agents: vec!["solo".into()], send: false, ..Grant::default() },
         &["a1", "solo"],
     );
     let mut summary = json!({
@@ -600,4 +637,25 @@ fn narrowed_tokens_cannot_obtain_static_service_browser_channels() {
         assert!(!scope_allows(DeviceScope::Chat, need), "{path}");
         assert!(scope_allows(DeviceScope::Full, need), "{path}");
     }
+}
+
+#[test]
+fn native_child_proof_has_an_exact_owner_only_boundary_for_all_methods(){
+    for method in METHODS {assert_eq!(classify(method,crate::agent_bus::native_subagent::PROOF_PATH),Some(Class::OwnerOnly));}
+    assert_eq!(classify("POST","/v2/internal/native-subagent/verify-other"),None);
+}
+
+#[test]
+fn owner_dispositions_have_no_non_owner_surface() {
+    for path in ["/v2/asks/ask-orphan/close","/v2/owner-notifications/n-orphan/ack","/v2/owner-notifications/n-orphan/dismiss",
+        "/v2/owner-notifications/n-orphan/delete","/v2/owner-notifications/n-orphan/safety-dismiss",
+        "/v2/job-service/close-follow-up","/v2/agent-bus/stuck-messages/end-follow-up"] {
+        assert_eq!(classify("POST",path),Some(Class::OwnerOnly),"{path}");
+    }
+}
+
+// r290 P6
+#[test]
+fn board_is_owner_only_for_every_http_method() {
+    for method in METHODS {assert_eq!(classify(method,"/v2/board"),Some(Class::OwnerOnly));}
 }

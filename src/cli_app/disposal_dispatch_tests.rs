@@ -215,6 +215,11 @@ fn disposed_request_occurrence_never_reaches_real_ask_native_dispatch() {
         crate::cli_app::test_home::IsolatedTestHome::new_private("disposed-ask-dispatch").unwrap();
     let native = NativeProbe::connect(home.root(), false);
     let session = &native.record.cutex_session_id;
+    // r290 integration: reserve the real reentrant admission lane before
+    // arranging the source, so the background disposal worker cannot close it
+    // before the dispatch-entry disposal guard is exercised.
+    let lane = cutex::management::v2::session_coordination::session_lane(session).unwrap();
+    let _reservation = lane.lock().unwrap();
     // Nonzero occurrence catches guards incorrectly rebuilding the legacy id.
     let (input_id, submission) = reserved_ask(session, 3);
     cutex::management::v2::input_disposal::request(session, &input_id).unwrap();
@@ -240,6 +245,7 @@ fn disposed_result_delivery_never_reaches_real_submit_or_steer_dispatch() {
             state.events.insert(
                 message.clone(),
                 EventOutboxRecord {
+                    held_runtime_generation: None,
                     event_id: message.clone(),
                     cutex_session_id: session.clone(),
                     delivery_ids: vec![delivery.clone()],

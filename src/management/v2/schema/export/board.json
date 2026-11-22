@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:board",
+  "title": "Project board summary",
+  "description": "Owner-only host summary; ETag/If-None-Match supports304; cache freshness5s; safety poll60s with SSE refresh hints. Null counts mean unavailable, never healthy zero. finishedToday counts closed asks in explicit host calendar-day bounds.",
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "hostId",
+        "instanceId",
+        "generatedAt",
+        "etag",
+        "refreshAfterSeconds",
+        "day",
+        "availability",
+        "projects",
+        "cacheTtlSeconds"
+      ],
+      "properties": {
+        "contractVersion": {
+          "const": 1
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "instanceId": {
+          "type": "string"
+        },
+        "generatedAt": {
+          "type": "string"
+        },
+        "etag": {
+          "type": "string"
+        },
+        "refreshAfterSeconds": {
+          "const": 60
+        },
+        "day": {
+          "type": "object",
+          "required": [
+            "start",
+            "end",
+            "timeZone"
+          ],
+          "properties": {
+            "start": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string"
+            },
+            "timeZone": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "availability": {
+          "type": "object",
+          "required": [
+            "members",
+            "delegations",
+            "finishedToday",
+            "needs"
+          ],
+          "properties": {
+            "members": {
+              "type": "boolean"
+            },
+            "delegations": {
+              "type": "boolean"
+            },
+            "finishedToday": {
+              "type": "boolean"
+            },
+            "needs": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/project"
+          }
+        },
+        "cacheTtlSeconds": {
+          "const": 5
+        }
+      },
+      "additionalProperties": true
+    },
+    "project": {
+      "type": "object",
+      "required": [
+        "projectId",
+        "projectKey",
+        "name",
+        "hosts",
+        "members",
+        "openDelegationsCount",
+        "finishedToday",
+        "needsYouCount",
+        "problems",
+        "delegations",
+        "delegationsTruncated",
+        "director",
+        "needsYou"
+      ],
+      "properties": {
+        "projectId": {
+          "type": "string"
+        },
+        "projectKey": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "color": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hosts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "hostId",
+              "instanceId"
+            ],
+            "properties": {
+              "hostId": {
+                "type": "string"
+              },
+              "instanceId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "members": {
+          "$ref": "#/$defs/members"
+        },
+        "openDelegationsCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "finishedToday": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "needsYouCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "problems": {
+          "type": "object",
+          "required": [
+            "count",
+            "items",
+            "byCode"
+          ],
+          "properties": {
+            "count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "items": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "required": [
+                  "code",
+                  "id",
+                  "targetKind"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "targetKind": {
+                    "enum": [
+                      "agent",
+                      "delegation"
+                    ]
+                  }
+                },
+                "additionalProperties": true
+              }
+            },
+            "byCode": {
+              "type": "object",
+              "description": "Exact collected counts by problem code across all problems, independent of the capped examples; zero counts may be omitted. Source availability still applies.",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "delegations": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/delegation"
+          }
+        },
+        "delegationsTruncated": {
+          "type": "boolean"
+        },
+        "director": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/director"
+            }
+          ]
+        },
+        "needsYou": {
+          "type": "object",
+          "required": [
+            "count",
+            "items"
+          ],
+          "properties": {
+            "count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "items": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "id",
+                  "agentId"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "agentId": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "members": {
+      "type": "object",
+      "required": [
+        "total",
+        "busy",
+        "idle",
+        "offline",
+        "paused",
+        "starting",
+        "error",
+        "unknown"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "busy": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "idle": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offline": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paused": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "starting": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "director": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "state",
+        "plan",
+        "goal",
+        "goalAvailable",
+        "goalProvenance"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "plan": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/progress"
+            }
+          ]
+        },
+        "goal": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "goalAvailable": {
+          "type": "boolean"
+        },
+        "goalProvenance": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "progress": {
+      "type": "object",
+      "required": [
+        "done",
+        "total",
+        "currentStep",
+        "updatedAt",
+        "source"
+      ],
+      "properties": {
+        "done": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "currentStep": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "enum": [
+            "plan",
+            "progressNote"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "delegation": {
+      "type": "object",
+      "required": [
+        "askId",
+        "target",
+        "execution",
+        "steps",
+        "quietSince",
+        "stalled",
+        "stalledAfterSeconds",
+        "toolCallStartedAt"
+      ],
+      "properties": {
+        "askId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "requester": {
+          "type": "object"
+        },
+        "target": {
+          "type": "string"
+        },
+        "execution": {
+          "type": "string"
+        },
+        "hold": {
+          "type": [
+            "object",
+            "string",
+            "null"
+          ]
+        },
+        "attempt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "steps": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/progress"
+            }
+          ]
+        },
+        "quietSince": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stalled": {
+          "type": "boolean"
+        },
+        "stallReason": {
+          "enum": [
+            null,
+            "noProgress",
+            "longToolCall"
+          ]
+        },
+        "stalledAfterSeconds": {
+          "const": 900
+        },
+        "toolCallStartedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "#/$defs/snapshot"
+    }
+  ]
+}

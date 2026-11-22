@@ -184,7 +184,7 @@ pub fn stop_held(state: &AskState, session: &str) -> bool {
 }
 
 /// Record an owner pause on `session`'s admission and hold its queued asks.
-/// Returns whether the pause was created now.
+/// Returns whether the pause was created or took over a runtime gate now.
 pub fn owner_pause(state: &mut AskState, session: &str, now: DateTime<Utc>) -> bool {
     pause_with(state, session, ORIGIN_OWNER_PAUSE, false, None, now)
 }
@@ -273,11 +273,14 @@ pub fn quota_reset_reopen_default(session: &str) {
 }
 
 fn clear_pause_holds(state: &mut AskState, session: &str, now: DateTime<Utc>) {
+    super::delivery::supersede_gate_notices(state, session, now);
     let gate_hold = Some(Hold::HeldByRuntime { native: Some(NATIVE_GATE_CLOSED.into()) });
-    let held: Vec<String> = state
-        .waiting_for_target(session)
-        .iter()
-        .filter(|ask| matches!(ask.hold, Some(Hold::Paused { by: PausedBy::Owner })) || ask.hold == gate_hold)
+    let held: Vec<String> = state.asks.values()
+        .filter(|ask| ask.remote.is_none() && ask.target_cutex_session_id == session && ask.is_open())
+        // A retained running ask can inherit paused(owner) when the owner
+        // takes over its runtime gate. Resume clears that hold on the same attempt.
+        .filter(|ask| (matches!(ask.execution, ExecutionState::Queued | ExecutionState::PendingReview | ExecutionState::Running)
+            && matches!(ask.hold, Some(Hold::Paused { by: PausedBy::Owner }))) || ask.hold == gate_hold)
         .map(|ask| ask.ask_id.clone())
         .collect();
     for ask_id in held {
@@ -287,7 +290,7 @@ fn clear_pause_holds(state: &mut AskState, session: &str, now: DateTime<Utc>) {
 
 fn pause_with(state: &mut AskState, session: &str, origin: &str, stop: bool, generation: Option<u64>, now: DateTime<Utc>) -> bool {
     let created = !state.pauses.contains_key(session);
-    let pause = state.pauses.entry(session.to_string()).or_insert_with(|| AdmissionPause {
+    let pause = state.pauses.entry(session.to_string()).or_insert_with(|| AdmissionPause { stop_answer_authorized: false,
         cutex_session_id: session.to_string(),
         by: PausedBy::Owner,
         since: now_rfc3339(now),
@@ -295,13 +298,21 @@ fn pause_with(state: &mut AskState, session: &str, origin: &str, stop: bool, gen
         stop_hold: false,
         runtime_generation: generation,
     });
+    // An explicit owner pause takes authority over a failed-turn gate or a
+    // Stop exception. A runtime-gate release must not clear this owner hold.
+    let owner_took_over = origin == ORIGIN_OWNER_PAUSE
+        && pause.origin.as_deref() != Some(ORIGIN_OWNER_PAUSE);
+    if owner_took_over {
+        pause.origin = Some(ORIGIN_OWNER_PAUSE.into());
+        pause.runtime_generation = None;
+    }
     let stop_added = stop && !pause.stop_hold;
     pause.stop_hold |= stop;
     let paused_hold = pause_hold(pause);
-    let queued: Vec<String> = state
-        .waiting_for_target(session)
-        .iter()
-        .filter(|ask| ask.execution == ExecutionState::Queued)
+    let queued: Vec<String> = state.asks.values()
+        .filter(|ask| ask.remote.is_none() && ask.target_cutex_session_id == session && ask.is_open())
+        .filter(|ask| ask.execution == ExecutionState::Queued || ask.resume_pending()
+            || (owner_took_over && matches!(&ask.hold, Some(Hold::HeldByRuntime { native }) if native.as_deref() == Some(NATIVE_GATE_CLOSED))))
         .map(|ask| ask.ask_id.clone())
         .collect();
     for ask_id in queued {
@@ -311,13 +322,13 @@ fn pause_with(state: &mut AskState, session: &str, origin: &str, stop: bool, gen
             ask.hold = hold.clone();
             changed
         });
-        if changed == Some(true) {
+        if changed == Some(true) || origin == ORIGIN_RUNTIME_GATE {
             if let Some(ask) = state.asks.get(&ask_id).cloned() {
                 super::delivery::record_state_delivery(state, &ask, "paused", now);
             }
         }
     }
-    if created || stop_added {
+    if created || stop_added || owner_took_over {
         let reason = if stop {
             ORIGIN_OWNER_STOP
         } else if origin == ORIGIN_RUNTIME_GATE {
@@ -327,7 +338,7 @@ fn pause_with(state: &mut AskState, session: &str, origin: &str, stop: bool, gen
         };
         pause_changed_notice(state, session, reason);
     }
-    created
+    created || owner_took_over
 }
 
 /// Clear an owner pause; queue the N2 gate resume. Returns whether a pause
@@ -348,6 +359,10 @@ pub fn owner_resume(state: &mut AskState, session: &str, reason: &str, now: Date
 /// hold everything that could start a turn (owner decision 2026-10-12). The
 /// native gate the interrupt closes is left closed; a release reopens it.
 pub fn owner_stop(state: &mut AskState, session: &str, now: DateTime<Utc>) {
+    turn_stop(state,session,true,now);
+}
+
+pub fn turn_stop(state: &mut AskState, session: &str, owner_authorized: bool, now: DateTime<Utc>) {
     super::waits::cancel_waits(state, session);
     // A stop supersedes a closed-gate pause: it is the owner's own hold now.
     if runtime_gate_closed(state, session) {
@@ -357,6 +372,14 @@ pub fn owner_stop(state: &mut AskState, session: &str, now: DateTime<Utc>) {
         }
     }
     pause_with(state, session, ORIGIN_OWNER_STOP, true, None, now);
+    // A second Stop invalidates a result reservation prepared before it.
+    if let Some(pause) = state.pauses.get_mut(session) {
+        pause.stop_answer_authorized=owner_authorized;
+        let at = super::parse_time(&pause.since).filter(|since|*since>=now)
+            .and_then(|since|since.checked_add_signed(chrono::Duration::nanoseconds(1))).unwrap_or(now);
+        // Preserve the increment even when two Stops share a millisecond.
+        pause.since = at.to_rfc3339_opts(chrono::SecondsFormat::Nanos,true);
+    }
 }
 
 /// Release a stop hold (`cutex/userInput/queue/resume`): an `ownerStop`
@@ -390,16 +413,13 @@ pub fn owner_message(state: &mut AskState, session: &str, disposition: &str, now
     owner_resume(state, session, "ownerMessage", now)
 }
 
-/// Best-effort hook for `cutex/turn/stop`: a store failure is logged, never
-/// fails the stop.
-pub fn owner_stop_default(session: &str) {
-    let Ok(store) = AskStore::open_default() else {
-        return;
-    };
-    match store.with_state(|state| owner_stop(state, session, Utc::now())) {
-        Ok(()) => crate::management::v2::asks::publish_pending_notices(&store),
-        Err(error) => eprintln!("asks: could not record the owner stop for {session}: {error:#}"),
-    }
+/// Persist Stop provenance before native interruption. A failed write must
+/// not let a scoped user inherit a previous owner's result admission proof.
+pub fn owner_stop_default(session: &str, owner_authorized: bool) -> anyhow::Result<()> {
+    let store=AskStore::open_default()?;
+    store.with_state(|state|turn_stop(state,session,owner_authorized,Utc::now()))?;
+    crate::management::v2::asks::publish_pending_notices(&store);
+    Ok(())
 }
 
 /// Best-effort hook for `cutex/userInput/queue/resume`: release the stop
@@ -430,23 +450,44 @@ pub fn release_stop_hold_default(session: &str) -> bool {
 /// only with an open input gate, so a `runtimeGate` pause ends (reason
 /// `turnStarted`). Cheap when there is none; never creates the store.
 pub fn runtime_gate_turn_started_default(session: &str) -> bool {
-    let Ok(store) = AskStore::open_default() else {
-        return false;
-    };
-    if !store.inspect(|state| runtime_gate_closed(state, session)).unwrap_or(false) {
+    runtime_gate_event_default(session, None)
+}
+
+/// The current adapter retained its silent input and reached the loop guard.
+/// Running asks keep their original attempt; only their admission hold changes.
+pub fn runtime_gate_retained(state: &mut AskState, session: &str, generation: u64, now: DateTime<Utc>) -> bool {
+    let changed = runtime_gate_pause(state, session, generation, now);
+    if !runtime_gate_closed(state, session) { return changed; }
+    let ids: Vec<_> = state.asks.values().filter(|ask| ask.remote.is_none()
+        && ask.target_cutex_session_id == session && ask.execution == ExecutionState::Running && ask.is_open())
+        .map(|ask| ask.ask_id.clone()).collect();
+    for id in ids {
+        state.update_ask(&id, now, |ask| ask.hold = Some(Hold::HeldByRuntime { native: Some(NATIVE_GATE_CLOSED.into()) }));
+        if let Some(ask) = state.asks.get(&id).cloned() {
+            super::delivery::record_state_delivery(state, &ask, "held", now);
+        }
+    }
+    changed
+}
+
+pub fn runtime_gate_retained_default(session: &str, generation: u64) -> bool {
+    runtime_gate_event_default(session, Some(generation))
+}
+
+fn runtime_gate_event_default(session: &str, retained_generation: Option<u64>) -> bool {
+    let Ok(store) = AskStore::open_default() else { return false; };
+    if retained_generation.is_none() && !store.inspect(|state| runtime_gate_closed(state, session)).unwrap_or(false) {
         return false;
     }
-    match store.with_state(|state| runtime_gate_opened(state, session, None, "turnStarted", Utc::now())) {
-        Ok(ended) => {
-            if ended {
-                crate::management::v2::asks::publish_pending_notices(&store);
-            }
-            ended
+    match store.with_state(|state| match retained_generation {
+        Some(generation) => runtime_gate_retained(state, session, generation, Utc::now()),
+        None => runtime_gate_opened(state, session, None, "turnStarted", Utc::now()),
+    }) {
+        Ok(changed) => {
+            crate::management::v2::asks::publish_pending_notices(&store);
+            changed
         }
-        Err(error) => {
-            eprintln!("asks: could not end the runtime gate pause of {session}: {error:#}");
-            false
-        }
+        Err(error) => { eprintln!("asks: runtime gate event of {session} not recorded: {error:#}"); false }
     }
 }
 
@@ -526,8 +567,159 @@ pub fn pause_state_default(session: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_stop_has_no_owner_result_authorization() {
+        let pause: super::AdmissionPause=serde_json::from_value(serde_json::json!({
+            "cutexSessionId":"cutex.legacy-stop","by":"owner","since":"2026-11-17T00:00:00Z",
+            "origin":"ownerStop","stopHold":true
+        })).unwrap();
+        assert!(!pause.stop_answer_authorized);
+    }
     use super::*;
     use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+
+    #[test]
+    fn review_owner_resume_clears_takeover_hold_on_running_retained_ask() {
+        let now = Utc::now();
+        let mut state = AskState::default();
+        let ask = state.create_ask(new_ask("review-running-owner-resume", "retained work"), now).unwrap().0;
+        state.update_ask(&ask.ask_id, now, |ask| ask.execution = ExecutionState::Running);
+        assert!(runtime_gate_retained(&mut state, TARGET, 3, now));
+        assert_eq!(state.asks[&ask.ask_id].hold,
+            Some(Hold::HeldByRuntime { native: Some(NATIVE_GATE_CLOSED.into()) }));
+        assert!(owner_pause(&mut state, TARGET, now));
+        assert_eq!(state.pauses[TARGET].origin.as_deref(), Some(ORIGIN_OWNER_PAUSE));
+        assert_eq!(state.asks[&ask.ask_id].hold, Some(Hold::Paused { by: PausedBy::Owner }));
+        let retained = state.asks[&ask.ask_id].clone();
+
+        assert!(owner_resume(&mut state, TARGET, "resumed", now));
+        let resumed = &state.asks[&ask.ask_id];
+        assert_eq!(resumed.hold, None);
+        assert_eq!(resumed.hold_since, None);
+        assert_eq!(resumed.execution, ExecutionState::Running);
+        assert_eq!(resumed.attempts, retained.attempts);
+        assert_eq!(resumed.request_sha256, retained.request_sha256);
+        assert_eq!(resumed.target_cutex_session_id, retained.target_cutex_session_id);
+        assert_eq!(state.asks.len(), 1, "resume retains the original ask");
+        assert!(!state.pauses.contains_key(TARGET));
+        assert!(gate_resume_queued(&state, TARGET));
+        assert_eq!(state.commands.len(), 1);
+        let revision = resumed.revision;
+        assert!(!owner_resume(&mut state, TARGET, "resumed", now));
+        assert_eq!(state.asks[&ask.ask_id].revision, revision);
+        assert_eq!(state.commands.len(), 1, "repeated resume is idempotent");
+    }
+
+    #[test]
+    fn owner_resume_preserves_running_foreign_holds_and_other_target() {
+        let now = Utc::now();
+        let mut state = AskState::default();
+        owner_pause(&mut state, TARGET, now);
+        let mut protected = Vec::new();
+        for (index, hold) in [
+            Hold::Paused { by: PausedBy::PlanMode },
+            Hold::HeldByRuntime { native: Some("unrelated_native_hold".into()) },
+            Hold::HeldByRuntime { native: None },
+            Hold::WaitingForApproval,
+            Hold::WaitingForInput,
+        ].into_iter().enumerate() {
+            let ask = state.create_ask(new_ask(&format!("protected-running-{index}"), "work"), now).unwrap().0;
+            state.update_ask(&ask.ask_id, now, |ask| {
+                ask.execution = ExecutionState::Running;
+                ask.hold = Some(hold);
+            });
+            protected.push(state.asks[&ask.ask_id].clone());
+        }
+        let mut other = new_ask("protected-other-target", "work");
+        other.target_cutex_session_id = "cutex.00000000-0000-0000-0000-0000000000b2".into();
+        let other = state.create_ask(other, now).unwrap().0;
+        state.update_ask(&other.ask_id, now, |ask| {
+            ask.execution = ExecutionState::Running;
+            ask.hold = Some(Hold::Paused { by: PausedBy::Owner });
+        });
+        protected.push(state.asks[&other.ask_id].clone());
+
+        assert!(owner_resume(&mut state, TARGET, "resumed", now));
+        for before in protected {
+            assert_eq!(state.asks[&before.ask_id], before, "unrelated hold/target must remain unchanged");
+        }
+        assert!(gate_resume_queued(&state, TARGET));
+        assert!(!gate_resume_queued(&state, &other.target_cutex_session_id));
+    }
+
+    #[test]
+    fn owner_resume_of_running_takeover_does_not_clear_agent_or_project_pause() {
+        use crate::asks::project_control::{Mode, RunControl, Scope};
+        let now = Utc::now();
+        let mut state = AskState::default();
+        let ask = state.create_ask(new_ask("running-takeover-other-pauses", "work"), now).unwrap().0;
+        state.update_ask(&ask.ask_id, now, |ask| ask.execution = ExecutionState::Running);
+        runtime_gate_retained(&mut state, TARGET, 3, now);
+        owner_pause(&mut state, TARGET, now);
+        super::super::agent_pause::pause(&mut state, TARGET, "owner", None, now);
+        state.project_control.projects.insert("alpha".into(), RunControl {
+            project_id: "alpha".into(), epoch: 1, pause_id: Some("project-hold".into()),
+            requested_by: None, requested_at: Some(now), mode: Mode::AfterTurn, scope: Scope::Members,
+            membership_revision: 1, excluded_session_ids: Default::default(),
+            members: [TARGET.to_string()].into(), interrupt_unknown: Default::default(),
+        });
+        let agent_pause = serde_json::to_value(&state.presence[TARGET].agent_pause).unwrap();
+        let project_pause = serde_json::to_value(&state.project_control).unwrap();
+        assert!(owner_resume(&mut state, TARGET, "resumed", now));
+        assert_eq!(state.asks[&ask.ask_id].hold, None);
+        assert_eq!(state.asks[&ask.ask_id].execution, ExecutionState::Running);
+        assert_eq!(serde_json::to_value(&state.presence[TARGET].agent_pause).unwrap(), agent_pause);
+        assert_eq!(serde_json::to_value(&state.project_control).unwrap(), project_pause);
+        assert!(super::super::agent_pause::is_paused(&state, TARGET));
+        assert!(super::super::project_control::is_paused(&state, TARGET));
+    }
+
+    #[test]
+    fn retained_running_input_guard_is_visible_resumable_and_owner_pause_takes_over() {
+        let now = Utc::now();
+        let mut state = AskState::default();
+        let ask = state.create_ask(new_ask("retained-running", "work"), now).unwrap().0;
+        state.update_ask(&ask.ask_id, now, |ask| ask.execution = ExecutionState::Running);
+        runtime_gate_retained(&mut state, TARGET, 3, now);
+        assert!(runtime_gate_closed(&state, TARGET));
+        assert_eq!(state.asks[&ask.ask_id].execution, ExecutionState::Running);
+        assert!(state.deliveries.values().any(super::super::delivery::is_gate_notice));
+        assert_eq!(super::super::agent_pause::resume(&mut state, TARGET)["changed"], true);
+        assert!(state.asks[&ask.ask_id].hold.is_none());
+        state.commands.clear();
+        runtime_gate_retained(&mut state, TARGET, 3, now);
+        owner_pause(&mut state, TARGET, now);
+        assert_eq!(super::super::agent_pause::resume(&mut state, TARGET)["changed"], false);
+        assert_eq!(state.pauses[TARGET].origin.as_deref(), Some(ORIGIN_OWNER_PAUSE));
+        assert!(matches!(state.asks[&ask.ask_id].hold, Some(Hold::Paused { .. })));
+    }
+
+    #[test]
+    fn gate_notices_cover_first_and_later_asks_without_stale_wakes() {
+        use crate::asks::delivery;
+        let mut state = AskState::default();
+        let now = Utc::now();
+        let (first, _) = state.create_ask(new_ask("gate-first", "x"), now).unwrap();
+        // The refusing scheduler already wrote the hold before recording the pause.
+        state.asks.get_mut(&first.ask_id).unwrap().hold = Some(Hold::HeldByRuntime { native: Some(NATIVE_GATE_CLOSED.into()) });
+        runtime_gate_pause(&mut state, TARGET, 4, now);
+        let first_delivery = state.deliveries.values().find(|d| delivery::is_gate_notice(d)).unwrap().delivery_id.clone();
+        assert!(!state.deliveries[&first_delivery].passive);
+        assert!(delivery::actionable(&state, &state.deliveries[&first_delivery]));
+        let (later, _) = state.create_ask(new_ask("gate-later", "x"), now).unwrap();
+        pause_with(&mut state, TARGET, ORIGIN_RUNTIME_GATE, false, Some(4), now);
+        pause_with(&mut state, TARGET, ORIGIN_RUNTIME_GATE, false, Some(4), now);
+        assert_eq!(state.deliveries.values().filter(|d| delivery::is_gate_notice(d)).count(), 2);
+        let later_delivery = state.deliveries.values().find(|d| d.ask_id == later.ask_id).unwrap().delivery_id.clone();
+        // An unknown native outcome must not be turned into a read receipt.
+        state.deliveries.get_mut(&later_delivery).unwrap().unsubmitted = false;
+        owner_resume(&mut state, TARGET, "resumed", now);
+        assert_eq!(state.deliveries[&first_delivery].settled_by.as_deref(), Some(delivery::SUPERSEDED));
+        assert_eq!(state.deliveries[&later_delivery].state, DeliveryState::Pending);
+        assert!(!delivery::actionable(&state, &state.deliveries[&later_delivery]));
+        runtime_gate_pause(&mut state, TARGET, 4, now + chrono::Duration::seconds(1));
+        assert_eq!(state.deliveries.values().filter(|d| delivery::is_gate_notice(d)).count(), 4);
+    }
 
     #[test]
     fn owner_message_probe_leaves_absent_store_absent() {
@@ -695,7 +887,7 @@ mod tests {
         // A legacy pause (no origin) reads as `legacy`.
         state.pauses.insert(
             TARGET.into(),
-            AdmissionPause { cutex_session_id: TARGET.into(), by: PausedBy::Owner, since: "t".into(), origin: None, stop_hold: false, runtime_generation: None },
+            AdmissionPause { stop_answer_authorized: false, cutex_session_id: TARGET.into(), by: PausedBy::Owner, since: "t".into(), origin: None, stop_hold: false, runtime_generation: None },
         );
         assert_eq!(pause_json(state.pauses.get(TARGET))["origin"], json!("legacy"));
     }

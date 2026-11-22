@@ -257,6 +257,7 @@ fn sample(provider: &str, model: &str, profile: &str, input: u64, cached: u64, o
         model_context_window: None,
         compaction_count: None,
         model_requests: None,
+        background_tokens: None, // r290 P8: no background breakdown for this source.
         tokens: TokenUsageBreakdown {
             total_tokens: input + output,
             input_tokens: input,

@@ -45,7 +45,7 @@ def test_compaction_without_launch_values_unsets_on_a_switch():
     # `""` unsets the override in Claude Code (checked in 2.1.301): Claude Code decides again.
     assert c.switch_env('claude-sonnet-5-5', 'claude-opus-5-5') == {WINDOW_ENV: '', PERCENT_ENV: ''}
     assert Compaction({MODELS_ENV: 'not json'}).models == {}
-    assert Compaction({WINDOW_ENV: '533000'}).default is None, 'both values or none'
+    assert Compaction({WINDOW_ENV: '533000'}).default is None, 'percentage is required'
 
 
 def flag_requests(client):
@@ -124,3 +124,20 @@ async def test_an_older_cli_replaces_the_idle_child_when_auto_compaction_differs
     assert owner.client is not first, 'set_model alone would keep the old environment'
     assert owner.client.options.model == 'opus' and owner.client.options.env[WINDOW_ENV] == '333000'
     assert flag_requests(first) == []
+
+
+# r290 P13
+async def test_percent_only_launch_child_and_live_model_switch(ph, monkeypatch):
+    monkeypatch.setattr(ph.server.model_catalog.probe, 'read', AsyncMock(return_value='2.1.301'))
+    ph.engine.compaction = Compaction({WINDOW_ENV: '533000', PERCENT_ENV: '100',
+        MODELS_ENV: json.dumps({'sonnet': {'percent': 80}, 'opus': {'window': None, 'percent': 75}})})
+    assert ph.engine.compaction.child_env('sonnet') == {WINDOW_ENV: '', PERCENT_ENV: '80'}
+    assert Compaction({PERCENT_ENV: '70'}).default == (None, 70)
+    tid, turn, _ = await running_turn(ph)
+    client = ph.engine.driver.owners[tid].client
+    assert client.options.env[WINDOW_ENV] == ''
+    await ph.call('thread/settings/update', {'threadId': tid, 'model': 'opus'})
+    assert flag_requests(client)[-1]['env'] == {WINDOW_ENV: '', PERCENT_ENV: '75'}
+    await ph.call('thread/settings/update', {'threadId': tid, 'model': 'claude-opus-5-5'})
+    assert flag_requests(client)[-1]['env'] == {WINDOW_ENV: '533000', PERCENT_ENV: '100'}
+    await ph.call('turn/interrupt', {'threadId': tid, 'turnId': turn})

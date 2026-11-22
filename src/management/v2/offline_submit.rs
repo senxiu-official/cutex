@@ -124,11 +124,19 @@ pub(super) fn dispatch_owner_submit(
     session: &Value,
     request: &ValidatedCutexRequest,
 ) -> Result<Value, UserInputExecutionError> {
+    if request.params.get("interruptSend").is_some() {
+        if owner.is_none() || !crate::management::users::caller_is_owner() {
+            return Err(super::input_ledger::route_error("owner_required","interruptSend batches require the owner".into(),false));
+        }
+        if !super::input_ledger::enabled() {
+            return Err(super::input_ledger::route_error("interrupt_send_many_unsupported","interruptSend batches require the input ledger".into(),false));
+        }
+    }
     if let Some(id)=request.params.get("clientUserMessageId").and_then(Value::as_str) {
         super::input_disposal::check(cutex_session_id,[id])
             .map_err(|error|super::input_ledger::route_error("input_disposed",error.to_string(),false))?;
     }
-    let request = owner_starts_offline(owner.is_some() && super::input_ledger::enabled(), request);
+    let request = owner_starts_offline(owner.is_some() && crate::management::users::caller_is_owner() && super::input_ledger::enabled(), request);
     dispatch(event_repository, context, owner, cutex_session_id, session, &request)
 }
 
@@ -162,7 +170,8 @@ pub(super) fn start_for_offline_steer(
     request: &ValidatedCutexRequest,
     error: UserInputExecutionError,
 ) -> UserInputExecutionError {
-    let Some(queue_id) = offline_steer_item(owner.is_some() && super::input_ledger::enabled(), session, request, &error) else {
+    let owner_on = owner.is_some() && crate::management::users::caller_is_owner() && super::input_ledger::enabled();
+    let Some(queue_id) = offline_steer_item(owner_on, session, request, &error) else {
         return error;
     };
     let Some(item) = user_input_repository().ok()
@@ -292,6 +301,11 @@ pub(super) fn dispatch_marking_bypass(
         .pointer("/runtime/appServerConnected")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Never turn an original owner batch into an offline draft-only queue item.
+    if !connected && request.params.get("interruptSend").is_some() {
+        return Err(super::input_ledger::route_error("input_not_interruptible",
+            "owner batch requires the connected runtime of the selected turn; nothing queued or started".into(),false));
+    }
     let thread_bound = session
         .pointer("/native/threadId")
         .and_then(Value::as_str)
@@ -341,7 +355,9 @@ pub(super) fn dispatch_marking_bypass(
         if agent_paused {
             return Ok(result);
         }
-        if !follow_up {
+        // Only the owner's offline input goes out past the owner's queue
+        // pause; a shared-access user's input waits behind it.
+        if !follow_up && crate::management::users::caller_is_owner() {
             if let Some(queue_id) = result.pointer("/queue/queueId").and_then(Value::as_str) {
                 mark_bypass(queue_id);
             }
@@ -536,6 +552,19 @@ mod tests {
     use crate::management::v2::user_input::UserInputSubmitExecution;
     use std::cell::RefCell;
 
+    #[test]
+    fn offline_owner_batch_never_queues_or_starts_a_draft_alone() {
+        let (root,repository)=repository();
+        let mut request=request(Some(json!(true)));
+        request.params["strategy"]=json!("interrupt");
+        request.params["interruptSend"]=json!({"inputIds":["old"],"expectedRevs":{"old":1},
+            "expectedTurnId":"turn-old","expectedRuntimeGeneration":1});
+        let error=dispatch_marking_bypass(&repository,fake_submit,"batch-offline",&session(false,"offline"),&request,
+            |_|panic!("batch cannot start an offline runtime"),|_|panic!("batch cannot queue its draft alone")).unwrap_err();
+        assert_eq!(error.code,"input_not_interruptible");assert!(seen("batch-offline").is_empty());
+        drop(repository);std::fs::remove_dir_all(root).unwrap();
+    }
+
     static SEEN: Mutex<Vec<(String, UserInputStrategy, Option<String>)>> = Mutex::new(Vec::new());
 
     fn seen(session: &str) -> Vec<(UserInputStrategy, Option<String>)> {
@@ -576,7 +605,7 @@ mod tests {
                     bypass_pause: false,
                     delivery: None,
                 }),
-                queue_paused: false,
+                queue_paused: false, passive_notes: None,
             });
         }
         Ok(UserInputSubmitExecution {
@@ -587,7 +616,7 @@ mod tests {
             native_method: Some("turn/start".into()),
             turn_id: Some("turn-1".into()),
             queue: None,
-            queue_paused: false,
+            queue_paused: false, passive_notes: None,
         })
     }
 

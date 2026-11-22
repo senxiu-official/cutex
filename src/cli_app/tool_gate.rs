@@ -40,11 +40,68 @@ fn pushed() -> &'static Mutex<Pushed> {
     PUSHED.get_or_init(Default::default)
 }
 
+// r290 P9: another observer/CLI process can set the shared native gate. Keep
+// notifications separate from the push mutex: its owner may be waiting for
+// precisely this connection's RPC response. No IO occurs under this lock.
+fn observed_gates() -> &'static Mutex<HashMap<String, bool>> {
+    static OBSERVED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    OBSERVED.get_or_init(Default::default)
+}
+
+fn observe_gate(session: &str, held: bool) {
+    if let Ok(mut observed) = observed_gates().lock() {
+        observed.insert(session.into(), held);
+    }
+}
+
 /// What one push did: the runtime has a gate and was set, or it has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Push {
     Set,
     Unsupported,
+}
+
+// r290 P9: every new control connection starts with its capable runtime's
+// tool gate closed, before bridge/observer publication. The scheduler then
+// applies current owner intent; this also covers a pause racing readiness.
+pub(crate) fn prepare_before_publish(
+    session: &str,
+    thread: &str,
+    generation: u64,
+    handle: &cutex::app_server::client::AppServerHandle,
+    claude: bool,
+) -> anyhow::Result<()> {
+    let supported = if claude {
+        handle.request_with_timeout("claude/capabilities", serde_json::json!({}), Duration::from_secs(10))?
+            .get("toolGate").and_then(Value::as_str) == Some(CLAUDE_SET)
+    } else {
+        handle.initialize_response().and_then(|value| value.get("toolGateVersion"))
+            .and_then(Value::as_u64).is_some_and(|version| version >= 1)
+    };
+    prepare_before_publish_with(session, supported, || {
+        let method = if claude { CLAUDE_SET } else { "thread/toolGate/set" };
+        let params = if claude {
+            serde_json::json!({"threadId":thread,"held":true})
+        } else {
+            serde_json::json!({"version":1,"ownerId":session,"threadId":thread,
+                               "runtimeGeneration":generation,"held":true})
+        };
+        handle.request_with_timeout(method, params, Duration::from_secs(10))?;
+        Ok(())
+    })
+}
+
+// r290 P9: failures never publish a successfully prepared connection, and
+// an old cached open state must not suppress reconciliation of this gate.
+fn prepare_before_publish_with(
+    session: &str, supported: bool, close: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !supported { return Ok(()); } // Historical pins without a tool gate stay on their turn-end contract.
+    close()?;
+    let mut state = pushed().lock().map_err(|_| anyhow::anyhow!("tool gate state poisoned"))?;
+    state.confirmed.remove(session);
+    state.retry_at.remove(session);
+    Ok(())
 }
 
 /// One scheduler tick. Reads only the cached presence rows; a runtime is
@@ -58,13 +115,31 @@ pub(crate) fn reconcile_with(
     push: &mut dyn FnMut(&str, bool) -> anyhow::Result<Push>,
     now: Instant,
 ) -> anyhow::Result<()> {
-    let rows: Vec<(String, Option<u64>, bool)> = store.inspect(|state| {
-        state.presence.iter()
+    // r290 P9: include current project membership once its running turn ends.
+    // Project afterTurn must still let that turn finish; an individual pause
+    // remains a tool-boundary hold. A busy authority fence sends no open IO.
+    let rows: Vec<(String, Option<u64>, bool)> = match cutex::asks::pause_admission::try_with_authority(|roster| {
+        store.inspect(|state| state.presence.iter()
             .filter(|(_, presence)| presence.online)
-            .map(|(session, presence)| (session.clone(), presence.runtime_generation, presence.agent_pause.is_some()))
-            .collect()
-    })?;
+            .map(|(session, presence)| (session.clone(), presence.runtime_generation,
+                presence.agent_pause.is_some() || (!presence.busy &&
+                    cutex::asks::pause_admission::is_paused_in(state, roster, session))))
+            .collect())
+    })? {
+        cutex::asks::pause_admission::Admission::Ready(rows) => rows,
+        cutex::asks::pause_admission::Admission::Deferred => return Ok(()),
+    };
+    // r290 P9: a newly closed gate from another process invalidates our old
+    // open confirmation. A matching acknowledgement causes no retry loop.
+    let observed = std::mem::take(&mut *observed_gates().lock()
+        .map_err(|_| anyhow::anyhow!("observed tool gate state poisoned"))?);
     let mut pushed = pushed().lock().map_err(|_| anyhow::anyhow!("tool gate state poisoned"))?;
+    for (session, held) in observed {
+        if pushed.confirmed.get(&session).is_some_and(|(_, known)| *known != held) {
+            pushed.confirmed.remove(&session);
+            pushed.retry_at.remove(&session);
+        }
+    }
     // Offline or gone: forget, the next runtime occurrence is pushed afresh.
     pushed.confirmed.retain(|session, _| rows.iter().any(|row| &row.0 == session));
     for (session, generation, want) in rows {
@@ -140,6 +215,11 @@ pub(crate) fn note_changed(session: &str, thread_id: &str, params: Option<&Value
     let Some(held) = params.and_then(|params| held_from(thread_id, params)) else {
         return;
     };
+    // r290 P9: a valid bound notification also reconciles cross-process gate
+    // changes when no individual pause exists (there is no held list to save).
+    if let Some(held) = params.and_then(|params| params.get("held")).and_then(Value::as_bool) {
+        observe_gate(session, held);
+    }
     let result = AskStore::open_default().and_then(|store| store.with_state(|state| {
         cutex::asks::agent_pause::note_held(state, session, held, Utc::now())
     }));
@@ -178,9 +258,145 @@ mod tests {
     }
 
     fn reset() {
+        observed_gates().lock().unwrap().clear();
         let mut pushed = pushed().lock().unwrap();
         pushed.confirmed.remove(S);
         pushed.retry_at.remove(S);
+    }
+
+    // r290 P9: a second CLI observer closing the same generation cannot leave
+    // an unpaused process held forever by our previously cached open state.
+    #[test]
+    fn another_observer_closing_a_cached_open_gate_is_reconciled_without_a_loop() {
+        let _serial = serial();
+        reset();
+        let store = store("tool-gate-other-observer");
+        online(&store, 7, false);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut push = |_: &str, held: bool| { calls.borrow_mut().push(held); Ok(Push::Set) };
+        let now = Instant::now();
+        reconcile_with(&store, &mut push, now).unwrap();
+        observe_gate(S, true);
+        reconcile_with(&store, &mut push, now).unwrap();
+        assert_eq!(*calls.borrow(), [false, false]);
+        observe_gate(S, false); // acknowledgement of our own last push
+        reconcile_with(&store, &mut push, now).unwrap();
+        assert_eq!(*calls.borrow(), [false, false], "a matching ack must not create repeated RPCs");
+    }
+
+    // r290 P9: a newly closed connection must be reconciled even if this
+    // process previously cached an open gate for the very same generation.
+    #[test]
+    fn prepared_connection_invalidates_open_cache_and_retry_backoff() {
+        let _serial = serial();
+        reset();
+        {
+            let mut state = pushed().lock().unwrap();
+            state.confirmed.insert(S.into(), (Some(7), false));
+            state.retry_at.insert(S.into(), Instant::now() + RETRY);
+        }
+        let called = std::cell::Cell::new(false);
+        prepare_before_publish_with(S, true, || { called.set(true); Ok(()) }).unwrap();
+        assert!(called.get());
+        let state = pushed().lock().unwrap();
+        assert!(!state.confirmed.contains_key(S));
+        assert!(!state.retry_at.contains_key(S));
+    }
+
+    // r290 P9: no fake success on timeout, and historical pins keep their
+    // explicit unsupported contract instead of receiving an unknown RPC.
+    #[test]
+    fn prepare_failure_does_not_clear_cache_or_hide_the_error() {
+        let _serial = serial();
+        reset();
+        pushed().lock().unwrap().confirmed.insert(S.into(), (Some(7), false));
+        assert!(prepare_before_publish_with(S, true, || anyhow::bail!("gate timed out")).is_err());
+        assert!(pushed().lock().unwrap().confirmed.contains_key(S));
+        prepare_before_publish_with(S, false, || panic!("unsupported runtime was contacted")).unwrap();
+    }
+
+    // r290 P9: project afterTurn lets the current turn finish, then retains
+    // the project hold on the new/idle runtime without an individual pause.
+    #[test]
+    fn project_after_turn_stays_open_until_idle_then_holds_new_generation() {
+        let _serial = serial();
+        reset();
+        let store = store("project-tool-gate");
+        online(&store, 7, true);
+        store.with_state(|state| {
+            state.project_control.projects.insert("alpha".into(), serde_json::from_value(json!({
+                "projectId":"alpha", "epoch":1, "pauseId":"project-pause-1",
+                "requestedBy":null, "requestedAt":null, "mode":"afterTurn", "scope":"all",
+                "membershipRevision":0, "excludedSessionIds":[], "members":[S]
+            })).unwrap());
+        }).unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut push = |_: &str, held: bool| { calls.borrow_mut().push(held); Ok(Push::Set) };
+        let now = Instant::now();
+        reconcile_with(&store, &mut push, now).unwrap();
+        assert_eq!(*calls.borrow(), [false], "afterTurn must not hold an existing active turn");
+        online(&store, 8, false);
+        reconcile_with(&store, &mut push, now).unwrap();
+        assert_eq!(*calls.borrow(), [false, true], "idle replacement remains project-paused");
+        assert!(agent_pause(&store).is_none(), "no individual pause was synthesized");
+    }
+
+    // r290 P9: exercise the actual RPC handle, bound wire fields and failures.
+    // The owned loopback peer accepts control only; no model/tool input RPC.
+    #[test]
+    fn prepare_wire_is_bound_closed_and_propagates_refusal() {
+        let _serial = serial();
+        reset();
+        use cutex::app_server::client::{AppServerClient, AppServerClientOptions, AppServerEndpoint};
+        for (claude, refuse) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
+            let observed = requests.clone();
+            let peer = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                while let Ok(message) = ws.read() {
+                    let tungstenite::Message::Text(text) = message else { continue; };
+                    let request: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    observed.lock().unwrap().push(request.clone());
+                    if request.get("id").is_none() { continue; }
+                    let method = request["method"].as_str().unwrap();
+                    let reply = match method {
+                        "initialize" => json!({"id":request["id"],"result":{"toolGateVersion":1}}),
+                        "claude/capabilities" => json!({"id":request["id"],"result":{"toolGate":CLAUDE_SET}}),
+                        "thread/toolGate/set" | CLAUDE_SET if refuse =>
+                            json!({"id":request["id"],"error":{"code":-32001,"message":"fixture gate refused"}}),
+                        "thread/toolGate/set" | CLAUDE_SET => json!({"id":request["id"],"result":{"held":true}}),
+                        _ => panic!("unexpected input/control RPC {method}"),
+                    };
+                    if ws.send(tungstenite::Message::Text(reply.to_string().into())).is_err() { break; }
+                }
+            });
+            let options = AppServerClientOptions::new(AppServerEndpoint::LoopbackWebSocket {
+                url:format!("ws://{address}/"), bearer_token:None,
+            });
+            let client = AppServerClient::connect(options).unwrap();
+            let outcome = prepare_before_publish(S, "bound-thread", 17, &client.handle(), claude);
+            assert_eq!(outcome.is_err(), refuse);
+            drop(client);
+            peer.join().unwrap();
+            let requests = requests.lock().unwrap();
+            let gate = requests.iter().find(|request|
+                matches!(request["method"].as_str(), Some("thread/toolGate/set" | CLAUDE_SET))).unwrap();
+            assert_eq!(gate["params"]["held"], true);
+            assert_eq!(gate["params"]["threadId"], "bound-thread");
+            if !claude {
+                assert_eq!(gate["params"]["ownerId"], S);
+                assert_eq!(gate["params"]["runtimeGeneration"], 17);
+                assert_eq!(gate["params"]["version"], 1);
+            }
+            assert_eq!(requests.iter().filter(|request|
+                request["method"] == "thread/toolGate/set" || request["method"] == CLAUDE_SET).count(), 1,
+                "refused/unknown gate requests are not replayed during publication");
+        }
     }
 
     #[test]

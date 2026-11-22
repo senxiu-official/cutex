@@ -396,6 +396,10 @@ fn stop_linux(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = super::stock_lifecycle::stock_runtime_scope(record, binding) {
+        return stop_systemd_publication(binding, &scope, force);
+    }
     let mut scope = load_scope(record, binding)?;
     let expected = chrono::DateTime::parse_from_rfc3339(&binding.started_at)?;
     if scope.is_none() {
@@ -447,6 +451,46 @@ fn stop_linux(
     }
     stop_captured_scope(scope.as_mut().unwrap(), force)
 }
+#[cfg(target_os = "linux")]
+fn stop_systemd_publication(
+    binding: &cutex::session::model::CutexAppServerRuntimeBinding,
+    scope: &cutex::runtime::process_scope::LinuxRuntimeScope,
+    force: bool,
+) -> anyhow::Result<ProcessTerminateOutcome> {
+    // The receipt is durable before the gate opens. If the creator died in
+    // that interval, the exact child can still be outside the recorded scope.
+    // Check the manager first and stop that child by pidfd, then drain the
+    // scope (which could have appeared while the child was being signaled).
+    let _ = scope.is_empty()?;
+    let expected = chrono::DateTime::parse_from_rfc3339(&binding.started_at)?;
+    let mut forced = false;
+    if let Some(root) = member(binding.pid)?.filter(|m| !matches!(m.state.as_str(), "Z" | "X")) {
+        let actual = cutex::platform::process::process_started_at(binding.pid)?;
+        if actual.timestamp_millis() == expected.timestamp_millis()
+            && !scope.contains_pid(root.pid).or_else(|error| {
+                if member(root.pid)?.is_none() { Ok(false) } else { Err(error) }
+            })?
+        {
+            ensure!(root.group == root.pid && root.session == root.pid,
+                "stock publication child outside its scope has an unexpected process session");
+            signal_exact(&root, libc::SIGTERM)?;
+            if force {
+                forced = true;
+                signal_exact(&root, libc::SIGKILL)?;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while member(root.pid)?.is_some_and(|m| m.ticks == root.ticks && !matches!(m.state.as_str(), "Z" | "X")) {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(ProcessTerminateOutcome { stopped: false, forced, detail: "stock_scope_gate_stop_timeout".into() });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    let outcome = scope.terminate(force)?;
+    Ok(ProcessTerminateOutcome { stopped: outcome.stopped, forced: forced || outcome.forced, detail: outcome.detail })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn refresh_and_persist_scope(
     scope: &mut StopScope,
@@ -687,6 +731,10 @@ mod tests {
 pub(super) fn verify_stopped(record: &CutexSessionRecord) -> anyhow::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(binding) = &record.app_server_runtime {
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = super::stock_lifecycle::stock_runtime_scope(record, binding) {
+            ensure!(scope.is_empty()?, "native runtime systemd scope is still populated");
+        }
         let _lock = if scope_path(binding).exists() {
             Some(scope_lock(binding)?)
         } else {

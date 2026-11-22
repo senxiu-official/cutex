@@ -306,7 +306,8 @@ async def test_background_child_denials(ph):
         decision = await run.bridge.pre_tool({**base, **extra, 'tool_name': name, 'tool_input': tool_input or {}}, identifier(), {})
         return decision.get('hookSpecificOutput', {}).get('permissionDecisionReason')
 
-    assert await reason('mcp__cutex__agent_tell', {'arguments': {}}) == BACKGROUND_NO_HOST_TOOLS
+    from cute_claude.subagent_policy import DENIED
+    assert await reason('mcp__cutex__agent_tell', {'arguments': {}}) == DENIED
     assert await reason('Agent', {'prompt': 'x', 'run_in_background': False}) == BACKGROUND_NO_AGENTS
     assert await reason('Task', {'prompt': 'x'}) == BACKGROUND_NO_AGENTS
     assert await reason('AskUserQuestion', {'questions': []}) == BACKGROUND_NO_QUESTIONS
@@ -345,8 +346,8 @@ async def test_stop_ends_a_running_background_subagent(ph):
     assert notice['status'] == 'stopped' and notice['noticeId'] == task_id
     row = ph.engine.subagents.resolve(f'claude:{run.owner.session_id}:task:{task_id}')
     assert row['status'] == 'interrupted'
-    error = await ph.call('claude/tasks/stop', {'threadId': run.tid, 'taskId': task_id}, error=True)
-    assert 'not a known running task' in error['message']
+    receipt = await ph.call('claude/tasks/stop', {'threadId': run.tid, 'taskId': task_id})
+    assert receipt['outcome'] == 'refused' and receipt['reason'] == 'taskNotRunning'
 
 
 async def test_interrupting_or_ending_the_parent_turn_keeps_the_child(ph):

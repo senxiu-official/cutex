@@ -19,6 +19,55 @@ mod linux {
     use uuid::Uuid;
 
     #[test]
+    fn managed_scope_launches_without_session_bus_environment() {
+        if let ManagedAgentProcessIsolation::Direct { reason } = managed_agent_process_isolation("cutex.scope-env") {
+            eprintln!("SKIPPED real user-manager launch: {reason}");
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "linux::session_bus_environment_child", "--nocapture"])
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .output().unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ran scoped child without inherited bus environment"),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore = "child process of managed_scope_launches_without_session_bus_environment"]
+    fn session_bus_environment_child() {
+        assert!(std::env::var_os("XDG_RUNTIME_DIR").is_none());
+        assert!(std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none());
+        for address in [None, Some("unix:path=/cutex-test/session-bus")] {
+            let id = format!("cutex.scope-env-{}", Uuid::new_v4().simple());
+            let ManagedAgentProcessIsolation::SystemdScope { unit_name } = managed_agent_process_isolation(&id) else {
+                panic!("the local user manager must be discoverable without a login environment");
+            };
+            let root = std::env::temp_dir().join(&id);
+            fs::create_dir(&root).unwrap();
+            let log = root.join("runtime.log");
+            // A distinct, unreachable address must reach the Agent without
+            // being used for the actual systemd-run connection.
+            let mut launch = LaunchCommand::new("/bin/sh")
+                .args(["-c", r#"printf '%s\n' "${DBUS_SESSION_BUS_ADDRESS-unset}"; exec /bin/cat /proc/self/cgroup"#]);
+            if let Some(bus) = address {
+                launch = launch.env("DBUS_SESSION_BUS_ADDRESS", bus);
+            }
+            let mut child = spawn_managed_agent_runtime_launch(&id, &launch, root.to_str().unwrap(), &log).unwrap();
+            let status = child.wait().unwrap();
+            let output = fs::read_to_string(log).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(status.success() && output.trim_end().ends_with(&unit_name), "{status}: {output}");
+            assert_eq!(output.lines().next(), Some(address.unwrap_or("unset")));
+        }
+        println!("ran scoped child without inherited bus environment");
+    }
+
+    #[test]
     fn scope_timeout_can_be_reobserved_absent_after_child_finishes() {
         let id = format!("cutex.scope-timeout-proof-{}", Uuid::new_v4().simple());
         if let ManagedAgentProcessIsolation::Direct { reason } =

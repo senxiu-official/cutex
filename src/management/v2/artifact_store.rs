@@ -36,6 +36,9 @@ use crate::artifacts::store::{Archived, ArtifactStore, ListFilter, Patch, StoreE
 use crate::artifacts::{Producer, Scope, Which};
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 
+#[path = "artifact_store_raw.rs"]
+pub(crate) mod raw;
+
 pub const PATH: &str = "/v2/artifact-store";
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -57,6 +60,8 @@ pub const EXPORTED_SCHEMA: super::schema_export::ExportedSchema = super::schema_
         "PATCH /v2/artifact-store/{artifactId}",
         "DELETE /v2/artifact-store/{artifactId}",
         "GET /v2/artifact-store/{artifactId}/versions/{n|latest}/content",
+        "GET /v2/artifact-store/{artifactId}/versions/{n|latest}/raw",
+        "HEAD /v2/artifact-store/{artifactId}/versions/{n|latest}/raw",
         "GET /v2/artifact-store/{artifactId}/diff",
         "POST /v2/artifact-store/resolve",
         "GET /v2/artifact-store/usage",
@@ -67,6 +72,59 @@ pub const EXPORTED_SCHEMA: super::schema_export::ExportedSchema = super::schema_
 
 pub fn is_path(path: &str) -> bool {
     path == PATH || path.starts_with("/v2/artifact-store/")
+}
+
+/// A read route a non-owner may use (access gate `ArtifactRead`,
+/// capability `user-project-roles`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadTarget {
+    /// `GET /v2/artifact-store` (filtered to what the user sees).
+    List,
+    /// Detail, version content / raw, diff of one artifact.
+    Artifact(String),
+}
+
+pub fn read_target(method: &str, path: &str) -> Option<ReadTarget> {
+    let rest = path.strip_prefix(PATH)?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let segments: Vec<&str> = rest.split('/').filter(|segment| !segment.is_empty()).collect();
+    let artifact = |id: &str| crate::artifacts::is_artifact_id(id).then(|| ReadTarget::Artifact(id.to_string()));
+    match (method, segments.as_slice()) {
+        ("GET", []) => Some(ReadTarget::List),
+        ("GET", [id] | [id, "diff"] | [id, "versions", _, "content"]) => artifact(id),
+        ("GET" | "HEAD", [id, "versions", _, "raw"]) => artifact(id),
+        _ => None,
+    }
+}
+
+/// `GET /v2/artifact-store` for a non-owner: the list restricted to
+/// `allowed` scopes (none: nothing). A requested `project` / `session` /
+/// `forSession` scope outside `allowed` lists nothing.
+pub(crate) fn write_list_within(stream: &mut TcpStream, request: &SimpleHttpRequest, allowed: Vec<Scope>) -> anyhow::Result<()> {
+    let query = request.path.split_once('?').map_or("", |(_, query)| query);
+    let result = ManagementHost
+        .store()
+        .map_err(|store_error| unavailable(format!("{store_error:#}")))
+        .and_then(|store| list_restricted(&ManagementHost, &store, &query_params(query)?, Some(allowed)));
+    match result {
+        Ok(body) => write_json_response(stream, 200, "OK", &body),
+        Err(route_error) => super::server::write_v2_error(
+            stream,
+            route_error.status,
+            super::server::http_reason_for(route_error.status),
+            route_error.code,
+            &route_error.message,
+            route_error.status == 503,
+            route_error.details,
+        ),
+    }
+}
+
+/// The scope of an existing artifact (`None`: no such artifact).
+pub(crate) fn artifact_scope(id: &str) -> anyhow::Result<Option<Scope>> {
+    Ok(ManagementHost.store()?.get(id)?.map(|artifact| artifact.scope))
 }
 
 #[derive(Debug)]
@@ -120,8 +178,17 @@ fn quota_error(used: u64, quota: u64) -> RouteError {
     }
 }
 
-fn query_params(query: &str) -> HashMap<String, String> {
-    url::form_urlencoded::parse(query.as_bytes()).map(|(key, value)| (key.into_owned(), value.into_owned())).collect()
+/// The percent-decoded query of an artifact-store request. r290 P1: a name
+/// given twice is refused (400 `invalid_request`), so the access gate and
+/// this handler always read the same single value.
+pub(crate) fn query_params(query: &str) -> Result<HashMap<String, String>, RouteError> {
+    let mut params = HashMap::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if params.insert(key.to_string(), value.into_owned()).is_some() {
+            return Err(invalid(format!("query parameter {key} must not be repeated")));
+        }
+    }
+    Ok(params)
 }
 
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, RouteError> {
@@ -134,6 +201,9 @@ fn non_empty(params: &HashMap<String, String>, key: &str) -> Option<String> {
 
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let (path, query) = request.path.split_once('?').unwrap_or((request.path.as_str(), ""));
+    if raw::is_path(path) && matches!(request.method.as_str(), "GET" | "HEAD") {
+        return raw::handle(&ManagementHost, stream, request);
+    }
     match route(&ManagementHost, &request.method, path, query, &request.body, Utc::now()) {
         Ok((status, body)) => write_json_response(stream, status, super::server::http_reason_for(status), &body),
         Err(route_error) => super::server::write_v2_error(
@@ -153,7 +223,7 @@ pub fn route(host: &dyn ArtifactHost, method: &str, path: &str, query: &str, bod
     let rest = path.strip_prefix(PATH).ok_or_else(|| error(404, "route_not_found", "no such artifact store route"))?;
     let segments: Vec<&str> = rest.split('/').filter(|segment| !segment.is_empty()).collect();
     let store = || host.store().map_err(|store_error| unavailable(format!("{store_error:#}")));
-    let params = query_params(query);
+    let params = query_params(query)?;
     match (method, segments.as_slice()) {
         ("GET", []) => list(host, &store()?, &params).map(|body| (200, body)),
         ("POST", []) => publish(host, &store()?, body, now).map(|body| (201, body)),
@@ -175,6 +245,12 @@ pub fn route(host: &dyn ArtifactHost, method: &str, path: &str, query: &str, bod
 }
 
 fn list(host: &dyn ArtifactHost, store: &ArtifactStore, params: &HashMap<String, String>) -> Result<Value, RouteError> {
+    list_restricted(host, store, params, None)
+}
+
+/// `restrict`: a non-owner's visible scopes. r290 P1: always applied; a
+/// requested scope is intersected with it, never trusted on its own.
+fn list_restricted(host: &dyn ArtifactHost, store: &ArtifactStore, params: &HashMap<String, String>, restrict: Option<Vec<Scope>>) -> Result<Value, RouteError> {
     let scopes: Vec<Scope> = [
         non_empty(params, "project").map(Scope::project),
         non_empty(params, "session").map(Scope::session),
@@ -209,7 +285,11 @@ fn list(host: &dyn ArtifactHost, store: &ArtifactStore, params: &HashMap<String,
             .ok_or_else(|| invalid(format!("limit: 1-{MAX_LIMIT}")))?,
     };
     let filter = ListFilter {
-        scopes: scope.clone().map(|scope| vec![scope]),
+        scopes: match (scope.clone(), restrict) {
+            (Some(scope), Some(allowed)) => Some(if allowed.contains(&scope) { vec![scope] } else { Vec::new() }),
+            (Some(scope), None) => Some(vec![scope]),
+            (None, restrict) => restrict,
+        },
         q: non_empty(params, "q"),
         kind,
         producer: non_empty(params, "producer"),
@@ -428,22 +508,71 @@ fn publish(host: &dyn ArtifactHost, store: &ArtifactStore, body: &[u8], now: Dat
         note: body.note,
         producer: Producer::owner(),
     };
+    // r290 P10 (d): the owner's own publish is not held to the agent rules
+    // (workspace containment, credential names / directories): what the
+    // owner may preview, the owner may publish.
+    let _shares = super::host_files::owner_share_scope();
+    let owner_publish = super::host_files::owner_share_request();
+    let _owner = owner_publish.then(|| owner_publish_scope(host.settings().max_blob_bytes));
     let outcome = crate::artifacts::publish::publish(host, &request, now).map_err(|publish_error| match publish_error {
         PublishError::Invalid(message) => invalid(message),
         PublishError::Forbidden(message) => error(403, "artifact_path_forbidden", message),
         PublishError::QuotaFull { used, quota } => quota_error(used, quota),
         PublishError::Store(store_error) => unavailable(format!("{store_error:#}")),
     })?;
+    let credential_warning = owner_publish
+        .then(|| crate::artifacts::paths::forbidden_reason(std::path::Path::new(&outcome.version.source_path)))
+        .flatten();
     let result = json!({
         "artifact": outcome.artifact,
         "version": outcome.version,
         "newVersion": outcome.new_version,
         "markdown": crate::artifacts::markdown(&outcome.artifact.name, outcome.version.version, &outcome.version.reference),
+        // r290 P10 (d): set when an owner publish took what agents may not publish (a
+        // credential name or location, a file outside the workspace is not reported): the
+        // reason, for the desktop to show; null otherwise.
+        "credentialWarning": credential_warning,
     });
     if let Err(store_error) = store.remember(OWNER, request_id, &digest, &result, now) {
         eprintln!("artifacts: idempotency record not written: {store_error:#}");
     }
     Ok(result)
+}
+
+/// r290 P10 (d): the owner's publish rules (see `paths::OwnerPublishScope`).
+/// Owner request = `host_files::owner_share_request` (owner principal, full
+/// scope, on a Management connection). On top of a regular file and the
+/// network / device / ADS rules (owner share allowance included):
+/// - the cutex home stays refused (host control credentials; a copy in the
+///   library would reach every paired and narrowed device);
+/// - preview parity: what `GET /v2/fs/file` refuses this caller
+///   (`refuse_root_credential_file`) is refused here too;
+/// - a file over `maxBlobBytes` is referenced in place, not copied, and the
+///   library reads such references under the agent rules: it must satisfy them
+///   (no credential name / location, not on a network share).
+fn owner_publish_scope(max_blob_bytes: u64) -> crate::artifacts::paths::OwnerPublishScope {
+    use crate::artifacts::paths::PathError;
+    crate::artifacts::paths::OwnerPublishScope::enter(move |path, bytes| {
+        if let Ok(home) = crate::config::paths::config_dir() {
+            let home = crate::artifacts::paths::canonical(&home).unwrap_or(home);
+            if crate::artifacts::paths::within(path, &home) {
+                return Err(PathError::Forbidden("files under the cutex home cannot be published".into()));
+            }
+        }
+        super::host_files::refuse_root_credential_file(path).map_err(|denied| PathError::Forbidden(denied.message))?;
+        if bytes > max_blob_bytes {
+            let network = path.to_string_lossy().starts_with(r"\\");
+            if let Some(reason) = crate::artifacts::paths::forbidden_reason(path)
+                .or_else(|| network.then(|| "it is on a network share".to_string()))
+            {
+                return Err(PathError::Forbidden(format!(
+                    "{} is larger than maxBlobBytes ({max_blob_bytes} bytes), so it would be referenced in place rather than copied, and {reason}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    })
 }
 
 fn patch(host: &dyn ArtifactHost, store: &ArtifactStore, id: &str, body: &[u8], now: DateTime<Utc>) -> Result<Value, RouteError> {
@@ -690,5 +819,75 @@ mod tests {
         assert_eq!((full.status, full.code, full.details["quotaBytes"].as_u64()), (507, "artifact_quota_exceeded", Some(4)));
         fails(&host, "POST", PATH, json!({"requestId": "q-2", "project": "p", "path": "a.md"}));
         assert_eq!(host.quota_notices.borrow().len(), 1);
+    }
+
+
+    // r290 P10 (d): the owner's publish is not held to the agent rules; the real limits stay.
+    #[test]
+    fn owner_publish_takes_files_agents_may_not_and_keeps_the_real_limits() {
+        use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
+        use crate::management::{listeners, users};
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
+        struct Context;
+        impl Drop for Context {
+            fn drop(&mut self) {
+                listeners::set_current_connection(None);
+                listeners::set_current_client_token(None);
+                users::set_current_principal(None);
+            }
+        }
+        let _context = Context;
+        let host = TestHost::new("owner-publish");
+        let workspace = host.workspace("proj");
+        host.set_project_root("p", &workspace);
+        let outside = host.workspace(".claude");
+        std::fs::write(workspace.join(".env.example"), "A=1").unwrap();
+        std::fs::write(outside.join("notes.md"), "notes").unwrap();
+        let elsewhere = outside.join("notes.md").display().to_string();
+        let publish = |id: &str, path: &str| call(&host, "POST", PATH, json!({"requestId": id, "project": "p", "path": path}));
+        // No Management request (the agent rules, as MCP artifact_publish and auto capture): refused.
+        assert_eq!(publish("agent-1", ".env.example").unwrap_err().code, "artifact_path_forbidden");
+        assert_eq!(publish("agent-2", &elsewhere).unwrap_err().code, "artifact_path_forbidden");
+        // The owner's desktop (root credential on loopback).
+        listeners::set_current_connection(Some(listeners::ConnectionInfo { remote: false, peer: "127.0.0.1:1".parse().unwrap() }));
+        let (status, env) = publish("owner-1", ".env.example").unwrap();
+        assert_eq!(status, 201);
+        assert_valid("artifacts", "publishResponse", &env);
+        assert!(env["credentialWarning"].as_str().unwrap().contains(".env.example"), "{env}");
+        let (status, notes) = publish("owner-2", &elsewhere).unwrap();
+        assert_eq!(status, 201);
+        assert!(notes["credentialWarning"].is_null());
+        assert_eq!(notes["artifact"]["name"], "notes.md");
+        // A narrowed owner token keeps the agent rules.
+        let mut narrowed = VerifiedClientToken::test_token("mct-publish-chat");
+        narrowed.scope = DeviceScope::Chat;
+        listeners::set_current_client_token(Some(narrowed));
+        users::set_current_principal(Some(users::Principal::Owner));
+        assert_eq!(publish("chat-1", &elsewhere).unwrap_err().code, "artifact_path_forbidden");
+        // A paired full-scope owner device is the owner.
+        let mut paired = VerifiedClientToken::test_token("mct-publish-paired");
+        paired.issued_via = crate::management::client_tokens::IssuedVia::Pairing;
+        listeners::set_current_client_token(Some(paired));
+        assert_eq!(publish("paired-1", &elsewhere).unwrap().0, 201);
+        // The cutex home stays refused, and so do device / ADS forms and directories.
+        let cutex_home = crate::config::paths::config_dir().unwrap();
+        std::fs::create_dir_all(&cutex_home).unwrap();
+        let inside = cutex_home.join("owner-publish-fixture.md");
+        std::fs::write(&inside, "x").unwrap();
+        assert_eq!(publish("home-1", &inside.display().to_string()).unwrap_err().code, "artifact_path_forbidden");
+        std::fs::remove_file(&inside).unwrap();
+        for path in [r"\\.\pipe\x", r"\??\C:\x", "notes.md::$DATA"] {
+            assert!(publish(&format!("bad-{}", path.len()), path).is_err(), "{path}");
+        }
+        assert_eq!(publish("dir-1", &workspace.display().to_string()).unwrap_err().code, "artifact_path_forbidden");
+        // Over maxBlobBytes the file is referenced in place, so it must satisfy the agent rules.
+        host.settings.borrow_mut().max_blob_bytes = 1;
+        let refused = publish("big-1", ".env.example").unwrap_err();
+        assert_eq!(refused.code, "artifact_path_forbidden");
+        assert!(refused.message.contains("maxBlobBytes"), "{}", refused.message);
+        std::fs::write(outside.join("big.md"), "big notes").unwrap();
+        let referenced = publish("big-2", &outside.join("big.md").display().to_string()).unwrap().1;
+        assert_eq!(referenced["version"]["storage"], "external");
     }
 }

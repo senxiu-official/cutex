@@ -445,6 +445,244 @@ fn coalesce(run: &mut Run, message: &str) -> String {
     event.expect("event")
 }
 
+fn pending_result_kinds(run: &mut Run, action: &str) -> (String, Vec<String>) {
+    let (ask, answer) = answered(run, action);
+    let mut ids = vec![answer];
+    run.write(|state| {
+        let record = state.asks[&ask].clone();
+        ids.push(crate::asks::delivery::record_question_delivery(state, &record, "q-pending", now()).unwrap());
+        ids.push(crate::asks::delivery::record_handover_delivery(state, &record, 2, false, now()).unwrap());
+    });
+    (ask, ids)
+}
+
+// A settled result remains readable by its controller. Withdrawing its panel
+// surface must not prevent a later explicit read or wait from recording context.
+#[test]
+fn review_settled_then_read_records_the_read() {
+    for outcome in [CloseOutcome::Accepted, CloseOutcome::Abandoned, CloseOutcome::Cancelled] {
+        for uncertain in [false, true] {
+            let mut run = Run::new();
+            let (ask, id) = answered(&mut run, "review-settled-read");
+            if uncertain {
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::sending()).unwrap();
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::uncertain("runtimeLost")).unwrap();
+            }
+            set(&mut run, &ask, |ask| ask.closed = Some(outcome));
+            assert_eq!(run.record(REQUESTER, &id).surface, Surface::None);
+            run.write(|state| { crate::asks::delivery::settle_for_ask(state, REQUESTER, &ask, Some(1), "read", now()); });
+            assert_eq!(run.state.deliveries[&id].settled_by.as_deref(), Some("read"));
+            let row = run.record(REQUESTER, &id);
+            assert_eq!(row.state, InputState::InContext, "{outcome:?}, uncertain={uncertain}");
+            assert_eq!(row.evidence, Some(Evidence::ReadByTool));
+            assert_eq!(row.surface, Surface::None);
+        }
+    }
+}
+
+#[test]
+fn review_settled_then_wait_claim_records_the_claim() {
+    for outcome in [CloseOutcome::Accepted, CloseOutcome::Abandoned, CloseOutcome::Cancelled] {
+        for uncertain in [false, true] {
+            let mut run = Run::new();
+            let (ask, id) = answered(&mut run, "review-settled-wait");
+            if uncertain {
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::sending()).unwrap();
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::uncertain("runtimeLost")).unwrap();
+            }
+            set(&mut run, &ask, |ask| ask.closed = Some(outcome));
+            assert_eq!(run.record(REQUESTER, &id).surface, Surface::None);
+            run.write(|state| { assert_eq!(crate::asks::delivery::claim_for_wait(state, REQUESTER, &[], "w-review", now()).len(), 1); });
+            let row = run.record(REQUESTER, &id);
+            assert_eq!(row.state, InputState::InContext, "{outcome:?}, uncertain={uncertain}");
+            assert_eq!(row.evidence, Some(Evidence::ClaimedByWait));
+            assert_eq!(row.surface, Surface::None);
+        }
+    }
+}
+
+#[test]
+fn settled_delegation_retires_unchanged_pending_deliveries() {
+    for outcome in [CloseOutcome::Accepted, CloseOutcome::Abandoned, CloseOutcome::Cancelled] {
+        let mut run = Run::new();
+        let (ask, ids) = pending_result_kinds(&mut run, "settled-live");
+        let deliveries = run.state.deliveries.clone();
+        run.write(|state| { state.update_ask(&ask, now(), |ask| ask.closed = Some(outcome)); });
+        assert_eq!(run.state.deliveries, deliveries, "the business delivery records are retained");
+        for id in ids {
+            assert!(!crate::asks::delivery::actionable(&run.state, &run.state.deliveries[&id]));
+            let row = run.record(REQUESTER, &id);
+            assert_eq!((row.state, row.surface), (InputState::Waiting, Surface::None), "{outcome:?}: {id}");
+            assert!(!row.state.is_settled());
+        }
+    }
+}
+
+#[test]
+fn settled_delegation_repairs_persisted_waiting_rows_on_rebuild() {
+    for outcome in [CloseOutcome::Accepted, CloseOutcome::Abandoned, CloseOutcome::Cancelled] {
+        let mut run = Run::new();
+        let (ask, ids) = pending_result_kinds(&mut run, "settled-rebuild");
+        let delayed = run.commit(|state| { state.update_ask(&ask, now(), |ask| ask.closed = Some(outcome)); });
+        // Simulate an older daemon/crash that committed only the source close.
+        let reopened = InputLedger::open(run.root.join(il::DATABASE_FILE));
+        for id in ids {
+            let waiting = run.record(REQUESTER, &id);
+            assert_eq!(waiting.state, InputState::Waiting);
+            let job = drift_job(&run.state, &waiting).expect("rebuild of closed result");
+            apply_job(&reopened, &job);
+            assert_eq!((run.record(REQUESTER, &id).state, run.record(REQUESTER, &id).surface), (InputState::Waiting, Surface::None), "{outcome:?}");
+            assert!(apply_job(&reopened, &job).iter().all(|change| !change.changed));
+            let empty = Run::new();
+            apply_job(&empty.ledger, &job);
+            assert!(empty.ledger.get(REQUESTER, &[id]).unwrap().records.is_empty(), "rebuild creates no phantom closed row");
+        }
+        run.apply(delayed);
+    }
+}
+
+#[test]
+fn settled_delegation_follow_up_end_retires_its_acknowledged_notices() {
+    for rebuild in [false, true] {
+        let mut run = Run::new();
+        let (ask, ids) = pending_result_kinds(&mut run, "settled-follow-up");
+        let jobs = run.commit(|state| {
+            crate::asks::tools::close_in_state(state, None, &ask, "followUpEnded", false, now()).unwrap();
+        });
+        if !rebuild { run.apply(jobs); }
+        for id in ids {
+            assert_eq!(run.state.deliveries[&id].settled_by.as_deref(), Some("followUpEnded"));
+            if rebuild {
+                let row = run.record(REQUESTER, &id);
+                run.apply(vec![drift_job(&run.state, &row).unwrap()]);
+            }
+            assert_eq!(run.record(REQUESTER, &id).state, InputState::Discarded);
+        }
+    }
+}
+
+#[test]
+fn settled_delegation_requester_close_finalizes_only_acknowledged_results() {
+    for outcome in ["accepted", "abandoned", "followUpEnded"] {
+        for uncertain in [false, true] {
+            let mut run = Run::new();
+            let (ask, id) = answered(&mut run, "requester-close");
+            set(&mut run, &ask, |ask| {
+                ask.execution = ExecutionState::Answered;
+                ask.review = Some(ReviewState::AwaitingAcceptance);
+            });
+            if uncertain {
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::sending()).unwrap();
+                run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::uncertain("runtimeLost")).unwrap();
+            }
+            run.write(|state| { crate::asks::tools::close_in_state(state, (outcome != "followUpEnded").then_some(REQUESTER), &ask, outcome, false, now()).unwrap(); });
+            assert_eq!(run.state.deliveries[&id].state, DeliveryState::Acknowledged);
+            let row = run.record(REQUESTER, &id);
+            assert_eq!((row.state, row.surface), (InputState::Discarded, Surface::None), "{outcome}, uncertain={uncertain}");
+            assert_eq!(row.reason.as_deref(), Some("settlementClosed"));
+        }
+    }
+}
+
+#[test]
+fn settled_delegation_owner_close_updates_the_real_source_without_a_requester_read() {
+    for outcome in ["accepted", "abandoned"] {
+        let mut run = Run::new();
+        let (ask, ids) = pending_result_kinds(&mut run, "settled-owner-close");
+        set(&mut run, &ask, |ask| { ask.execution = ExecutionState::Answered; ask.review = Some(ReviewState::AwaitingAcceptance); });
+        run.write(|state| { crate::asks::tools::close_in_state(state, None, &ask, outcome, false, now()).unwrap(); });
+        for id in ids {
+            assert_eq!(run.state.deliveries[&id].state, DeliveryState::Pending);
+            assert_eq!(run.record(REQUESTER, &id).state, InputState::Waiting);
+        }
+    }
+}
+
+#[test]
+fn settled_delegation_preserves_in_flight_and_read_evidence() {
+    for progress in 0..5 {
+        let mut run = Run::new();
+        let (ask, id) = answered(&mut run, "settled-evidence");
+        if progress > 0 { run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::sending()).unwrap(); }
+        if progress == 2 || progress == 4 { run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::accepted()).unwrap(); }
+        if progress == 3 { run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::uncertain("outcomeUnknown")).unwrap(); }
+        if progress == 4 { run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::in_context(Evidence::HistoryRead)).unwrap(); }
+        let before = run.record(REQUESTER, &id);
+        set(&mut run, &ask, |ask| ask.closed = Some(CloseOutcome::Abandoned));
+        let after = run.record(REQUESTER, &id);
+        if progress == 0 || progress == 3 {
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.reason, before.reason);
+            assert_eq!(after.since, before.since);
+            assert_eq!(after.surface, Surface::None);
+        }
+        else { assert_eq!(after, before, "in-flight/positive evidence is not settlement"); }
+    }
+}
+
+#[test]
+fn settled_delegation_never_retires_ordinary_completion_or_an_open_owner_hold() {
+    let mut run = Run::new();
+    let (held_ask, held) = answered(&mut run, "open-held");
+    run.write(|state| state.deliveries.get_mut(&held).unwrap().owner_hold = true);
+    let held_row = run.record(REQUESTER, &held);
+    for outcome in [CloseOutcome::Completed, CloseOutcome::Stopped, CloseOutcome::Superseded] {
+        let (ask, id) = answered(&mut run, &format!("ordinary-{outcome:?}"));
+        set(&mut run, &ask, |ask| ask.closed = Some(outcome));
+        assert_eq!(run.record(REQUESTER, &id).state, InputState::Waiting);
+        assert!(crate::asks::delivery::actionable(&run.state, &run.state.deliveries[&id]));
+    }
+    let (ask, _) = answered(&mut run, "other-close");
+    set(&mut run, &ask, |ask| ask.closed = Some(CloseOutcome::Accepted));
+    assert!(run.state.asks[&held_ask].is_open());
+    assert_eq!(run.record(REQUESTER, &held), held_row);
+}
+
+#[test]
+fn settled_delegation_fences_delayed_waiting_metadata() {
+    let mut run = Run::new();
+    let (ask, id) = answered(&mut run, "settled-stale-job");
+    let delayed = run.commit(|state| state.deliveries.get_mut(&id).unwrap().owner_hold = true);
+    set(&mut run, &ask, |ask| ask.closed = Some(CloseOutcome::Cancelled));
+    let closed = run.record(REQUESTER, &id);
+    assert_eq!((closed.state, closed.surface), (InputState::Waiting, Surface::None));
+    run.apply(delayed);
+    assert_eq!(run.record(REQUESTER, &id), closed);
+}
+
+#[test]
+fn result_native_held_remains_visible_and_explicitly_retryable() {
+    let mut run=Run::new();let (_,id)=answered(&mut run,"native-held");
+    let event=coalesce(&mut run,"native-held-original");
+    run.write(|state|{
+        state.deliveries.get_mut(&id).unwrap().settled_by=Some("nativeHeld:predates Stop".into());
+    });
+    let record=run.record(REQUESTER,&id);
+    assert_eq!(record.state,InputState::Waiting);assert_eq!(record.reason.as_deref(),Some("nativeHeld"));
+    assert_eq!(record.details["nativeReason"],"predates Stop");assert_eq!(record.details["manualRetry"],true);
+    assert_eq!(il::actions_for(record.kind,record.state,record.reason.as_deref()),vec![il::Action::Retry,il::Action::Dismiss]);
+    let retried=run.ledger.transition(REQUESTER,&id,Expect::rev(record.rev),Next::waiting("ownerRetry")).unwrap();
+    assert_eq!(retried.record.attempt,record.attempt+1);
+    run.write(|state|retry_result(state,REQUESTER,&id,now()).unwrap());
+    assert!(run.state.deliveries[&id].settled_by.is_none());
+    assert!(!run.state.events.contains_key(&event));
+    assert_eq!(run.state.deliveries[&id].state,DeliveryState::Pending);
+}
+
+#[test]
+fn result_native_held_consumption_moves_to_context_and_leaves_next_up() {
+    let mut run=Run::new();let (_,id)=answered(&mut run,"native-held-read");
+    let event=coalesce(&mut run,"native-held-key");
+    run.write(|s|s.deliveries.get_mut(&id).unwrap().settled_by=Some("nativeHeld:interrupted".into()));
+    run.write(|s|{
+        s.deliveries.get_mut(&id).unwrap().settled_by=None;
+        crate::asks::delivery::acknowledge_event(s,&event,"original-resumed-turn",now());
+    });
+    let record=run.record(REQUESTER,&id);
+    assert_eq!(record.state,InputState::InContext);assert_eq!(record.surface,Surface::Timeline);
+    assert_eq!(record.turn_id.as_deref(),Some("original-resumed-turn"));
+}
+
 #[test]
 fn result_coalesces_and_is_sent_without_flapping_while_the_host_is_busy() {
     let mut run = Run::new();

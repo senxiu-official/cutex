@@ -1,0 +1,30 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"urn:cutex:management-v2:schedules",
+  "title":"RecurringSchedules",
+  "description":"Owner-created recurring schedules; host timezone; capability recurring-schedules-v1. Agent schedule_list returns only schedules targeting the caller.",
+  "anyOf":[{"$ref":"#/$defs/item"},{"$ref":"#/$defs/list"},{"$ref":"#/$defs/history"}],
+  "$defs":{
+    "rule":{"oneOf":[
+      {"type":"object","additionalProperties":false,"required":["kind","time"],"properties":{"kind":{"const":"daily"},"time":{"type":"string","pattern":"^([01][0-9]|2[0-3]):[0-5][0-9]$"}}},
+      {"type":"object","additionalProperties":false,"required":["kind","weekday","time"],"properties":{"kind":{"const":"weekly"},"weekday":{"type":"integer","minimum":1,"maximum":7},"time":{"type":"string","pattern":"^([01][0-9]|2[0-3]):[0-5][0-9]$"}}},
+      {"type":"object","additionalProperties":false,"required":["kind","hours"],"properties":{"kind":{"const":"interval"},"hours":{"type":"integer","minimum":1,"maximum":4294967295}}}
+    ]},
+    "date":{"type":"string","format":"date-time"},
+    "nullableDate":{"anyOf":[{"$ref":"#/$defs/date"},{"type":"null"}]},
+    "run":{"type":"object","required":["id","sequence","scheduleId","scheduleRevision","targetSessionId","message","scheduledAt","startedAt","finishedAt","outcome","attempts","nextAttemptAt","lastError","messageId"],"properties":{
+      "id":{"type":"string"},"sequence":{"type":"integer","minimum":1},"scheduleId":{"type":"string"},"scheduleRevision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},
+      "scheduledAt":{"$ref":"#/$defs/date"},"startedAt":{"$ref":"#/$defs/nullableDate"},"finishedAt":{"$ref":"#/$defs/nullableDate"},
+      "outcome":{"enum":["pending","dispatching","held","retrying","handedOff","refused","cancelled"]},"attempts":{"type":"integer","minimum":0},"nextAttemptAt":{"$ref":"#/$defs/date"},"lastError":{"type":["string","null"]},"messageId":{"type":["string","null"]},"leaseToken":{"type":["string","null"]}
+    }},
+    "schedule":{"type":"object","required":["id","revision","targetSessionId","message","rule","timezone","enabled","nextRunAt","createdAt","updatedAt","deletedAt","lastRun"],"properties":{
+      "id":{"type":"string"},"revision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},"rule":{"$ref":"#/$defs/rule"},"timezone":{"const":"host"},"enabled":{"type":"boolean"},"nextRunAt":{"$ref":"#/$defs/nullableDate"},"createdAt":{"$ref":"#/$defs/date"},"updatedAt":{"$ref":"#/$defs/date"},"deletedAt":{"$ref":"#/$defs/nullableDate"},"lastRun":{"anyOf":[{"$ref":"#/$defs/run"},{"type":"null"}]}
+    }},
+    "item":{"type":"object","required":["schedule"],"properties":{"schedule":{"$ref":"#/$defs/schedule"}}},
+    "list":{"type":"object","required":["data","nextCursor"],"properties":{"data":{"type":"array","items":{"$ref":"#/$defs/schedule"},"maxItems":100},"nextCursor":{"type":["string","null"]}}},
+    "history":{"type":"object","required":["data","nextCursor"],"properties":{"data":{"type":"array","items":{"$ref":"#/$defs/run"},"maxItems":100},"nextCursor":{"type":["string","null"]}}},
+    "create":{"type":"object","additionalProperties":false,"required":["actionId","targetSessionId","message","rule"],"properties":{"actionId":{"type":"string","minLength":1,"maxLength":256},"targetSessionId":{"type":"string"},"message":{"type":"string","minLength":1},"rule":{"$ref":"#/$defs/rule"},"enabled":{"type":"boolean","default":true}}},
+    "update":{"type":"object","additionalProperties":false,"required":["actionId","expectedRevision","targetSessionId","message","rule","enabled"],"properties":{"actionId":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},"rule":{"$ref":"#/$defs/rule"},"enabled":{"type":"boolean"}}},
+    "delete":{"type":"object","additionalProperties":false,"required":["actionId","expectedRevision"],"properties":{"actionId":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1}}}
+  }
+}

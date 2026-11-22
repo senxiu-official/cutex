@@ -1,6 +1,6 @@
 //! Same-row durable evidence, close audit and recoverable per-session outbox.
 use super::super::agent_bus_settlement_model::{
-    CloseOutcome, CloseRequest, Closure, Evidence, Refusal, SettlementRecord, SettlementView,
+    CloseOutcome, CloseRequest, Closure, Evidence, Refusal, SettlementRecord, SettlementView, EndFollowUpRequest,
     StaleAckEvidence, EVENT_METHOD, STALE_ACK_MIN_WAIT_SECS,
 };
 use super::*;
@@ -31,7 +31,7 @@ pub(super) fn observe_selected(
                 continue;
             };
             let row: ObservationRow = serde_json::from_slice(&bytes)?;
-            row.record.evidence.validate_shape()?;
+            row.record.evidence()?.validate_shape()?;
             anyhow::ensure!(
                 row.version == 1
                     && row.record.closure.is_none()
@@ -95,7 +95,7 @@ pub(super) fn refresh_observations(cache: &mut CachedStore, database: &Path) -> 
                     "unknown settlement evidence collection"
                 );
                 let row: ObservationRow = serde_json::from_slice(&bytes)?;
-                row.record.evidence.validate_shape()?;
+                row.record.evidence()?.validate_shape()?;
                 anyhow::ensure!(
                     row.version == 1
                         && row.record.closure.is_none()
@@ -326,9 +326,7 @@ pub(super) fn settlement_view(
     current_record(stored).map(|record| {
         let eligible = record.closure.is_none()
             && eligible(stored)
-            && evidence_bound(stored, &record.evidence)
-            && super::super::agent_bus_settlement_model::runtime_matches(&record.evidence)
-                .unwrap_or(false);
+            && record.evidence.as_ref().is_some_and(|e|evidence_bound(stored,e) && super::super::agent_bus_settlement_model::runtime_matches(e).unwrap_or(false));
         record.view(eligible, now)
     })
 }
@@ -436,33 +434,47 @@ pub(super) fn validate_settlement_record(
     stored: &StoredAgentBusMessage,
     record: &SettlementRecord,
 ) -> anyhow::Result<()> {
+    if let Some(request)=&record.owner_request {
+        request.validate().map_err(|e|anyhow::anyhow!(e.message))?;
+        let closure=record.closure.as_ref().context("owner follow-up has no closure")?;
+        let audit=record.audit.as_ref().context("owner follow-up has no audit")?;
+        anyhow::ensure!(record.evidence.is_none() && record.evidence_token.is_empty() && record.request.is_none()
+            && request.message_id==stored.snapshot.message_id && closure.request_id==request.action_id
+            && !closure.actor.trim().is_empty() && closure.reason==request.reason.trim()
+            && request.expected_semantic_sha256.as_ref().is_none_or(|sha|stored.snapshot.semantic_sha256.as_ref()==Some(sha))
+            && audit["messageId"]==request.message_id && audit["actionId"]==request.action_id
+            && audit["actor"]==closure.actor && audit["outcome"]=="unconfirmed" && audit["by"]=="owner",
+            "invalid owner follow-up disposition");
+        return Ok(());
+    }
+    let evidence=record.evidence()?;
     // Delivery may advance after close, but original frozen identity cannot.
     let envelope = stored
         .snapshot
         .external_input
         .as_ref()
         .context("settlement has no frozen native identity")?;
-    record.evidence.validate_shape()?;
-    if let Some(proof) = &record.evidence.stale_ack {
+    evidence.validate_shape()?;
+    if let Some(proof) = &evidence.stale_ack {
         anyhow::ensure!(
             stored.queued_at.as_deref().and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
                 .is_some_and(|queued| queued.with_timezone(&Utc) == proof.queued_at)
-                && evidence_kind(stored, &record.evidence)
+                && evidence_kind(stored, evidence)
                 // A legacy fallback is updated by close itself. Bind it before
                 // commit; historical closure/audit must survive that timestamp.
                 && (record.closure.is_some() || accepted_at(stored) == Some(proof.accepted_at))
-                && (record.evidence.processing_state != "none"
+                && (evidence.processing_state != "none"
                     || (envelope.message.delivery == crate::app_server::external_input::Delivery::Passive
-                        && record.evidence.attempt_id == unassigned_attempt_id(&record.evidence.thread_id))),
+                        && evidence.attempt_id == unassigned_attempt_id(&evidence.thread_id))),
             "stale acknowledgement durable identity changed"
         );
     }
     anyhow::ensure!(
-        record.evidence.schema_version == 1
-            && crate::management::v2::agent_bus_state::native_id_matches_source(&stored.snapshot.message_id, &record.evidence.message_id)
-            && record.evidence.recipient_id == stored.owner_cutex_session_id
-            && record.evidence.thread_id == envelope.thread_id
-            && record.evidence.semantic_sha256 == envelope.semantic_sha256
+        evidence.schema_version == 1
+            && crate::management::v2::agent_bus_state::native_id_matches_source(&stored.snapshot.message_id, &evidence.message_id)
+            && evidence.recipient_id == stored.owner_cutex_session_id
+            && evidence.thread_id == envelope.thread_id
+            && evidence.semantic_sha256 == envelope.semantic_sha256
             && uuid::Uuid::parse_str(&record.evidence_token).is_ok(),
         "invalid settlement binding"
     );
@@ -500,7 +512,7 @@ fn check_candidate(
 ) -> Result<(), Refusal> {
     if !(ordinary(stored)
         || (stale_kind(stored)
-            && current_record(stored).is_some_and(|record| record.evidence.stale_ack.is_some())))
+            && current_record(stored).is_some_and(|record| record.evidence.as_ref().is_some_and(|e|e.stale_ack.is_some()))))
     {
         return Err(conflict(
             "message_protected",
@@ -525,13 +537,13 @@ fn check_candidate(
             "terminal evidence changed; refresh this item",
         ));
     }
-    if !record.evidence.fresh(now) {
+    if !record.evidence.as_ref().is_some_and(|e|e.fresh(now)) {
         return Err(conflict(
             "settlement_evidence_expired",
             "terminal evidence expired; wait for reconciliation and refresh",
         ));
     }
-    if !evidence_bound(stored, &record.evidence) {
+    if !record.evidence.as_ref().is_some_and(|e|evidence_bound(stored,e)) {
         return Err(conflict(
             "settlement_evidence_changed",
             "message identity or processing attempt changed",
@@ -550,6 +562,9 @@ fn replay(
         let Some(record) = &stored.settlement else {
             continue;
         };
+        if record.owner_request.as_ref().is_some_and(|prior|prior.action_id==request.request_id) {
+            return Err(conflict("request_id_conflict","requestId belongs to an owner follow-up disposition"));
+        }
         let Some(prior) = &record.request else {
             continue;
         };
@@ -577,6 +592,52 @@ fn replay(
 }
 
 impl AgentBusMessageRepository {
+    /// Owner disposition records uncertainty without asking a runtime for proof.
+    pub fn end_follow_up(
+        &self,
+        request: &EndFollowUpRequest,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Result<CloseOutcome, Refusal>> {
+        if let Err(error) = request.validate() {
+            return Ok(Err(error));
+        }
+        anyhow::ensure!(!actor.trim().is_empty(), "owner actor is required");
+        self.update_keyed(super::DirtyRows::Messages(vec![request.message_id.clone()]), Some(&request.action_id), |store| {
+            for stored in store.messages.values() {
+                if let Some(record) = &stored.settlement {
+                    let action = record.owner_request.as_ref().map(|r|r.action_id.as_str())
+                        .or_else(||record.request.as_ref().map(|r|r.request_id.as_str()));
+                    if action == Some(request.action_id.as_str()) {
+                        if record.owner_request.as_ref() != Some(request) || record.closure.as_ref().is_none_or(|c|c.actor != actor) {
+                            return Ok((Err(conflict("action_id_conflict", "actionId was used for a different request or actor")),false));
+                        }
+                        return Ok((Ok(CloseOutcome {message_id:request.message_id.clone(),changed:false,settlement:record.view(false,now)}),false));
+                    }
+                }
+            }
+            let Some(stored) = store.messages.get_mut(&request.message_id) else {
+                return Ok((Err(Refusal::new(404,"message_not_found","no durable message has this id")),false));
+            };
+            if settlement_closed(stored) {return Ok((Err(conflict("follow_up_already_closed","message follow-up is already closed")),false));}
+            if request.expected_semantic_sha256.as_ref().is_some_and(|sha|stored.snapshot.semantic_sha256.as_ref()!=Some(sha)) {
+                return Ok((Err(conflict("semantic_digest_mismatch","message identity changed")),false));
+            }
+            let closure = Closure {actor:actor.into(),closed_at:now,reason:request.reason.trim().into(),request_id:request.action_id.clone()};
+            let audit = json!({"event":"owner_message_followup_ended","messageId":request.message_id,"actionId":request.action_id,
+                "actor":actor,"outcome":"unconfirmed","by":"owner","closedAt":now,"reason":closure.reason,
+                "previousState":stored.snapshot.state,"request":request});
+            let mut sessions=both_streams(stored); sessions.sort();sessions.dedup();
+            let record=SettlementRecord {evidence_token:String::new(),evidence:None,owner_request:Some(request.clone()),
+                closure:Some(closure),request:None,audit:Some(audit),pending_sessions:sessions};
+            let outcome=CloseOutcome {message_id:request.message_id.clone(),changed:true,settlement:record.view(false,now)};
+            stored.settlement=Some(record); stored.updated_at=now.to_rfc3339();
+            store.live_discards.remove(&request.message_id);
+            store.version=store.version.max(10);
+            Ok((Ok(outcome),true))
+        })
+    }
+
     /// Coherent frozen identity + durable age/provenance proof for the collector.
     pub fn stale_ack_candidate_context(
         &self,
@@ -612,15 +673,15 @@ impl AgentBusMessageRepository {
                 "unknown settlement evidence collection"
             );
             let row: ObservationRow = serde_json::from_slice(bytes)?;
-            row.record.evidence.validate_shape()?;
+            row.record.evidence()?.validate_shape()?;
             anyhow::ensure!(
                 row.version == 1
                     && row.record.closure.is_none()
                     && row.record.request.is_none()
                     && row.record.audit.is_none()
                     && row.record.pending_sessions.is_empty()
-                    && crate::management::v2::agent_bus_state::native_id_matches_source(message, &row.record.evidence.message_id)
-                    && row.record.evidence.schema_version == 1
+                    && crate::management::v2::agent_bus_state::native_id_matches_source(message, &row.record.evidence()?.message_id)
+                    && row.record.evidence()?.schema_version == 1
                     && uuid::Uuid::parse_str(&row.record.evidence_token).is_ok(),
                 "invalid observation-only settlement namespace"
             );
@@ -714,12 +775,13 @@ impl AgentBusMessageRepository {
             let prior = stored.observed_settlement.as_ref();
             let record = evidence.map(|evidence| {
                 let token = prior
-                    .filter(|old| old.evidence.same_identity(&evidence))
+                    .filter(|old| old.evidence.as_ref().is_some_and(|e|e.same_identity(&evidence)))
                     .map(|old| old.evidence_token.clone())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 SettlementRecord {
                     evidence_token: token,
-                    evidence,
+                    evidence: Some(evidence),
+                    owner_request: None,
                     closure: None,
                     request: None,
                     audit: None,
@@ -909,7 +971,7 @@ impl AgentBusMessageRepository {
             };
             if let Err(error) = check_candidate(stored, request, now) { return Ok((Err(error), false)); }
             let record = current_record(stored).expect("candidate checked");
-            if !fresh.fresh(now) || !evidence_bound(stored, fresh) || !record.evidence.same_identity(fresh) {
+            if !fresh.fresh(now) || !evidence_bound(stored, fresh) || !record.evidence.as_ref().is_some_and(|e|e.same_identity(fresh)) {
                 return Ok((Err(conflict("settlement_evidence_changed", "fresh runtime evidence differs; refresh this item")), false));
             }
             match runtime_fence(fresh) {
@@ -918,7 +980,7 @@ impl AgentBusMessageRepository {
                 Err(_) => return Ok((Err(Refusal::new(503, "settlement_observation_unavailable", "runtime identity unavailable before close commit")), false)),
             }
             let now = now.max(clock());
-            if !record.evidence.fresh(now) || !fresh.fresh(now) {
+            if !record.evidence.as_ref().is_some_and(|e|e.fresh(now)) || !fresh.fresh(now) {
                 return Ok((Err(conflict("settlement_evidence_expired", "terminal evidence expired before close commit")), false));
             }
             let closure = Closure { actor: actor.into(), closed_at: now, reason: request.reason.trim().into(), request_id: request.request_id.clone() };
@@ -941,7 +1003,7 @@ impl AgentBusMessageRepository {
             sessions.sort(); sessions.dedup();
             stored.settlement = Some(current_record(stored).expect("candidate checked").clone());
             let record = stored.settlement.as_mut().expect("candidate checked");
-            record.evidence = fresh.clone();
+            record.evidence = Some(fresh.clone());
             record.closure = Some(closure);
             record.request = Some(request.clone());
             record.audit = Some(audit);

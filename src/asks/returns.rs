@@ -32,6 +32,79 @@ use super::{new_id, now_rfc3339};
 
 pub use super::owner_carries::{reserve_owner_results, release_owner_results, set_owner_hold, OwnerResultBundle};
 
+const NATIVE_HELD_PREFIX: &str = "nativeHeld:";
+pub fn native_held(delivery: &DeliveryRecord) -> Option<&str> {
+    delivery.settled_by.as_deref().and_then(|by|by.strip_prefix(NATIVE_HELD_PREFIX))
+}
+
+fn record_native_held(state: &mut AskState, session: &str, event_id: &str, reason: &str, now: DateTime<Utc>) {
+    let generation=state.leases.get(session).into_iter().chain(state.next_step_leases.get(session))
+        .find(|lease|matches!(&lease.holder,LeaseHolder::Event{event_id:id} if id==event_id)).map(|lease|lease.runtime_generation);
+    if let Some(event)=state.events.get_mut(event_id) {
+        if generation.is_some(){event.held_runtime_generation=generation;}
+    }
+    let ids=state.events.get(event_id).map(|event|event.delivery_ids.clone()).unwrap_or_default();
+    for id in ids {
+        if let Some(delivery)=state.deliveries.get_mut(&id).filter(|d|d.state==DeliveryState::QueuedAsEvent && d.event_id.as_deref()==Some(event_id)) {
+            delivery.settled_by=Some(format!("{NATIVE_HELD_PREFIX}{}",super::truncate_chars(reason,200)));
+            delivery.updated_at=now_rfc3339(now);
+        }
+    }
+    remove_event_lease(state,session,event_id);
+}
+
+fn reconcile_native_held(runtime:&dyn AskRuntime,store:&AskStore,now:DateTime<Utc>)->anyhow::Result<()> {
+    type Key=(std::path::PathBuf,String);
+    static QUERIES:OnceLock<Mutex<std::collections::BTreeMap<Key,DateTime<Utc>>>>=OnceLock::new();
+    let queries=QUERIES.get_or_init(||Mutex::new(Default::default()));
+    let snapshot=store.shared()?;
+    let mut due=Vec::new();
+    for event in snapshot.events.values().filter(|event|!event.acknowledged && event.held_runtime_generation.is_some()) {
+        if snapshot.pauses.contains_key(&event.cutex_session_id)
+            || super::agent_pause::is_paused(&snapshot,&event.cutex_session_id)
+            || !event.delivery_ids.iter().any(|id|snapshot.deliveries.get(id).is_some_and(|d|
+                d.state==DeliveryState::QueuedAsEvent && native_held(d).is_some())) {continue;}
+        let key=(store.dir().to_path_buf(),event.event_id.clone());
+        let last=queries.lock().map_err(|_|anyhow::anyhow!("held receipt throttle poisoned"))?.get(&key).copied();
+        if last.is_none_or(|at|now-at>=chrono::Duration::seconds(30)) {due.push((last,event.event_id.clone()));}
+    }
+    due.sort();
+    for (_,id) in due.into_iter().take(4) {
+        let event=&snapshot.events[&id];let session=&event.cutex_session_id;
+        if super::pause_admission::gate(store,session)?!=super::pause_admission::Gate::Open {continue;}
+        {
+            let mut attempts=queries.lock().map_err(|_|anyhow::anyhow!("held receipt throttle poisoned"))?;
+            attempts.retain(|_,at|now-*at<chrono::Duration::minutes(15));
+            attempts.insert((store.dir().to_path_buf(),id.clone()),now);
+        }
+        let generation=event.held_runtime_generation.unwrap();
+        let target=runtime.target_status(session);
+        if !target.online || target.runtime_generation!=generation {continue;}
+        let Some(text)=event.event_artifact.as_deref().and_then(|id|store.read_artifact(id,None).ok().flatten())
+            .map(|(_,bytes)|String::from_utf8_lossy(&bytes).into_owned()) else{break;};
+        let submission=event_submission(&snapshot,event,text);
+        let turn=match runtime.message_status(session,generation,&submission) {
+            NativeMessageStatus::Persisted{turn_id} | NativeMessageStatus::Held{turn_id:Some(turn_id),..}=>turn_id,
+            NativeMessageStatus::Unavailable(_)=>break,
+            _=>continue,
+        };
+        let keys=event_asks(&snapshot,event);let records:Vec<&str>=keys.iter().map(String::as_str).collect();
+        store.with_records(&records,|state|{
+            if state.pauses.contains_key(session) || super::agent_pause::is_paused(state,session) {return;}
+            let Some(current)=state.events.get(&id) else{return;};
+            if current.acknowledged || current.native_message_id!=event.native_message_id
+                || current.held_runtime_generation!=Some(generation) {return;}
+            let members=current.delivery_ids.clone();
+            if !members.iter().all(|id|state.deliveries.get(id).is_some_and(|d|
+                d.state==DeliveryState::QueuedAsEvent && d.event_id.as_deref()==Some(event.event_id.as_str()) && native_held(d).is_some())) {return;}
+            for id in members {state.deliveries.get_mut(&id).unwrap().settled_by=None;}
+            super::delivery::acknowledge_event(state,&id,&turn,now);
+            state.events.get_mut(&id).unwrap().held_runtime_generation=None;
+        })?;
+    }
+    Ok(())
+}
+
 fn answer_text(store: &AskStore, answer: &AnswerRecord) -> Option<String> {
     let artifact = answer.artifact_id.as_deref()?;
     store
@@ -99,7 +172,15 @@ pub fn return_item(store: &AskStore, state: &AskState, delivery: &DeliveryRecord
             ask_id: ask.ask_id.clone(),
             title: ask.title.clone(),
             target: target_label(ask),
-            state: delivery.ref_id.split('@').next().unwrap_or("changed").to_string(),
+            // r290 P7: resolve the exact failed attempt, never the newest one.
+            failure: delivery.ref_id.strip_prefix(super::handler_failure::PREFIX)
+                .and_then(|n| n.parse::<u32>().ok()).and_then(|n|ask.attempts.iter().find(|r|r.n == n))
+                .and_then(|r|r.handler_failure.clone()),
+            state: if super::delivery::is_gate_notice(delivery) {
+                "held: target last turn failed or was interrupted; ask the Director or owner to resume".to_string()
+            } else {
+                delivery.ref_id.split('@').next().unwrap_or("changed").to_string()
+            },
         },
     })
 }
@@ -128,8 +209,14 @@ pub fn item_json(item: &ReturnItem) -> Value {
             "question_id": question_id,
             "questions": questions,
         }),
-        ReturnItem::State { ask_id, title, target, state } => {
+        ReturnItem::State { ask_id, title, target, state, failure } => {
             let mut value = json!({"kind":"state","ask_id":ask_id,"title":title,"target":target,"state":state});
+            // r290 P7
+            if let Some(failure) = failure { value["handlerFailure"] = json!(failure); }
+            if let Some(detail) = state.strip_prefix("held: ") {
+                value["state"] = json!("held");
+                value["detail"] = json!(detail);
+            }
             if state.starts_with("revisionUnacknowledged:") {
                 value["detail"] = json!(super::render::state_note(state, target, ask_id));
             }
@@ -369,8 +456,46 @@ pub fn promote_next_step_leases(state: &mut AskState) {
 /// lease bound to a turn (the running turn: the runtime status must show it
 /// active). A lease without a turn (a submit not yet bound, a next-step event
 /// not read yet) still waits.
+/// Only the Stop-created hold has this exception; an explicit asks/agent/project
+/// pause remains authoritative. Readiness belongs to an observed runtime pin.
+pub fn stop_answer_ready(state: &AskState, session: &str) -> bool {
+    state.pauses.get(session).is_some_and(|p| p.by==PausedBy::Owner && p.stop_hold && p.stop_answer_authorized
+        && p.origin.as_deref() == Some(super::control::ORIGIN_OWNER_STOP))
+        && state.presence.get(session).is_some_and(|p| p.stop_answer_generation.is_some()
+            && p.stop_answer_generation == p.runtime_generation)
+}
+
+pub fn delivery_admissible(state: &AskState, session: &str, delivery: &DeliveryRecord) -> bool {
+    native_held(delivery).is_none() && !super::agent_pause::is_paused(state, session)
+        && (!state.pauses.contains_key(session)
+            || (delivery.kind == DeliveryKind::Answer && stop_answer_ready(state, session)))
+}
+
+/// Runtime adapter rechecks the daemon-owned frozen event under its session
+/// input lane. This flag is never accepted from a model or owner input payload.
+pub fn stop_answer_submission(state: &AskState, session: &str, generation: u64, submission: &Submission) -> anyhow::Result<bool> {
+    let Some(since) = submission.view.as_ref().and_then(|v| v["data"]["stopAnswerSince"].as_str()) else { return Ok(false); };
+    anyhow::ensure!(submission.source_agent.is_none() && submission.event_type == render::ANSWER_EVENT
+        && submission.attempt.is_none(), "invalid_stop_answer");
+    anyhow::ensure!(!super::agent_pause::is_paused(state, session), "agent_paused");
+    anyhow::ensure!(state.pauses.get(session).is_none_or(|p|
+        p.since == since && stop_answer_ready(state, session)), "stop_answer_superseded");
+    let event = state.events.values().find(|e| e.cutex_session_id == session
+        && e.native_message_id == submission.message_id && e.view == submission.view)
+        .ok_or_else(|| anyhow::anyhow!("stop_answer_event_missing"))?;
+    anyhow::ensure!(!event.delivery_ids.is_empty() && event.delivery_ids.iter().all(|id|
+        state.deliveries.get(id).is_some_and(|d| d.kind == DeliveryKind::Answer && !d.passive
+            && super::delivery::is_for(state,d,session)
+            && d.state == DeliveryState::QueuedAsEvent && d.event_id.as_deref() == Some(event.event_id.as_str())
+            && {let mut pending=d.clone();pending.state=DeliveryState::Pending;super::delivery::actionable(state,&pending)})), "invalid_stop_answer_deliveries");
+    anyhow::ensure!(state.leases.get(session).is_some_and(|l| l.runtime_generation == generation
+        && l.native_message_id == submission.message_id
+        && l.holder == (LeaseHolder::Event { event_id: event.event_id.clone() })), "stop_answer_lease_changed");
+    Ok(true)
+}
+
 pub(crate) fn results_admissible(state: &AskState, requester: &str) -> Option<Option<String>> {
-    if state.pauses.contains_key(requester)
+    if (state.pauses.contains_key(requester) && !stop_answer_ready(state, requester))
         || super::agent_pause::is_paused(state, requester)
         || waiting(state, requester) || state.next_step_leases.contains_key(requester) {
         return None;
@@ -709,12 +834,16 @@ fn unsent_event_open(store:&AskStore,session:&str,event_id:&str)->anyhow::Result
     let host=super::routing_policy::integration::local_host_id();
     Ok(match super::pause_admission::try_with_authority(|roster|store.inspect(|state| {
         !super::pause_admission::is_paused_in(state,roster,session)
-            && !state.pauses.contains_key(session)
+            && (!state.pauses.contains_key(session) || (stop_answer_ready(state,session)
+                && state.events.get(event_id).is_some_and(|event| event.delivery_ids.iter().all(|id|
+                    state.deliveries.get(id).is_some_and(|d|delivery_admissible(state,session,d)))
+                    && event.view.as_ref().and_then(|v|v["data"]["stopAnswerSince"].as_str()) == Some(state.pauses[session].since.as_str()))))
             && state.leases.get(session).into_iter().chain(state.next_step_leases.get(session))
                 .any(|lease|matches!(&lease.holder,LeaseHolder::Event{event_id:id} if id==event_id))
             && state.events.get(event_id).is_some_and(|e|e.delivery_ids.iter().all(|id|
                 state.deliveries.get(id).is_some_and(|d|!d.passive&&d.state==DeliveryState::QueuedAsEvent
                     &&d.event_id.as_deref()==Some(event_id)
+                    &&super::delivery::is_for(state,d,session)
                     &&!super::lineage::stopped_parent(state,&host,&d.ask_id)
                     && {let mut pending=d.clone();pending.state=DeliveryState::Pending;super::delivery::actionable(state,&pending)})))
     }))? {super::pause_admission::Admission::Ready(open)=>open,super::pause_admission::Admission::Deferred=>false})
@@ -757,6 +886,7 @@ pub fn admit_events(
     report: &mut TickReport,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    reconcile_native_held(runtime,store,now)?;
     let state = store.shared()?;
     if !state.leases.values().any(|lease| matches!(lease.holder, LeaseHolder::Event { .. }))
         && state.next_step_leases.is_empty()
@@ -939,6 +1069,18 @@ pub fn admit_events(
                     }
                 }
             }
+            NativeMessageStatus::Held { reason, turn_id: None } if event.view.as_ref().is_some_and(|v|v["data"]["stopAnswerSince"].is_string()) => {
+                let keys=event_asks(&state,event);
+                let records:Vec<&str>=keys.iter().map(String::as_str).collect();
+                store.with_records(&records,|current| {
+                    if !same_event_reservation(current,&state,lease,event) { return; }
+                    // Keep the exact outbox/native identity and unread members,
+                    // but no executing turn owns the receiver's admission slot.
+                    record_native_held(current,&session,&event_id,&reason,now);
+                })?;
+                forget_next_step(&event_id);
+                if in_slot { report.released.push(session.clone()); }
+            }
             NativeMessageStatus::Held { reason, turn_id: None } => {
                 settle_unreconcilable_event(store, &session, &event_id, &event.delivery_ids, submission.asks.clone(), &reason, now)?;
                 forget_next_step(&event_id);
@@ -962,6 +1104,9 @@ pub fn admit_events(
             }
             None => None,
         };
+        let status = runtime.target_status(&requester);
+        let ready = (status.online && runtime.supports_stop_answer(&requester, status.runtime_generation)).then_some(status.runtime_generation);
+        store.record_stop_answer_capability(&requester,status.runtime_generation,ready)?;
         let state = store.shared()?;
         // `held_turn`: the running turn whose lease the results go beside.
         let Some(held_turn) = results_admissible(&state, &requester) else {
@@ -982,6 +1127,9 @@ pub fn admit_events(
                 else if status.plan_mode { "planMode" } else { "runtimeUnsupported" }.into());
             continue;
         }
+        // A Stop exception starts a separate result turn. It must never steer
+        // into another input or carry QUESTION/STATE items beside that turn.
+        if stop_answer_ready(&state,&requester) && status.active_turn_id.is_some() { continue; }
         // A leased requester only beside the very turn its lease holds (a
         // lease of a turn that already ended waits for its release).
         if held_turn.is_some() && status.active_turn_id != held_turn {
@@ -996,7 +1144,11 @@ pub fn admit_events(
             note_waited_busy(&requester);
             // A delegation the owner refused in review is due at once (023
             // Q3): the requester only learns its request will not run.
-            let due = pending_review_refusal(&state, &requester)
+            let due = state.deliveries.values().any(|delivery|
+                super::delivery::is_gate_notice(delivery)
+                    && super::delivery::is_for(&state, delivery, &requester)
+                    && super::delivery::actionable(&state, delivery))
+                || pending_review_refusal(&state, &requester)
                 || busy_wait().is_some_and(|wait| {
                     oldest_pending(&state, &requester)
                         .is_some_and(|since| (now - since).to_std().unwrap_or_default() >= wait)
@@ -1054,9 +1206,11 @@ pub fn admit_events(
         let pairs: Vec<(String, ReturnItem)> = ids
             .iter()
             .filter_map(|id| state.deliveries.get(id))
+            .filter(|delivery| delivery_admissible(&state, &requester, delivery))
             .filter_map(|delivery| return_item(store, &state, delivery).map(|item| (delivery.delivery_id.clone(), item)))
             .collect();
         let all_items: Vec<ReturnItem> = pairs.iter().map(|(_, item)| item.clone()).collect();
+        if all_items.is_empty() { continue; }
         let settings = world.documents();
         let budget = status.receiver_limit.budget(settings.margin_percent);
         let fitted = fit_returns(&all_items, &budget, &message_id, settings.preview_bytes as usize);
@@ -1064,7 +1218,8 @@ pub fn admit_events(
         let unfit=ids_of(&fitted.unfit);
         let items: Vec<ReturnItem> = fitted.included.iter().map(|index| all_items[*index].clone()).collect();
         let (event_type, text) = (fitted.event_type, fitted.text);
-        let results_view = super::views::results_view(
+        let stop_since = stop_answer_ready(&state,&requester).then(||state.pauses[&requester].since.as_str());
+        let results_view = super::views::results_view_with_stop_answer(
             &items,
             &|ask_id| {
                 state
@@ -1074,6 +1229,7 @@ pub fn admit_events(
                     .unwrap_or_else(|| (String::new(), None))
             },
             &|answer_id| state.answers.get(answer_id).and_then(|answer| answer.preview.clone()),
+            stop_since,
         );
         let artifact = store.put_artifact(text.as_bytes(), "text/plain; charset=utf-8", &[], None, now)?;
         let selected=ids_of(&fitted.included);
@@ -1083,7 +1239,7 @@ pub fn admit_events(
         let taken = super::pause_admission::with_state_or(store,None, |state, _| {
             if results_admissible(state,&requester).as_ref()!=Some(&held_turn)
                 || !pairs.iter().all(|(id,_)| state.deliveries.get(id)==expected.deliveries.get(id)
-                    && state.deliveries.get(id).is_some_and(|d|super::delivery::actionable(state,d)&&!d.passive&&super::delivery::is_for(state,d,&requester)))
+                    && state.deliveries.get(id).is_some_and(|d|delivery_admissible(state,&requester,d)&&super::delivery::actionable(state,d)&&!d.passive&&super::delivery::is_for(state,d,&requester)))
             {
                 return None;
             }
@@ -1155,6 +1311,11 @@ pub fn admit_events(
             note_sent_into(&event_id, status.active_turn_id.as_deref(), &requester);
         }
         let started = store.with_state(|state| match outcome {
+            SubmitOutcome::Held { reason } => {
+                record_native_held(state,&requester,&event_id,&reason,now);
+                report.released.push(requester.clone());
+                None
+            },
             // Accepted, not read yet: acknowledged (and the lease, which has
             // no turn, released) once the receipt shows it read (above).
             SubmitOutcome::Started { .. } if next_step => {
@@ -1212,6 +1373,201 @@ mod tests {
     use super::*;
     use crate::asks::scheduler::tests::{finish_turn, world, FakeRuntime};
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
+
+    #[test]
+    fn stop_answer_starts_new_turn_once_while_owner_queue_and_other_kinds_stay_held() {
+        let (world,wd)=world("stop-answer");let (store,dir)=temp_store("stop-answer");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+        store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+        let queue=store.queue_repository().unwrap();
+        let params=crate::management::v2::user_input::parse_user_input_submit_params(&json!({
+            "clientUserMessageId":"owner-held", "origin":{"kind":"other","clientId":"test"},
+            "strategy":"queue", "input":[{"type":"text","text":"Stay held"}]
+        })).unwrap();
+        queue.enqueue(REQUESTER,"thread","owner-request",&params).unwrap();
+        queue.pause(REQUESTER,"interrupted",None).unwrap();
+        let ask=answered(&world,&runtime,&store,now);
+        store.with_state(|s|{
+            let answer=s.deliveries.values().find(|d|d.ask_id==ask&&d.kind==DeliveryKind::Answer).unwrap().clone();
+            for (id,kind) in [("question-held",DeliveryKind::Question),("state-held",DeliveryKind::State)] {
+                let mut item=answer.clone();item.delivery_id=id.into();item.kind=kind;item.ref_id="state".into();s.deliveries.insert(id.into(),item);
+            }
+        }).unwrap();
+        let before=runtime.submitted.borrow().len();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),before+1);
+        let state=store.snapshot().unwrap();
+        assert!(state.pauses[REQUESTER].stop_hold);assert!(queue.pause_state(REQUESTER).unwrap().is_some());
+        assert_eq!(queue.list(REQUESTER).unwrap().1.len(),1);
+        assert_eq!(state.deliveries["question-held"].state,DeliveryState::Pending);
+        assert_eq!(state.deliveries["state-held"].state,DeliveryState::Pending);
+        let sent=runtime.submitted.borrow().last().unwrap().1.clone();
+        assert_eq!(sent.event_type,"ANSWER");assert!(sent.view.as_ref().unwrap()["data"]["stopAnswerSince"].is_string());
+        let view=crate::management::v2::admission::ask_next_step(&state,REQUESTER);
+        assert!(view.iter().filter(|r|r.delivery_kind!="answer").all(|r|!r.eligible&&r.held.as_deref()==Some("ownerStop")));
+        for _ in 0..3 { admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap(); }
+        assert_eq!(runtime.submitted.borrow().len(),before+1);
+        assert!(runtime.resumes.borrow().is_empty(),"no global runtime resume");
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn stop_answer_respects_explicit_pauses_owner_hold_and_legacy_runtime_pin() {
+        for mode in ["agent","project","asks","owner-held","old-runtime","scoped-stop","internal-interrupt","legacy-stop"] {
+            let (world,wd)=world("stop-answer-hold");let (store,dir)=temp_store("stop-answer-hold");
+            let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+            store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+            answered(&world,&runtime,&store,now);
+            store.with_state(|s| {
+                match mode {
+                    "agent" => {super::super::agent_pause::pause(s,REQUESTER,"owner",None,now);},
+                    "project" => {
+                        use crate::asks::{project_control as p,routing_policy::{RoutingContext,RoutingActor}};
+                        let ctx=RoutingContext{project_id:"paused-result-project".into(),authority_epoch:0,current_director:None,actor:RoutingActor::Owner,operator_may_route:false};
+                        p::pause(s,&ctx,&p::PauseRequest{action_id:"pause".into(),expected_epoch:0,mode:p::Mode::AfterTurn,scope:p::Scope::Members},
+                            &p::Membership{revision:0,members:[REQUESTER.into()].into(),excluded:Default::default()},"test-host",now).unwrap();
+                    },
+                    "asks" => {super::super::control::owner_pause(s,REQUESTER,now);},
+                    "scoped-stop" => {super::super::control::turn_stop(s,REQUESTER,false,now);},
+                    "legacy-stop" => {s.pauses.get_mut(REQUESTER).unwrap().stop_answer_authorized=false;},
+                    "owner-held" => {for d in s.deliveries.values_mut().filter(|d|d.requester_cutex_session_id==REQUESTER){d.owner_hold=true;}},
+                    _=>{},
+                }
+            }).unwrap();
+            if mode=="internal-interrupt" {store.revoke_stop_answer(REQUESTER).unwrap();}
+            if ["scoped-stop","internal-interrupt","legacy-stop"].contains(&mode) {
+                assert!(!AskStore::at(&dir).snapshot().unwrap().pauses[REQUESTER].stop_answer_authorized);
+            }
+            if mode=="old-runtime" {runtime.stop_answer.set(false);}
+            let before=runtime.submitted.borrow().len();
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            assert_eq!(runtime.submitted.borrow().len(),before,"{mode}");
+            assert!(runtime.resumes.borrow().is_empty());
+            let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+        }
+    }
+
+    #[test]
+    fn stop_answer_native_held_replay_requires_explicit_retry() {
+        let (world,wd)=world("stop-answer-native-held");let (store,dir)=temp_store("stop-answer-native-held");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+        store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+        answered(&world,&runtime,&store,now);
+        runtime.outcomes.borrow_mut().push(SubmitOutcome::Held{reason:"input predates Stop".into()});
+        let before=runtime.submitted.borrow().len();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),before+1);
+        let state=AskStore::at(&dir).snapshot().unwrap();
+        let delivery=state.deliveries.values().find(|d|d.kind==DeliveryKind::Answer).unwrap();
+        let id=delivery.delivery_id.clone();let original=delivery.event_id.clone();
+        assert_eq!(native_held(delivery),Some("input predates Stop"));
+        assert_eq!(delivery.state,DeliveryState::QueuedAsEvent);
+        assert!(!state.leases.contains_key(REQUESTER));
+        for _ in 0..3 {admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();}
+        store.with_state(|s|super::super::control::release_stop_hold(s,REQUESTER,"resumed",now)).unwrap();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),before+1,"resume alone cannot silently resend an old held ID");
+        store.with_state(|s|super::super::ledger::retry_result(s,REQUESTER,&id,now)).unwrap().unwrap();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),before+2);
+        assert_ne!(store.snapshot().unwrap().deliveries[&id].event_id,original);
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn stop_answer_held_receipt_reconciles_only_after_manual_release_on_original_generation() {
+        for mode in ["consumed","held","changed","unavailable"] {
+            let (world,wd)=world("held-receipt");let (store,dir)=temp_store("held-receipt");
+            let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+            store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+            answered(&world,&runtime,&store,now);
+            runtime.outcomes.borrow_mut().push(SubmitOutcome::Held{reason:"interrupted".into()});
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            let state=store.snapshot().unwrap();
+            let item=state.deliveries.values().find(|d|native_held(d).is_some()).unwrap();
+            let id=item.delivery_id.clone();let event=state.events[item.event_id.as_ref().unwrap()].clone();
+            assert_eq!(event.held_runtime_generation,Some(1));
+            runtime.native.borrow_mut().insert(event.native_message_id.clone(),match mode {
+                "consumed"=>NativeMessageStatus::Persisted{turn_id:"original-resumed-turn".into()},
+                "unavailable"=>NativeMessageStatus::Unavailable("lost status".into()),
+                _=>NativeMessageStatus::Held{reason:"interrupted".into(),turn_id:None},
+            });
+            let queries=*runtime.status_queries.borrow();let submitted=runtime.submitted.borrow().len();
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            assert_eq!(*runtime.status_queries.borrow(),queries,"no receipt query before manual release");
+            store.with_state(|s|super::super::control::release_stop_hold(s,REQUESTER,"resumed",now)).unwrap();
+            if mode=="changed" {runtime.set(REQUESTER,|status|status.runtime_generation=2);}
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            let current=store.snapshot().unwrap();
+            assert_eq!(*runtime.status_queries.borrow(),queries+usize::from(mode!="changed"));
+            if mode=="consumed" {
+                assert_eq!(current.deliveries[&id].state,DeliveryState::Acknowledged);
+                assert!(current.deliveries[&id].settled_by.is_none());
+                assert_eq!(current.events[&event.event_id].turn_id.as_deref(),Some("original-resumed-turn"));
+            } else {
+                assert_eq!(current.deliveries[&id].state,DeliveryState::QueuedAsEvent);
+                assert!(native_held(&current.deliveries[&id]).is_some());
+            }
+            let queried=*runtime.status_queries.borrow();
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now+chrono::Duration::seconds(5)).unwrap();
+            assert_eq!(*runtime.status_queries.borrow(),queried,"throttled per original key");
+            assert_eq!(runtime.submitted.borrow().len(),submitted,"read-only; no native resubmit");
+            assert_eq!(current.events[&event.event_id].native_message_id,event.native_message_id);
+            assert!(runtime.resumes.borrow().is_empty());
+            let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+        }
+    }
+
+    #[test]
+    fn stop_answer_held_receipt_queries_are_bounded_and_stop_on_first_error() {
+        let (world,wd)=world("held-receipt-bound");let (store,dir)=temp_store("held-receipt-bound");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+        store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+        for n in 0..5 {
+            answered_named(&world,&runtime,&store,now,&format!("held-{n}"));
+            runtime.outcomes.borrow_mut().push(SubmitOutcome::Held{reason:"interrupted".into()});
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        }
+        let events=store.snapshot().unwrap().events.values().cloned().collect::<Vec<_>>();
+        assert_eq!(events.len(),5);
+        for event in &events {runtime.native.borrow_mut().insert(event.native_message_id.clone(),NativeMessageStatus::Held{reason:"interrupted".into(),turn_id:None});}
+        store.with_state(|s|super::super::control::release_stop_hold(s,REQUESTER,"resumed",now)).unwrap();
+        let before=*runtime.status_queries.borrow();let submitted=runtime.submitted.borrow().len();
+        reconcile_native_held(&runtime,&store,now).unwrap();assert_eq!(*runtime.status_queries.borrow(),before+4);
+        reconcile_native_held(&runtime,&store,now).unwrap();assert_eq!(*runtime.status_queries.borrow(),before+5);
+        reconcile_native_held(&runtime,&store,now).unwrap();assert_eq!(*runtime.status_queries.borrow(),before+5);
+        for event in &events {runtime.native.borrow_mut().insert(event.native_message_id.clone(),NativeMessageStatus::Unavailable("unreachable".into()));}
+        reconcile_native_held(&runtime,&store,now+chrono::Duration::seconds(31)).unwrap();
+        assert_eq!(*runtime.status_queries.borrow(),before+6,"stop at first error");
+        assert_eq!(runtime.submitted.borrow().len(),submitted);
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn second_stop_at_the_same_timestamp_invalidates_an_unsent_answer_reservation() {
+        let (world,wd)=world("stop-answer-fence");let (store,dir)=temp_store("stop-answer-fence");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+        store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+        answered(&world,&runtime,&store,now);
+        let submission=store.with_state(|s|{
+            let p=s.presence.entry(REQUESTER.into()).or_default();p.runtime_generation=Some(1);p.stop_answer_generation=Some(1);
+            let view=json!({"schema":super::super::views::RESULTS_VIEW,"data":{"stopAnswerSince":s.pauses[REQUESTER].since}});
+            let ids=s.deliveries.values().filter(|d|d.kind==DeliveryKind::Answer&&super::super::delivery::is_for(s,d,REQUESTER))
+                .map(|d|d.delivery_id.clone()).collect();
+            let message="cutex-ask-event-fenced";
+            let id=super::super::delivery::coalesce_selected_into_event(s,REQUESTER,message,ids,now).unwrap();
+            s.events.get_mut(&id).unwrap().view=Some(view.clone());
+            s.leases.insert(REQUESTER.into(),AdmissionLease{cutex_session_id:REQUESTER.into(),holder:LeaseHolder::Event{event_id:id},
+                native_message_id:message.into(),runtime_generation:1,turn_id:None,since:now_rfc3339(now)});
+            Submission{message_id:message.into(),source_agent:None,event_type:"ANSWER",text:"answer".into(),asks:vec![],attempt:None,view:Some(view)}
+        }).unwrap();
+        assert!(stop_answer_submission(&store.snapshot().unwrap(),REQUESTER,1,&submission).unwrap());
+        store.with_state(|s|super::super::control::owner_stop(s,REQUESTER,now)).unwrap();
+        assert!(stop_answer_submission(&store.snapshot().unwrap(),REQUESTER,1,&submission).is_err());
+        let event=store.snapshot().unwrap().events.values().next().unwrap().event_id.clone();
+        assert!(!unsent_event_open(&store,REQUESTER,&event).unwrap());
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(wd);
+    }
 
     #[test]
     fn abandoned_owner_carry_source_rebuilds_after_unreconcilable_or_manual_release_crash() {

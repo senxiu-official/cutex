@@ -43,6 +43,12 @@ pub struct HeldOwnerInput {
     /// delivery record of the identity decides whether it was already sent.
     #[serde(default)]
     pub claimed: bool,
+    /// Who held it: `Some(true)` the owner (or root), `Some(false)` a
+    /// shared-access user. Always written. A record without it (written
+    /// before r289) is not proven owner: when it lands it is delivered as
+    /// usual but does not lift the owner's delegation pause or stop hold.
+    #[serde(default)]
+    pub owner_authorized: Option<bool>,
 }
 
 impl HeldOwnerInput {
@@ -68,7 +74,14 @@ impl HeldOwnerInput {
             held_since: now.to_rfc3339(),
             deadline: deadline.to_rfc3339(),
             claimed: false,
+            owner_authorized: Some(crate::management::users::caller_is_owner()),
         }
+    }
+
+    /// Landing this input may act as the owner's message (fail-closed for
+    /// records without provenance).
+    pub fn proven_owner(&self) -> bool {
+        self.owner_authorized == Some(true)
     }
 
     fn expired(&self, now: DateTime<Utc>) -> bool {
@@ -281,6 +294,16 @@ pub fn unclaim_all() -> anyhow::Result<()> {
     })
 }
 
+/// A definitely-unsent group is still held after one worker pass. Preserve
+/// its original FIFO position/deadline while allowing a later admission pass.
+pub fn unclaim(session:&str,id:&str)->anyhow::Result<()> {
+    with_file(true,|file| {
+        if let Some(held)=file.inputs.iter_mut().find(|h|h.cutex_session_id==session && h.client_user_message_id==id) {
+            held.claimed=false;
+        }
+    })
+}
+
 /// Unclaimed inputs past their own deadline, removed from the store. Later
 /// inputs of the same session keep their place (the next one becomes head).
 pub fn take_expired(now: DateTime<Utc>) -> anyhow::Result<Vec<HeldOwnerInput>> {
@@ -315,5 +338,52 @@ pub fn any_waiting() -> anyhow::Result<bool> {
 pub(crate) fn reset_for_test() {
     if let Ok(mut guard) = store().0.lock() {
         guard.file = None;
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::config::instance::{self, Selection};
+
+    /// The owner flag is always written; a record without it (r288) reads
+    /// back as not proven owner after a cold load.
+    #[test]
+    fn held_input_provenance_is_written_and_missing_reads_as_not_owner() {
+        let _home_lock = crate::config::paths::test_home_env_lock();
+        let root = crate::config::paths::home_dir().unwrap().join(format!("oh-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
+        let previous = instance::selected().unwrap();
+        instance::set_test_selection(Selection::Custom(root.join(".cutex")));
+        reset_for_test();
+        let now = Utc::now();
+        crate::management::users::set_current_principal(None);
+        let owner = HeldOwnerInput::new("cutex.held-prov", "owner-1", "req-1", "thread-1", serde_json::json!({}), false, now);
+        crate::management::users::set_current_principal(Some(crate::management::users::Principal::User {
+            id: "user-1".into(), name: "Shared".into(), grant: Default::default() }));
+        let shared = HeldOwnerInput::new("cutex.held-prov", "shared-1", "req-2", "thread-1", serde_json::json!({}), false, now);
+        crate::management::users::set_current_principal(None);
+        assert_eq!((owner.owner_authorized, shared.owner_authorized), (Some(true), Some(false)));
+        hold(owner).unwrap();
+        hold(shared).unwrap();
+        // Round trip: both flags are on disk, and a cold load reads them back.
+        let raw: Value = serde_json::from_slice(&std::fs::read(path().unwrap()).unwrap()).unwrap();
+        let flags: Vec<Value> = raw["inputs"].as_array().unwrap().iter().map(|input| input["ownerAuthorized"].clone()).collect();
+        assert_eq!(flags, [Value::Bool(true), Value::Bool(false)], "{raw}");
+        reset_for_test();
+        let loaded = held_for("cutex.held-prov").unwrap();
+        assert_eq!(loaded.iter().map(HeldOwnerInput::proven_owner).collect::<Vec<_>>(), [true, false]);
+        // A legacy record (no field) cold-loads as not proven owner.
+        let mut legacy = raw.clone();
+        for input in legacy["inputs"].as_array_mut().unwrap() { input.as_object_mut().unwrap().remove("ownerAuthorized"); }
+        std::fs::write(path().unwrap(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        reset_for_test();
+        let loaded = held_for("cutex.held-prov").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|held| held.owner_authorized.is_none() && !held.proven_owner()));
+        reset_for_test();
+        instance::set_test_selection(previous);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

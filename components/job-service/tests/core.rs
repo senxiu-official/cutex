@@ -113,6 +113,49 @@ fn await_terminal(service: &JobService, id: &str) -> JobRecord {
 }
 
 #[test]
+fn close_follow_up_preserves_live_process_and_ignores_late_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let cfg = config(root.path());
+    let service = JobService::open(cfg.clone()).unwrap();
+    let request = job_request(cwd.path(), "close-follow-up-live", "sleep 0.6; printf survived");
+    let running = service.submit(API, request.clone(), issue(&request)).unwrap().job;
+    assert_eq!(running.state, JobState::Running);
+    let pid = running.process_id.unwrap();
+    assert!(matches!(service.human_close_follow_up(b"wrong", &running.job_id, running.revision, "done".into()), Err(JobError::Unauthorized(_))));
+    assert!(matches!(service.human_close_follow_up(API, &running.job_id, running.revision + 1, "done".into()), Err(JobError::Conflict(_))));
+    let closed = service.human_close_follow_up(API, &running.job_id, running.revision, "done".into()).unwrap();
+    assert_eq!(closed.state, JobState::Unconfirmed);
+    assert!(closed.state.terminal());
+    assert_eq!(closed.terminal_reason.as_deref(), Some("followUpEnded"));
+    assert_eq!(closed.exit_code, None);
+    let listed = service.human_list(API, json!({})).unwrap();
+    assert_eq!(listed["data"][0]["state"], "unconfirmed");
+    assert_eq!(listed["data"][0]["processAlive"], true);
+    // Signal 0 only checks existence; the child must also reach its stdout marker.
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+    let until = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid as i32, 0) } == 0 {
+        assert!(Instant::now() < until, "natural child exit was not observed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let output = service.read_output(API, &running.job_id, "stdout", 0, 1024).unwrap();
+    assert_eq!(hex::decode(output.bytes_hex).unwrap(), b"survived");
+    assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["processAlive"], false);
+    assert_eq!(service.query(API, &running.job_id).unwrap(), closed);
+    assert_eq!(service.human_close_follow_up(API, &running.job_id, running.revision, "done".into()).unwrap(), closed);
+    assert!(matches!(service.human_close_follow_up(API, &running.job_id, running.revision, "different".into()), Err(JobError::Conflict(_))));
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("state.json")).unwrap()).unwrap();
+    assert!(stored["outbox"].as_object().unwrap().is_empty());
+    // The watcher has released its Arc before reopening the private store.
+    drop(service);
+    let reopened = JobService::open(cfg).unwrap();
+    assert_eq!(reopened.query(API, &running.job_id).unwrap(), closed);
+    assert_eq!(reopened.human_close_follow_up(API, &running.job_id, running.revision, "done".into()).unwrap(), closed);
+}
+
+#[test]
 fn running_job_observes_sigstop_without_becoming_terminal() {
     let root = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
@@ -713,6 +756,8 @@ fn persisted_launch_pending_recovers_as_unknown_without_launch() {
     let cwd = tempfile::tempdir().unwrap();
     let request = job_request(cwd.path(), "crash-window", "/bin/sleep 30");
     let record = JobRecord {
+        launch_pending: false,
+        follow_up_ended: None,
         external: None,
         schema: CONTRACT.into(),
         job_id: "job_crash_window".into(),

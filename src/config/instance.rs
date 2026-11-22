@@ -29,7 +29,7 @@ const PROTECTED_USER_DIRS: [&str; 5] = [".cutex", ".codex", ".codez-cli", ".code
 /// Server commands of an instance drop them at start.
 const INHERITED_AGENT_ENV_PREFIXES: [&str; 2] = ["CUTEX_AGENT_", "CUTEX_RUNTIME_"];
 const INHERITED_AGENT_ENV_KEEP: [&str; 1] = [crate::agent_bus::service::AGENT_BUS_SERVE_TOKEN_ENV];
-const INHERITED_AGENT_ENV_EXACT: [&str; 2] = ["CUTEX_MCP_THREAD_ID", "CUTEX_MANAGEMENT_URL"];
+const INHERITED_AGENT_ENV_EXACT: [&str; 3] = ["CUTEX_MCP_THREAD_ID", "CUTEX_MCP_CHILD_ID", "CUTEX_MANAGEMENT_URL"];
 
 /// The `instance` section of `config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +197,20 @@ pub fn selected() -> anyhow::Result<Selection> {
 #[cfg(test)]
 pub fn set_test_selection(selection: Selection) {
     TEST_SELECTION.with(|s| *s.borrow_mut() = selection);
+}
+
+/// Bind all default repositories to a fixture, restoring this thread even on unwind.
+#[cfg(test)]
+pub(crate) fn scoped_test_selection(selection: Selection) -> impl Drop {
+    struct Restore(Selection, std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_test_selection(self.0.clone());
+        }
+    }
+    let previous = selected().expect("test instance selection");
+    set_test_selection(selection);
+    Restore(previous, std::marker::PhantomData)
 }
 
 /// The state directory of an independent instance, `None` for the default.
@@ -838,6 +852,7 @@ mod tests {
         assert!(inherited_agent_env("CUTEX_AGENT_BUS_URL"));
         assert!(inherited_agent_env("CUTEX_RUNTIME_LAUNCH_ID"));
         assert!(inherited_agent_env("CUTEX_MCP_THREAD_ID"));
+        assert!(inherited_agent_env("CUTEX_MCP_CHILD_ID"));
         assert!(inherited_agent_env("CUTEX_MANAGEMENT_URL"));
         assert!(!inherited_agent_env("CUTEX_AGENT_BUS_SERVE_TOKEN"));
         assert!(!inherited_agent_env("CUTEX_HOME"));

@@ -43,6 +43,10 @@ fn evidence_with(
     let evidence = match collector(&snapshot) {
         Ok(Observation::Terminal(evidence)) => Some(evidence),
         Ok(Observation::Ineligible) => None,
+        Ok(Observation::RuntimeGone) => {
+            repository.observe_settlement(message_id, None, now)?;
+            return Ok(Err(Refusal::new(409, "runtime_gone", "recipient session is retired or deleted; execution remains unconfirmed")));
+        }
         Err(_) => {
             repository.observe_settlement(message_id, None, now)?;
             return Ok(Err(Refusal::new(
@@ -94,6 +98,40 @@ pub fn handle_evidence(stream: &mut TcpStream, request: &SimpleHttpRequest) -> a
     }
 }
 
+/// Full owner route; no session lookup, runtime observation or native submission.
+pub fn handle_end_follow_up(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+) -> anyhow::Result<()> {
+    if request.method != "POST" {
+        return refusal(stream, &Refusal::new(405, "method_not_allowed", "use POST"));
+    }
+    let parsed: model::EndFollowUpRequest = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(_) => {
+            return refusal(
+                stream,
+                &Refusal::new(
+                    400,
+                    "invalid_request",
+                    "expected messageId, actionId, reason and optional expectedSemanticSha256",
+                ),
+            )
+        }
+    };
+    if let Err(error) = parsed.validate() {
+        return refusal(stream, &error);
+    }
+    let result = super::agent_bus_state::agent_bus_message_repository().and_then(|repository| {
+        let result = repository.end_follow_up(&parsed, "owner", Utc::now())?;
+        if result.is_ok() {
+            repair_outbox(repository);
+        }
+        Ok(result)
+    });
+    write_outcome(stream, result)
+}
+
 pub fn parse(body: &[u8]) -> Result<CloseRequest, Refusal> {
     let request: CloseRequest = serde_json::from_slice(body).map_err(|_| {
         Refusal::new(
@@ -133,6 +171,10 @@ pub fn close_with_fence(
             let _reservation = lane.reserve()?;
             let evidence = match collector(&snapshot) {
                 Ok(Observation::Terminal(evidence)) => evidence,
+                Ok(Observation::RuntimeGone) => {
+                    repository.observe_settlement(&request.message_id,None,now)?;
+                    return Ok(Err(Refusal::new(409,"runtime_gone","recipient session is retired or deleted; use owner endFollowUp to stop tracking")));
+                }
                 Ok(Observation::Ineligible) => {
                     repository.observe_settlement(&request.message_id, None, now)?;
                     return Ok(Err(Refusal::new(
@@ -287,6 +329,183 @@ mod tests {
 
     const TO: &str = "cutex.11111111-1111-4111-8111-111111111111";
     const FROM: &str = "cutex.22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn full_live_discard_budget_refuses_before_withdrawal() {
+        use super::super::{agent_bus_stuck, hot_store};
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        fixture
+            .repository
+            .discard_live_occurrence("seed", None, "discard", now)
+            .unwrap();
+        let database = fixture.root.join(hot_store::DATABASE_FILE);
+        let generation = hot_store::generation(&database, "agent_bus")
+            .unwrap()
+            .unwrap();
+        let rows=(0..9999).map(|n| {
+            let id=format!("cap-{n}");
+            hot_store::RowChange::Put {collection:"live-discard".into(),key:id.clone(),value:serde_json::to_vec(&json!({
+                "messageId":id,"semanticSha256":null,"reason":"discard","by":"owner","discardedAt":now,"expiresAt":null
+            })).unwrap()}
+        }).collect();
+        hot_store::commit(&database, "agent_bus", generation, rows).unwrap();
+        struct Live;
+        impl agent_bus_stuck::LiveBus for Live {
+            fn queued(&self) -> anyhow::Result<Vec<crate::agent_bus::queue::QueuedAgentBusMessage>> {
+                Ok(vec![crate::agent_bus::queue::QueuedAgentBusMessage {
+                    message_id: "new".into(),
+                    agent_id: "runtime".into(),
+                    agent_name: None,
+                    to_cutex_session_id: None,
+                    created_at_epoch_secs: 1,
+                    sender: "producer".into(),
+                    sender_kind: "agent".into(),
+                    control_type: None,
+                    content_preview: "hello".into(),
+                }])
+            }
+            fn withdraw(&self, _: &[String], _: &str) -> anyhow::Result<Vec<(String, String)>> {
+                panic!("capacity refusal must not withdraw")
+            }
+        }
+        let request = agent_bus_stuck::DiscardRequest {
+            message_id: "new".into(),
+            reason: "discard".into(),
+            expected_semantic_sha256: None,
+            allow_protected: false,
+        };
+        let refusal = agent_bus_stuck::discard(&fixture.repository, &Live, &request, now, &|_| {})
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.code, "live_discard_capacity");
+        assert_eq!(refusal.status, 409);
+        assert!(!fixture.repository.live_discarded("new").unwrap());
+        assert!(fixture.repository.live_discarded("seed").unwrap());
+        assert_eq!(hot_store::live_discard_usage(&database).unwrap().0, 10_000);
+    }
+
+    #[test]
+    fn owner_end_follow_up_is_evidence_free_durable_and_never_redriven() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        fixture.queued("owner-end", false);
+        let before = fixture
+            .repository
+            .snapshot_by_message_id("owner-end")
+            .unwrap();
+        let req = model::EndFollowUpRequest {
+            message_id: "owner-end".into(),
+            action_id: "end-1".into(),
+            reason: "stop tracking".into(),
+            expected_semantic_sha256: None,
+        };
+        let first = fixture
+            .repository
+            .end_follow_up(&req, "owner", now)
+            .unwrap()
+            .unwrap();
+        assert!(first.changed);
+        assert!(first.settlement.evidence.is_none());
+        assert_eq!(first.settlement.outcome.as_deref(), Some("unconfirmed"));
+        assert_eq!(first.settlement.by.as_deref(), Some("owner"));
+        assert!(!first.settlement.can_close);
+        super::super::schema_export::assert_valid(
+            "owner-dispositions",
+            "ownerMessageSettlement",
+            &serde_json::to_value(&first.settlement).unwrap(),
+        );
+        assert_eq!(
+            before,
+            fixture
+                .repository
+                .snapshot_by_message_id("owner-end")
+                .unwrap()
+        );
+        let reopened = AgentBusMessageRepository::open(&fixture.root).unwrap();
+        assert!(
+            !reopened
+                .end_follow_up(&req, "owner", now)
+                .unwrap()
+                .unwrap()
+                .changed
+        );
+        assert!(reopened.suppress_native_delivery(TO, "owner-end").unwrap());
+        assert!(!reopened
+            .pending_v2()
+            .unwrap()
+            .iter()
+            .any(|m| m.canonical_envelope.id == "owner-end"));
+        let mut changed = req.clone();
+        changed.reason = "different".into();
+        assert_eq!(
+            reopened
+                .end_follow_up(&changed, "owner", now)
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "action_id_conflict"
+        );
+        fixture.queued("other-end", false);
+        changed = req.clone();
+        changed.message_id = "other-end".into();
+        assert_eq!(
+            reopened
+                .end_follow_up(&changed, "owner", now)
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "action_id_conflict"
+        );
+        let events = std::cell::RefCell::new(Vec::new());
+        reopened
+            .drain_settlement_outbox(&|session, _, value| {
+                events.borrow_mut().push((session.to_string(), value));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(events.borrow().len(), 2);
+        assert!(events
+            .borrow()
+            .iter()
+            .all(|(_, v)| v["settlement"]["outcome"] == "unconfirmed"));
+    }
+
+    #[test]
+    fn owner_end_native_preserves_receipts_and_stays_closed_after_late_failure() {
+        let fixture=Fixture::new();let now=Utc::now();
+        fixture.reviewed("owner-native",now,"held");
+        let before=fixture.repository.snapshot_by_message_id("owner-native").unwrap().unwrap();
+        let request=model::EndFollowUpRequest {message_id:"owner-native".into(),action_id:"native-end".into(),reason:"runtime gone".into(),expected_semantic_sha256:before.semantic_sha256.clone()};
+        fixture.repository.end_follow_up(&request,"owner",now).unwrap().unwrap();
+        fixture.repository.record_failed(TO,"owner-native",json!({"code":"late_failure","retryable":false}),now).unwrap();
+        let after=fixture.repository.snapshot_by_message_id("owner-native").unwrap().unwrap();
+        assert_eq!(after.external_input,before.external_input);
+        assert_eq!(after.external_input_receipt,before.external_input_receipt);
+        assert_eq!(after.local_inbox_receipt,before.local_inbox_receipt);
+        let view=fixture.repository.settlement_view_by_id("owner-native",now).unwrap().unwrap();
+        assert_eq!(view.state,"closed");assert_eq!(view.outcome.as_deref(),Some("unconfirmed"));assert!(view.evidence.is_none());
+        assert!(fixture.repository.pending_native_envelopes(TO).unwrap().is_empty());
+        assert!(fixture.repository.suppress_native_delivery(TO,"owner-native").unwrap());
+        assert!(!fixture.repository.end_follow_up(&request,"owner",now).unwrap().unwrap().changed);
+    }
+
+    #[test]
+    fn runtime_gone_is_nonretryable_and_never_confirms_execution() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        fixture.reviewed("gone", now, "held");
+        let before = fixture.repository.snapshot_by_message_id("gone").unwrap();
+        let request = fixture.request("gone");
+        let error = close_with(&fixture.repository, &request, "owner", now, |_| Ok(Observation::RuntimeGone)).unwrap().unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(error.code, "runtime_gone");
+        assert_eq!(before, fixture.repository.snapshot_by_message_id("gone").unwrap());
+        assert!(fixture.repository.settlement_view_by_id("gone", now).unwrap().is_none());
+        let error = evidence_with(&fixture.repository, "gone", now, |_| Ok(Observation::RuntimeGone)).unwrap().unwrap_err();
+        assert_eq!(error.code, "runtime_gone");
+        assert_eq!(error.status, 409);
+    }
 
     #[test]
     fn explicit_evidence_demand_cannot_close_resend_or_invent_receipts() {
@@ -830,7 +1049,7 @@ mod tests {
         assert_eq!(outcome.settlement.state, "closed");
         assert!(
             outcome.settlement.closure.unwrap().closed_at
-                >= outcome.settlement.evidence.observed_at
+                >= outcome.settlement.evidence.as_ref().unwrap().observed_at
         );
     }
 

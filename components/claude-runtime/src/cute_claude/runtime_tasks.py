@@ -56,6 +56,13 @@ TYPES = {'TaskStartedMessage': 'task_started', 'TaskProgressMessage': 'task_prog
          'TaskNotificationMessage': 'task_notification', 'TaskUpdatedMessage': 'task_updated'}
 
 
+def stop_outcome(tid, task_id, outcome, reason):
+    """A control receipt, never evidence that a task has ended."""
+    return {'threadId': tid, 'taskId': task_id, 'outcome': outcome, 'reason': reason,
+            'stopRequested': {'accepted': True, 'refused': False, 'unknown': None}[outcome],
+            'terminalConfirmed': False}
+
+
 def field(message, key, default=None):
     value = message.get(key, default) if isinstance(message, dict) else getattr(message, key, default)
     if value is default:

@@ -75,6 +75,81 @@ fn register(service: &JobService, prepared: &PrepareRemoteReceipt) -> SubmitRece
         .unwrap()
 }
 #[test]
+fn close_follow_up_external_is_durable_and_fences_source_events() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path());
+    let service = JobService::open(cfg.clone()).unwrap();
+    let prepared = prepare(&service);
+    let job = register(&service, &prepared).job;
+    assert!(service.capabilities(API).unwrap()["humanOperations"].as_array().unwrap().contains(&serde_json::json!("closeFollowUp")));
+    let closed = service.human_close_follow_up(API, &job.job_id, job.revision, "owner no longer tracking".into()).unwrap();
+    assert_eq!(closed.state, JobState::Unconfirmed);
+    assert_eq!(closed.process_id, None);
+    let event = ExternalSourceEvent {
+        source: "nci".into(), remote_id: "123.gadi-pbs".into(),
+        correlation_token: prepared.correlation_token, event_id: "late".into(),
+        state: JobState::Running, exit_code: None, reason: None, resources: None,
+    };
+    let _ = service.ingest_external_event(API, event);
+    assert_eq!(service.query(API, &job.job_id).unwrap(), closed);
+    drop(service);
+    let reopened = JobService::open(cfg).unwrap();
+    assert_eq!(reopened.human_close_follow_up(API, &job.job_id, job.revision, "owner no longer tracking".into()).unwrap(), closed);
+}
+
+#[test]
+fn close_follow_up_unknown_state_and_local_record_without_owned_process() {
+    for wire_state in ["queued", "future_wire_state"] {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let service = JobService::open(cfg.clone()).unwrap();
+        let prepared = prepare(&service);
+        let job = register(&service, &prepared).job;
+        drop(service);
+        let path = root.path().join("state.json");
+        let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["jobs"][&job.job_id]["external"] = serde_json::Value::Null;
+        stored["jobs"][&job.job_id]["state"] = serde_json::json!(wire_state);
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let reopened = JobService::open(cfg).unwrap();
+        if wire_state == "future_wire_state" {
+            assert_eq!(reopened.query(API, &job.job_id).unwrap().state, JobState::Unconfirmed);
+        }
+        let current = reopened.query(API, &job.job_id).unwrap();
+        let closed = reopened.human_close_follow_up(API, &job.job_id, current.revision, "unconfirmed execution".into()).unwrap();
+        assert_eq!(closed.state, JobState::Unconfirmed);
+        assert_eq!(closed.process_id, None);
+        assert_eq!(closed.follow_up_ended.unwrap().expected_revision, current.revision);
+        drop(reopened);
+        let reopened = JobService::open(config(root.path())).unwrap();
+        assert_eq!(reopened.query(API, &job.job_id).unwrap().state, JobState::Unconfirmed);
+    }
+}
+
+#[test]
+fn close_follow_up_preserves_frozen_terminal_outcome_and_outbox() {
+    let root = tempfile::tempdir().unwrap();
+    let service = JobService::open(config(root.path())).unwrap();
+    let prepared = prepare(&service);
+    let job = register(&service, &prepared).job;
+    drop(service);
+    let path = root.path().join("state.json");
+    let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // On restart a local running record is terminal Interrupted, with frozen
+    // completion facts. Disposition must not rewrite that existing outcome.
+    stored["jobs"][&job.job_id]["external"] = serde_json::Value::Null;
+    stored["jobs"][&job.job_id]["state"] = serde_json::json!("running");
+    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let service = JobService::open(config(root.path())).unwrap();
+    let terminal = service.query(API, &job.job_id).unwrap();
+    assert_eq!(terminal.state, JobState::Interrupted);
+    assert_eq!(service.human_close_follow_up(API, &job.job_id, terminal.revision, "done".into()).unwrap(), terminal);
+    drop(service);
+    let service = JobService::open(config(root.path())).unwrap();
+    assert_eq!(service.query(API, &job.job_id).unwrap(), terminal);
+}
+
+#[test]
 fn source_default_off_and_authenticated_preparation() {
     let root = tempfile::tempdir().unwrap();
     let mut cfg = config(root.path());

@@ -37,6 +37,7 @@ from .model_observations import ModelObservations
 from .mcp_recovery import RecoveringSdkClient, cancelled_host_tool_result
 
 from .subagent_transcripts import SubagentTranscripts
+from .subagent_policy import DENIED as CHILD_TOOL_DENIED, child_context, readonly_tool, agent_definitions
 from .native_tools import (COMMAND_TOOLS, EDIT_TOOLS, OWNER_DECLINED, OWNER_STOPPED, UNANSWERED_PERMISSION, NativeTools,
                            PlanState, bypass_safety_denial, command_spec, exclusions, external_mcp_allowed,
                            external_mcp_tool, interrupted_item, preview)
@@ -363,7 +364,10 @@ class OfficialSdkDriver:
             if name == 'AskUserQuestion':
                 return self.sdk.PermissionResultDeny(message=BACKGROUND_NO_QUESTIONS)
             if name.startswith(f'mcp__{SERVER_NAME}__'):
-                return self.sdk.PermissionResultDeny(message=BACKGROUND_NO_HOST_TOOLS)
+                tool = name[len(f'mcp__{SERVER_NAME}__'):]
+                if readonly_tool(engine, tool) and bridge.child_grant_valid(args, agent_id, call_id):
+                    return self.sdk.PermissionResultAllow(updated_input=args)
+                return self.sdk.PermissionResultDeny(message=CHILD_TOOL_DENIED)
             if engine.permissions.effective_mode(tid) != 'bypassPermissions':
                 return self.sdk.PermissionResultDeny(message=BACKGROUND_NEEDS_APPROVAL)
             safety = getattr(engine, 'safety_grants', None)
@@ -426,7 +430,7 @@ class OfficialSdkDriver:
             grant = bridge.grants.get(args.get(CALL_FIELD, '')) if isinstance(args,dict) else None
             if not grant or not bridge.accepting or grant[0] != bridge.binding:
                 return self.sdk.PermissionResultDeny(message='No active adapter invocation.')
-            binding, call = grant
+            binding, call = grant[:2]
             if name != f'mcp__{SERVER_NAME}__{call["name"]}' or args.get('arguments') != call['input']:
                 return self.sdk.PermissionResultDeny(message='Invocation parameters differ.')
             task = asyncio.create_task(engine.approve_tool(tid, binding[0], call['name'], call['input'], call['id']))
@@ -447,14 +451,19 @@ class OfficialSdkDriver:
         async def post_tool(data, tool_use_id, context):
             binding = bridge.binding
             call_id = tool_use_id or data.get('tool_use_id')
+            event = data.get('hook_event_name')
             # A claim needs the PreToolUse-admitted main-agent tool id:
             # callback_valid alone accepts a callback without any call id.
-            authenticated = (data.get('hook_event_name') == 'PostToolUse'
+            authenticated = (event in {'PostToolUse', 'PostToolUseFailure'}
                              and isinstance(call_id, str) and call_id != ''
                              and bridge.callback_valid(data, call_id) and call_id not in bridge.context_hooks)
             if authenticated:
                 bridge.context_hooks.add(call_id)
             result = await bridge.native.post(data, tool_use_id, context)
+            # A failed-tool callback is an input boundary only for the same
+            # PreToolUse-admitted main-chain call, never an arbitrary failure.
+            if event == 'PostToolUseFailure' and not authenticated:
+                return result
             # Notes other agents left while this turn runs: read after the
             # main agent's tool call (never into a subagent's context).
             if data.get('agent_id') or data.get('parent_tool_use_id') or not bridge.binding or not bridge.accepting:
@@ -469,7 +478,7 @@ class OfficialSdkDriver:
                 # never claim busy inputs after the turn ended.
                 if not notes:
                     return result
-                return {'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': notes}}
+                return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext': notes}}
             # This claim and the final hook return have no yielding operation
             # between them. A turn end before this point leaves the FIFO intact.
             busy = engine.busy_delivery.inject(tid, binding[0]) if authenticated else ''
@@ -478,8 +487,8 @@ class OfficialSdkDriver:
                 return result
             if busy:
                 engine.busy_delivery.offered(tid, binding[0], call_id=call_id, context=notes,
-                    bridge=bridge, hook_name=f"PostToolUse:{data.get('tool_name', '')}")
-            return {'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': notes}}
+                    bridge=bridge, hook_name=f"{event}:{data.get('tool_name', '')}")
+            return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext': notes}}
         thread = engine.store.thread(tid)
         connectors = engine.settings.claude_ai_connectors and self.api_account is None
         system_prompt, bridge.prompt_digest = system_prompt_option(
@@ -499,6 +508,7 @@ class OfficialSdkDriver:
             # --strict-mcp-config keeps every other MCP source out; claude.ai connectors (subscription
             # logins only) are fetched by Claude Code only without it.
             mcp_servers={**engine.settings.mcp_servers, SERVER_NAME: server}, strict_mcp_config=not connectors,
+            agents=agent_definitions(self.sdk, engine),
             # The SDK warns that can_use_tool is never invoked under bypassPermissions; Claude Code still
             # calls it for AskUserQuestion and for its safety checks (NativeTools.approve declines those).
             # Settings sources are the profile's opt-in (project / user = the account home); plugins stay off.
@@ -506,7 +516,7 @@ class OfficialSdkDriver:
             # A paused agent holds its next tool call in this hook (tool_gate.py): a long timeout, not the CLI's 600 s.
             hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool], timeout=HOOK_TIMEOUT)],
                    'PostToolUse': [self.sdk.HookMatcher(hooks=[post_tool])],
-                   'PostToolUseFailure': [self.sdk.HookMatcher(hooks=[bridge.native.post])],
+                   'PostToolUseFailure': [self.sdk.HookMatcher(hooks=[post_tool])],
                    'SubagentStart': [self.sdk.HookMatcher(hooks=[bridge.subagent_start])],
                    'SubagentStop': [self.sdk.HookMatcher(hooks=[bridge.subagent_stop])]},
             # Claude Code's own prompt (environment, date, tool guidance) plus
@@ -553,7 +563,7 @@ class SdkToolBridge:
         self.prompt_digest: str | None = None
         self.native = NativeTools(self)
         self.native_questions: dict[str, tuple] = {}
-        self.grants: dict[str, tuple[tuple[str, str], dict]] = {}
+        self.grants: dict[str, tuple[tuple[str, str], dict, str | None]] = {}
         self.host_tasks: set[asyncio.Task] = set()
         self.children: dict[str, tuple] = {}
         self.call_agents: dict[str, str | None] = {}
@@ -579,7 +589,8 @@ class SdkToolBridge:
         self.accepting = False
         if self.binding:
             self.engine.store.clear_browser_replay(self.tid, self.binding[0])
-        self.grants.clear()
+        self.grants = {token: grant for token, grant in self.grants.items()
+                       if len(grant) > 2 and grant[2] in self.background}
         self.native_questions.clear()
         self.native.calls.clear()
         self.native.seen.clear()
@@ -669,7 +680,17 @@ class SdkToolBridge:
         if name == 'AskUserQuestion':
             return self.denied(BACKGROUND_NO_QUESTIONS)
         if name.startswith(f'mcp__{SERVER_NAME}__'):
-            return self.denied(BACKGROUND_NO_HOST_TOOLS)
+            tool = name[len(f'mcp__{SERVER_NAME}__'):]
+            if not readonly_tool(self.engine, tool):
+                return self.denied(CHILD_TOOL_DENIED)
+            held = await self.hold_at_gate(call_id, name, agent_id, None)
+            if held is not None:
+                return held
+            origin = self.background.get(agent_id)
+            if origin is None:
+                return self.denied('Native subagent context ended')
+            self.background_calls[call_id] = agent_id
+            return self.grant_cutex_call(call_id, tool, data.get('tool_input', {}), origin, agent_id)
         if self.engine.permissions.planning(self.tid) and name not in PLAN_SUBAGENT_TOOLS and not name.startswith('mcp__'):
             return self.denied('Plan mode allows read-only subagent tools')
         external = external_mcp_tool(self.engine.settings, name)
@@ -708,6 +729,10 @@ class SdkToolBridge:
 
     async def subagent_start(self, data, tool_use_id, context):
         agent_id = data.get('agent_id')
+        parent = getattr(self.engine.tools, 'parent_agent_name', None) or self.engine.settings.external_owner_id or 'the parent agent'
+        framing = {'hookSpecificOutput': {'hookEventName': 'SubagentStart', 'additionalContext': child_context(parent)}}
+        if data.get('session_id') == self.sid and isinstance(agent_id, str) and agent_id in self.background:
+            return framing
         if (data.get('session_id') != self.sid or not self.accepting or not self.binding
                 or not isinstance(agent_id, str) or not agent_id or len(agent_id) > 256 or agent_id in self.background):
             return {}
@@ -715,7 +740,7 @@ class SdkToolBridge:
         owner = getattr(self.engine.driver, 'owners', {}).get(self.tid)
         if owner:
             await owner.tasks.child_started(agent_id, self.binding[0])
-        return {}
+        return framing
 
     async def subagent_stop(self, data, tool_use_id, context):
         agent_id = data.get('agent_id')
@@ -757,6 +782,18 @@ class SdkToolBridge:
         call_id = tool_use_id or data.get('tool_use_id')
         if not isinstance(call_id, str) or not call_id:
             return self.denied('Missing native tool-call ID')
+        checkpoint = getattr(self.engine, 'checkpoints', {}).get(binding[0])
+        if checkpoint is not None:
+            if data.get('agent_id'):
+                checkpoint.unsafe = True
+            else:
+                cached_mcp = (full_name.startswith('mcp__cutex__')
+                    and full_name[len('mcp__cutex__'):] in self.engine.tools.tools
+                    and not external_mcp_tool(self.engine.settings, full_name))
+                if call_id in checkpoint.results and not cached_mcp:
+                    return self.denied('This native tool ID already has a recorded result. '
+                                       'The completed action was not executed again; inspect its existing result.')
+                checkpoint.admit(call_id, full_name)
         agent_id = data.get('agent_id')
         if call_id in self.call_agents and self.call_agents[call_id] != agent_id:
             return self.denied('Native tool-call identity belongs to another agent')
@@ -808,10 +845,13 @@ class SdkToolBridge:
         name = full_name[len(prefix):] if full_name.startswith(prefix) else ''
         if name not in self.engine.tools.tools:
             return self.denied('Tool is not registered by this adapter')
+        if agent_id and not readonly_tool(self.engine, name):
+            return self.denied(CHILD_TOOL_DENIED)
         if self.engine.permissions.planning(self.tid) and not self.engine.tools.tools[name].read_only:
             return self.denied('Plan mode allows read-only tools. Switch to Default mode before executing changes.')
-        args = data.get('tool_input', {})
-        call_id = tool_use_id or data.get('tool_use_id')
+        return self.grant_cutex_call(call_id, name, data.get('tool_input', {}), binding, agent_id)
+
+    def grant_cutex_call(self, call_id, name, args, binding, agent_id):
         if not isinstance(call_id, str) or not call_id or not isinstance(args, dict) or not isinstance(args.get('arguments'), dict):
             return self.denied('Missing native tool-call ID or arguments')
         original = args['arguments']
@@ -822,20 +862,39 @@ class SdkToolBridge:
         token = identifier()
         if len(self.grants) >= 256:
             return self.denied('Too many pending tool callbacks; inspect the runtime')
-        self.grants[token] = (binding, deepcopy(call))
+        self.grants[token] = (binding, deepcopy(call), agent_id)
         return {'hookSpecificOutput': {'hookEventName': 'PreToolUse',
             'updatedInput': {'arguments': original, CALL_FIELD: token}}}
 
+    def child_grant_valid(self, args, agent_id, call_id) -> bool:
+        grant = self.grants.get(args.get(CALL_FIELD, '')) if isinstance(args, dict) else None
+        return bool(grant and len(grant) > 2 and grant[2] == agent_id and grant[1]['id'] == call_id
+                    and agent_id in self.background and self.background[agent_id] == grant[0])
+
     async def execute(self, name: str, args: dict) -> dict:
         grant = self.grants.pop(args.get(CALL_FIELD, ''), None)
-        if not grant or not self.accepting or grant[0] != self.binding:
+        child_id = grant[2] if grant and len(grant) > 2 else None
+        background = child_id is not None and self.background.get(child_id) == (grant[0] if grant else None)
+        current = self.accepting and grant and grant[0] == self.binding
+        if not grant or (not background and not current):
             return {'content': [{'type': 'text', 'text': 'Missing or expired invocation correlation; tool was not executed.'}], 'is_error': True}
-        binding, call = grant
+        binding, call = grant[:2]
         if call['name'] != name or call['input'] != args.get('arguments'):
             return {'content': [{'type': 'text', 'text': 'Invocation parameters differ; tool was not executed.'}], 'is_error': True}
+        if child_id is not None:
+            if not readonly_tool(self.engine, name) or (not background and self.children.get(child_id) != binding):
+                return {'content':[{'type':'text','text':CHILD_TOOL_DENIED}], 'is_error':True}
+            if background:
+                # A background child can outlive the parent's turn. Its read
+                # belongs to the child transcript, never a new parent turn.
+                result = await self.engine.tools.execute(name, call['input'],
+                    ToolContext(self.tid, binding[0], call['id'], self.engine.settings.workspace, child_id))
+                return {'content':result.mcp_content(), 'is_error':not result.success}
         # Freeze the turn ID before any await. Never read mutable current_turn
         # after executing host code; late callbacks cannot write a later turn.
-        task = asyncio.create_task(self._execute_bound(binding[0], name, call))
+        execution = (self._execute_bound(binding[0], name, call) if child_id is None
+                     else self._execute_bound(binding[0], name, call, child_id))
+        task = asyncio.create_task(execution)
         self.host_tasks.add(task)
         try:
             return await task
@@ -851,7 +910,7 @@ class SdkToolBridge:
         finally:
             self.host_tasks.discard(task)
 
-    async def _execute_bound(self, turn_id: str, name: str, call: dict) -> dict:
+    async def _execute_bound(self, turn_id: str, name: str, call: dict, child_id: str | None = None) -> dict:
         call_id = call['id']
         store = self.engine.store
         # Recheck atomically immediately before effects, including concurrent
@@ -880,7 +939,7 @@ class SdkToolBridge:
         await self.engine.emit(self.tid, 'item/started', {'threadId': self.tid, 'turnId': turn_id, 'item': item})
         started = time.monotonic()
         result = await self.engine.tools.execute(name, call['input'],
-            ToolContext(self.tid, turn_id, call_id, self.engine.settings.workspace))
+            ToolContext(self.tid, turn_id, call_id, self.engine.settings.workspace, child_id))
         stored = journal_result(name, {'content': result.text, 'mcpContent': result.mcp_content(), 'is_error': not result.success})
         if stored.get('browserImagesOmitted') and self.accepting and self.binding and self.binding[0] == turn_id:
             stored['browserReplayItemId'] = item['id']
@@ -945,7 +1004,12 @@ class SubscriptionEngine(Engine):
         super().__init__(settings, store, driver, tools)
         self.driver = driver
         self.open_tools: dict[str, dict[str, dict]] = {}
+        self.queue_backoffs: dict[str, asyncio.Event] = {}
+        from .checkpoint_recovery import install
+        install(store)
+        self.checkpoints = {}
         self.retry_blocked: set[str] = set()
+        self.queue_effects: set[str] = set()
         self.retry_turns: dict[str, str] = {}
         self.retry_waiting: set[str] = set()
         self.native_tool_inventory = {}
@@ -976,6 +1040,8 @@ class SubscriptionEngine(Engine):
                 'claude/input/contextPersisted', 'thread/presentation/appended',
                 'turn/plan/updated', 'turn/diff/updated'}):
             self.retry_blocked.add(turn_id)
+        if turn_id and method.startswith('item/') and params.get('item', {}).get('type') not in {'userMessage', 'external_event', 'externalInput'}:
+            self.queue_effects.add(turn_id)
         await super().emit(tid, method, params, durable=durable)
 
     def _loaded_settings_hooks(self, tid: str) -> bool:
@@ -1130,8 +1196,70 @@ class SubscriptionEngine(Engine):
             raise RpcError(-32601, 'This driver does not implement persistent runtime lifecycle')
         status = await self.driver.start(self, tid)
         self.offline_threads.discard(tid)
-        # Start is connection-only; no wake()/claim()/business prompt.
+        # Only a proved interrupted transport probe may resume prior work.
+        # Normal Start remains connection-only.
+        if tid in self.store.recovered_probes:
+            self.__dict__.setdefault('_probe_runtime_started', set()).add(tid)
         return status
+
+    async def restore_retained_probe(self, tid: str) -> None:
+        turn_id = self.store.recovered_probes.get(tid)
+        if (not turn_id or tid not in self.__dict__.get('_probe_runtime_started', set())
+                or tid not in self.__dict__.get('_probe_gate_synced', set())):
+            return
+        owner = getattr(self.driver, 'owners', {}).get(tid)
+        if owner is None or owner.active or owner.lease is None or self.tool_gate.closed(tid):
+            return
+        from .queue_recovery import restart_candidate, empty_history, empty_receipt, owner_stamp
+        from .checkpoint_recovery import Checkpoint
+        row = self.store.db.execute('SELECT value FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,)).fetchone()
+        expected = row[0] if row else None
+        retry = json.loads(expected) if expected else {}
+        old = retry.get('receipt') or {}
+        stamp = owner_stamp(owner)
+        def live():
+            return (not self.closing and tid not in self.offline_threads and self.driver.owners.get(tid) is owner
+                and owner.lease is not None and not owner.lease.file.closed and not owner.task.done()
+                and owner.accepting and owner.active is None and turn_id not in owner.cancelled_turns
+                and owner_stamp(owner) == stamp and owner.recovery_arrivals == owner.recovery_revision == 0
+                and not Checkpoint(self, tid, turn_id, owner.session_id).live_effects(owner)
+                and not self._loaded_settings_hooks(tid))
+        safe = (restart_candidate(self.store, tid, turn_id, retry)
+                and old.get('sessionId') == self.session(tid)['session_id'] and live())
+        try:
+            if safe and old.get('state') == 'terminal-empty':
+                history = old['history']
+                safe = await asyncio.to_thread(empty_history, owner, owner.session_id, old['errorUuid'], history['anchor']) == history
+            # Stop/Resume/Close or a newly replayed explicit pause wins an I/O race.
+            if (self.store.recovered_probes.get(tid) != turn_id or self.closing or tid in self.offline_threads
+                    or self.tool_gate.closed(tid) or tid not in self.__dict__.get('_probe_gate_synced', set())):
+                return
+            safe = safe and live()
+            if safe:
+                renewed = empty_receipt(self, tid, turn_id, owner, terminal=old['state']=='terminal-empty', error_uuid=old.get('errorUuid'))
+                renewed['history'] = old.get('history')
+                with self.store.transaction():
+                    current = self.store.db.execute('SELECT value FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,)).fetchone()
+                    queued = self.store.db.execute("SELECT 1 FROM inputs i JOIN turns t ON t.id=i.turn_id WHERE i.thread_id=? AND i.turn_id=? AND i.state='queued' AND t.state='inProgress'", (tid,turn_id)).fetchone()
+                    safe = (live() and queued is not None and current is not None and current[0] == expected
+                        and restart_candidate(self.store, tid, turn_id, retry))
+                    if safe:
+                        changed = self.store.db.execute('UPDATE meta SET value=? WHERE key=? AND value=?',
+                            (json.dumps({**retry,'receipt':renewed}), 'claudeQueueRetry:' + turn_id, expected)).rowcount
+                        safe = changed == 1
+                        if safe:
+                            self.store.db.execute('UPDATE threads SET halted=0 WHERE id=?', (tid,))
+        except (OSError, ValueError, KeyError, TypeError):
+            safe = False
+        if self.store.recovered_probes.get(tid) != turn_id:
+            return
+        self.store.recovered_probes.pop(tid, None)
+        if safe:
+            self.wake(tid)
+        else:
+            await self.emit(tid, 'claude/queue/holdChanged', {'threadId':tid, 'turnId':turn_id, 'held':True, 'reason':'silentTransportGuard'})
+            await self.emit(tid, 'error', {'threadId':tid, 'turnId':turn_id, 'willRetry':False, 'error':{
+                'message':'The saved input needs inspection before Resume; its outcome is not proved empty.', 'codexErrorInfo':'other', 'additionalDetails':None}})
 
     async def runtime_control(self, tid: str, kind: str, **arguments):
         self.store.thread(tid)
@@ -1208,6 +1336,8 @@ class SubscriptionEngine(Engine):
     async def close_runtime(self, tid: str) -> dict:
         self.store.thread(tid)
         self.offline_threads.add(tid)
+        if tid in self.queue_backoffs:
+            self.queue_backoffs[tid].set()
         if not getattr(self.driver, 'persistent', False):
             raise RpcError(-32601, 'This driver does not implement persistent runtime lifecycle')
         await self._interrupt_before_close(tid)
@@ -1227,22 +1357,37 @@ class SubscriptionEngine(Engine):
         return status
 
     def wake(self, tid: str) -> None:
+        from .queue_recovery import remaining
+        if tid in self.queue_backoffs and remaining(self.store, tid) == 0:
+            self.queue_backoffs[tid].set()
         if tid not in self.offline_threads:
             super().wake(tid)
 
     async def _worker(self, tid: str) -> None:
         try:
             while not self.closing and tid not in self.offline_threads:
+                from .queue_recovery import remaining, wait_backoff
+                delay = remaining(self.store, tid)
+                if delay:
+                    event = self.queue_backoffs[tid] = asyncio.Event()
+                    try:
+                        await wait_backoff(event, delay)
+                    finally:
+                        self.queue_backoffs.pop(tid, None)
+                if self.closing or tid in self.offline_threads:
+                    break
                 record = self.store.claim(tid)
                 if record is None: break
                 await self._run_turn(tid, record)
-                if self.store.thread(tid)['halted']: break
+                if self.store.thread(tid)['halted'] or not self.store.pending(tid): break
         finally:
             if self.workers.get(tid) is asyncio.current_task():
                 self.workers.pop(tid, None)
 
     async def interrupt(self, tid: str, turn_id: str) -> None:
-        if turn_id in self.retry_waiting:
+        retained = self.store.db.execute("SELECT 1 FROM inputs WHERE thread_id=? AND turn_id=? AND state='queued' AND EXISTS(SELECT 1 FROM meta WHERE key=?)",
+            (tid, turn_id, 'claudeQueueRetry:' + turn_id)).fetchone()
+        if turn_id in self.retry_waiting or retained:
             # The native query already returned its explicit terminal result.
             # Interrupt the worker's cancellable backoff, not the idle CLI mailbox.
             return await super().interrupt(tid, turn_id)
@@ -1272,6 +1417,8 @@ class SubscriptionEngine(Engine):
         if not getattr(self.driver, 'persistent', False):
             return await super().close()
         self.closing = True
+        for event in self.queue_backoffs.values():
+            event.set()
         await asyncio.gather(*(self._interrupt_before_close(tid) for tid in list(self.driver.owners)))
         # No raw owner cancellation: let official disconnect flush and reap.
         await self.driver.close()
@@ -1296,15 +1443,22 @@ class SubscriptionEngine(Engine):
         turn_id = record['turn_id']
         state, error = 'completed', None
         uncertain = False
+        failure = None
         pending: dict[int, dict] = {}
         reasoning: dict[int, dict] = {}
         last_item: dict | None = None
         session = self.session(tid)
+        from .checkpoint_recovery import Checkpoint, attempts, reserve, candidate, CONTINUATION, delay as checkpoint_delay
+        checkpoint = self.checkpoints[turn_id] = Checkpoint(self, tid, turn_id, session['session_id'])
+        checkpoint.queue_retry = bool(record.get('queue_retry'))
+        checkpoint.queue_receipt = record.get('retry_receipt')
+        checkpoint.queue_authorized = bool(record.get('retry_authorized'))
         self.open_tools[turn_id] = {}
         got_result = False
         terminal_failure = None
         planning = self.permissions.planning(tid)
-        usage_calls = [{'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None}]
+        usage_calls = list(json.loads(self.store.db.execute('SELECT usage FROM turns WHERE id=?', (turn_id,)).fetchone()[0]).get('modelRequests', [])) if record.get('queue_retry') else []
+        usage_calls.append({'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None})
         last_call: dict = {}
 
         async def begin_text(index: int) -> dict:
@@ -1510,6 +1664,7 @@ class SubscriptionEngine(Engine):
                 counts = usage_counts(field(message, 'usage') or {})
                 if counts.get('output_tokens', 0) or (field(message, 'num_turns') or 0) > 1:
                     self.retry_blocked.add(turn_id)
+                    self.queue_effects.add(turn_id)
                 usage_calls[-1].update(outcome='received', usage=counts,
                     sdkNumTurns=field(message, 'num_turns'), billingScope='sdk-main-loop-reported-not-an-invoice')
                 # Background subagents of this turn that already ended (add_task_usage).
@@ -1550,13 +1705,15 @@ class SubscriptionEngine(Engine):
                     'clientId': json.loads(record['payload']).get('clientId')})
 
         try:
-            await self.emit(tid, 'turn/started', {'threadId': tid, 'turn': self.store.turn(turn_id, include_items=False)})
+            if not record.get('queue_retry'):
+                await self.emit(tid, 'turn/started', {'threadId': tid, 'turn': self.store.turn(turn_id, include_items=False)})
             await self.emit(tid, 'thread/status/changed', {'threadId': tid, 'status': {'type': 'active', 'activeFlags': []}})
-            await self.emit_input_presentation(tid, record["message_id"])
+            if not record.get('queue_retry'):
+                await self.emit_input_presentation(tid, record["message_id"])
             payload = json.loads(record['payload'])
             compact = payload.get('eventType') == COMPACT_EVENT
             quota_notes = self.busy_delivery.continue_quota_notes(tid, turn_id) if payload['source']['kind'] == 'user' and not compact else []
-            for item in self.store.items(turn_id):
+            for item in ([] if record.get('queue_retry') else self.store.items(turn_id)):
                 await self.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
             self._usage(turn_id, usage_calls)
@@ -1578,28 +1735,86 @@ class SubscriptionEngine(Engine):
             side = getattr(self, 'side_chats', None)
             if side is not None and not compact and side.boundary_pending(tid):
                 notes = [*SIDE_BOUNDARY_BLOCKS, *notes]
-            message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim, preceding=notes)
+            prefix = payload.get('metadata', {}).get('ownerInputs', [])
+            message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim,
+                                       preceding=[] if prefix and not compact else notes)
+            if prefix and not compact:
+                # All blocks are owner user input, in source order. Preserve
+                # images/parts rather than converting earlier inputs to notes.
+                blocks = [{'type': 'text', 'text': note} for note in notes]
+                for original in prefix:
+                    content = sdk_user_message(original['text'], original.get('attachments') or [], verbatim=True)['message']['content']
+                    blocks.extend([{'type': 'text', 'text': content}] if isinstance(content, str) else content)
+                content = message['message']['content']
+                message['message']['content'] = blocks + ([{'type': 'text', 'text': content}] if isinstance(content, str) else content)
+                if not prompt:
+                    # An image-only carrier has no typed text: the preceding
+                    # owner's /paths and @mentions must stay literal input.
+                    message['client_composed'] = True
+            if record.get('retry_continuation'):
+                from .transient_retry import RETRY_CONTINUATION
+                prompt = RETRY_CONTINUATION
+                message = sdk_user_message(prompt, [], verbatim=True)
             # Initial input presentation is not model output or a context receipt.
             # Start the sticky observation barrier before submitting to the CLI.
             self.retry_turns[tid] = turn_id
             if self._loaded_settings_hooks(tid):
                 self.retry_blocked.add(turn_id)
+            # A durably retained, proved empty transport probe has a separate
+            # backoff policy. It spends no bounded checkpoint/effect-recovery
+            # reservation; SDK admission still checks Stop, arrivals and effects.
             delays, attempt, transient_attempt = refresh_retry_delays(), 0, 0
             while True:
                 self._check_retry_cancelled(tid, turn_id)
                 await self.driver.run(engine=self, tid=tid, turn_id=turn_id,
                     session_id=session['session_id'], resume=bool(session['attempted']),
                     prompt=prompt, message=message, on_message=on_message)
+                checkpoint.queue_retry = False  # Later effect-bearing continuations use their own checkpoint.
                 self._check_retry_cancelled(tid, turn_id)
                 silent = last_item is None and not pending and not reasoning and not self.open_tools.get(turn_id)
+                owner = getattr(self.driver, 'owners', {}).get(tid)
+                if (got_result and candidate(terminal_failure) and not getattr(self.driver, 'api_account', None)
+                        and attempts(self.store, turn_id) < 2 and not self._loaded_settings_hooks(tid)
+                        and await checkpoint.verified(owner)):
+                    ordinal = reserve(self.store, turn_id, 'checkpoint-connection', {
+                        'sessionId': session['session_id'], 'errorUuid': checkpoint.error_uuid,
+                        'toolResultUuids': sorted({v[0] for v in checkpoint.results.values()})})
+                    if ordinal is None:
+                        break
+                    self.retry_waiting.add(turn_id)
+                    try:
+                        self._check_retry_cancelled(tid, turn_id)
+                        await asyncio.sleep(checkpoint_delay(ordinal))
+                        self._check_retry_cancelled(tid, turn_id)
+                    finally:
+                        self.retry_waiting.discard(turn_id)
+                    if self._loaded_settings_hooks(tid) or not await checkpoint.verified(owner):
+                        break
+                    checkpoint.pending_note = ordinal
+                    # Earlier commentary and file diffs stay visible, but an
+                    # empty success must not promote an earlier reply to final.
+                    last_item = None
+                    prompt = CONTINUATION
+                    message = sdk_user_message(prompt, [], verbatim=True)
+                    terminal_failure, got_result = None, False
+                    usage_calls.append({'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None,
+                                        'retry': ordinal, 'retryReason': 'checkpoint-connection'})
+                    self._usage(turn_id, usage_calls)
+                    continue
                 from .transient_retry import RETRY_CONTINUATION, retry_delay
                 delay = retry_delay(terminal_failure, transient_attempt) if (
                     not getattr(self.driver, 'api_account', None) and got_result and silent
+                    and attempts(self.store, turn_id) < 2
                     and turn_id not in self.retry_blocked
                     and not self._loaded_settings_hooks(tid)
                     and not self.store.db.execute('SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone()
                 ) else None
+                from .queue_recovery import transport_failure
+                if (got_result and silent and transport_failure(terminal_failure) and not checkpoint.calls
+                        and not checkpoint.unsafe and not self._loaded_settings_hooks(tid)):
+                    delay = None  # The durable input queue owns effect-free outage retries.
                 if delay is not None:
+                    reserve(self.store, turn_id, 'silent-transient')
                     transient_attempt += 1
                     self.retry_waiting.add(turn_id)
                     try:
@@ -1627,6 +1842,7 @@ class SubscriptionEngine(Engine):
                     continue
                 if not (isinstance(terminal_failure, SdkResponseError) and terminal_failure.transient_refresh
                         and got_result and silent and turn_id not in self.retry_blocked
+                        and attempts(self.store, turn_id) < 2
                         and not self._loaded_settings_hooks(tid) and attempt < len(delays)):
                     break
                 # The OAuth refresh lock was held (another Claude Code process on this
@@ -1634,6 +1850,7 @@ class SubscriptionEngine(Engine):
                 # a fixed continuation is sent once the lock is free. The native
                 # transcript already keeps the failed copy of the original input.
                 delay = delays[attempt]
+                reserve(self.store, turn_id, 'refresh-lock')
                 attempt += 1
                 self.retry_waiting.add(turn_id)
                 try:
@@ -1669,17 +1886,50 @@ class SubscriptionEngine(Engine):
             state = 'interrupted'
         except Exception as exc:
             state = 'failed'
+            failure = exc
             uncertain = isinstance(exc, OutcomeUncertain)
             account = getattr(self.driver, 'api_account', None)
             fallback = (f'{api_error_subject(account)} turn failed ({type(exc).__name__}). Check the API account configuration.'
                         if account else f'Subscription turn failed ({type(exc).__name__}). Inspect official login/seat access; no API fallback.')
             msg = str(exc) if isinstance(exc, (RpcError, ProviderError)) else fallback
-            error = {'message': msg, 'codexErrorInfo': exc.codex_error_info if isinstance(exc, SdkResponseError) else 'other',
+            error = {'message': msg, 'codexErrorInfo': exc.codex_error_info if isinstance(exc, SdkResponseError) else ({'httpConnectionFailed': {'httpStatusCode': None}} if getattr(exc, 'transport_failure', False) else 'other'),
                      'additionalDetails': exc.additional_details if isinstance(exc, SdkResponseError) else None}
         finally:
+            from .queue_recovery import plan, held_plan, QueueRetryHeld, owner_stamp
+            in_flight = bool(self.open_tools.get(turn_id)) or self.store.db.execute(
+                "SELECT 1 FROM tool_calls WHERE turn_id=? AND state IN ('started','uncertain') LIMIT 1", (turn_id,)).fetchone() is not None
+            recovery = plan(self.store, tid, failure, tool_in_flight=in_flight or checkpoint.inflight_effects
+                            or getattr(failure, 'tool_effects_uncertain', False)) if failure else None
+            owner = getattr(self.driver, 'owners', {}).get(tid)
+            empty = (last_item is None and not pending and not reasoning and not checkpoint.fresh_content
+                and not checkpoint.calls and not checkpoint.hooks and not checkpoint.inflight_effects
+                and not checkpoint.unsafe and turn_id not in self.queue_effects and not locals().get('compact', False)
+                and not in_flight and not getattr(failure, 'tool_effects_uncertain', False)
+                and not self._loaded_settings_hooks(tid)
+                and not self.store.db.execute('SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone()
+                and (owner is None or not checkpoint.live_effects(owner)
+                    and owner.recovery_arrivals == owner.recovery_revision
+                    and (not got_result or getattr(checkpoint, 'empty_terminal_stamp', None) == owner_stamp(owner))))
+            defer_input = bool(recovery and empty and (got_result and isinstance(failure, SdkResponseError) or getattr(failure, 'before_submission', False)))
+            if defer_input:
+                recovery = plan(self.store, tid, failure, tool_in_flight=False, empty=True)
+            if recovery and not defer_input:
+                progressed = bool(last_item or pending or reasoning or checkpoint.fresh_content or checkpoint.calls
+                    or turn_id in self.queue_effects or self.store.db.execute(
+                        'SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone())
+                recovery = recovery if progressed else None
+            if isinstance(failure, QueueRetryHeld) and record.get('queue_retry') and not in_flight and not self.store.db.execute('SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone():
+                recovery, defer_input = held_plan(self.store, tid), True
+            if recovery and error:
+                error['message'] += (' Queue held because repeated consumed failures or uncertain runtime activity require review; use Resume to continue untouched queued work.'
+                    if recovery['held'] else ' Connection interrupted; retrying the same retained input after backoff.' if defer_input else ' Untouched queued work continues after backoff; this failed input is not replayed.')
             self.retry_turns.pop(tid, None)
             self.retry_waiting.discard(turn_id)
             self.retry_blocked.discard(turn_id)
+            self.queue_effects.discard(turn_id)
+            self.checkpoints.pop(turn_id, None)
+            self.store.db.execute("UPDATE sdk_recovery_attempts SET state=? WHERE turn_id=? AND state IN ('reserved','submitted')",
+                                  (state, turn_id))
             for item in list(pending.values()) + list(reasoning.values()):
                 self.store.put_item(turn_id, item)
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
@@ -1687,12 +1937,40 @@ class SubscriptionEngine(Engine):
                 interrupted_item(item, 'Execution interrupted; inspect the execution outcome and any side effects.')
                 self.store.put_item(turn_id, item)
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
-            self.store.db.execute('UPDATE sdk_sessions SET last_status=? WHERE thread_id=?', (state, tid))
-            self.store.finish(tid, turn_id, state, error)
+            self.store.db.execute('UPDATE sdk_sessions SET last_status=? WHERE thread_id=?', ('queued' if defer_input else state, tid))
+            if defer_input:
+                from .queue_recovery import empty_receipt, empty_history, owner_stamp
+                try:
+                    receipt = empty_receipt(self, tid, turn_id, owner, terminal=bool(got_result), error_uuid=checkpoint.error_uuid)
+                    previous = record.get('retry_receipt') or {}
+                    if not got_result and record.get('retry_continuation') and previous.get('state') == 'terminal-empty':
+                        receipt = dict(previous)  # Saved native context survives a probe that never submitted.
+                    if got_result and owner is not None:
+                        receipt['history'] = await asyncio.to_thread(empty_history, owner, session['session_id'], checkpoint.error_uuid, (previous.get('history') or {}).get('anchor'))
+                        if owner_stamp(owner) != getattr(checkpoint, 'empty_terminal_stamp', None):
+                            recovery = held_plan(self.store, tid)
+                except OSError:
+                    receipt, recovery = None, held_plan(self.store, tid)
+                self.store.defer_silent_input(tid, turn_id, recovery, continuation=bool(record.get('retry_continuation') or got_result), error=error, receipt=receipt, dispatch='terminal-empty' if got_result else 'not-submitted')
+            else:
+                self.store.finish(tid, turn_id, state, error, queue_recovery=recovery)
             await self._flush_task_usage(tid, turn_id)
-            if uncertain:
+            if uncertain and not defer_input:
                 self.store.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=?", (turn_id,))
-            await self.emit(tid, 'turn/completed', {'threadId': tid, 'turn': self.store.turn(turn_id)})
+            if defer_input and recovery['held']:
+                await self.emit(tid, 'claude/queue/holdChanged', {'threadId': tid, 'turnId': turn_id,
+                    'held': True, 'reason': 'silentTransportGuard'})
+            if defer_input:
+                from .queue_recovery import remaining
+                retry_seconds = int(remaining(self.store, tid))
+                await self.emit(tid, 'error', {'threadId': tid, 'turnId': turn_id, 'willRetry': not recovery['held'],
+                    'nextRetryAt': int(recovery['notBefore'] * 1000), 'retryableInput': not recovery['held'], 'error': {
+                    'message': 'Connection unavailable; the original input remains queued. ' + (
+                        'Ask the Director or owner to Resume after the connection recovers.' if recovery['held'] else
+                        f'Connection interrupted; waiting for network; retrying in {retry_seconds // 60:02d}:{retry_seconds % 60:02d} without consuming the next input.'),
+                    'codexErrorInfo': error['codexErrorInfo'] if error else 'other', 'additionalDetails': None}})
+            else:
+                await self.emit(tid, 'turn/completed', {'threadId': tid, 'turn': self.store.turn(turn_id)})
             await self.emit(tid, 'thread/status/changed', {'threadId': tid, 'status': {'type': 'idle'}})
             await self.emit(tid, 'claude/input/statusChanged', self.store.input_status(tid, record['message_id']))
 

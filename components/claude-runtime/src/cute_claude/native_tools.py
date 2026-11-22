@@ -479,6 +479,11 @@ class NativeTools:
             return b.denied('Native tool call omitted its identity or arguments')
         if not b.accepting or not b.binding:
             return {}
+        checkpoint = getattr(b.engine, 'checkpoints', {}).get(b.binding[0])
+        if observation and checkpoint is not None and call_id in checkpoint.results:
+            # A repeated completed ID is rejected by PreToolUse. Its canonical
+            # observation must not replace the original successful timeline row.
+            return {}
         if call_id in self.seen:
             return {}  # SDK owns retries; observation never authorizes an execution.
         self.seen.add(call_id)

@@ -28,12 +28,23 @@ def validate_metadata(event_type: str, metadata: dict) -> None:
             'metadata.attempt must be a positive integer')
 
 
-def busy_reason(server, tid: str) -> str | None:
+def busy_reason(server, tid: str, *, stop_answer: bool = False) -> str | None:
     """Why an exclusive input can't start its own turn now (None: it can)."""
     thread = server.store.thread(tid)
-    if thread['halted'] or tid in getattr(server.engine, 'offline_threads', set()):
+    if tid in server.store.recovered_probes:
+        return 'active_turn'
+    if tid in getattr(server.engine, 'offline_threads', set()) or thread['archived']:
         return 'gate_closed'
-    if server.store.pending(tid):
+    if (thread['halted'] and not stop_answer) or tid in server.store.history_mutations:
+        return 'gate_closed'
+    gate = getattr(server.engine, 'tool_gate', None)
+    if stop_answer and gate is not None and gate.closed(tid):
+        return 'agent_paused'
+    from .queue_recovery import remaining
+    if remaining(server.store, tid) > 0:
+        return 'active_turn'
+    processing = server.store.db.execute("SELECT 1 FROM inputs WHERE thread_id=? AND state='processing' LIMIT 1", (tid,)).fetchone()
+    if (processing if stop_answer else server.store.pending(tid)):
         return 'active_turn'
     if server.approvals.planning(tid):
         return 'plan_mode'

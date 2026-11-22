@@ -473,7 +473,15 @@ mod windows {
     }
 
     fn nt_result(status: i32) -> io::Result<()> {
-        if status < 0 {
+        // A delete-pending name has already left the usable namespace. Windows maps
+        // this status to access denied, which would confuse normal SQLite sidecar
+        // teardown with a permissions failure. Keep genuine access-denied errors.
+        if status as u32 == 0xc0000056 {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cleanup object is delete-pending",
+            ))
+        } else if status < 0 {
             Err(io::Error::from_raw_os_error(
                 unsafe { RtlNtStatusToDosError(status) } as i32,
             ))
@@ -628,24 +636,67 @@ mod windows {
         };
         nt_result(status)?;
         let file = unsafe { File::from_raw_handle(handle) };
-        // Verify the opened object before reading any content or returning a writable output.
-        // Comparing handle paths also rejects filesystem-specific unexpected root-reparse behavior.
+        verify_child_binding(dir, child, &file, parent_identity)?;
+        // Materialize the final handle identity now, before the caller can read/copy bytes.
+        file_identity(&file)?;
+        Ok(file)
+    }
+
+    fn delete_pending(file: &File) -> io::Result<bool> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+        };
+        let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStandardInfo,
+                (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.DeletePending)
+    }
+
+    fn verify_child_binding(
+        dir: &Dir,
+        child: &OsStr,
+        file: &File,
+        parent_identity: (u64, u64),
+    ) -> io::Result<()> {
+        // Comparing handle paths also rejects unexpected root-reparse behavior.
         let expected = handle_path(&dir.file)?.join(child);
-        let actual = handle_path(&file)?;
-        if !actual
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
-            || file_identity(&dir.file)? != parent_identity
+        let actual = handle_path(file);
+        if file_identity(&dir.file)? != parent_identity
             || !matches!(kind(&dir.file.metadata()?), Kind::Directory)
         {
             return Err(io::Error::other(
                 "cleanup filesystem parent binding changed",
             ));
         }
-        // Materialize the final handle identity now, before the caller can read/copy bytes.
-        file_identity(&file)?;
-        Ok(file)
+        if !actual.as_ref().is_ok_and(|path| {
+            path.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+        }) {
+            // Metadata-only handles do not prevent SQLite's unlink. Windows can
+            // move that object into $Extend/$Deleted between open and inspection.
+            // Only a confirmed deleted object is absent; a rename still fails closed.
+            if delete_pending(file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cleanup object was deleted",
+                ));
+            }
+            actual?;
+            return Err(io::Error::other(
+                "cleanup filesystem parent binding changed",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn snapshot(dir: &Dir, child: &OsStr) -> io::Result<Entry> {
@@ -882,6 +933,92 @@ mod windows {
             }
             names.sort();
             Ok(names)
+        }
+    }
+
+    #[cfg(test)]
+    mod sidecar_tests {
+        use super::*;
+
+        fn fixture() -> (PathBuf, Arc<Dir>) {
+            let root =
+                std::env::temp_dir().join(format!("cleanup-sidecar-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let dir = Dir::absolute(&root.canonicalize().unwrap()).unwrap();
+            (root, dir)
+        }
+
+        #[test]
+        fn pending_delete_sidecars_are_absent_without_hiding_access_denied() {
+            let (root, dir) = fixture();
+            for name in ["storage.sqlite3-wal", "storage.sqlite3-shm"] {
+                fs::write(root.join(name), b"synthetic sidecar").unwrap();
+                let held = child_handle(
+                    &dir,
+                    OsStr::new(name),
+                    DELETE | FILE_READ_ATTRIBUTES,
+                    1,
+                    0x40,
+                    true,
+                )
+                .unwrap();
+                let disposition = 1u8;
+                let mut completion = IoStatusBlock {
+                    value: IoStatusValue { status: 0 },
+                    information: 0,
+                };
+                nt_result(unsafe {
+                    NtSetInformationFile(
+                        held.as_raw_handle(),
+                        &mut completion,
+                        (&disposition as *const u8).cast(),
+                        1,
+                        13,
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    snapshot(&dir, OsStr::new(name)).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+                drop(held);
+            }
+            assert_eq!(
+                nt_result(0xc0000022u32 as i32).unwrap_err().raw_os_error(),
+                Some(5)
+            );
+            drop(dir);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn deleted_sidecar_handles_are_absent_but_renamed_handles_are_rejected() {
+            let (root, dir) = fixture();
+            for name in ["storage.sqlite3-wal", "storage.sqlite3-shm"] {
+                let name = OsStr::new(name);
+                fs::write(root.join(name), b"synthetic sidecar").unwrap();
+                let held = pin_file(&dir, name).unwrap();
+                let parent = file_identity(&dir.file).unwrap();
+                fs::remove_file(root.join(name)).unwrap();
+                assert_eq!(
+                    verify_child_binding(&dir, name, &held, parent)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::NotFound
+                );
+                drop(held);
+
+                fs::write(root.join(name), b"synthetic replacement").unwrap();
+                let held = pin_file(&dir, name).unwrap();
+                fs::rename(root.join(name), root.join("renamed")).unwrap();
+                let error = verify_child_binding(&dir, name, &held, parent).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert!(error.to_string().contains("parent binding changed"));
+                drop(held);
+                fs::remove_file(root.join("renamed")).unwrap();
+            }
+            drop(dir);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }

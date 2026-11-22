@@ -170,9 +170,12 @@ fn listed_tools(port: u16, token: &str, runtime: &RuntimeAgentId) -> Value {
 const ALARM_SET: &str = "alarm_set";
 const ALARM_LIST: &str = "alarm_list";
 const ALARM_CANCEL: &str = "alarm_cancel";
+const SCHEDULE_LIST: &str = "schedule_list"; // r290 P5 own-target read only.
 
 pub fn tools() -> Value {
     let mut tools = crate::agent_bus::alarms::tools();
+    tools.push(crate::profile_quota_agents::tool()); // r290 P12.
+    tools.extend(crate::schedules::runtime::agent_tools()); // r290 P5.
     tools.extend(management::tools().into_iter().filter(|t| t["name"] != "agent_archive"));
     tools.extend(archive_mcp::definitions());
     tools.extend(services::tools());
@@ -305,6 +308,27 @@ fn caller_thread(params: &Value, bound_thread: Option<&str>) -> anyhow::Result<S
     bound.or(supplied).context("MCP threadId missing: use launcher binding or per-call metadata")
 }
 
+/// Launcher bindings are explicit. Native root discovery is fresh on every
+/// request: a shared MCP process can survive a parent thread replacement.
+fn current_parent_binding(bound:Option<&str>,load:impl FnOnce()->Option<String>)->Option<String> {
+    bound.map(str::to_owned).or_else(load)
+}
+
+/// Caller identity comes only from launcher state/native transport metadata.
+/// The child never borrows a parent management principal.
+fn caller_scope(params:&Value,bound:Option<&str>,child_env:Option<&str>)->anyhow::Result<(String,Option<String>)> {
+    let supplied=params.pointer("/_meta/threadId").map(|v|v.as_str().context("invalid MCP threadId")
+        .and_then(crate::session::identity::normalize_codex_session_id)).transpose()?;
+    let Some(root)=bound else {anyhow::ensure!(child_env.is_none(),"native child requires a verified parent binding");return Ok((caller_thread(params,None)?,None));};
+    if let Some(child)=child_env {
+        anyhow::ensure!(super::native_subagent::valid_child(child),"invalid native child identity");
+        anyhow::ensure!(supplied.as_deref().is_none_or(|id|id==root || id==child),"MCP child metadata differs from launcher");
+        return Ok((root.to_owned(),Some(child.to_owned())));
+    }
+    if let Some(child)=supplied.filter(|id|id!=root) {return Ok((root.to_owned(),Some(child)));}
+    Ok((caller_thread(params,Some(root))?,None))
+}
+
 /// The default `action_id` of an ask tool call (asks §6.1), known before the
 /// first side effect: (runtime, generation, thread, turn, tool, canonical
 /// arguments). The turn comes from cute-codex's per-call metadata
@@ -398,6 +422,11 @@ fn rpc_error(id: &Value, error: &anyhow::Error) -> Value {
 
 pub fn run() -> anyhow::Result<()> {
     use std::io::{BufRead, Read, Write};
+    // r290 P8/P12: each MCP process installs the live five-hour attribution reader.
+    let _ = crate::profile_quota_agents::attribution::install(|profile| {
+        use crate::management::v2::usage::quota_attribution::{live, Selector, WindowKind};
+        live(&Selector::Profile(profile.into()), WindowKind::FiveHour).ok()
+    });
     let runtime = RuntimeAgentId::new(std::env::var("CUTEX_AGENT_ID")?)
         .map_err(|_| anyhow::anyhow!("invalid runtime ID"))?;
     let generation: u64 = std::env::var("CUTEX_RUNTIME_GENERATION")?.parse()?;
@@ -419,6 +448,10 @@ pub fn run() -> anyhow::Result<()> {
         bail!("MCP requires the configured local Cutex Bus endpoint");
     }
     let port = url.port().context("explicit local Bus port required")?;
+    // Native stdio servers are shared by parent/child threads. Resolve only the
+    // authenticated runtime's root; per-call child ancestry is verified later.
+    let env_child=std::env::var(super::native_subagent::CHILD_ENV).ok();
+
     // approval-wait: cutex opts this façade in (Codex launch config, Claude
     // adapters declaring features.approvalWait); then gated service and
     // agent launches hold on the Bus for the owner instead of answering
@@ -452,7 +485,7 @@ pub fn run() -> anyhow::Result<()> {
         };
         let concurrent = message["method"] == "tools/call";
         let respond = {
-            let (token, runtime, bound_thread, output, process, env_turn) = (token.clone(), runtime.clone(), bound_thread.clone(), output.clone(), process.clone(), env_turn.clone());
+            let (token, runtime, bound_thread, output, process, env_turn, env_child) = (token.clone(), runtime.clone(), bound_thread.clone(), output.clone(), process.clone(), env_turn.clone(),env_child.clone());
             move || -> anyhow::Result<()> {
         let id = &id;
         let mut timing = (message["method"] == "tools/call").then(|| {
@@ -468,10 +501,22 @@ pub fn run() -> anyhow::Result<()> {
                 json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cutex-outbound-prototype","version":"1"}}),
             ),
             Some("ping") => Ok(json!({})),
-            Some("tools/list") => Ok(listed_tools(port, &token, &runtime)),
+            Some("tools/list") => {
+                let list=listed_tools(port,&token,&runtime);
+                let root=current_parent_binding(bound_thread.as_deref(),||
+                    crate::agent_bus::client::fetch_mcp_toolset(port,&token,&runtime).ok().and_then(|value|
+                        value["parentThreadId"].as_str().and_then(|id|crate::session::identity::normalize_codex_session_id(id).ok())));
+                let child=env_child.is_some() || caller_scope(&message["params"],root.as_deref(),None).is_ok_and(|(_,child)|child.is_some());
+                Ok(if child {super::native_subagent::filter_tools(list)} else {list})
+            },
             Some(method) if empty_listing(method).is_some() => Ok(empty_listing(method).unwrap_or_default()),
             Some("tools/call") => (|| -> anyhow::Result<Value> {
-                let thread = caller_thread(&message["params"], bound_thread.as_deref())?;
+                // Read the authenticated current root for each call. Neither an early
+                // missing binding nor a previous thread is retained across calls.
+                let root=current_parent_binding(bound_thread.as_deref(),||
+                    crate::agent_bus::client::fetch_mcp_toolset(port,&token,&runtime).ok().and_then(|value|
+                        value["parentThreadId"].as_str().and_then(|id|crate::session::identity::normalize_codex_session_id(id).ok())));
+                let (thread, child) = caller_scope(&message["params"], root.as_deref(),env_child.as_deref())?;
                 let name = message["params"]["name"]
                     .as_str()
                     .context("tool name missing")?;
@@ -481,6 +526,12 @@ pub fn run() -> anyhow::Result<()> {
                     generation,
                 };
                 let (name, mut args) = legacy_call(name, args).map_err(anyhow::Error::msg)?;
+                if let Some(child)=child {
+                    if !super::native_subagent::allowed(name) {return Ok(super::native_subagent::refusal());}
+                    return crate::agent_bus::client::submit_native_child_read(port,&token,&runtime,&fence,&child,
+                        &json!({"tool":name,"arguments":args}));
+                }
+
                 if (matches!(name, "agent_create" | "agent_delegate" | "agent_tell" | "agent_pause" | "agent_resume")
                     || management::is_tool(name) || archive_mcp::is_tool(name)) && args.get("action_id").is_none_or(Value::is_null) {
                     let key = receipt_action_id(&message["params"], &rpc_call_key(&process, id),
@@ -571,13 +622,14 @@ pub fn run() -> anyhow::Result<()> {
                         )?,
                         Err(error) => json!({"ok":false,"code":"invalid_arguments","detail":error.to_string()}),
                     }
-                } else if matches!(name, ALARM_SET | ALARM_LIST | ALARM_CANCEL) {
+                } else if matches!(name, ALARM_SET | ALARM_LIST | ALARM_CANCEL | SCHEDULE_LIST | "profile_list") { // r290 P5/P12.
                     let roster = crate::agent_bus::client::submit_mcp_control(
                         port, &token, &runtime, &fence,
                         crate::agent_bus::agent_auth::MCP_AGENT_LIST_PATH, &json!({}))?;
                     let outcome = (|| -> anyhow::Result<Value> {
                         anyhow::ensure!(roster["ok"] == true && roster["scope"] == "local_group_visible", "Caller registration unavailable");
                         let owner = crate::agent_bus::alarms::caller_owner(runtime.as_str())?;
+                        if name == "profile_list" {return crate::profile_quota_agents::list(&owner,&args)} // r290 P12.
                         match name {
                             ALARM_SET => {
                                 let a: crate::agent_bus::alarms::SetArgs=serde_json::from_value(args)?;
@@ -596,6 +648,7 @@ pub fn run() -> anyhow::Result<()> {
                                 anyhow::ensure!(args.as_object().is_some_and(|a|a.is_empty()),"Expected empty arguments");
                                 crate::agent_bus::alarms::list(Some(&owner))
                             }
+                            SCHEDULE_LIST => crate::schedules::runtime::agent_list(&owner,&args), // r290 P5.
                             _ => {
                                 anyhow::ensure!(args.as_object().is_some_and(|a|a.len()==1),"Expected alarm_id only");
                                 crate::agent_bus::alarms::cancel(Some(&owner),args["alarm_id"].as_str().context("alarm_id missing")?)
@@ -609,7 +662,7 @@ pub fn run() -> anyhow::Result<()> {
                         detail: format!("Nothing was sent: {} is not a cutex tool; use the tools in tools/list.", name.chars().take(80).collect::<String>()),
                     }));
                 };
-                if matches!(name, ALARM_SET | ALARM_LIST | ALARM_CANCEL) {
+                if matches!(name, ALARM_SET | ALARM_LIST | ALARM_CANCEL | SCHEDULE_LIST) {
                     if let Ok(index)=crate::short_ids::session_index() {
                         crate::short_ids::render_value(&mut result,&index,crate::short_ids::settings());
                     }
@@ -1073,5 +1126,32 @@ mod tests {
         assert!(!down.to_string().contains("C:/x"));
         let resolver = json!({"ok":false,"code":"id_ambiguous","candidates":[]});
         assert_eq!(preflight_rejection(resolver.clone()), resolver);
+    }
+}
+
+#[cfg(test)]
+mod native_child_scope_tests {
+    use super::*;
+    const ROOT:&str="018e0000-0000-7000-8000-0000a0000001";
+    const CHILD:&str="018e0000-0000-7000-8000-0000a0000002";
+    #[test] fn native_parent_binding_refreshes_after_missing_root_and_thread_replacement() {
+        assert_eq!(current_parent_binding(None,||None),None);
+        let first=current_parent_binding(None,||Some(ROOT.into()));
+        assert_eq!(first.as_deref(),Some(ROOT));
+        let replaced=current_parent_binding(None,||Some(CHILD.into()));
+        assert_eq!(replaced.as_deref(),Some(CHILD));
+        // A surviving facade recognizes the replacement parent as the parent,
+        // rather than using the old positive binding to classify it as a child.
+        assert_eq!(caller_scope(&json!({"_meta":{"threadId":CHILD}}),replaced.as_deref(),None).unwrap(),(CHILD.into(),None));
+        assert_eq!(current_parent_binding(None,||None),None,"old roots must not survive missing runtime state");
+        assert_eq!(current_parent_binding(Some(ROOT),||panic!("explicit launcher binding")),Some(ROOT.into()));
+    }
+    #[test] fn native_and_claude_children_do_not_replace_parent_fence() {
+        assert_eq!(caller_scope(&json!({"_meta":{"threadId":CHILD}}),Some(ROOT),None).unwrap(),(ROOT.into(),Some(CHILD.into())));
+        assert_eq!(caller_scope(&json!({"_meta":{"threadId":ROOT}}),Some(ROOT),Some("a3f74c9")).unwrap(),(ROOT.into(),Some("a3f74c9".into())));
+        assert_eq!(caller_scope(&json!({"_meta":{"threadId":ROOT}}),Some(ROOT),None).unwrap(),(ROOT.into(),None));
+        assert!(caller_scope(&json!({"_meta":{"threadId":CHILD}}),Some(ROOT),Some("different")).is_err());
+        assert_eq!(caller_scope(&json!({"arguments":{"childId":CHILD}}),Some(ROOT),None).unwrap(),(ROOT.into(),None));
+        assert!(caller_scope(&json!({"_meta":{"threadId":ROOT}}),None,Some("child")).is_err());
     }
 }

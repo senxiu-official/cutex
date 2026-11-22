@@ -100,6 +100,44 @@ pub fn read_since(since: i64) -> anyhow::Result<Vec<QuotaSnapshot>> {
     read_since_at(&history_root()?, since)
 }
 
+// r290 P12: reuse parsed history while the underlying month files are unchanged.
+#[derive(Clone)]
+struct HistoryCacheEntry {
+    root:PathBuf,
+    signature:Vec<(PathBuf,u64,Option<std::time::SystemTime>)>,
+    since:i64,
+    points:std::sync::Arc<Vec<QuotaSnapshot>>,
+}
+#[derive(Default)]
+struct HistoryCache { entry:Mutex<Option<HistoryCacheEntry>> }
+static HISTORY_CACHE:HistoryCache=HistoryCache{entry:Mutex::new(None)};
+impl HistoryCache {
+    fn signature(root:&Path)->anyhow::Result<Vec<(PathBuf,u64,Option<std::time::SystemTime>)>> {
+        let mut stems=list_month_stems(root)?;stems.sort();
+        stems.into_iter().rev().take(2).map(|stem| {
+            let path=root.join(format!("{stem}.jsonl"));let metadata=fs::metadata(&path)?;
+            Ok((path,metadata.len(),metadata.modified().ok()))
+        }).collect()
+    }
+    fn read(&self,root:&Path,since:i64,load:impl FnOnce(&Path,i64)->anyhow::Result<Vec<QuotaSnapshot>>)->anyhow::Result<Vec<QuotaSnapshot>> {
+        let signature=Self::signature(root)?;
+        let cached=self.entry.lock().map_err(|_|anyhow::anyhow!("quota history cache poisoned"))?.clone();
+        if let Some(entry)=cached.filter(|e|e.root==root&&e.signature==signature&&e.since<=since) {
+            return Ok(entry.points.iter().filter(|p|p.ts>=since).cloned().collect())
+        }
+        let floor=since.div_euclid(3600)*3600;
+        let points=std::sync::Arc::new(load(root,floor)?);
+        // No cache mutex across file IO. Do not cache a snapshot if a writer raced it.
+        if signature==Self::signature(root)? {
+            *self.entry.lock().map_err(|_|anyhow::anyhow!("quota history cache poisoned"))?=Some(HistoryCacheEntry{root:root.into(),signature,since:floor,points:std::sync::Arc::clone(&points)});
+        }
+        Ok(points.iter().filter(|p|p.ts>=since).cloned().collect())
+    }
+}
+pub fn read_cached_since(since:i64)->anyhow::Result<Vec<QuotaSnapshot>> {
+    HISTORY_CACHE.read(&history_root()?,since,read_since_at)
+}
+
 pub(super) fn read_since_at(root: &Path, since: i64) -> anyhow::Result<Vec<QuotaSnapshot>> {
     let mut snapshots = read_recent(root)?;
     snapshots.retain(|snapshot| snapshot.ts >= since);
@@ -268,6 +306,21 @@ fn sort_and_dedup(all: &mut Vec<QuotaSnapshot>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_cache_reuses_unchanged_files_and_invalidates_appends() {
+        let root=std::env::temp_dir().join(format!("quota-history-cache-{}",uuid::Uuid::new_v4()));
+        let snapshot=QuotaSnapshot{ts:1800000000,profile_id:"p".into(),profile:"P".into(),gauge_id:"g".into(),label:None,kind:Some("window".into()),remaining_percent:Some(30.0),balance:None,reset_at:None};
+        append_snapshot(&root,&snapshot).unwrap();
+        let cache=HistoryCache::default();let reads=std::cell::Cell::new(0);
+        let load=|root:&Path,since|{reads.set(reads.get()+1);read_since_at(root,since)};
+        assert_eq!(cache.read(&root,snapshot.ts-100,&load).unwrap().len(),1);
+        assert_eq!(cache.read(&root,snapshot.ts,&load).unwrap().len(),1);assert_eq!(reads.get(),1);
+        let mut next=snapshot.clone();next.ts+=60;append_snapshot(&root,&next).unwrap();
+        assert_eq!(cache.read(&root,snapshot.ts,&load).unwrap().len(),2);assert_eq!(reads.get(),2);
+        assert_eq!(cache.read(&root,snapshot.ts+1,&load).unwrap(),vec![next]);assert_eq!(reads.get(),2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recent_history_deduplicates_upstream_observations_like_range_history() {

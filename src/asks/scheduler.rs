@@ -160,6 +160,9 @@ pub enum SubmitOutcome {
     TooLarge { item_bytes: Option<u64>, limit: Option<u64> },
     /// Sent; the outcome is unknown. Reconcile by message id.
     Uncertain(String),
+    /// Replay of an existing native result that is positively held and has
+    /// not entered a turn. Keep its identity; only an owner retry may resend.
+    Held { reason: String },
 }
 
 /// Host event (owner): cutex gave up delivering a delegation message,
@@ -371,9 +374,15 @@ pub trait AskRuntime {
         None
     }
     fn target_status(&self, session: &str) -> TargetStatus;
+    // r290 P7: positive process-exit evidence, never a transport disconnect.
+    fn runtime_exited(&self, _session: &str, _generation: u64) -> bool { false }
     /// N1 submit. Implementations re-check owner input under the session's
     /// input lock and answer `Busy` when the owner got there first.
     fn submit_exclusive(&self, session: &str, generation: u64, submission: &Submission) -> SubmitOutcome;
+    fn supports_stop_answer(&self, _session: &str, _generation: u64) -> bool { false }
+    fn query_awaited_job(&self, _session: &str, _job_id: &str) -> anyhow::Result<Value> {
+        anyhow::bail!("job query unavailable")
+    }
     fn message_status(&self, session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus;
     /// 057 §6: take a carried results event back from the runtime. `true`:
     /// its carrier steer is proven never read and the runtime no longer has
@@ -779,6 +788,9 @@ fn fail_ask_with(state: &mut AskState, ask_id: &str, code: &str, detail: Option<
         }
         ask.closed = Some(CloseOutcome::Completed);
         ask.closed_at = Some(now_rfc3339(now));
+        ask.awaiting = None;
+        ask.resume = None;
+        ask.bounded_continuation.cancel(code);
     });
     if let Some(ask) = state.asks.get(ask_id).cloned() {
         super::delivery::record_state_delivery(state, &ask, code, now);
@@ -1095,6 +1107,15 @@ pub(crate) fn reconcile_bound(
     }
     let status = runtime.target_status(&lease.cutex_session_id);
     if !status.online {
+        // r290 P7: a dead original runtime proves this turn cannot continue.
+        // Deliberate owner-offline and Stop keep their existing settlement.
+        let owner_offline = store.inspect(|state| state.owner_offline.contains(&lease.cutex_session_id))?;
+        if !owner_offline && runtime.runtime_exited(&lease.cutex_session_id, lease.runtime_generation) {
+            super::observe::finalize_fenced(store, &lease.cutex_session_id, ask_id, *attempt,
+                &json!({"id":turn_id,"status":"interrupted","error":{"code":"runtimeExited","message":"The handler runtime process exited before the turn finished."}}),
+                Some(InterruptReason::RuntimeRestart), now, lease)?;
+            return Ok(());
+        }
         // 054 §2.12 (c): offline past the grace makes the lease stale.
         super::lease_reconcile::offline(store.dir(), lease, now);
         return Ok(());
@@ -1260,22 +1281,9 @@ pub(super) fn settle_stopped_attempt(store: &AskStore, session: &str, ask_id: &s
     Ok(true)
 }
 
-/// Settle stops a target can no longer take (asks with an offline or
-/// archived target never closed: the interrupt fails while the target is
-/// offline, and bound-lease reconciliation waits for it to come back).
-///
-/// Rule, per leased attempt that is not over yet:
-/// - target **online or reconnectable**: nothing here (the queued
-///   interrupt or the reconciliation ends it; a reconnecting runtime never
-///   settles early);
-/// - target **archived** (retired, or no longer in the directory): the
-///   attempt ends `interrupted(stopped)` at once, whether or not a stop was
-///   requested (it can never run again);
-/// - target **offline, not reconnectable, stop pending**: the first tick
-///   that sees it records `stopOfflineSince`; once it has been seen so for
-///   `asks.limits.stopOfflineGraceSecs` (default 300 s) the attempt ends
-///   `interrupted(stopped)`. Seeing the target online or reconnectable in
-///   between clears the mark (the grace starts over).
+/// Retirement is terminal directory evidence even while transport metadata
+/// remains reconnectable. Offline silence is handled by the durable absolute
+/// stop deadline; it never manufactures a native completion.
 fn settle_unreachable_stops(
     world: &dyn SchedulerWorld,
     runtime: &dyn AskRuntime,
@@ -1297,7 +1305,6 @@ fn settle_unreachable_stops(
     }
     // Loaded at most once per tick, and only for an offline target.
     let mut directory: Option<Option<Directory>> = None;
-    let mut grace: Option<chrono::Duration> = None;
     for (session, ask_id, attempt) in leased {
         let Some(record) = state
             .asks
@@ -1309,53 +1316,19 @@ fn settle_unreachable_stops(
         if record.state.is_terminal() {
             continue;
         }
-        let status = runtime.target_status(&session);
-        if status.online || status.reconnectable {
-            if record.stop_offline_since.is_some() {
-                store.with_state(|state| {
-                    state.update_ask(&ask_id, now, |ask| {
-                        if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
-                            record.stop_offline_since = None;
-                        }
-                    })
-                })?;
-            }
-            continue;
-        }
-        let archived = directory
-            .get_or_insert_with(|| world.directory().ok())
-            .as_ref()
+        let archived = directory.get_or_insert_with(|| world.directory().ok()).as_ref()
             .is_some_and(|directory| directory.get(&session).is_none_or(|info| info.archived));
         if archived {
-            if settle_stopped_attempt(store, &session, &ask_id, attempt, now)? {
-                report.interrupted.push(ask_id);
-            }
+            if settle_stopped_attempt(store, &session, &ask_id, attempt, now)? { report.interrupted.push(ask_id); }
             continue;
         }
+        let _ = runtime;
         if !record.stop_requested {
             continue;
         }
-        let grace = *grace.get_or_insert_with(|| {
-            // Capped at a year (chrono's range; "never" is not offered).
-            chrono::Duration::seconds(world.limits().stop_offline_grace_secs.min(365 * 24 * 3600) as i64)
-        });
-        match record.stop_offline_since.as_deref().and_then(super::parse_time) {
-            Some(since) if now - since >= grace => {
-                if settle_stopped_attempt(store, &session, &ask_id, attempt, now)? {
-                    report.interrupted.push(ask_id);
-                }
-            }
-            Some(_) => {}
-            None => {
-                store.with_state(|state| {
-                    state.update_ask(&ask_id, now, |ask| {
-                        if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
-                            record.stop_offline_since = Some(now_rfc3339(now));
-                        }
-                    })
-                })?;
-            }
-        }
+        // Offline silence never proves the original occurrence ended.
+        // stop_settlement's durable absolute deadline exposes unconfirmed.
+
     }
     Ok(())
 }
@@ -1817,7 +1790,7 @@ fn admit(
         SubmitOutcome::Busy { .. } | SubmitOutcome::Refused(_) => 409,
         SubmitOutcome::Unsupported(_) => 422,
         SubmitOutcome::TooLarge { .. } => 413,
-        SubmitOutcome::Uncertain(_) => 503,
+        SubmitOutcome::Uncertain(_) | SubmitOutcome::Held { .. } => 503,
     });
     timing.stage(ControlStage::StoreWrite);
     if let Err(error) = store.with_state(|state| match outcome {
@@ -1841,7 +1814,7 @@ fn admit(
         SubmitOutcome::TooLarge { item_bytes, limit } => {
             rejected_too_large(state, target, ask_id, attempt_n, "ASK", submission.text.len(), item_bytes, limit, &target_label, report, now);
         }
-        SubmitOutcome::Uncertain(error) => {
+        SubmitOutcome::Uncertain(error) | SubmitOutcome::Held { reason: error } => {
             // Keep `submitting` and the lease; reconcile by message id (at
             // once), and admit again only after a backoff.
             state.update_ask(ask_id, now, |ask| {
@@ -2053,7 +2026,7 @@ fn admit_continuation(
         SubmitOutcome::Busy { .. } | SubmitOutcome::Refused(_) => 409,
         SubmitOutcome::Unsupported(_) => 422,
         SubmitOutcome::TooLarge { .. } => 413,
-        SubmitOutcome::Uncertain(_) => 503,
+        SubmitOutcome::Uncertain(_) | SubmitOutcome::Held { .. } => 503,
     });
     timing.stage(ControlStage::StoreWrite);
     if let Err(error) = store.with_state(|state| match outcome {
@@ -2077,7 +2050,7 @@ fn admit_continuation(
         SubmitOutcome::TooLarge { item_bytes, limit } => {
             rejected_too_large(state, target, ask_id, attempt_n, "ASK continuation", submission.text.len(), item_bytes, limit, &target_label, report, now);
         }
-        SubmitOutcome::Uncertain(error) => {
+        SubmitOutcome::Uncertain(error) | SubmitOutcome::Held { reason: error } => {
             state.update_ask(ask_id, now, |ask| {
                 super::continuation::runtime::unknown(ask);
                 let failures = note_submit_failure(ask, &error, now);
@@ -2572,9 +2545,11 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
     }
     // 054 §2.12: reconcile states of leases that are gone (memory only).
     super::lease_reconcile::retain(store.dir(), |session| state.leases.contains_key(session));
+    report.interrupted.extend(super::stop_settlement::reconcile(world, store, now)?);
     settle_unreachable_stops(world, runtime, store, &mut report, now)?;
     send_compaction_reminders(runtime, store, world.documents().margin_percent, now)?;
     // Await timeouts (and waits met while the turn still ran).
+    super::awaits::poll_follow_up_ended(runtime,store,now)?;
     if super::awaits::any_due(&*store.shared()?, now) {
         store.with_state(|state| super::awaits::wake_due(state, now))?;
     }
@@ -3189,6 +3164,7 @@ pub(crate) mod tests {
         pub submitted: RefCell<Vec<(String, Submission)>>,
         /// Next outcomes (default: a receipt with a fresh turn id).
         pub outcomes: RefCell<Vec<SubmitOutcome>>,
+        pub job_snapshots: RefCell<BTreeMap<String, Value>>,
         pub native: RefCell<BTreeMap<String, NativeMessageStatus>>,
         pub interrupts: RefCell<Vec<String>>,
         pub resumes: RefCell<Vec<String>>,
@@ -3211,6 +3187,7 @@ pub(crate) mod tests {
         /// r217h2: the runtime takes `soon` (results at the next step).
         pub next_step: std::cell::Cell<bool>,
         pub durable_next_step: std::cell::Cell<bool>,
+        pub stop_answer: std::cell::Cell<bool>,
         pub status_hook: RefCell<Option<Box<dyn FnOnce()>>>,
         pub submit_hook: RefCell<Option<Box<dyn FnOnce()>>>,
         pub read_turn_hook: RefCell<Option<Box<dyn FnOnce()>>>,
@@ -3222,6 +3199,7 @@ pub(crate) mod tests {
         pub fn idle(sessions: &[&str]) -> Self {
             let runtime = Self::default();
             runtime.reminder_fence.set(true);
+            runtime.stop_answer.set(true);
             for session in sessions {
                 runtime.status.borrow_mut().insert(
                     session.to_string(),
@@ -3253,6 +3231,13 @@ pub(crate) mod tests {
             if let Some(hook) = hook { hook(); }
             status
         }
+        fn supports_stop_answer(&self, _session: &str, _generation: u64) -> bool { self.stop_answer.get() }
+        fn query_awaited_job(&self, session: &str, job_id: &str) -> anyhow::Result<Value> {
+            let result=self.job_snapshots.borrow().get(job_id).cloned().ok_or_else(||anyhow::anyhow!("job unavailable"))?;
+            self.mcp_calls.borrow_mut().push((session.into(),"awaitQuery".into(),json!({"jobId":job_id})));
+            Ok(result)
+        }
+
         fn submit_exclusive(&self, session: &str, _generation: u64, submission: &Submission) -> SubmitOutcome {
             let hook = self.submit_hook.borrow_mut().take();
             if let Some(hook) = hook { hook(); }
@@ -3675,7 +3660,7 @@ pub(crate) mod tests {
         let owner = queued_owner(&store, "owner");
         let second = store.with_state(|state| state.create_ask(new_ask("second", "second"), now).unwrap().0.ask_id).unwrap();
         store.with_state(|state| {
-            state.pauses.insert(TARGET.into(), AdmissionPause {
+            state.pauses.insert(TARGET.into(), AdmissionPause { stop_answer_authorized: false,
                 cutex_session_id: TARGET.into(), by: PausedBy::Owner,
                 since: now_rfc3339(now), origin: Some("ownerPause".into()), stop_hold: false, runtime_generation: None,
             });
@@ -4085,6 +4070,24 @@ pub(crate) mod tests {
     /// is not retried, the owner's queued message may start, and the owner's
     /// resume (or message) reopens the gate; a runtime restart ends it.
     #[test]
+    fn queued_ask_added_under_gate_gets_one_actionable_notice() {
+        let (store, dir) = temp_store("late-gate-notice");
+        let now = Utc::now();
+        store.with_state(|state| super::super::control::runtime_gate_pause(state, TARGET, 1, now)).unwrap();
+        let ask = store.with_state(|state| state.create_ask(new_ask("late", "x"), now).unwrap().0.ask_id).unwrap();
+        for _ in 0..3 {
+            let snapshot = store.snapshot().unwrap();
+            assert!(paused_target(&store, &snapshot, TARGET, &[ask.clone()], now).unwrap());
+        }
+        let state = store.snapshot().unwrap();
+        let deliveries: Vec<_> = state.deliveries.values().filter(|d| super::super::delivery::is_gate_notice(d)).collect();
+        assert_eq!(deliveries.len(), 1);
+        assert!(!deliveries[0].passive);
+        assert!(super::super::delivery::actionable(&state, deliveries[0]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn runtime_gate_pause_holds_asks_and_lets_the_owner_go_first() {
         let (world, dir) = world("gate-pause");
         let (store, store_dir) = temp_store("gate-pause");
@@ -4209,7 +4212,7 @@ pub(crate) mod tests {
         tick(&world, &runtime, &store, now).unwrap();
         // An owner's real pause still overrides the advisory native hold.
         store.with_state(|state| {
-            state.pauses.insert(TARGET.into(), AdmissionPause {
+            state.pauses.insert(TARGET.into(), AdmissionPause { stop_answer_authorized: false,
                 cutex_session_id: TARGET.into(), by: PausedBy::Owner,
                 since: now_rfc3339(now), origin: Some("ownerStop".into()), stop_hold: true, runtime_generation: None,
             });
@@ -4376,7 +4379,7 @@ pub(crate) mod tests {
         world.approvals.decide(&approval, true, None, now).unwrap();
         // Owner pause holds even an approved ask.
         store.with_state(|state| {
-            state.pauses.insert(TARGET.into(), AdmissionPause { cutex_session_id: TARGET.into(), by: PausedBy::Owner, since: "t".into(), origin: None, stop_hold: false, runtime_generation: None })
+            state.pauses.insert(TARGET.into(), AdmissionPause { stop_answer_authorized: false, cutex_session_id: TARGET.into(), by: PausedBy::Owner, since: "t".into(), origin: None, stop_hold: false, runtime_generation: None })
         }).unwrap();
         tick(&world, &runtime, &store, now).unwrap();
         let state = store.snapshot().unwrap();
@@ -5200,6 +5203,7 @@ pub(crate) mod tests {
         let now = Utc::now();
         store.with_state(|state| {
             state.events.insert("event".into(), EventOutboxRecord {
+                held_runtime_generation: None,
                 event_id: "event".into(), cutex_session_id: REQUESTER.into(), delivery_ids: vec![], native_message_id: "message".into(),
                 event_artifact: None, turn_id: Some("event-turn".into()), acknowledged: false, created_at: now_rfc3339(now), view: None,
                 compacted_at: Some(now_rfc3339(now)), compaction_reminder_pending: true,
@@ -5250,7 +5254,7 @@ pub(crate) mod tests {
         assert!(state.asks[&ask].is_open());
         assert_eq!(state.asks[&ask].execution, ExecutionState::Running);
         assert_eq!(state.commands.len(), 1, "the stop is still queued");
-        assert!(state.asks[&ask].attempts[0].stop_offline_since.is_some());
+        assert!(state.asks[&ask].attempts[0].stop_deadline.is_some());
         assert!(runtime.interrupts.borrow().is_empty());
         // Retired: settles at once.
         world.directory.agents.get_mut(TARGET).unwrap().archived = true;
@@ -5277,65 +5281,27 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(store_dir);
     }
 
-    /// A stop pending on an offline target: a reconnectable runtime never
-    /// settles; an offline, not reconnectable one settles only after it was
-    /// seen so for the whole grace (`stopOfflineGraceSecs`, default 300 s);
-    /// seeing it reconnectable in between starts the grace over.
+    /// Reconnection cannot renew the stop's absolute deadline or prove an end.
     #[test]
-    fn offline_stop_settles_after_the_grace_and_never_while_reconnecting() {
+    fn offline_stop_deadline_is_absolute_and_never_fabricates_completion() {
         let (world, dir) = world("settle-offline");
         let (store, store_dir) = temp_store("settle-offline");
         let runtime = FakeRuntime::idle(&[TARGET]);
-        let grace = chrono::Duration::seconds(crate::asks::budget::STOP_OFFLINE_GRACE_SECS as i64);
         let now = Utc::now();
-        let (ask, next) = store
-            .with_state(|state| {
-                (state.create_ask(new_ask("a", "x"), now).unwrap().0.ask_id, state.create_ask(new_ask("b", "y"), now).unwrap().0.ask_id)
-            })
-            .unwrap();
-        tick(&world, &runtime, &store, now).unwrap();
-        runtime.set(TARGET, |status| {
-            status.online = false;
-            status.reconnectable = true;
-            status.active_turn_id = None;
-        });
-        crate::asks::tools::close_ask(&store, Some(REQUESTER), &ask, "stop", now).unwrap();
-        let open = |at| {
-            tick(&world, &runtime, &store, at).unwrap();
-            let state = store.snapshot().unwrap();
-            (state.asks[&ask].is_open(), state.asks[&ask].attempts[0].stop_offline_since.clone())
-        };
-        // Reconnecting: never settles, however long.
-        assert_eq!(open(now), (true, None));
-        assert_eq!(open(now + grace * 10), (true, None));
-        // Gone for good: the grace starts at the first tick that sees it.
-        runtime.set(TARGET, |status| status.reconnectable = false);
-        let t1 = now + grace * 10 + chrono::Duration::seconds(1);
-        assert_eq!(open(t1), (true, Some(crate::asks::now_rfc3339(t1))));
-        assert!(open(t1 + grace - chrono::Duration::seconds(1)).0);
-        // Reconnectable again just before the grace ends: starts over.
-        runtime.set(TARGET, |status| status.reconnectable = true);
-        assert_eq!(open(t1 + grace), (true, None));
-        runtime.set(TARGET, |status| status.reconnectable = false);
-        let t2 = t1 + grace + chrono::Duration::seconds(1);
-        assert_eq!(open(t2), (true, Some(crate::asks::now_rfc3339(t2))));
-        assert!(open(t2 + grace - chrono::Duration::seconds(1)).0);
-        let report = tick(&world, &runtime, &store, t2 + grace).unwrap();
-        assert_eq!(report.interrupted, vec![ask.clone()]);
-        let state = store.snapshot().unwrap();
-        assert_eq!(state.asks[&ask].closed, Some(CloseOutcome::Stopped));
-        assert_eq!(state.asks[&ask].attempts[0].interrupt_reason, Some(InterruptReason::Stopped));
-        assert!(state.leases.is_empty());
-        // The other ask was never touched and is admitted once the target is back.
-        assert!(state.asks[&next].is_open());
-        assert_eq!(state.asks[&next].execution, ExecutionState::Queued);
-        runtime.set(TARGET, |status| {
-            status.online = true;
-            status.runtime_generation = 2;
-        });
-        assert_eq!(tick(&world, &runtime, &store, t2 + grace).unwrap().admitted, vec![next]);
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(store_dir);
+        let ask = store.with_state(|s|s.create_ask(new_ask("a","x"),now).unwrap().0.ask_id).unwrap();
+        tick(&world,&runtime,&store,now).unwrap();
+        runtime.set(TARGET,|status| {status.online=false;status.reconnectable=true;status.active_turn_id=None;});
+        crate::asks::tools::close_ask(&store,Some(REQUESTER),&ask,"stop",now).unwrap();
+        let deadline=store.snapshot().unwrap().asks[&ask].attempts[0].stop_deadline.clone();
+        for seconds in [0,300,599,600,601,1200] {
+            runtime.set(TARGET,|s|s.reconnectable=seconds%2==0);
+            tick(&world,&runtime,&store,now+chrono::Duration::seconds(seconds)).unwrap();
+            let state=store.snapshot().unwrap();let a=&state.asks[&ask];
+            assert!(a.is_open());assert!(a.answer_id.is_none());assert_eq!(a.attempts[0].stop_deadline,deadline);
+            assert_eq!(a.attempts[0].stop_unconfirmed,seconds>=600);
+        }
+        assert!(runtime.interrupts.borrow().is_empty());
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(store_dir);
     }
 
     /// An offline target without a pending stop is left to reconciliation

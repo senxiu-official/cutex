@@ -78,6 +78,20 @@ mod tests {
     fn call(cache: &ClientCache<Client>, session: &str, generation: u64) -> anyhow::Result<u64> {
         cache.with_client(session, generation, || Ok(Client::new(generation)), |c| c.id, |_| false)
     }
+
+    #[test]
+    fn soft_note_transport_failure_retires_only_its_exact_connection() {
+        use cutex::app_server::pre_turn_notes::{Report,SkippedNote};
+        for (waiting,error,reconnected) in [("nativeReconciliation",Some("reply lost"),true),
+            ("nativeRelease",None,false),("runtimeCapabilityOrBinding",Some("old pin"),false)] {
+            let cache=ClientCache::default();
+            cache.with_client("s",7,||Ok(Client::new(1)),|_|Report {
+                skipped:vec![SkippedNote {input_id:"original-note".into(),waiting_for:waiting.into(),error:error.map(str::to_owned)}],
+                ..Default::default()
+            },super::super::discard_note_report).unwrap();
+            assert_eq!(call(&cache,"s",7).unwrap(),if reconnected {7} else {1});
+        }
+    }
     fn pins(cache: &ClientCache<Client>, session: &str, expected: usize) {
         let start = Instant::now();
         loop {

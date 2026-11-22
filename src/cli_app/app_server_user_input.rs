@@ -36,6 +36,7 @@ use super::app_server_runtime;
 #[path = "app_server_interrupt_send.rs"]
 mod interrupt_send;
 pub(crate) use interrupt_send::interrupt_send_v2;
+pub(crate) use interrupt_send::interrupt_send_many_v2;
 
 const INTERRUPT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -91,6 +92,12 @@ pub(crate) fn submit_v2_with_image_settings(
         execution_error("route", "event_persistence_unavailable", error, true, false)
     })?;
     trace.stage(TimingStage::Dispatch);
+    if command.params.interrupt_send.is_some() {
+        return interrupt_send::submit_many_v2(&command, repository);
+    }
+    if let Some(resumed)=interrupt_send::resume_held_v2(&command,repository) {
+        return resumed;
+    }
     if let Some(held) = held_entry(&command) {
         return held;
     }
@@ -602,7 +609,7 @@ fn submit_v2_with_repository_and_image_settings(
             native_method: None,
             turn_id,
             queue: None,
-            queue_paused: false,
+            queue_paused: false, passive_notes: None,
         });
     }
     let active_turn_id = thread.as_ref().and_then(active_turn_id_from_thread);
@@ -766,6 +773,8 @@ fn route_submit_with_image_settings(
                 };
             }
             UserInputStrategy::Interrupt => {
+                super::asks_runtime::revoke_internal_interrupt(&command.cutex_session_id,&command.thread_id)
+                    .map_err(|error|execution_error("interrupt","persistence_unavailable",error,true,false))?;
                 // The record exists while the route waits for the interrupt.
                 ledger::materialize(&command.cutex_session_id, &command.params.client_user_message_id);
                 timed_input(TimingPath::InputNative, TimingStage::Dispatch, || session_manager(&command.cutex_session_id)
@@ -989,7 +998,7 @@ fn enqueue_submit(
             native_method: None,
             turn_id: active_turn_id,
             queue: Some(queue),
-            queue_paused: queue_paused()?,
+            queue_paused: queue_paused()?, passive_notes: None,
         }),
         QueueEnqueueDecision::Deduplicated(queue) => Ok(UserInputSubmitExecution {
             join_refusal: None, queued_reason: None,
@@ -999,7 +1008,7 @@ fn enqueue_submit(
             native_method: None,
             turn_id: active_turn_id,
             queue: Some(queue),
-            queue_paused: queue_paused()?,
+            queue_paused: queue_paused()?, passive_notes: None,
         }),
         QueueEnqueueDecision::ClientMessageConflict => Err(execution_error_message(
             "queue",
@@ -1224,9 +1233,12 @@ fn send_recorded(
         cutex::asks::pause_admission::release_worker_fence();
     }
     ledger::native_sending(session, &command.params, method == "turn/steer");
-    match prepare_native_input(method == "turn/steer"
-        && image_steering::contains_images(&command.params.input) && is_claude_session(session), method, params)
-        .and_then(|params| send_native(command, method, params, disposition)) {
+    match remember_native_owner_input(command)
+        .and_then(|()| prepare_native_input(method == "turn/steer"
+            && image_steering::contains_images(&command.params.input) && is_claude_session(session), method, params))
+        .and_then(|params| {
+            send_native(command, method, params, disposition)
+        }) {
         Ok(execution) => {
             // 054 §2.9: sending → inContext{turnStartInput} / accepted{turnId}.
             ledger::native_accepted(session, &command.params, execution.disposition, execution.turn_id.as_deref(),
@@ -1281,18 +1293,83 @@ fn send_recorded(
     }
 }
 
+/// Persist the complete logical input before native IO. In particular a
+/// merged queued item must replace the original survivor's resend copy.
+fn remember_native_owner_input(command: &UserInputSubmitCommand) -> Result<(), UserInputExecutionError> {
+    if cutex::management::v2::input_ledger::enabled() {
+        let ledger = cutex::management::v2::input_ledger::default_ledger()
+            .map_err(|error| execution_error("route", "event_persistence_unavailable", error, true, false))?;
+        let mut payload = cutex::management::v2::input_ledger_settle::owner_submit_payload(&command.params);
+        if let Some(original) = ledger.payload(&command.cutex_session_id, &command.params.client_user_message_id)
+            .map_err(|error| execution_error("route", "event_persistence_unavailable", error, true, false))? {
+            for key in ["allowHeld", "startIfOffline", cutex::management::v2::agent_bus_wake::READ_NOTES_FIELD] {
+                if let Some(value) = original.get(key) { payload[key] = value.clone(); }
+            }
+        }
+        ledger.put_payload(&command.cutex_session_id, &command.params.client_user_message_id, &payload)
+            .map_err(|error| execution_error("route", "event_persistence_unavailable", error, true, false))?;
+    }
+    Ok(())
+}
+
 fn send_user_input_native_request(
     command: &UserInputSubmitCommand,
     method: &str,
-    mut params: Value,
+    params: Value,
     disposition: UserInputDisposition,
 ) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+    send_user_input_native_request_bound(command,method,params,disposition,None)
+}
+
+fn send_user_input_native_request_bound(
+    command:&UserInputSubmitCommand, method:&str, mut params:Value,
+    disposition:UserInputDisposition, required_generation:Option<u64>,
+) -> Result<UserInputSubmitExecution,UserInputExecutionError> {
     let session = &command.cutex_session_id;
     let status = session_manager(session).status(session)
         .map_err(|error| execution_error("native_request", "app_server_unavailable", error, true, false))?;
     let generation = status.as_ref().filter(|status| status.connected && status.thread_id == command.thread_id)
         .map(|status| status.runtime_generation);
-    let carries = if matches!(method, "turn/start" | "turn/steer") && owner_reopens_gate(command)
+    if required_generation.is_some() && required_generation!=generation {
+        return Err(execution_error_message("native_request","revision_conflict",
+            "owner batch runtime generation changed; nothing sent to the replacement",false,false));
+    }
+    let selected_notes = if cutex::management::v2::input_ledger::enabled() {
+        cutex::management::v2::agent_bus_wake::selected_note_ids(
+            cutex::management::v2::input_ledger::default_ledger()
+                .map_err(|error| execution_error("native_request", "event_persistence_unavailable", error, true, false))?,
+            session, &command.params.client_user_message_id)
+            .map_err(|error| execution_error("native_request", "read_notes_unavailable", error, false, false))?
+    } else { None };
+    if selected_notes.as_ref().is_some_and(|ids| !ids.is_empty())
+        && (!owner_reopens_gate(command) || !generation.is_some_and(|generation|
+            super::owner_carries::OwnerCarries::supported(session, generation))) {
+        return Err(execution_error_message("native_request", "read_notes_unsupported",
+            "this runtime cannot atomically read the selected notes with the owner's input; nothing sent", false, false));
+    }
+    let owner_batch = params.get("ownerInputs").is_some();
+    if !owner_batch && cutex::management::v2::input_ledger::enabled() {
+        let ledger=cutex::management::v2::input_ledger::default_ledger()
+            .map_err(|e|execution_error("native_request","event_persistence_unavailable",e,true,false))?;
+        let records=ledger.get(session,&[command.params.client_user_message_id.clone()])
+            .map_err(|e|execution_error("native_request","event_persistence_unavailable",e,true,false))?;
+        if records.records.iter().any(|r|r.details["interruptBatch"]["attempt"].as_u64()==Some(r.attempt)
+            && !matches!(r.state,cutex::management::v2::input_ledger::InputState::InContext)) {
+            let unsent=records.records.iter().any(|r|matches!(r.state,
+                cutex::management::v2::input_ledger::InputState::Held|cutex::management::v2::input_ledger::InputState::Waiting)
+                && r.details["interruptBatch"].get("deferredIds").is_some());
+            if unsent {
+                return Err(execution_error_message("native_request","owner_batch_not_submitted",
+                    "the original input is retained by its unsent owner batch; no singleton replay",false,false));
+            }
+            return Err(execution_error_message("native_request","request_outcome_unknown",
+                "the original input belongs to an interrupted owner batch; no automatic single-input replay",false,true));
+        }
+    }
+    if owner_batch && !generation.is_some_and(|generation|session_manager(session).owner_input_batch_supported(session,generation)) {
+        return Err(execution_error_message("native_request","interrupt_send_many_unsupported","runtime lacks ownerInputBatch:1; nothing sent",false,false));
+    }
+    let carries = if !owner_batch && matches!(method, "turn/start" | "turn/steer") && owner_reopens_gate(command)
         && generation.is_some_and(|generation| super::owner_carries::OwnerCarries::supported(session, generation))
         && !super::owner_carries::OwnerCarries::goes_alone(session, &command.params.client_user_message_id)
             .map_err(|error| execution_error("native_request", "owner_carry_reservation_failed", error, true, false))? {
@@ -1306,7 +1383,12 @@ fn send_user_input_native_request(
     if let Some(carries) = &carries { carries.attach(&mut params); }
     if let Some(carries)=&carries {carries.check_dispositions()
         .map_err(|error|execution_error("native_request","input_disposed",error,false,false))?;}
-    let result = send_user_input_native_request_inner(command, method, params, disposition, generation);
+    let budget=if let Some(prefix)=params.get("ownerInputs").and_then(Value::as_array) {
+        let bytes=prefix.iter().map(|input|serde_json::to_vec(input).map(|v|v.len()).unwrap_or(usize::MAX))
+            .fold(0usize,usize::saturating_add);
+        cutex::app_server::pre_turn_notes::Budget::after_carried(prefix.len(),bytes)
+    } else {carries.as_ref().map(|c|c.passive_budget()).unwrap_or_default()};
+    let result = send_user_input_native_request_inner(command, method, params, disposition, generation, budget);
     if let Some(carries) = &carries {
         match &result {
             Ok(execution) => carries.accepted(execution.turn_id.as_deref(), execution.disposition == UserInputDisposition::Started),
@@ -1323,6 +1405,7 @@ fn send_user_input_native_request_inner(
     params: Value,
     disposition: UserInputDisposition,
     expected_generation: Option<u64>,
+    note_budget: cutex::app_server::pre_turn_notes::Budget,
 ) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
     use cutex::app_server::client::AppServerClientError;
 
@@ -1343,6 +1426,8 @@ fn send_user_input_native_request_inner(
     // `reserved`: the first send follows the C-010 `sending` reservation the
     // caller (`send_recorded`, every owner native request) just made under
     // the host fence, which re-checked the pause (r274 decision 1).
+    let passive_notes=std::cell::RefCell::new(cutex::app_server::pre_turn_notes::Report::default());
+    let remaining_note_budget=std::cell::Cell::new(note_budget);
     let send = |native_request_id: &str, reserved: bool| {
         cutex::management::v2::input_disposal::check(&command.cutex_session_id,[command.params.client_user_message_id.as_str()])
             .map_err(|error|execution_error("native_request","input_disposed",error,false,false))?;
@@ -1354,10 +1439,24 @@ fn send_user_input_native_request_inner(
                 }
             }
         }
+        if let Some(prefix)=params.get("ownerInputs").and_then(Value::as_array) {
+            cutex::management::v2::input_disposal::check(&command.cutex_session_id,
+                prefix.iter().filter_map(|v|v["clientUserMessageId"].as_str()))
+                .map_err(|e|execution_error("native_request","input_disposed",e,false,false))?;
+        }
         ensure_native_input_open_after(repository_for_retry()?, &command.cutex_session_id, reserved)?;
         // r271: the owner admission worker held the host fence only for the
         // re-check and the durable `sending` reservation. Never native IO.
         cutex::asks::pause_admission::release_worker_fence();
+        if method == "turn/start" {
+            let remaining=remaining_note_budget.get();
+            let report=super::turn_notes::synchronize_with_budget(&command.cutex_session_id, &command.thread_id, expected_generation,remaining);
+            remaining_note_budget.set(cutex::app_server::pre_turn_notes::Budget {
+                notes:remaining.notes.saturating_sub(report.budget_notes),bytes:remaining.bytes.saturating_sub(report.budget_bytes),
+            });
+            passive_notes.borrow_mut().merge(report);
+            passive_notes.borrow().attach_to_input(&command.cutex_session_id,&command.params.client_user_message_id);
+        }
         timed_input(TimingPath::InputNative, TimingStage::Dispatch, || handle
         .request_raw_message(json!({
             "id": native_request_id,
@@ -1391,11 +1490,7 @@ fn send_user_input_native_request_inner(
     // be uncertain) is the owner's acknowledgement: reopen the gate, as
     // `cutex/asks/resume` does, and send it once more. Never for agent
     // deliveries.
-    if method == "turn/start"
-        && response.get("error").is_some_and(is_claude_gate_refusal)
-        && owner_reopens_gate(command)
-        && is_claude_session(&command.cutex_session_id)
-    {
+    if reopens_claude_gate(command, method, &response, is_claude_session) {
         ensure_native_input_open_after(repository_for_retry()?, &command.cutex_session_id, false)?;
         match super::asks_claude::resume(&command.cutex_session_id) {
             Ok(()) => {
@@ -1434,6 +1529,7 @@ fn send_user_input_native_request_inner(
     session_manager(&command.cutex_session_id)
         .note_active_turn(&command.cutex_session_id, turn_id.clone())
         .map_err(|error| execution_error("post_submit", "internal_error", error, false, true))?;
+    let passive_notes=passive_notes.into_inner();
     Ok(UserInputSubmitExecution {
         join_refusal: None, queued_reason: None,
         disposition,
@@ -1442,7 +1538,7 @@ fn send_user_input_native_request_inner(
         native_method: Some(method.to_string()),
         turn_id,
         queue: None,
-        queue_paused: false,
+        queue_paused: false, passive_notes: (!passive_notes.is_empty()).then_some(passive_notes),
     })
 }
 
@@ -1485,12 +1581,30 @@ fn is_claude_gate_refusal(error: &Value) -> bool {
 }
 
 /// Owner input (desktop, TUI, CLI, Cutex automation the owner enabled), not
-/// an Agent Bus delivery.
+/// an Agent Bus delivery. r290 P1: and sent by the owner (or root), never a
+/// shared-access user, whatever origin its client reports: only the owner
+/// reopens a closed Claude input gate or releases the owner's carries.
 fn owner_reopens_gate(command: &UserInputSubmitCommand) -> bool {
     !matches!(
         command.params.origin.kind,
         cutex::management::v2::user_input::UserInputOriginKind::AgentBus
-    )
+    ) && cutex::management::users::caller_is_owner()
+}
+
+/// The Claude resume path of a refused `turn/start`: only the owner's own
+/// message to a Claude agent whose input gate is closed reopens it
+/// (`asks_claude::resume`) and sends again; a shared-access user's or an
+/// Agent Bus delivery's refusal stands (r290 P1).
+fn reopens_claude_gate(
+    command: &UserInputSubmitCommand,
+    method: &str,
+    response: &Value,
+    is_claude: impl Fn(&str) -> bool,
+) -> bool {
+    method == "turn/start"
+        && response.get("error").is_some_and(is_claude_gate_refusal)
+        && owner_reopens_gate(command)
+        && is_claude(&command.cutex_session_id)
 }
 
 fn native_user_input_failure(error: &Value) -> UserInputExecutionError {
@@ -1805,6 +1919,7 @@ fn flush_queued_locked_with(
             cutex_session_id: cutex_session_id.to_string(),
             thread_id: thread_id.clone(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: queue_item.client_user_message_id.clone(),
                 origin: queue_item.origin.clone(),
@@ -1926,6 +2041,7 @@ fn retry_deferred_queue_send(session: &str, error: &UserInputExecutionError) -> 
 pub(crate) fn interrupt_active_turn_v2(
     cutex_session_id: &str,
     thread_id: &str,
+    owner_authorized: bool,
 ) -> Result<Option<String>, UserInputExecutionError> {
     let session_lock = session_input_lock(cutex_session_id)
         .map_err(|error| execution_error("route", "internal_error", error, true, false))?;
@@ -1938,6 +2054,11 @@ pub(crate) fn interrupt_active_turn_v2(
             false,
         )
     })?;
+    // Repeat the durable provenance write inside this lane. Concurrent owner
+    // and scoped Stops must follow the actual interrupt order, not the order
+    // their route preflight writes happened outside the lane.
+    cutex::asks::control::owner_stop_default(cutex_session_id,owner_authorized)
+        .map_err(|error|execution_error("interrupt","persistence_unavailable",error,true,false))?;
     // Newest turn only (thread/turns/list), not the full thread snapshot.
     let active_turn_id = super::active_turn::active_turn_id(cutex_session_id, thread_id)
         .map_err(|error| {
@@ -2187,6 +2308,8 @@ mod tests {
     include!("app_server_user_input/image_tests.rs");
     include!("app_server_user_input/owner_sink_tests.rs");
     include!("app_server_user_input/owner_carry_retry_tests.rs");
+    include!("app_server_user_input/read_note_tests.rs");
+    include!("app_server_user_input/merge_resend_tests.rs");
     use super::*;
     use cutex::management::v2::user_input::UserInputOrigin;
     use cutex::management::v2::user_input::UserInputOriginKind;
@@ -2202,8 +2325,45 @@ mod tests {
         assert!(!is_claude_gate_refusal(&json!({"code": -32011, "message": "queue paused"})));
         let mut command = queue_command("cutex.s", "c");
         assert!(owner_reopens_gate(&command));
+        // r290 P1: a shared-access user's input (any origin) never reopens it.
+        cutex::management::users::set_current_principal(Some(cutex::management::users::Principal::User {
+            id: "u-000000000001".into(), name: "Shared".into(), grant: Default::default() }));
+        assert!(!owner_reopens_gate(&command));
+        cutex::management::users::set_current_principal(Some(cutex::management::users::Principal::Owner));
+        assert!(owner_reopens_gate(&command));
+        cutex::management::users::set_current_principal(None);
         command.params.origin.kind = UserInputOriginKind::AgentBus;
         assert!(!owner_reopens_gate(&command));
+    }
+
+    /// r290 P1: the Claude resume path (reopen the closed input gate, then
+    /// send again) is the owner's only: a shared-access user's message, an
+    /// unproven held record (run as pending) or an Agent Bus delivery keeps
+    /// the refusal.
+    #[test]
+    fn claude_resume_path_reopens_the_gate_for_the_owner_only() {
+        use cutex::management::users::{set_current_principal, Principal};
+        let refused = json!({"error": {"code": -32009, "message": "interruption gate is closed; resume before retry"}});
+        let claude = |_: &str| true;
+        let mut command = queue_command("cutex.claude-resume", "c");
+        set_current_principal(None);
+        assert!(reopens_claude_gate(&command, "turn/start", &refused, claude), "local owner");
+        set_current_principal(Some(Principal::Owner));
+        assert!(reopens_claude_gate(&command, "turn/start", &refused, claude), "owner device");
+        assert!(!reopens_claude_gate(&command, "turn/steer", &refused, claude), "only turn/start");
+        assert!(!reopens_claude_gate(&command, "turn/start", &json!({"error": {"code": -32011, "message": "queue paused"}}), claude));
+        assert!(!reopens_claude_gate(&command, "turn/start", &refused, |_: &str| false), "no Claude gate on other runtimes");
+        for principal in [
+            Principal::User { id: "u-000000000001".into(), name: "Collaborator".into(), grant: Default::default() },
+            Principal::Pending,
+        ] {
+            set_current_principal(Some(principal.clone()));
+            assert!(!reopens_claude_gate(&command, "turn/start", &refused, claude), "{principal:?}");
+        }
+        set_current_principal(Some(Principal::Owner));
+        command.params.origin.kind = UserInputOriginKind::AgentBus;
+        assert!(!reopens_claude_gate(&command, "turn/start", &refused, claude), "agent delivery");
+        set_current_principal(None);
     }
 
     #[test]
@@ -2255,6 +2415,7 @@ mod tests {
             cutex_session_id: "cutex.offline-queue".to_string(),
             thread_id: "thread-offline-queue".to_string(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: "client-offline-queue-1".to_string(),
                 origin: UserInputOrigin {
@@ -2307,6 +2468,7 @@ mod tests {
             cutex_session_id: "cutex.busy-claude".to_string(),
             thread_id: "thread-busy".to_string(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: client.to_string(),
                 origin: UserInputOrigin {
@@ -2363,6 +2525,7 @@ mod tests {
             cutex_session_id: "cutex.fast-submit".to_string(),
             thread_id: "thread-fast".to_string(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: client.to_string(),
                 origin: UserInputOrigin {
@@ -2382,7 +2545,7 @@ mod tests {
             native_method: Some(method.to_string()),
             turn_id: Some("turn-x".to_string()),
             queue: None,
-            queue_paused: false,
+            queue_paused: false, passive_notes: None,
         };
         let no_history = |_: &str, _: &str| -> anyhow::Result<Value> {
             panic!("a new clientUserMessageId must not read the native history")
@@ -2615,6 +2778,7 @@ mod tests {
             cutex_session_id: session.to_string(),
             thread_id: "thread-q".to_string(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: client.to_string(),
                 origin: UserInputOrigin {
@@ -2667,7 +2831,7 @@ mod tests {
                 native_method: Some(method.to_string()),
                 turn_id: Some("turn-new".to_string()),
                 queue: None,
-                queue_paused: false,
+                queue_paused: false, passive_notes: None,
             })
         }
     }
@@ -2870,7 +3034,7 @@ mod tests {
             native_method: Some("turn/start".into()),
             turn_id: Some(format!("turn-{}", command.params.client_user_message_id)),
             queue: None,
-            queue_paused: false,
+            queue_paused: false, passive_notes: None,
             join_refusal: None,
             queued_reason: None,
         }
@@ -3907,6 +4071,7 @@ mod tests {
         store.with_state(|state| {
             state.leases.insert(session.into(), lease.clone());
             state.events.insert("old-event".into(), EventOutboxRecord {
+                held_runtime_generation: None,
                 event_id: "old-event".into(), cutex_session_id: session.into(), delivery_ids: vec![],
                 native_message_id: "accepted-event".into(), event_artifact: None,
                 turn_id: Some("old-turn".into()), acknowledged: true, created_at: now.to_rfc3339(),
@@ -4060,7 +4225,7 @@ mod tests {
                 native_method: Some(method.to_string()),
                 turn_id: turns.last().cloned(),
                 queue: None,
-                queue_paused: false,
+                queue_paused: false, passive_notes: None,
             })
         }
 
@@ -4075,6 +4240,7 @@ mod tests {
             cutex_session_id: session.to_string(),
             thread_id: "thread-c010".to_string(),
             params: cutex::management::v2::user_input::UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: "same-client-message".to_string(),
                 origin: UserInputOrigin {
@@ -4155,7 +4321,7 @@ mod tests {
                 native_method: Some(method.to_string()),
                 turn_id: Some(turn.to_string()),
                 queue: None,
-                queue_paused: false,
+                queue_paused: false, passive_notes: None,
             })
         }
     }
@@ -4759,4 +4925,58 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+
+    /// r289 (fail-closed provenance): in a cold process, held records are
+    /// read from disk. A record without `ownerAuthorized` (written by r288)
+    /// or with `false` lands but keeps the owner's Stop hold and gate; only a
+    /// record with `true` lifts it.
+    #[test]
+    fn cold_loaded_held_input_lifts_the_stop_hold_only_with_owner_provenance() {
+        if test_runs_in_private_home("cold_loaded_held_input_lifts_the_stop_hold_only_with_owner_provenance") { return; }
+        use cutex::asks::store::{AskStore, RuntimeCommand};
+        use cutex::management::v2::owner_held::HeldOwnerInput;
+        let cases = [("cutex.held-legacy", None), ("cutex.held-shared", Some(false)), ("cutex.held-owner", Some(true))];
+        let store = AskStore::open_default().unwrap();
+        let mut inputs = Vec::new();
+        for (session, flag) in cases {
+            store.with_state(|state| cutex::asks::control::owner_stop(state, session, chrono::Utc::now())).unwrap();
+            let held = HeldOwnerInput::new(session, &format!("{session}-input"), &format!("{session}-req"), "thread-q",
+                super::super::owner_admission::wire_params(&auto_command(session, &format!("{session}-input"))), false, chrono::Utc::now());
+            let mut record = serde_json::to_value(&held).unwrap();
+            match flag {
+                None => { record.as_object_mut().unwrap().remove("ownerAuthorized"); }
+                Some(flag) => record["ownerAuthorized"] = json!(flag),
+            }
+            inputs.push(record);
+        }
+        // Written before this process touches the held store: a cold load.
+        let path = cutex::config::paths::runtime_dir().unwrap().join("management-v2").join("owner-held-inputs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&json!({"inputs": inputs})).unwrap()).unwrap();
+        let landed = std::sync::Mutex::new(Vec::new());
+        let submit = |command: UserInputSubmitCommand| {
+            landed.lock().unwrap().push(command.cutex_session_id.clone());
+            // r290 P1: the route runs as the owner only for owner-proven records.
+            assert_eq!(cutex::management::users::caller_is_owner(), command.cutex_session_id == "cutex.held-owner",
+                "{}", command.cutex_session_id);
+            Ok(started(&command))
+        };
+        std::thread::scope(|scope| scope.spawn(|| {
+            cutex::management::v2::session_coordination::set_thread_lane_try_only(true);
+            while super::super::owner_admission::admit_one(&submit).unwrap() {}
+        }).join().unwrap());
+        assert_eq!(landed.lock().unwrap().len(), 3, "every held input is delivered");
+        let state = store.snapshot().unwrap();
+        for (session, flag) in cases {
+            let gate = state.commands.iter().any(|queued|
+                matches!(&queued.command, RuntimeCommand::ResumeGate { cutex_session_id } if cutex_session_id == session));
+            if flag == Some(true) {
+                assert!(!state.pauses.contains_key(session), "the owner's held input lifts the Stop hold");
+                assert!(gate, "and reopens the native gate");
+            } else {
+                assert!(state.pauses.get(session).is_some_and(|pause| pause.stop_hold), "{session}: the Stop hold stays");
+                assert!(!gate, "{session}: the gate stays closed");
+            }
+        }
+    }
 }

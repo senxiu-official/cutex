@@ -26,6 +26,7 @@ pub mod budget;
 pub mod caps;
 pub mod children;
 pub mod commands;
+pub mod stop_settlement;
 pub mod control;
 pub mod continuation;
 pub mod routing_policy;
@@ -39,11 +40,15 @@ pub mod ledger;
 pub mod owner_carries;
 pub mod create_task;
 pub mod delivery;
+// r290 P14
+pub mod deliver;
 pub mod directory;
 pub mod gate;
 pub mod lifecycle;
 pub mod model;
 pub mod observe;
+// r290 P7
+pub mod handler_failure;
 pub mod questions;
 pub mod render;
 pub mod returns;
@@ -178,3 +183,6 @@ mod tests {
         assert!(new_id("ask").starts_with("ask-"));
     }
 }
+
+// r290 P6
+pub mod board_progress;

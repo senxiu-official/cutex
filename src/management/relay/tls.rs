@@ -13,6 +13,7 @@ const HANDSHAKE_LIMIT: usize = 16;
 const RELAY_LIMIT: usize = 64;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(4);
 const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+const GRACE_CONNECTION: Duration = Duration::from_secs(120); // r290 P10 (B3)
 static HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 static TAILNET_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 static RELAY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -48,8 +49,33 @@ impl ClientCertVerifier for RegisteredClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let proof = self.inner.verify_client_cert(cert, intermediates, now)?;
         let id = fingerprint(cert);
+        let proof = match self.inner.verify_client_cert(cert, intermediates, now) {
+            Ok(proof) => proof,
+            // r290 P10 (B3): an expired leaf in its grace window still
+            // proves its key; the chain is checked as of just before its
+            // expiry and the connection is restricted to renewal
+            // (`request_gate`). Revocation and device deletion still end it.
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. },
+            )) => {
+                let record = self
+                    .store
+                    .grace_uncached(&id)
+                    .map_err(|_| rustls::Error::General("relay credential state unavailable".into()))?
+                    .ok_or(rustls::Error::InvalidCertificate(rustls::CertificateError::Expired))?;
+                let expiry = chrono::DateTime::parse_from_rfc3339(&record.expires_at)
+                    .map_err(|_| rustls::Error::General("relay credential state unavailable".into()))?;
+                let before = u64::try_from(expiry.timestamp() - 60).unwrap_or(0);
+                self.inner.verify_client_cert(
+                    cert,
+                    intermediates,
+                    UnixTime::since_unix_epoch(Duration::from_secs(before)),
+                )?;
+                return Ok(ClientCertVerified::assertion());
+            }
+            Err(error) => return Err(error),
+        };
         match self.store.active_uncached(&id) {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -336,9 +362,16 @@ fn connection_admitted(
         .and_then(|c| c.first())
         .context("client certificate required")?;
     let certificate_id = fingerprint(cert);
-    let record = store
-        .active_uncached(&certificate_id)?
-        .context("certificate no longer active")?;
+    // r290 P10 (B3): a grace leaf (expired, renewable) gets a restricted connection.
+    let (record, grace) = match store.active_uncached(&certificate_id)? {
+        Some(record) => (record, false),
+        None => (
+            store
+                .grace_uncached(&certificate_id)?
+                .context("certificate no longer active")?,
+            true,
+        ),
+    };
     drop(handshake);
     let _relay_permit =
         Permit::acquire(&RELAY_CONNECTIONS, RELAY_LIMIT).context("relay connection capacity")?;
@@ -360,7 +393,9 @@ fn connection_admitted(
     std::thread::spawn(move || {
         let _finish_http = finish_http;
         set_peer(Some(identity));
+        set_grace(grace); // r290 P10 (B3)
         serve(server, ConnectionInfo { remote: true, peer }, handler_slot);
+        set_grace(false);
         set_peer(None);
     });
     let result = pump(
@@ -369,6 +404,7 @@ fn connection_admitted(
         &mut tls,
         &store,
         &record.certificate_id,
+        grace,
     );
     let _ = shutdown.shutdown(Shutdown::Both);
     let _ = transport.shutdown(Shutdown::Both);
@@ -404,6 +440,7 @@ fn pump(
     tls: &mut rustls::ServerConnection,
     store: &Store,
     id: &str,
+    grace: bool, // r290 P10 (B3)
 ) -> anyhow::Result<()> {
     socket.set_read_timeout(None)?;
     socket.set_write_timeout(None)?;
@@ -412,6 +449,7 @@ fn pump(
     let mut incoming = Vec::new();
     let mut outgoing = Vec::new();
     let mut buf = [0u8; 16384];
+    let opened = Instant::now(); // r290 P10 (B3)
     let mut checked = Instant::now() - Duration::from_secs(1);
     let mut backend_eof = false;
     let mut closing = false;
@@ -419,7 +457,9 @@ fn pump(
     let mut drain_since: Option<Instant> = None;
     loop {
         if checked.elapsed() >= Duration::from_millis(500) {
-            if store.active(id)?.is_none() {
+            // r290 P10 (B3): a grace connection lives at most 2 minutes.
+            let live = if grace { opened.elapsed() < GRACE_CONNECTION && store.grace_uncached(id)?.is_some() } else { store.active(id)?.is_some() };
+            if !live {
                 bail!("relay certificate or device revoked");
             }
             checked = Instant::now();

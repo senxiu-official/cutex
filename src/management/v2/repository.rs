@@ -41,6 +41,8 @@ use super::model::MAX_SAFE_SEQUENCE;
 
 #[path = "integration_lookup_snapshot.rs"]
 mod integration_lookup_snapshot;
+#[path = "submitted_input_lookup.rs"]
+mod submitted_input_lookup;
 pub(super) use integration_lookup_snapshot::{LookupCheckpoint,ReadSnapshot};
 
 const STATE_FILE_NAME: &str = "stream-state.json";
@@ -817,6 +819,12 @@ impl EventRepository {
 
     pub fn page(&self, query: ReplayQuery) -> Result<EventPage, ReplayError> {
         self.with_replay_lock(|repository| repository.page_locked(query))
+    }
+
+    /// Latest submitted input by recipient and logical input id. The durable
+    /// advisory index consumes only the journal tail after its checkpoint.
+    pub fn latest_submitted_input_sha256(&self, session: &str, id: &str) -> anyhow::Result<Option<String>> {
+        submitted_input_lookup::latest(self, session, id).map(|(hash, _)| hash)
     }
 
     /// Keep stable handles/byte boundaries only. Cold lookup parsing must not

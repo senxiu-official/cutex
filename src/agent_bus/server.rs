@@ -244,6 +244,10 @@ pub fn handle_agent_bus_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if request.headers.contains_key(crate::agent_bus::native_subagent::CHILD_HEADER)
+        && path_only!=crate::agent_bus::native_subagent::PATH {
+        return write_json_response(stream,403,"Forbidden",&crate::agent_bus::native_subagent::refusal());
+    }
     if request.method == "POST" && path_only == crate::pan::api::BUS_PATH {
         let caller = authenticated_pan_caller(&request, state);
         let result = match caller {
@@ -338,7 +342,7 @@ pub fn handle_agent_bus_request(
             }
         }
         // Asks (委托) MCP tools (asks design §6): the fence gives the caller.
-        ("POST", crate::asks::tools::PATH | crate::asks::short_ids::PATH) => {
+        ("POST", crate::asks::tools::PATH | crate::asks::short_ids::PATH | crate::agent_bus::native_subagent::PATH) => {
             let mut timing = ControlTrace::new(if path_only == crate::asks::short_ids::PATH {
                 ControlPath::McpResolveIds
             } else { control_request_path(&request.body, false) });
@@ -351,6 +355,24 @@ pub fn handle_agent_bus_request(
                 Ok(Some(invocation)) => {
                     let caller = invocation.caller_cutex_session.as_str().to_string();
                     let runtime = invocation.caller_runtime_agent_id.clone();
+                    let child_read=path_only==crate::agent_bus::native_subagent::PATH;
+                    if child_read {
+                        let child=request.headers.get(crate::agent_bus::native_subagent::CHILD_HEADER).context("child identity missing")?;
+                        let generation=request.headers.get(crate::agent_bus::mcp::GENERATION_HEADER).context("generation missing")?.parse()?;
+                        let principal=crate::agent_bus::native_subagent::ChildPrincipal {parent_session_id:caller.clone(),generation,child_id:child.clone()};
+                        let body:Value=serde_json::from_slice(&request.body)?;
+                        let tool=body["tool"].as_str().unwrap_or("");
+                        if !crate::agent_bus::native_subagent::allowed(tool) {return write_control_response(stream,&mut timing,&crate::agent_bus::native_subagent::refusal());}
+                        if crate::agent_bus::native_subagent::verify_in_management(&principal).is_err()
+                            || validate_mcp_caller_fence(&request,state).ok().flatten().is_none() {
+                            return write_control_response(stream,&mut timing,&serde_json::json!({"ok":false,"code":"native_child_unverified","detail":"native child ancestry or current generation could not be verified"}));
+                        }
+                        if tool=="service_list" {
+                            let result=crate::services::agent_api::handle(&caller,&serde_json::to_vec(&serde_json::json!({"op":"list","args":body["arguments"]}))?,None);
+                            return write_control_response(stream,&mut timing,&result);
+                        }
+                    }
+
                     if request.path == crate::asks::tools::PATH
                         && request.headers.get(crate::agent_bus::mcp::action_receipts::HEADER).is_some_and(|v| v == "async-v1") {
                         let body: Value = serde_json::from_slice(&request.body)?;
@@ -441,7 +463,9 @@ pub fn handle_agent_bus_request(
                                         .map(String::as_str),
                                 ),
                             };
-                            if request.path == crate::asks::short_ids::PATH {
+                            if child_read {
+                                crate::asks::tools::handle_native_child_read(&ctx,&request.body)
+                            } else if request.path == crate::asks::short_ids::PATH {
                                 timing.stage(ControlStage::ContextRead);
                                 crate::asks::short_ids::handle(&ctx, &request.body)
                             } else {
@@ -1517,7 +1541,13 @@ fn mcp_toolset_response(request: &crate::agent_bus::agent_auth::BusRequest) -> s
         return serde_json::json!({"ok": false, "code": "caller_unresolved"});
     };
     match crate::agent_bus::tool_policy::roles_for_session(&session) {
-        Ok(roles) => crate::agent_bus::tool_policy::toolset_response(&session, roles),
+        Ok(roles) => {
+            let mut result=crate::agent_bus::tool_policy::toolset_response(&session,roles);
+            if let Ok(Some(record))=crate::session::store::shared_session_row(&session) {
+                result["parentThreadId"]=serde_json::json!(record.app_server_thread_id());
+            }
+            result
+        },
         Err(_) => serde_json::json!({"ok": false, "code": "roles_unavailable"}),
     }
 }
@@ -3211,6 +3241,7 @@ mod tests {
     /// In-memory bus state of a route test (no Task Service or other store).
     mod archive_bus_http_tests { include!("archive_bus_http_tests.rs"); }
     mod receipt_preflight_http_tests { include!("receipt_preflight_http_tests.rs"); }
+    mod native_child_http_tests { include!("native_child_http_tests.rs"); }
 
     fn route_state() -> Arc<Mutex<AgentBusState>> {
         Arc::new(Mutex::new(AgentBusState::default()))

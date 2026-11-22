@@ -448,6 +448,37 @@ impl ClientTokenStore {
         })
     }
 
+    /// r290 P10 (a): activate a staged relay device and, in the same store
+    /// write, remove the device token it replaces (re-pairing the same
+    /// phone). Idempotent: an already-removed predecessor is fine. Returns
+    /// whether the predecessor was removed by this call.
+    pub(crate) fn activate_relay_device_replacing(&self, id: &str, token: &str, replaces: Option<&str>) -> anyhow::Result<bool> {
+        self.with_store(|store| {
+            let record = store.tokens.iter_mut().find(|r| r.token_id == id).context("relay token revoked or missing")?;
+            let hash = token_hash_hex(token);
+            if record.token_sha256 != hash && record.token_sha256 != format!("pending-relay:{hash}") { anyhow::bail!("relay token changed"); }
+            record.token_sha256 = hash;
+            let before = store.tokens.len();
+            if let Some(old) = replaces.filter(|old| *old != id) {
+                store.tokens.retain(|r| r.token_id != old);
+            }
+            Ok(store.tokens.len() != before)
+        })
+        .inspect(|removed| {
+            if let (true, Some(old)) = (*removed, replaces) {
+                REVOCATION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::browser_relay::credential_revoked(old);
+            }
+        })
+    }
+
+    /// r290 P10 (a): the device token a presented secret belongs to, if it
+    /// is a paired device (`kind: device`).
+    pub(crate) fn device_of(&self, presented: &str) -> anyhow::Result<Option<String>> {
+        let Some(id) = self.verify(presented)? else { return Ok(None) };
+        Ok(self.list()?.into_iter().any(|t| t.token_id == id && t.kind == KIND_DEVICE).then_some(id))
+    }
+
     fn issue_record_staged(&self, label: &str, kind: Option<&str>, device_name: Option<String>, platform: Option<String>, scope: DeviceScope, staged: bool) -> anyhow::Result<IssuedClientToken> {
         let label = validate_label(label)?;
         let token = generate_token();

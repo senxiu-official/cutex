@@ -32,7 +32,7 @@ fn queue_and_focus_reads_do_not_load_runtime_status_or_full_session_projection()
     }
 }
 
-fn ordered_stop(session: &str, thread: &str) -> Result<Option<String>, UserInputExecutionError> {
+fn ordered_stop(session: &str, thread: &str, _owner_authorized: bool) -> Result<Option<String>, UserInputExecutionError> {
     assert_eq!(thread, session.trim_start_matches("cutex."));
     let mut hold = NATIVE_HOLD.get().unwrap().0.lock().unwrap();
     assert!(hold.released && hold.sends == 1);
@@ -84,7 +84,7 @@ fn blocked_submit(
                 native_method: Some(method.into()),
                 turn_id: Some("busy-turn".into()),
                 queue: None,
-                queue_paused: false,
+                queue_paused: false, passive_notes: None,
             })
         },
         |_, _| panic!("busy input must not flush"),
@@ -226,6 +226,7 @@ fn crash_command(session: &str) -> UserInputSubmitCommand {
         cutex_session_id: session.into(),
         thread_id: "crash-thread".into(),
         params: UserInputSubmitParams {
+                interrupt_send: None,
             join_delegation: None,
             client_user_message_id: "crash-client".into(),
             origin: UserInputOrigin {
@@ -269,6 +270,7 @@ fn blocked_raw_forward(
 fn ordered_raw_stop(
     session: &str,
     thread: &str,
+    _owner_authorized: bool,
 ) -> Result<Option<String>, UserInputExecutionError> {
     assert_eq!(thread, session.trim_start_matches("cutex."));
     let mut hold = NATIVE_HOLD.get().unwrap().0.lock().unwrap();

@@ -9,7 +9,9 @@ use crate::asks::{operations::{self,EffectState},project_control as control,rout
 use crate::http::server::{SimpleHttpRequest,write_json_response};
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum Route { Tree(String), Attempts(String), Stop(String), Policy(String), Grants(String), Approvals(String), Approval(String), Revoke(String), Decision(String), ResumeContinuation(String), RunControl(String), Pause(String), Resume(String), Operation(String) }
+pub enum Route { Tree(String), Attempts(String), Stop(String), Policy(String), Grants(String), Approvals(String), Approval(String), Revoke(String), Decision(String), ResumeContinuation(String), RunControl(String), Pause(String), Resume(String), Operation(String),
+    /// r290 P10 (A1): owner receipt lookup (false) / settle (true) for every panel action.
+    ProjectAction(String,bool) }
 pub fn parse_path(path:&str)->Option<Route>{
     let parts:Vec<_>=path.split('/').collect();
     let valid=|s:&str|!s.is_empty()&&s.len()<=256&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_.:".contains(&b));
@@ -29,6 +31,9 @@ pub fn parse_path(path:&str)->Option<Route>{
         ["","v2","delegations",id,"attempts"] if valid(id)=>Some(Route::Attempts((*id).into())),
         ["","v2","delegations",id,"stop"] if valid(id)=>Some(Route::Stop((*id).into())),
         ["","v2","delegation-operations",id] if valid(id)=>Some(Route::Operation((*id).into())),
+        // r290 P10 (A1)
+        ["","v2","project-actions",id] if valid(id)=>Some(Route::ProjectAction((*id).into(),false)),
+        ["","v2","project-actions",id,"settle"] if valid(id)=>Some(Route::ProjectAction((*id).into(),true)),
         _=>None
     }
 }
@@ -72,6 +77,8 @@ fn grant_view(grant:&routing::DelegationGrant)->Value{
 
 /// Invoked only after the root AND human-principal checks in server.rs.
 pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->anyhow::Result<()>{
+    // r290 P10 (A1): same owner gate as every route of this parser.
+    if let Route::ProjectAction(action,settle)=&route{return super::project_action_receipts::handle(stream,request,action,*settle);}
     let body=if request.body.is_empty(){Ok(json!({}))}else{serde_json::from_slice(&request.body).map_err(|e|invalid(e.to_string()))};
     let result=body.and_then(|body| {
         let store=AskStore::open_default().map_err(unavailable)?;
@@ -102,7 +109,7 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
                     .ok_or_else(||AskError::new("approval_not_found","no such approval"))?,
                 Route::ResumeContinuation(id)=>store.inspect(|s|s.asks.get(id).and_then(|a|a.project_id.clone())).map_err(unavailable)?
                     .ok_or_else(||AskError::new("ask_not_found","no such project delegation"))?,
-                Route::Operation(_)|Route::Attempts(_)|Route::Stop(_)=>unreachable!(),
+                Route::Operation(_)|Route::Attempts(_)|Route::Stop(_)|Route::ProjectAction(..)=>unreachable!(),
             };
             let ctx=owner_context(snapshot,&project)?;
             let host=routing::integration::local_host_id();

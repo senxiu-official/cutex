@@ -6,6 +6,14 @@ use serde_json::Value;
 /// Additive Management features beyond the frozen v2 baseline. Clients
 /// feature-detect on these strings (and the boolean `features` map).
 pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
+    // r290 P6
+    ("project-board-summary-v1","projectBoardSummaryV1"),
+    ("delegation-steps-v1","delegationStepsV1"),
+    ("delegation-quiet-v1","delegationQuietV1"),
+    ("project-director-progress-v1","projectDirectorProgressV1"),
+    // r290 P5 schedules.
+    (crate::schedules::CAPABILITY, "recurringSchedulesV1"),
+    (super::agent_bus_state::history::CAPABILITY, "bootstrapBoundedBus"),
     (super::session_paths::CAPABILITY, "sessionPathReapproval"),
     ("agent-memory-injection", "agentMemoryInjection"),
     // 2026-11-03: design 056 phase 1 (r275), opaque per-person layout sections.
@@ -26,6 +34,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("project-run-control-v1", "projectRunControlV1"),
     ("delegation-continuation-v1", "delegationContinuationV1"),
     ("agent-activity-v1", "agentActivityV1"),
+    // r290 P10 (A1): GET /v2/project-actions/{actionId}?kind=&entity= and
+    // POST .../settle: one owner receipt lookup for every project-panel
+    // lifecycle action (project_action_receipts.rs).
+    (super::project_action_receipts::FEATURE, "projectActionReceiptsV1"),
+    ("stop-answer-admission-v1", "stopAnswerAdmissionV1"),
+    ("ask-stop-settlement-v1", "askStopSettlementV1"),
     ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
     (
         crate::management::v2::agent_bus_settlement_model::STALE_ACK_FEATURE,
@@ -74,6 +88,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `result.profile_pick` (agent bus); profile `autoPick` (GET|PATCH);
     // GET /v2/profile-auto-pick preview; names auto / auto:… reserved.
     ("profile-auto-pick", "profileAutoPick"),
+    ("profile-quota-agents-v1", "profileQuotaAgentsV1"), // r290 P12.
     // GET /v2/profiles, GET|PATCH /v2/profiles/{profile}.
     ("profiles-api", "profilesApi"),
     // GET|PATCH /v2/settings.
@@ -90,6 +105,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // requestModel bindings and official catalog edits, gated by each profile's
     // modelVariantsSupported (the selected verified native server capability).
     ("profile-model-variants", "profileModelVariants"),
+    // r290 P13
+    ("profile-model-context-v1", "profileModelContextV1"),
     // Per-entry model display names: /v2/profiles items `modelDisplayNames`
     // {modelId: name}, PATCH `modelDisplayNames` {modelId: name | null} (merge;
     // null removes), GET .../models `models[].entryDisplayName`. Display only.
@@ -255,9 +272,31 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // record + native thread with a recovery copy under runtime/session-deletes/;
     // event cutex/session/deleted; session_referenced / session_busy refusals.
     ("session-delete", "sessionDelete"),
+    // r290 P10 (B7): cutex/session/delete {stopFirst: true} (owner): a busy
+    // session's turn is stopped (cutex/turn/stop path) and the delete waits
+    // for it (bounded); session_busy details carry `canStopFirst`; timeout
+    // is `session_stop_timeout` (409, nothing deleted).
+    ("session-delete-stop-first", "sessionDeleteStopFirst"),
+    // r290 P10 (B8): PATCH /v2/approval-rules/{id} {ownerResume: true}
+    // re-enables an unchanged paused high-risk rule without a typed token.
+    ("approval-rule-owner-resume", "approvalRuleOwnerResume"),
+    // r290 P10 (c): POST /v2/peers {ownHost: true} and
+    // POST /v2/peers/{id}/own-host apply the owner-to-owner peer preset.
+    ("peer-own-host-preset", "peerOwnHostPreset"),
     // /v2/settings archiveDeleteEmpty (default true): cutex/session/retire of a
     // session that never received input deletes it and answers {deleted: true}.
     ("session-delete-empty-on-archive", "sessionDeleteEmptyOnArchive"),
+    // r290 P10 (B4/A8): full-scope owner requests open \\wsl$\…, \\wsl.localhost\…
+    // and the /v2/settings `ownerShares` roots (\\server\share or Z:) in GET
+    // /v2/fs/file, /v2/fs/dirs, the workspace tree, writable roots, localImage
+    // input and owner publish. `ownerShares` PATCH: owner on the host only
+    // (403 owner_shares_owner_local_only); `ownerSharesEditable` in the view.
+    #[cfg(windows)]
+    ("owner-network-shares", "ownerNetworkShares"),
+    // r290 P10 (d): POST /v2/artifact-store by a full-scope owner: no
+    // workspace containment / credential-name rules (cutex home, preview
+    // refusals and size/reference limits stay); 201 body `credentialWarning`.
+    ("owner-artifact-publish", "ownerArtifactPublish"),
     // cutex/session/fork {afterTurnId?, name?} (root): new agent bound to a
     // forked native thread; result carries the new session; event
     // cutex/session/forked on the source.
@@ -461,6 +500,9 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // messageDelivered on both streams (Codex + Claude), bootstrap agentBusSentMessages,
     // view `cutex.agent-message.v1` body, cutex/agentBus/wake, agent_tell wake.
     ("agent-messages-v2", "agentMessagesV2"),
+    (super::agent_bus_wake::FEATURE, "agentBusReadNotesV1"),
+    ("pre-turn-passive-notes-v1", "preTurnPassiveNotesV1"),
+    ("passive-note-diagnostics-v1", "passiveNoteDiagnosticsV1"),
     // Delegation (委托) views `cutex.delegation-ask.v1` / `cutex.delegation-results.v1`,
     // GET /v2/asks involving/limit/hasMore, AskSummary attempt/answerPreview (r208).
     ("delegation-views", "delegationViews"),
@@ -517,6 +559,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/sessions/{id}/media/{sha256}; other tool strings over 1 MiB
     // are cut (truncated: true). Design 025 (an image thread of 1.5 GB).
     ("history-media-refs", "historyMediaRefs"),
+    // r290 P4: session read grants also cover history media and uploaded images.
+    ("session-media-read", "sessionMediaRead"),
+    // GET /v2/sessions/{id}/attachments/{attachmentId} -> raw image bytes.
+    ("session-attachment-read", "sessionAttachmentRead"),
+    // GET /v2/sessions/{id}/server-requests -> current-generation pending native requests.
+    ("session-server-requests-read", "sessionServerRequestsRead"),
     // Durable native-event binary references (cutexBlob descriptor), backed
     // by visible-session read grants on /blobs/{sha}; 256 KiB appended event cap.
     ("event-media-blobs", "eventMediaBlobs"),
@@ -551,6 +599,9 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // ownerNotify; summary needs ownerMessage / ownerReply and
     // cutex/summary/messageToOwner.
     ("owner-messages", "ownerMessages"),
+    ("owner-ask-disposition-v1", "ownerAskDispositionV1"),
+    ("owner-notify-direct-v1", "ownerNotifyDirectV1"),
+    ("agent-bus-owner-end-followup-v1", "agentBusOwnerEndFollowupV1"),
     // 备忘 (cutex-desktop .claude/reports/owner-pins-design-20261110.md):
     // agent tools owner_pin / owner_pins (same audience as owner_notify);
     // GET /v2/owner-pins?state=open|all&agentId=&limit=, PATCH
@@ -722,6 +773,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("artifacts", "artifacts"),
     // Whole-library source/latest-publisher filters and stable sorted pages.
     ("artifact-library", "artifactLibrary"),
+    ("artifact-raw-download", "artifactRawDownload"),
     // MCP artifact_publish {show: true}: after the publish, host event
     // cutex/artifact/showRequested {artifactId, version, ref, scope, name,
     // kind, mediaType, cutexSessionId, displayName, hostId, newVersion,
@@ -736,6 +788,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // time a session on that account runs (cutex never refreshes it). A 401 /
     // 403 with a valid token stays lastError with a re-login hint.
     ("claude-quota-stale-credentials", "claudeQuotaStaleCredentials"),
+    // r290 P8 (design 052): GET /v2/usage/quota-attribution
+    // ?account=<claude account id>|profile=<id or name>&window=5h|7d (root,
+    // computed on request): per-agent share of a Claude subscription
+    // account's current window from the usage ledger, calibrated per account
+    // on completed windows; unattributed / in-flight parts and a burn-rate
+    // forecast. 404 profile_not_found | claude_account_not_found, 409
+    // not_a_claude_profile | no_quota_windows (API account).
+    (crate::management::v2::usage::quota_attribution::FEATURE, "quotaAttribution"),
     // r224: GET /v2/host (host_info.rs) gains instanceId (same as here,
     // <cutex home>/instance-id), arch, osVersion (short human string or null)
     // and cutexBuild (same object as here); schema export `host`.
@@ -875,6 +935,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // visible and the path session is its requester or target (404
     // ask_not_found / question_not_found otherwise).
     ("users-p2-access", "usersP2Access"),
+    // r290 P1: grant.projectRoles {projectId: viewer|collaborator}; PUT|DELETE
+    // /v2/users/{id}/projects/{projectId}; non-owner read of artifacts of visible
+    // projects / agents (GET /v2/artifact-store[/{id}[/versions/{n}/content|raw]|/diff]).
+    // A project with a role follows it for sending (viewer: read-only).
+    ("user-project-roles", "userProjectRoles"),
+    // r290 P1: POST /v2/users/{id}/tokens {label, scope?} issues a client token bound to
+    // a non-owner user (secret returned once); DELETE /v2/users/{id}/tokens/{tokenId}.
+    ("user-token-issue", "userTokenIssue"),
     // POST /v2/human/agents accepts Claude subscription profiles: the agent is
     // created like agent_create / quick chats (the Claude runtime selected for
     // new sessions; the profile's Claude model / effort / write / exec rules,
@@ -1414,6 +1482,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Full portrait/emoji/letter style is independent of legacy avatarThemes.
     // Nullable appearance.avatarStyle has its own appearance revision/clock.
     ("profile-avatar-style", "profileAvatarStyle"),
+    // Same path-safe alphabet; matches desktop catalog themes up to 32 bytes.
+    ("profile-avatar-style-theme-32", "profileAvatarStyleTheme32"),
     ("profile-avatar-style-import-if-unset", "profileAvatarStyleImportIfUnset"),
     // Explicit fixed/inherit session intent; mode and avatar share a CAS field.
     ("session-avatar-mode", "sessionAvatarMode"),
@@ -1466,6 +1536,35 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // clientToken, issuedVia}. /v2/capabilities user.ownerLocal says whether
     // this connection counts; token items carry issuedVia.
     ("owner-local-only", "ownerLocalOnly"),
+    // r290 P10 (B6): a full-scope owner device (any listener, relay too)
+    // may always turn off / remove / revoke (peer disable / remove, PATCH
+    // /v2/settings {peers:{enabled:false}}, POST /v2/relay/pairing
+    // {enabled:false}, DELETE /v2/relay/certificates/{id}, invite cancel /
+    // deny). Widening (pairing codes / invites / approvals, peers on, public
+    // pairing on, owner approval off) answers 428 owner_confirm_required
+    // {action, summary, confirmToken, expiresAt, ttlSeconds}; the same
+    // request repeated with ?ownerConfirm=<confirmToken> (single use, 2 min,
+    // bound to the token and action) runs and publishes host event
+    // cutex/access/ownerRemoteAction {action, summary, tokenId, label,
+    // deviceName, platform, connection, at}.
+    ("owner-device-confirm", "ownerDeviceConfirm"),
+    // r290 P10 (B3): relay device leaf 30 days, renewable from day 15; an
+    // expired leaf renews with the same key for 30 days over a restricted
+    // grace connection (only GET /v2/relay-certificate and POST
+    // /v2/relay-certificate/renew; 403 relay_certificate_expired otherwise);
+    // GET /v2/relay-certificate adds graceUntil, expired; device rows (GET
+    // /v2/users tokens[], GET /v2/client-tokens) carry relayCertificate
+    // {certificateId, expiresAt, renewableFrom, graceUntil, state}.
+    ("relay-certificate-grace", "relayCertificateGrace"),
+    // r290 P10 (a): re-pairing the same device replaces it: POST /v2/pair
+    // {previousToken} → replacedTokenId; QR v2 apply {previousToken} or the
+    // same CSR key → the invite shows replacesDeviceId and approval removes
+    // the old token in the same write.
+    ("device-repair-replaces", "deviceRepairReplaces"),
+    // r290 P10 (b): pairing-code lockout is per source (IPv4 / IPv6 /64);
+    // the host-wide lock voids only older codes and a code issued during it
+    // lifts it.
+    ("pairing-lockout-owner-override", "pairingLockoutOwnerOverride"),
     // Limit 3: per-device scope "full" | "chat" | "read" on client / device
     // tokens (pairing-code `scope`, `client-token issue --scope`, PATCH
     // /v2/client-tokens/{id} {scope}); effective rights = user's rights ∩
@@ -1593,12 +1692,14 @@ fn add_input_ledger_feature(value: &mut Value, enabled: bool) {
         features.insert("ownerInputNextupV1".into(), Value::Bool(true));
         features.insert("ownerIdleBusyTimelineV1".into(), Value::Bool(true));
         features.insert("ownerCarriesV1".into(), Value::Bool(true));
+        features.insert("interruptSendManyV1".into(), Value::Bool(true));
     }
     if let Some(list) = value.get_mut("featureList").and_then(Value::as_array_mut) {
         list.push(Value::String("input-disposal-v1".into()));
         list.push(Value::String(super::input_ledger::CAPABILITY.into()));
         list.push(Value::String(super::input_ledger::OWNER_INPUT_NEXTUP_CAPABILITY.into()));
         list.push(Value::String(super::input_ledger::OWNER_CARRIES_CAPABILITY.into()));
+        list.push(Value::String(super::input_interrupt_send::MANY_FEATURE.into()));
         list.push(Value::String(super::input_ledger::OWNER_IDLE_BUSY_TIMELINE_CAPABILITY.into()));
     }
 }
@@ -1699,10 +1800,11 @@ mod tests {
         add_kimi_runtime_feature(&mut on);
         add_input_ledger_feature(&mut on, true);
         let list = on["featureList"].as_array().unwrap();
-        assert_eq!(&list[list.len() - 4..], [json!("input-ledger-v1"), json!("owner-input-nextup-v1"), json!("owner-carries-v1"), json!("owner-idle-busy-timeline-v1")]);
+        assert_eq!(&list[list.len() - 5..], [json!("input-ledger-v1"), json!("owner-input-nextup-v1"), json!("owner-carries-v1"), json!("interrupt-send-many-v1"), json!("owner-idle-busy-timeline-v1")]);
         assert_eq!(on["features"]["inputLedgerV1"], true);
         assert_eq!(on["features"]["ownerInputNextupV1"], true);
         assert_eq!(on["features"]["ownerCarriesV1"], true);
+        assert_eq!(on["features"]["interruptSendManyV1"], true);
         assert_eq!(on["features"]["ownerIdleBusyTimelineV1"], true);
     }
 
@@ -1736,6 +1838,17 @@ mod tests {
 
     #[test]
     fn capabilities_advertise_registry_and_features() {
+        // r290 P6
+        let board=capabilities_resource();
+        for (name,key) in [("project-board-summary-v1","projectBoardSummaryV1"),("delegation-steps-v1","delegationStepsV1"),("delegation-quiet-v1","delegationQuietV1"),("project-director-progress-v1","projectDirectorProgressV1")] {
+            assert_eq!(board["features"][key],true);assert!(board["featureList"].as_array().unwrap().iter().any(|v|v==name));
+        }
+
+        let dispositions=capabilities_resource();
+        for feature in ["owner-ask-disposition-v1","owner-notify-direct-v1","agent-bus-owner-end-followup-v1"] {
+            assert!(dispositions["featureList"].as_array().unwrap().iter().any(|item|item==feature));
+        }
+
         let value = capabilities_resource();
         assert_eq!(value["contractVersion"], 2);
         assert_eq!(value["continuationWakeKinds"], json!(["after", "children"]));
@@ -1892,6 +2005,7 @@ mod tests {
             "artifactLibrary",
             "artifactShow",
             "claudeQuotaStaleCredentials",
+            "quotaAttribution",
             "peers",
             "crossHostAsks",
             "crossHostTell",
@@ -1919,6 +2033,7 @@ mod tests {
             "sessionSandboxExtras",
             "profileAvatar",
             "profileAvatarStyle",
+            "profileAvatarStyleTheme32",
             "profileAvatarStyleImportIfUnset",
             "sessionAvatarMode",
             "sessionCreatedBy",

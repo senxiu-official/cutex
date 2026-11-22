@@ -21,6 +21,8 @@ pub struct GlobalConfigPatch {
     pub claude_usage_refresh_minutes: Option<u8>,
     pub profile_quota_refresh_minutes: Option<u8>,
     pub archive_delete_empty: Option<bool>,
+    /// r290 P10 (B4/A8): `ownerShares` (replaces the list; validated on apply).
+    pub owner_shares: Option<Vec<String>>,
     pub queue_owner_may_pass_asks: Option<bool>,
     pub image_input: Option<crate::management::v2::user_input::image_steering::ImageInputSettings>,
     pub auto_thread_titles: Option<bool>,
@@ -142,6 +144,12 @@ pub fn apply_global_config_patch(
         patch.profile_quota_refresh_minutes,
     );
     changed |= apply_value_update(&mut config.archive_delete_empty, patch.archive_delete_empty);
+    // r290 P10 (B4/A8)
+    if let Some(shares) = &patch.owner_shares {
+        let shares = crate::artifacts::paths::normalize_owner_shares(shares).map_err(anyhow::Error::msg)?;
+        changed |= config.owner_shares != shares;
+        config.owner_shares = shares;
+    }
     changed |= apply_value_update(&mut config.queue.owner_may_pass_asks, patch.queue_owner_may_pass_asks);
     changed |= apply_value_update(&mut config.auto_thread_titles, patch.auto_thread_titles);
     changed |= apply_value_update(

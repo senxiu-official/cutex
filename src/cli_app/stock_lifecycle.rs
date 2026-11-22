@@ -453,6 +453,8 @@ fn reconnect_verified(
 pub(super) struct StockExecutor {
     child: Option<super::stock_publication::GatedChild>,
     publication: Option<(cutex::agent_management::StockPublication, std::fs::File)>,
+    #[cfg(target_os = "linux")]
+    scope: Option<cutex::runtime::process_scope::LinuxRuntimeScope>,
 }
 impl Drop for StockExecutor {
     fn drop(&mut self) {
@@ -626,7 +628,7 @@ pub(super) fn configured(
         "unsupported stock provider key"
     );
     if let Some(projection) = &profile.selected_projection {
-        cutex::profiles::model_variants::validate_runtime(projection, bundle, native_home)?;
+        let projection = cutex::profiles::model_variants::projection_for_runtime(projection, bundle, native_home)?;
         launch = launch.args(if let Some(home) = migration_home {
             projection.migrated_native_args(
                 owner,
@@ -643,7 +645,7 @@ pub(super) fn configured(
         );
         // A catalog-less API-key profile on its own provider: the automatic
         // reviewer reviews with the agent's model (`reviewer_catalog`).
-        launch = launch.args(cutex::profiles::reviewer_catalog::launch_args(projection, &profile.model, bundle, native_home));
+        launch = launch.args(cutex::profiles::reviewer_catalog::launch_args(&projection, &profile.model, bundle, native_home));
     } else if profile.private_chatgpt_auth.is_some() {
         launch = option(launch, "cli_auth_credentials_store", "file")?;
     } else {
@@ -1026,6 +1028,15 @@ impl StockRuntimeExecutor for StockExecutor {
                 "publication_missing: cannot recover legacy binding"
             );
             self.publication(receipt)?;
+            #[cfg(target_os = "linux")]
+            if binding.linux_scope {
+                let scope = cutex::runtime::process_scope::LinuxRuntimeScope::new(
+                    receipt.review.subject.cutex_session_id.as_str(),
+                    "stock",
+                    std::path::Path::new(&binding.runtime_dir),
+                );
+                return scope.is_empty();
+            }
             Ok(true)
         }
         #[cfg(windows)]
@@ -1246,10 +1257,33 @@ impl StockRuntimeExecutor for StockExecutor {
                 ),
             )
             .env("CUTEX_AGENT_BUS_TOKEN", token);
-        let log = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir)
-            .join("stock.stderr.log");
-        // One gated setsid child, without contacting systemd. It cannot exec
-        // native stock until its binding has committed. This is not a cgroup.
+        let runtime_dir = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir);
+        let log = runtime_dir.join("stock.stderr.log");
+        // The gate still precedes every exec. After durable publication, the
+        // gated child execs systemd-run, which moves itself and execs the
+        // native binary in place. The binding always names the same PID.
+        #[cfg(target_os = "linux")]
+        {
+            use cutex::runtime::process_scope::{
+                CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, LinuxRuntimeScope,
+            };
+            match LinuxRuntimeScope::launcher(&record.cutex_session_id) {
+                Ok((launcher, manager)) => {
+                    let scope = LinuxRuntimeScope::new(&record.cutex_session_id, "stock", &runtime_dir);
+                    launch = stock_systemd_scope_launch(
+                        launch,
+                        &launcher,
+                        scope.arguments()?,
+                        scope.unit(),
+                        &manager,
+                    )?;
+                    self.scope = Some(scope);
+                }
+                Err(reason) => {
+                    launch = launch.env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, format!("direct:{reason}"));
+                }
+            }
+        }
         let secret = profile
             .selected_projection
             .as_ref()
@@ -1272,6 +1306,10 @@ impl StockRuntimeExecutor for StockExecutor {
             child.id(),
             cutex::platform::process::process_started_at(child.id())?.to_rfc3339(),
         );
+        #[cfg(target_os = "linux")]
+        {
+            binding.linux_scope = self.scope.is_some();
+        }
         binding.launched_profile = Some(profile.profile_name.clone());
         binding.launched_profile_id = Some(profile.profile_id.clone());
         binding.launch_profile_source = Some(if profile.inherited {
@@ -1384,6 +1422,16 @@ impl StockRuntimeExecutor for StockExecutor {
                 "host",
             )?;
         }
+        // r290 P9: close the bound tool gate before bridge/Ready publication.
+        // Runtime IO remains outside the registered host fence; compare the
+        // exact durable occurrence again before continuing readiness.
+        cutex::agent_management::verify_claim_outside_host_fence(
+            "initial runtime tool gate",
+            || live_runtime_claim(&record.cutex_session_id),
+            || super::tool_gate::prepare_before_publish(
+                &record.cutex_session_id, &receipt.review.contract.native_id,
+                receipt.expected_generation, &manager.handle(&record.cutex_session_id)?, false),
+        )?;
         if bundle.soon_ingress() {
             let status = manager
                 .status(&record.cutex_session_id)?
@@ -1475,10 +1523,17 @@ impl StockRuntimeExecutor for StockExecutor {
         if let Some(mut child) = self.child.take() {
             child.cleanup()?;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = self.scope.as_ref() {
+            ensure!(scope.terminate(true)?.stopped, "failed to empty stock runtime scope");
+            self.scope.take();
+        }
         self.publication.take();
         Ok(())
     }
     fn retain_owner(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.scope.take();
         if let Some(mut child) = self.child.take() {
             let _ = std::thread::Builder::new()
                 .name("stock-child-reaper".into())
@@ -1496,7 +1551,22 @@ pub(super) fn verify_stock_process(
     let sessions = cutex::session::store::load_cutex_session_store()?;
     let contract = running_stock_contract(record, binding, &sessions)?;
     let bundle = StockBundle::load_running(&contract)?;
-    verify_stock_process_with_bundle(binding, &bundle)
+    verify_stock_process_with_bundle(binding, &bundle)?;
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = stock_runtime_scope(record, binding) {
+        ensure!(scope.contains_pid(binding.pid)?, "stock owner outside its recorded Linux scope");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn stock_runtime_scope(
+    record: &CutexSessionRecord,
+    binding: &CutexAppServerRuntimeBinding,
+) -> Option<cutex::runtime::process_scope::LinuxRuntimeScope> {
+    binding.linux_scope.then(|| cutex::runtime::process_scope::LinuxRuntimeScope::new(
+        &record.cutex_session_id, "stock", std::path::Path::new(&binding.runtime_dir),
+    ))
 }
 
 // Desired configuration may change while an older runtime is still alive.
@@ -1861,6 +1931,34 @@ fn facade_config_env(management_port: u16) -> serde_json::Value {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn stock_systemd_scope_launch(
+    mut launch: cutex::launch::command::LaunchCommand,
+    launcher: &std::path::Path,
+    mut args: Vec<String>,
+    unit: &str,
+    manager: &cutex::runtime::process_scope::SystemdUserManager,
+) -> anyhow::Result<cutex::launch::command::LaunchCommand> {
+    use cutex::runtime::process_scope::{
+        CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR,
+    };
+
+    // The gated spawn uses a clean environment. Restore only a bus address
+    // explicitly present in the stock launch plan.
+    args.extend([
+        "/usr/bin/env".to_string(),
+        "-u".to_string(), "XDG_RUNTIME_DIR".to_string(),
+        "-u".to_string(), "INVOCATION_ID".to_string(),
+        launch.program,
+    ]);
+    args.extend(launch.args);
+    launch.program = launcher.to_str().context("systemd-run path must be UTF-8")?.to_owned();
+    launch.args = args;
+    Ok(manager.configure_scope_launch(launch, None)
+        .env(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR, unit)
+        .env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, format!("systemd_scope:{unit}")))
+}
+
 #[cfg(test)]
 mod facade_env_tests {
     #[test]
@@ -1880,6 +1978,40 @@ mod facade_env_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod ingress_guard_tests {
+    #[test]
+    fn stock_scope_restores_only_the_planned_session_bus() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use cutex::launch::command::LaunchCommand;
+        use cutex::runtime::process_scope::SystemdUserManager;
+
+        let dir = std::env::temp_dir().join(format!("ss-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("systemd")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _listener = UnixListener::bind(dir.join("systemd/private")).unwrap();
+        let runtime_dir = dir.to_str().unwrap();
+        let manager = SystemdUserManager::from_runtime_dir(runtime_dir.to_owned()).unwrap();
+        for address in [None, Some("unix:path=/stock/session-bus")] {
+            let mut launch = LaunchCommand::new("cute-codex").arg("app-server");
+            if let Some(bus) = address {
+                launch = launch.env("DBUS_SESSION_BUS_ADDRESS", bus);
+            }
+            let scoped = super::stock_systemd_scope_launch(
+                launch, std::path::Path::new("/usr/bin/systemd-run"),
+                vec!["--scope".to_owned(), "--".to_owned()], "stock.scope", &manager,
+            ).unwrap();
+            let bus_option = address.map(|value| format!("--setenv=DBUS_SESSION_BUS_ADDRESS={value}"));
+            assert_eq!(
+                scoped.args.iter().find(|arg| arg.starts_with("--setenv=DBUS_SESSION_BUS_ADDRESS=")),
+                bus_option.as_ref(),
+            );
+            let command = scoped.to_command();
+            assert!(command.get_envs().any(|(key, value)| key == "XDG_RUNTIME_DIR"
+                && value == Some(std::ffi::OsStr::new(runtime_dir))));
+            assert!(command.get_envs().any(|(key, value)| key == "DBUS_SESSION_BUS_ADDRESS" && value.is_none()));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn foreground_failure_retains_stderr_and_exit_code() {
         let (status, diagnostic) =
@@ -2049,6 +2181,7 @@ mod windows_environment_tests {
             launched_profile: None,
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: home.root().join("journal.jsonl").display().to_string(),
             schema_version: "test".into(),

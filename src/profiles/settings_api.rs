@@ -292,6 +292,8 @@ pub fn snapshot_json(snapshot: &CodexProfileConfigSnapshot) -> Value {
         "imageHistoryTrim": snapshot.image_history_trim.map(|trim| trim.to_json()),
         "modelCatalogJson": snapshot.model_catalog_json,
         "modelContextWindow": snapshot.model_context_window,
+        "modelAutoCompactPercent": snapshot.model_auto_compact_percent, // r290 P13
+        "modelContextSettingsV1": snapshot.model_context_settings_v1,
         "modelAutoCompactTokenLimit": snapshot.model_auto_compact_token_limit,
         "providerName": snapshot.provider_name,
         "providerBaseUrl": snapshot.provider_base_url,
@@ -442,6 +444,10 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         // for that entry (display only; ids stay what is selected and sent).
         "modelDisplayNames": account.model_display_names,
     });
+    // r290 P13: keep this large json! below its macro recursion budget.
+    item["modelAutoCompactPercent"] = json!(snapshot.as_ref().and_then(|s| s.model_auto_compact_percent));
+    item["modelContextSettingsV1"] = json!(snapshot.as_ref().is_some_and(|s| s.model_context_settings_v1));
+    item["modelContextSettingsSupport"] = super::model_context::support(account);
     if account.cli_kind == CliKind::Dsh {
         item["options"] = json!({"dsh":account.options.dsh});
     }
@@ -544,6 +550,8 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
                 "planLabel": true,
             },
         });
+        // r290 P13
+        item["detail"]["editable"]["modelAutoCompactPercent"] = json!(codex && item["modelContextSettingsSupport"]["supported"] == true);
         // profile-search-tool: Codex API-key profiles (outside json!: its
         // recursion limit).
         item["detail"]["editable"]["searchTool"] = json!(search_tool_supported(account));
@@ -1021,6 +1029,20 @@ pub fn update_profile(
     profile: &str,
     patch: &ProfileApiPatch,
 ) -> anyhow::Result<(StoredAccount, bool)> {
+    // r290 P13: migration takes overlay before lifecycle; never call it under the lifecycle lock.
+    let percent_patch = !matches!(patch.codex_config.model_auto_compact_percent, ConfigValueUpdate::Unchanged);
+    let context_patch = percent_patch
+        || !matches!(patch.codex_config.model_context_window, ConfigValueUpdate::Unchanged)
+        || !matches!(patch.codex_config.model_auto_compact_token_limit, ConfigValueUpdate::Unchanged);
+    if context_patch {
+        let account = crate::profiles::store::account_by_key(profile)?.context("profile not found")?;
+        let supported = crate::profiles::model_variants::context_supported(&account);
+        ensure!(!percent_patch || supported, "selected native runtime does not support modelContextSettingsV2");
+        if supported {
+            crate::profiles::catalog_overlay::ensure_context_migrated(&account)?;
+            ensure!(codex_snapshot(&account).model_context_settings_v1, "model context migration is incomplete");
+        }
+    }
     // Share the Management lifecycle lock with create/rename/delete. Different
     // fields compose across concurrent PATCHes; the same field is last-write-wins.
     let _profile_guard = crate::profiles::lifecycle::lock();
@@ -1136,12 +1158,20 @@ pub(crate) fn update_profile_locked(
         let (next, changed) =
             apply_codex_profile_config_patch(current_profile_config.as_deref(), &codex_config)?;
         let snapshot = inspect_codex_profile_config(next.as_deref())?;
+        // r290 P13: Native accepts a legacy absolute value above the window and
+        // caps its effective value. Migration and later v1 catalog edits keep
+        // that raw default; only a new write of the limits revalidates it.
+        let preserving_context_defaults = (snapshot.model_context_settings_v1
+            || matches!(codex_config.model_context_settings_v1, ConfigValueUpdate::Set(true)))
+            && matches!(codex_config.model_context_window, ConfigValueUpdate::Unchanged)
+            && matches!(codex_config.model_auto_compact_token_limit, ConfigValueUpdate::Unchanged)
+            && matches!(codex_config.model_auto_compact_percent, ConfigValueUpdate::Unchanged);
         if let (Some(window), Some(limit)) = (
             snapshot.model_context_window,
             snapshot.model_auto_compact_token_limit,
         ) {
             ensure!(
-                limit < window,
+                preserving_context_defaults || limit < window,
                 "modelAutoCompactTokenLimit ({limit}) must be smaller than modelContextWindow ({window})"
             );
         }
@@ -1176,6 +1206,11 @@ pub(crate) fn update_profile_locked(
     .flatten()
     .filter(|model| *model != account.options.claude.model);
 
+    // r290 P13: legacy fixed-window records remain writable on an old adapter.
+    let claude_percent_only = matches!(patch.claude_compaction, ConfigValueUpdate::Set(value) if value.auto_compact_window.is_none())
+        || matches!(&patch.claude_compaction_models, ConfigValueUpdate::Set(models) if models.values().any(|value| value.auto_compact_window.is_none()));
+    ensure!(!claude_percent_only || (!codex && crate::runtime::claude::selected_model_context_supported()),
+        "percent-only compaction requires a Claude adapter with modelContextSettingsV1");
     let compaction = match patch.claude_compaction {
         ConfigValueUpdate::Unchanged => None,
         ConfigValueUpdate::Set(_) | ConfigValueUpdate::Clear if codex => {

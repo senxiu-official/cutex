@@ -3,6 +3,7 @@ use serde_json::json;
 
 fn params(id: &str) -> UserInputSubmitParams {
     UserInputSubmitParams {
+                interrupt_send: None,
         client_user_message_id: id.into(),
         origin: UserInputOrigin {
             kind: UserInputOriginKind::Other,

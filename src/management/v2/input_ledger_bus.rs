@@ -258,6 +258,9 @@ impl NativeObserved {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusFacts {
     pub state: String,
+    pub stale_release_allowed: bool,
+    pub projection_failure: Option<Value>,
+    pub delivery_diagnostics: Option<Value>,
     pub timing: Timing,
     pub frozen: bool,
     pub a2: bool,
@@ -325,6 +328,15 @@ pub fn target_of(facts: &BusFacts) -> Target {
         let mut inner = facts.clone();
         inner.observed = native.as_deref().cloned();
         let target = target_of(&inner);
+        if facts.state == "stale_held" {
+            if let (Some(true), Target::Waiting {reason, details}) = (hold, &target) {
+                let mut details = details.clone().unwrap_or_else(|| json!({}));
+                details["ownerHold"] = json!(true);
+                details["releaseEffect"] = json!("removeOwnerPauseOnly");
+                return Target::Waiting {reason, details:Some(details)};
+            }
+            return target;
+        }
         if *carried { return Target::Carried(Box::new(target)); }
         if let (Some(held), Target::Waiting { reason, details }) = (hold, &target) {
             let mut details = details.clone().unwrap_or_else(|| json!({}));
@@ -357,7 +369,7 @@ pub fn target_of(facts: &BusFacts) -> Target {
             return Target::Rejected("targetUnavailable");
         }
         "failed" => return Target::Rejected("invalid"),
-        "stale_held" => return Target::Waiting { reason: "staleHeld", details: None },
+        "stale_held" => return Target::Waiting { reason: "staleHeld", details: Some(json!({"staleReleaseAllowed":facts.stale_release_allowed})) },
         _ => {}
     }
     match &facts.observed {
@@ -373,6 +385,11 @@ pub fn target_of(facts: &BusFacts) -> Target {
     if facts.a2 || facts.inbox || facts.state == "inbox_accepted" {
         return Target::Accepted { turn: None };
     }
+    if let Some(failure) = &facts.projection_failure {
+        let mut details = json!({"projectionFailure":failure});
+        if let Some(blocker) = failure.get("blockedByInputId") { details["blockedByInputId"] = blocker.clone(); }
+        return Target::Waiting { reason: timing_reason(facts.timing), details: Some(details) };
+    }
     Target::Waiting { reason: timing_reason(facts.timing), details: None }
 }
 
@@ -387,7 +404,15 @@ fn next_of(target: &Target) -> Next {
         Target::Waiting { reason, details } => {
             let next = Next::waiting(reason);
             match details {
-                Some(details) => next.details(details.clone()),
+                Some(details) => {
+                    let mut next = next.details(details.clone());
+                    if let Some(failure) = details.get("projectionFailure") {
+                        next = next.stalled((failure["attempts"].as_u64().unwrap_or(0) >= 2).then(|| input_ledger::Stalled {
+                            reason:"noProgress".into(), since:failure["since"].as_str().unwrap_or_default().into(),
+                        }));
+                    }
+                    next
+                },
                 None => next,
             }
         }
@@ -447,12 +472,30 @@ pub fn plan(current: Option<InputState>, target: &Target, timing: Timing) -> Vec
 /// Drive the record of `id` in `session` to `target` (creating it on the way
 /// with `input`). Returns the last record written.
 pub fn drive(session: &str, id: &str, input: &NewInput, target: &Target) -> Option<InputRecord> {
+    drive_with_diagnostics(session, id, input, target, None)
+}
+
+pub fn drive_with_diagnostics(session: &str, id: &str, input: &NewInput, target: &Target, diagnostics: Option<&Value>) -> Option<InputRecord> {
     if !active() {
         return None;
     }
     let existing = current(session, id);
     let mut last = None;
-    for next in plan(existing.as_ref().map(|record| record.state), target, input.intent.timing) {
+    let mut steps = plan(existing.as_ref().map(|record| record.state), target, input.intent.timing);
+    if steps.is_empty() && diagnostics.is_some() {
+        if let Some(record) = existing.as_ref().filter(|r| !r.state.is_settled() && r.details.get("deliveryDiagnostics") != diagnostics) {
+            let mut next = Next::to(record.state).details(record.details.clone());
+            next.reason = record.reason.clone(); next.stage = record.stage;
+            steps.push(next);
+        }
+    }
+    for next in steps {
+        let mut next = next;
+        if existing.as_ref().is_some_and(|r| r.details.get("projectionFailure").is_some())
+            && !matches!(target, Target::Waiting { details: Some(d), .. } if d.get("projectionFailure").is_some()) {
+            next = next.stalled(None);
+            if next.details.is_none() { next = next.details(json!({})); }
+        }
         let next = if next.state == InputState::Accepted && matches!(target, Target::Accepted { turn: None }) && input.intent.timing != Timing::Passive {
             next.deadline(Some(chrono::Utc::now() + chrono::Duration::seconds(60)))
         } else if matches!(target, Target::Accepted { turn: Some(_) })
@@ -461,6 +504,16 @@ pub fn drive(session: &str, id: &str, input: &NewInput, target: &Target) -> Opti
             // A repeated acceptance must not erase an existing turn-end grace.
             next.deadline(None)
         } else { next };
+        let mut next = next;
+        if let Some(diagnostics) = diagnostics.or_else(|| existing.as_ref().and_then(|r| r.details.get("deliveryDiagnostics"))) {
+            if existing.as_ref().is_some_and(|r| r.stalled.as_ref().is_some_and(|s|s.reason == "noProgress")
+                && r.details.get("deliveryDiagnostics").is_some_and(|before| before["stage"] != diagnostics["stage"])) {
+                next = next.stalled(None);
+            }
+            let mut details = next.details.take().unwrap_or_else(|| existing.as_ref().filter(|r| r.state == next.state).map(|r|r.details.clone()).unwrap_or_else(||json!({})));
+            details["deliveryDiagnostics"] = diagnostics.clone();
+            next.details = Some(details);
+        }
         last = write(session, id, next.create(input.clone()));
         if last.is_none() {
             break;
@@ -538,10 +591,10 @@ pub fn apply_changes(changes: Vec<BusChange>) {
 fn apply_now(changes: Vec<BusChange>) {
     for change in changes {
         let target = target_of(&change.after);
-        if change.before.as_ref().is_some_and(|before| target_of(before) == target) {
+        if change.before.as_ref().is_some_and(|before| target_of(before) == target && before.delivery_diagnostics == change.after.delivery_diagnostics) {
             continue;
         }
-        drive(&change.session, &change.message_id, &change.input, &target);
+        drive_with_diagnostics(&change.session, &change.message_id, &change.input, &target, change.after.delivery_diagnostics.as_ref());
     }
 }
 
@@ -844,7 +897,7 @@ pub fn backfill_batch(items: &[BackfillItem], now: DateTime<Utc>) -> usize {
                 }
             };
             for item in chunk.iter().filter(|item| missing.contains(&item.message_id)) {
-                if drive(session, &item.message_id, &item.input, &backfill_target(item, now)).is_some() {
+                if drive_with_diagnostics(session, &item.message_id, &item.input, &backfill_target(item, now), item.facts.delivery_diagnostics.as_ref()).is_some() {
                     created += 1;
                 }
             }

@@ -57,6 +57,17 @@ impl Fixture {
             })
             .unwrap();
     }
+    fn note(&self, id: &str) {
+        self.queue(id);
+        self.repository.mutate(|store| {
+            let row = store.messages.get_mut(id).unwrap();
+            row.snapshot.delivery_mode = "passive".into();
+            let message = row.canonical_envelope.as_mut().unwrap();
+            message.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::Passive;
+            message.trigger_turn = false;
+            Ok(())
+        }).unwrap();
+    }
     fn target(&self, id: &str) -> Target {
         let (_, facts, _) = self.repository.input_ledger_view(id).unwrap().unwrap();
         ledger::target_of(&facts)
@@ -91,6 +102,71 @@ fn envelope(message: &AgentBusMessage) -> anyhow::Result<Envelope> {
     e.semantic_sha256 = e.digest();
     e.validate()?;
     Ok(e)
+}
+
+fn passive_envelope(message: &AgentBusMessage) -> anyhow::Result<Envelope> {
+    let mut envelope = envelope(message)?;
+    envelope.message.delivery = Delivery::Passive;
+    envelope.semantic_sha256 = envelope.digest();
+    Ok(envelope)
+}
+
+#[test]
+fn read_now_reserves_only_selected_passive_identities_and_preserves_provenance() {
+    let f = Fixture::new();
+    f.on(|| {
+        for id in ["note-a", "note-b"] { f.note(id); }
+        f.queue("wake");
+        assert_eq!(f.repository.pending_note_ids(SESSION).unwrap().len(), 2);
+        let selected = vec!["note-b".to_string()];
+        let carried = f.repository.reserve_note_carries(SESSION, "owner-read", "native-thread", 7, &selected,
+            |message, _| passive_envelope(message)).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].message.id, "note-b");
+        assert_eq!(carried[0].message.source.id, SENDER);
+        assert_eq!(carried[0].message.delivery, Delivery::Passive);
+        assert!(!f.repository.owner_carried(SESSION, "note-a").unwrap());
+        assert!(!f.repository.owner_carried(SESSION, "wake").unwrap());
+        assert!(f.repository.owner_delivery_blocked(SESSION, "note-b").unwrap());
+        assert!(f.repository.reserve_note_carries(SESSION, "another-owner", "native-thread", 7, &selected,
+            |_, _| panic!("reserved identity must not be rebuilt")).is_err());
+        f.repository.release_owner_carries(SESSION, "owner-read").unwrap();
+        assert!(!f.repository.owner_carried(SESSION, "note-b").unwrap());
+    });
+}
+
+#[test]
+fn read_now_never_replays_a_frozen_unknown_note_and_batch_failure_is_atomic() {
+    let f = Fixture::new();
+    f.on(|| {
+        for id in ["note-a", "note-b"] { f.note(id); }
+        f.repository.freeze_external_input(SESSION, "note-b", passive_envelope).unwrap();
+        assert!(f.repository.reserve_note_carries(SESSION, "owner-read", "native-thread", 7,
+            &["note-a".into(), "note-b".into()], |message, _| passive_envelope(message)).is_err());
+        assert!(!f.repository.owner_carried(SESSION, "note-a").unwrap());
+        assert!(f.repository.snapshot_by_message_id("note-a").unwrap().unwrap().external_input.is_none());
+        assert!(f.repository.reserve_note_carries(SENDER, "owner-read", "native-thread", 7,
+            &["note-a".into()], |_, _| panic!("foreign recipient")).is_err());
+    });
+}
+
+#[test]
+fn read_now_keeps_accepted_note_in_its_exact_inbox_and_checks_binding() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.note("accepted-note");
+        f.repository.freeze_external_input(SESSION, "accepted-note", passive_envelope).unwrap();
+        f.repository.record_local_inbox(SESSION, "accepted-note", &json!({"threadId":"native-thread","turnId":null,
+            "messageId":"accepted-note","durable":true,"receiptScope":"local-inbox"})).unwrap();
+        let ids = ["accepted-note".into()];
+        assert!(f.repository.reserve_note_carries(SESSION, "owner-read", "native-thread", 7, &ids,
+            |_, _| panic!("accepted identity must never be submitted again")).unwrap().is_empty());
+        assert!(!f.repository.owner_carried(SESSION, "accepted-note").unwrap());
+        assert!(f.repository.reserve_note_carries(SESSION, "owner-read", "other-thread", 7, &ids,
+            |_, _| panic!("binding check first")).is_err());
+        assert!(f.repository.reserve_note_carries(SESSION, "owner-read", "native-thread", 8, &ids,
+            |_, _| panic!("generation check first")).is_err());
+    });
 }
 
 #[test]
@@ -136,6 +212,69 @@ fn hold_is_durable_and_only_explicit_release_allows_carry() {
             1
         );
         assert_eq!(reopened.read(|store| Ok(store.version)).unwrap(),8);
+    });
+}
+
+#[test]
+fn recipient_stale_release_checks_source_and_never_rearms_native_input() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.queue("stale-release");
+        f.repository.hold_stale_pending(SENDER, "stale-release", &"a".repeat(64), 3600, Utc::now()).unwrap();
+        assert!(f.repository.release_stale_input(SENDER, "stale-release").is_err());
+        assert!(f.repository.release_stale_input(SESSION, "stale-release").unwrap());
+        let row = f.repository.snapshot_by_message_id("stale-release").unwrap().unwrap();
+        assert_eq!(row.state, "pending");
+        assert!(row.stale_release_authorized);
+        assert!(f.repository.release_stale_input(SESSION, "stale-release").is_err());
+        f.repository.freeze_external_input(SESSION, "stale-release", envelope).unwrap();
+        assert!(f.repository.release_stale_input(SESSION, "stale-release").is_err());
+        assert!(f.repository.release_stale_held(SENDER, "stale-release", &"a".repeat(64), Utc::now()).is_err());
+    });
+}
+
+#[test]
+fn stale_release_action_is_projected_only_with_complete_pre_native_evidence() {
+    let f = Fixture::new();
+    f.on(|| {
+        for fault in ["safe", "native", "observed", "reserved", "ownerHeld", "noDigest"] {
+            f.queue(fault);
+            f.repository.hold_stale_pending(SENDER, fault, &"a".repeat(64), 3600, Utc::now()).unwrap();
+            if fault != "safe" {
+                f.repository.mutate_message(fault, |store| {
+                    store.version = store.version.max(8);
+                    let row = store.messages.get_mut(fault).unwrap();
+                    match fault {
+                        "native" => row.snapshot.external_input = Some(envelope(row.canonical_envelope.as_ref().unwrap())?),
+                        "observed" => row.snapshot.external_input_last_observed = Some(serde_json::from_value(json!({
+                            "messageId":fault,"semanticSha256":"a".repeat(64),"deliveryState":"unknown",
+                            "processing":{"state":"none","reason":null,"attemptId":null},"receipt":null}))?),
+                        "reserved" => {
+                            row.snapshot.external_input = Some(envelope(row.canonical_envelope.as_ref().unwrap())?);
+                            row.owner_carry = Some("other-owner".into());
+                        }
+                        "ownerHeld" => row.owner_hold = true,
+                        "noDigest" => row.snapshot.semantic_sha256 = None,
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }).unwrap();
+            }
+            let (_, facts, _) = f.repository.input_ledger_view(fault).unwrap().unwrap();
+            assert_eq!(facts.stale_release_allowed, fault == "safe", "{fault}");
+            let record = f.ledger.get(SESSION, &[fault.into()]).unwrap().records.pop().unwrap();
+            assert_eq!(record.actions.contains(&crate::management::v2::input_ledger::Action::ReleaseHold), matches!(fault,"safe"|"ownerHeld"), "{fault}: {record:?}");
+            if fault == "ownerHeld" {
+                assert_eq!(record.details["releaseEffect"], "removeOwnerPauseOnly");
+                assert!(f.repository.set_owner_hold(SESSION, fault, false).unwrap());
+                let row = f.repository.snapshot_by_message_id(fault).unwrap().unwrap();
+                assert_eq!(row.state, "stale_held");
+                assert!(!row.stale_release_authorized && row.external_input.is_none());
+                let row = f.ledger.get(SESSION, &[fault.into()]).unwrap().records.pop().unwrap();
+                assert!(row.actions.contains(&crate::management::v2::input_ledger::Action::ReleaseHold));
+                assert_eq!(row.details["staleReleaseAllowed"], true);
+            }
+        }
     });
 }
 

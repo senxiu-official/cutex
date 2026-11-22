@@ -4,6 +4,7 @@
 //! - `POST /v2/job-service/management-query` -> socket `humanList`
 //! - `GET  /v2/job-service/capabilities`     -> socket `capabilities`
 //! - `POST /v2/job-service/cancel`           -> socket `humanCancel`
+//! - `POST /v2/job-service/close-follow-up`  -> socket `humanCloseFollowUp`
 //! - `POST /v2/job-service/mark-external`  -> socket `humanMarkExternal`
 //! - `POST /v2/job-service/output`           -> socket `humanReadOutput`
 //!
@@ -155,10 +156,7 @@ pub(super) fn running_jobs() -> Option<Vec<Value>> {
     for _ in 0..10 {
         let page = call("humanList", json!({"query": "", "cursor": cursor, "limit": 50})).ok()?;
         for job in page.get("data").and_then(Value::as_array).into_iter().flatten() {
-            if matches!(
-                job.get("state").and_then(Value::as_str),
-                Some("registered" | "queued" | "launch_pending" | "running")
-            ) {
+            if is_running_job(job) {
                 jobs.push(job.clone());
             }
         }
@@ -168,6 +166,13 @@ pub(super) fn running_jobs() -> Option<Vec<Value>> {
         }
     }
     Some(jobs)
+}
+
+fn is_running_job(job: &Value) -> bool {
+    matches!(job.get("state").and_then(Value::as_str),
+        Some("registered" | "queued" | "launch_pending" | "running"))
+        || job.get("processAlive").and_then(Value::as_bool) == Some(true)
+        || job.get("launchPending").and_then(Value::as_bool) == Some(true)
 }
 
 /// `GET /v2/job-service/capabilities`: the service's `capabilities` result verbatim.
@@ -201,6 +206,67 @@ pub(super) fn handle_cancel(
         Ok(result) => write_json_response(stream, 200, "OK", &result),
         Err(error) => write_call_error(stream, &error),
     }
+}
+
+/// Owner disposition; does not cancel execution or resolve a session/runtime.
+pub(super) fn handle_close_follow_up(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+    let Some(params) = close_follow_up_params(&request.body) else {
+        return write_invalid(stream, "Expected {jobId, expectedRevision: positive integer, reason: nonempty string (<= 2048 bytes, no controls)}");
+    };
+    match close_follow_up_with(params, |params| call("humanCloseFollowUp", params), job_follow_up_ended_default) {
+        Ok(result) => write_json_response(stream, 200, "OK", &result),
+        Err(CallError::Service { code, message }) if code == "invalid" && !message.ends_with("unknown method") => write_invalid(stream, &message),
+        Err(error) => write_call_error(stream, &error),
+    }
+}
+
+/// Settle only the ask service's existing bindings after a newly committed close.
+fn job_follow_up_ended_default(job_id: &str, revision: u64) {
+    crate::asks::awaits::job_follow_up_ended_default(job_id, revision);
+}
+
+fn close_follow_up_with(
+    params: Value,
+    rpc: impl FnOnce(Value) -> Result<Value, CallError>,
+    hook: impl FnOnce(&str, u64),
+) -> Result<Value, CallError> {
+    let expected_id = params["jobId"].as_str().unwrap_or_default().to_owned();
+    let expected_revision = params["expectedRevision"].as_u64();
+    let mut result = rpc(params)?;
+    let committed = result.as_object_mut().and_then(|o| o.remove("followUpCommitted"))
+        .and_then(|v| v.as_bool()) == Some(true);
+    if committed {
+        let revision = result["revision"].as_u64();
+        if result["jobId"].as_str() != Some(expected_id.as_str())
+            || result["state"] != "unconfirmed" || result["terminalReason"] != "followUpEnded"
+            || result["followUpEnded"]["expectedRevision"].as_u64() != expected_revision
+            || revision.is_none()
+        {
+            return Err(CallError::Unavailable(anyhow::anyhow!("Invalid close follow-up receipt")));
+        }
+        hook(&expected_id, revision.expect("validated revision"));
+    }
+    Ok(result)
+}
+
+/// Read-only, session-bound owner query for the await reconciler. A single
+/// socket call has an absolute one-second deadline and the existing 1 MiB cap.
+pub fn query_job_for_await(session: &str, job_id: &str) -> anyhow::Result<Value> {
+    anyhow::ensure!(!session.is_empty() && !job_id.is_empty() && job_id.len() <= JOB_ID_MAX_LEN, "Invalid await job query");
+    #[cfg(target_os = "linux")]
+    let reply = socket_round_trip_with_timeout("humanQuery", json!({"jobId":job_id}), Some(std::time::Duration::from_secs(1)))
+        .map_err(CallError::Unavailable).and_then(interpret_reply);
+    #[cfg(not(target_os = "linux"))]
+    let reply = call("humanQuery", json!({"jobId":job_id}));
+    let job = reply.map_err(|e| anyhow::anyhow!("Job Service await query failed: {}", map_call_error(&e).1))?;
+    validate_await_job(session, job_id, job)
+}
+
+fn validate_await_job(session: &str, job_id: &str, job: Value) -> anyhow::Result<Value> {
+    anyhow::ensure!(job["jobId"].as_str() == Some(job_id), "Job Service returned a different job");
+    anyhow::ensure!(job["request"]["subscriberCutexSessionId"].as_str() == Some(session), "Job belongs to another session");
+    anyhow::ensure!(job["revision"].as_u64().is_some() && job["state"].as_str().is_some(), "Invalid Job Service record");
+    Ok(job)
 }
 
 /// Owner-only terminal update; the model-facing adapter has no corresponding tool.
@@ -377,6 +443,16 @@ fn cancel_params(body: &[u8]) -> Option<Value> {
     let job_id = valid_job_id(object.get("jobId"))?;
     let revision = object.get("expectedRevision")?.as_u64()?;
     Some(json!({"jobId": job_id, "expectedRevision": revision}))
+}
+
+fn close_follow_up_params(body: &[u8]) -> Option<Value> {
+    let object = body_object(body, &["jobId", "expectedRevision", "reason"])?;
+    let job_id = valid_job_id(object.get("jobId"))?;
+    let revision = object.get("expectedRevision")?.as_u64()?;
+    let reason = object.get("reason")?.as_str()?;
+    if revision == 0 || reason.trim().is_empty() || reason.len() > 2048
+        || reason.chars().any(char::is_control) { return None; }
+    Some(json!({"jobId":job_id,"expectedRevision":revision,"reason":reason}))
 }
 
 fn mark_external_params(body: &[u8]) -> Option<Value> {
@@ -709,6 +785,75 @@ mod tests {
         assert_eq!(cancel_params(long.as_bytes()), None);
         let max = format!(r#"{{"jobId":"{}","expectedRevision":1}}"#, "j".repeat(160));
         assert!(cancel_params(max.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn close_follow_up_body_is_strict() {
+        let value = json!({"jobId":"job_1","expectedRevision":3,"reason":"owner ended follow-up"});
+        assert_eq!(close_follow_up_params(&serde_json::to_vec(&value).unwrap()), Some(value.clone()));
+        for extra in [json!({"reason":""}), json!({"reason":"  "}), json!({"reason":"a\nb"}),
+            json!({"reason":"x".repeat(2049)}), json!({"reason":null}), json!({"expectedRevision":0}),
+            json!({"expectedRevision":-1}), json!({"expectedRevision":"3"}), json!({"callerGrant":{}})] {
+            let mut invalid = value.clone();
+            invalid.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            assert!(close_follow_up_params(&serde_json::to_vec(&invalid).unwrap()).is_none());
+        }
+        for key in ["jobId", "expectedRevision", "reason"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(close_follow_up_params(&serde_json::to_vec(&missing).unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn ended_follow_up_still_counts_a_live_process_for_idle_stop() {
+        assert!(is_running_job(&json!({"state":"unconfirmed","processAlive":true})));
+        assert!(is_running_job(&json!({"state":"future_state","processAlive":true})));
+        assert!(is_running_job(&json!({"state":"unconfirmed","processAlive":false,"launchPending":true})));
+        assert!(!is_running_job(&json!({"state":"unconfirmed","processAlive":false})));
+        assert!(!is_running_job(&json!({"state":"unconfirmed"})));
+        for state in ["registered", "queued", "launch_pending", "running"] {
+            assert!(is_running_job(&json!({"state":state})));
+        }
+        assert!(!is_running_job(&json!({"state":"exited"})));
+    }
+
+    #[test]
+    fn close_hook_runs_only_for_a_new_successful_disposition() {
+        let params = json!({"jobId":"job_1","expectedRevision":3,"reason":"done"});
+        let record = json!({"jobId":"job_1","revision":4,"state":"unconfirmed",
+            "terminalReason":"followUpEnded","followUpEnded":{"expectedRevision":3,"reason":"done","atEpochSecs":1},
+            "followUpCommitted":true});
+        let count = std::cell::Cell::new(0);
+        let hook = |id: &str, revision| {
+            assert_eq!(id, "job_1"); assert_eq!(revision, 4);
+            count.set(count.get() + 1);
+        };
+        let result = close_follow_up_with(params.clone(), |_| Ok(record.clone()), hook).unwrap();
+        assert_eq!(count.get(), 1);
+        assert!(result.get("followUpCommitted").is_none());
+        let mut replay = record.clone(); replay["followUpCommitted"] = json!(false);
+        close_follow_up_with(params.clone(), |_| Ok(replay), hook).unwrap();
+        let mut terminal = json!({"jobId":"job_1","revision":4,"state":"exited","followUpCommitted":false});
+        close_follow_up_with(params.clone(), |_| Ok(terminal.clone()), hook).unwrap();
+        for error in [CallError::Service {code:"conflict".into(),message:"stale revision".into()},
+            CallError::Unavailable(anyhow::anyhow!("write failed"))] {
+            assert!(close_follow_up_with(params.clone(), |_| Err(error), hook).is_err());
+        }
+        terminal["followUpCommitted"] = json!(true);
+        assert!(close_follow_up_with(params, |_| Ok(terminal), hook).is_err());
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn await_query_is_bound_to_the_job_and_subscriber() {
+        let job = json!({"jobId":"job_1","revision":4,"state":"unconfirmed","terminalReason":"followUpEnded",
+            "request":{"subscriberCutexSessionId":"cutex.a"}});
+        assert_eq!(validate_await_job("cutex.a", "job_1", job.clone()).unwrap(), job);
+        assert!(validate_await_job("cutex.b", "job_1", job.clone()).is_err());
+        assert!(validate_await_job("cutex.a", "job_2", job.clone()).is_err());
+        let mut invalid = job; invalid["revision"] = json!("4");
+        assert!(validate_await_job("cutex.a", "job_1", invalid).is_err());
     }
 
     #[test]

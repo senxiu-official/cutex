@@ -4,6 +4,7 @@ import asyncio
 import copy
 from dataclasses import replace
 
+import pytest
 import pytest_asyncio
 
 from cute_claude.config import Settings
@@ -67,3 +68,10 @@ async def h(tmp_path):
     await harness.init()
     yield harness
     await harness.close()
+
+
+@pytest.fixture(autouse=True)
+def fast_durable_queue_delays(monkeypatch):
+    # Private fake-provider tests do not spend production wall-clock backoff.
+    # The virtual five-minute outage test explicitly checks 10/30/60 seconds.
+    monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 0.001)

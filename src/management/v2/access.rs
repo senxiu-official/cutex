@@ -51,6 +51,10 @@ pub enum Scoped {
     SessionHistory,
     SessionHistoryTurn,
     SessionBlob,
+    // r290 P4: scoped session content reads.
+    SessionMedia,
+    AttachmentRead,
+    ServerRequests,
     NativeRequest,
     ServerResponse,
     CutexRequest,
@@ -83,6 +87,11 @@ pub enum Scoped {
     /// `POST /v2/sessions/{id}/attachments`: a visible agent, `send`; the
     /// upload is recorded for the calling token (P2 access).
     AttachmentUpload,
+    /// `GET /v2/artifact-store`, `GET /v2/artifact-store/{id}`,
+    /// `…/versions/{n|latest}/content`, `GET|HEAD …/versions/{n|latest}/raw`,
+    /// `…/diff`: artifacts of visible projects and agents, read-only
+    /// (capability `user-project-roles`).
+    ArtifactRead,
 }
 
 enum Matcher {
@@ -121,6 +130,7 @@ fn bootstrap_shape(path: &str) -> bool {
 }
 fn history_shape(path: &str) -> bool {
     super::server::history_session_id_from_path(path).is_some()
+        || super::agent_bus_state::history::parse_path(path).is_some()
 }
 fn history_turn_shape(path: &str) -> bool {
     super::server::history_turn_path(path).is_some()
@@ -131,6 +141,10 @@ fn native_shape(path: &str) -> bool {
 fn session_blob_shape(path: &str) -> bool {
     super::event_blobs::parse_path(path).is_some()
 }
+// r290 P4
+fn session_media_shape(path: &str) -> bool { super::media_refs::parse_path(path).is_some() }
+fn attachment_read_shape(path: &str) -> bool { super::attachments::read_path(path).is_some() }
+fn server_requests_shape(path: &str) -> bool { super::server_requests::session_id_from_path(path).is_some() }
 fn server_response_shape(path: &str) -> bool {
     super::server::server_response_session_id_from_path(path).is_some()
 }
@@ -164,6 +178,10 @@ fn project_read_shape(path: &str) -> bool {
 fn project_events_shape(path: &str) -> bool {
     super::project_events::parse_route(path).is_some()
 }
+// r290 P1
+fn artifact_read_shape(path: &str) -> bool {
+    super::artifact_store::read_target("GET", path).is_some()
+}
 
 macro_rules! owner_prefixes {
     ($($prefix:literal),* $(,)?) => {
@@ -175,6 +193,8 @@ macro_rules! owner_prefixes {
 /// parsers of the handlers they guard; `OwnerOnly` prefix rules follow.
 const SCOPED_RULES: &[Rule] = &[
     Rule {methods:ANY,matcher:Matcher::Prefix("/v2/pairing/"),class:Class::OwnerOnly},
+    Rule {methods:POST,matcher:Matcher::Exact("/v2/job-service/close-follow-up"),class:Class::OwnerOnly},
+    Rule {methods:ANY,matcher:Matcher::Exact(crate::agent_bus::native_subagent::PROOF_PATH),class:Class::OwnerOnly},
     Rule { methods: GET_PUT_DELETE, matcher: Matcher::Shape(super::user_layout_api::is_path), class: Class::Scoped(Scoped::UserLayout) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/page"), class: Class::OwnerOnly },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/changes"), class: Class::OwnerOnly },
@@ -195,6 +215,10 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Shape(history_shape), class: Class::Scoped(Scoped::SessionHistory) },
     Rule { methods: GET, matcher: Matcher::Shape(history_turn_shape), class: Class::Scoped(Scoped::SessionHistoryTurn) },
     Rule { methods: GET, matcher: Matcher::Shape(session_blob_shape), class: Class::Scoped(Scoped::SessionBlob) },
+    // r290 P4
+    Rule { methods: GET, matcher: Matcher::Shape(session_media_shape), class: Class::Scoped(Scoped::SessionMedia) },
+    Rule { methods: GET, matcher: Matcher::Shape(attachment_read_shape), class: Class::Scoped(Scoped::AttachmentRead) },
+    Rule { methods: GET, matcher: Matcher::Shape(server_requests_shape), class: Class::Scoped(Scoped::ServerRequests) },
     Rule { methods: GET, matcher: Matcher::Shape(session_read_shape), class: Class::Scoped(Scoped::SessionRead) },
     Rule { methods: POST, matcher: Matcher::Shape(native_shape), class: Class::Scoped(Scoped::NativeRequest) },
     Rule { methods: POST, matcher: Matcher::Shape(server_response_shape), class: Class::Scoped(Scoped::ServerResponse) },
@@ -205,6 +229,8 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Exact(super::summary::SUMMARY_EVENTS_PATH), class: Class::Scoped(Scoped::SummaryEvents) },
     Rule { methods: GET, matcher: Matcher::Shape(project_events_shape), class: Class::Scoped(Scoped::ProjectEvents) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/agent-management/projects"), class: Class::Scoped(Scoped::ProjectList) },
+    // r290 P1: artifacts of visible projects / agents, read-only.
+    Rule { methods: GET, matcher: Matcher::Shape(artifact_read_shape), class: Class::Scoped(Scoped::ArtifactRead) },
     Rule { methods: GET, matcher: Matcher::Shape(project_read_shape), class: Class::Scoped(Scoped::ProjectRead) },
     Rule { methods: GET, matcher: Matcher::Exact(super::asks::ASKS_PATH), class: Class::Scoped(Scoped::AskList) },
     Rule { methods: GET, matcher: Matcher::Shape(ask_read_shape), class: Class::Scoped(Scoped::AskRead) },
@@ -233,6 +259,11 @@ const SCOPED_RULES: &[Rule] = &[
 /// Every other route family: owner only (explicitly listed so the
 /// enumeration test proves each one was considered).
 const OWNER_RULES: &[Rule] = owner_prefixes![
+    // r290 P6
+    "/v2/board",
+    // r290 P10 (A1): receipt lookups and settlements belong to the owner.
+    "/v2/project-actions",
+    "/v2/schedules", // r290 P5 schedules: owner-only configuration and history.
     "/v2/admission", "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approval-rules", "/v2/approvals",
     "/v2/artifact-store", "/v2/artifacts", "/v2/asks", "/v2/browser", "/v2/capabilities",
     "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
@@ -261,6 +292,14 @@ fn rule_matches(rule: &Rule, method: &str, path: &str) -> bool {
 pub fn classify(method: &str, path: &str) -> Option<Class> {
     if path == "/v2" {
         return Some(Class::OwnerOnly);
+    }
+    // r290 P1: raw reads of an artifact are scoped (ArtifactRead).
+    if matches!(method, "GET" | "HEAD") && super::artifact_store::raw::is_path(path) {
+        return Some(if super::artifact_store::read_target(method, path).is_some() {
+            Class::Scoped(Scoped::ArtifactRead)
+        } else {
+            Class::OwnerOnly
+        });
     }
     SCOPED_RULES
         .iter()
@@ -484,7 +523,16 @@ fn scoped_gate(
     context: ManagementRequestContext,
 ) -> anyhow::Result<Gate> {
     use super::server as srv;
-    let query = |key: &str| crate::http::query::query_value(&request.path, key);
+    // r290 P1: the names a decision below reads, decoded as the handlers
+    // decode them; a repeated one is ambiguous and refused.
+    let decoded: Vec<(String, String)> = request.path.split_once('?')
+        .map(|(_, query)| url::form_urlencoded::parse(query.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
+        .unwrap_or_default();
+    if let Some(name) = GATE_QUERY_NAMES.iter().find(|name| decoded.iter().filter(|(key, _)| key == *name).count() > 1) {
+        return Ok(Gate::Handled(write_v2_error(stream, 400, "Bad Request", "invalid_request",
+            &format!("query parameter {name} must not be repeated"), false, json!({}))));
+    }
+    let query = |key: &str| decoded.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
     let session_gate = |stream: &mut TcpStream, id: &str| -> Option<Gate> {
         (!scope.sees_session(id)).then(|| session_not_found(stream, id))
     };
@@ -521,7 +569,7 @@ fn scoped_gate(
             session_gate(stream, &id).unwrap_or(Gate::Continue)
         }
         Scoped::SessionHistory => {
-            let id = srv::history_session_id_from_path(path).unwrap_or_default();
+            let id = srv::history_session_id_from_path(path).or_else(|| super::agent_bus_state::history::parse_path(path)).unwrap_or_default();
             session_gate(stream, &id).unwrap_or(Gate::Continue)
         }
         Scoped::SessionHistoryTurn => {
@@ -532,6 +580,19 @@ fn scoped_gate(
             let (id,_) = super::event_blobs::parse_path(path).unwrap_or_default();
             session_gate(stream,&id).unwrap_or(Gate::Continue)
         }
+        // r290 P4
+        Scoped::SessionMedia => {
+            let (id, _) = super::media_refs::parse_path(path).unwrap_or_default();
+            session_gate(stream, &id).unwrap_or(Gate::Continue)
+        }
+        Scoped::AttachmentRead => {
+            let (id, _) = super::attachments::read_path(path).unwrap_or_default();
+            session_gate(stream, &id).unwrap_or(Gate::Continue)
+        }
+        Scoped::ServerRequests => {
+            let id = super::server_requests::session_id_from_path(path).unwrap_or_default();
+            session_gate(stream, &id).unwrap_or(Gate::Continue)
+        }
         Scoped::NativeRequest => {
             let id = srv::native_request_session_id_from_path(path).unwrap_or_default();
             if let Some(gate) = session_gate(stream, &id) {
@@ -541,7 +602,7 @@ fn scoped_gate(
             let method = body.pointer("/native/message/method").and_then(Value::as_str).unwrap_or("");
             match native_need(method) {
                 Need::Read => Gate::Continue,
-                Need::Send if scope.grant.send => Gate::Continue,
+                Need::Send if scope.may_send(&id) => Gate::Continue,
                 Need::Send => send_not_granted(stream),
                 Need::Owner | Need::Ask => deny(stream, "owner_required", "this native method is the host owner's", json!({ "method": method })),
             }
@@ -551,7 +612,7 @@ fn scoped_gate(
             if let Some(gate) = session_gate(stream, &id) {
                 return Ok(gate);
             }
-            if scope.grant.send { Gate::Continue } else { send_not_granted(stream) }
+            if scope.may_send(&id) { Gate::Continue } else { send_not_granted(stream) }
         }
         Scoped::CutexRequest => {
             let id = srv::cutex_request_session_id_from_path(path).unwrap_or_default();
@@ -570,7 +631,7 @@ fn scoped_gate(
             }
             match cutex_need(method) {
                 Need::Read => Gate::Continue,
-                Need::Send | Need::Ask if !scope.grant.send => send_not_granted(stream),
+                Need::Send | Need::Ask if !scope.may_send(&id) => send_not_granted(stream),
                 Need::Send => match check_input_for(&body["params"], &id) {
                     Ok(()) => Gate::Continue,
                     Err(InputRefusal::Type) => deny(
@@ -589,7 +650,7 @@ fn scoped_gate(
                 Need::Ask => {
                     let inputs:Vec<&str>=["askId","questionId"].iter().filter_map(|key|body["params"][*key].as_str()).collect();
                     let state = crate::asks::store::AskStore::open_default()?.lookup_snapshot(&inputs)?;
-                    match ask_command_target(&state, &body["params"], &id, scope) {
+                    match ask_command_target(&state, method, &body["params"], &id, scope) {
                         AskTarget::Allowed => Gate::Continue,
                         AskTarget::Invalid => Gate::Continue, // the handler answers invalid_arguments
                         AskTarget::Hidden(code) => not_found(stream, code),
@@ -614,7 +675,47 @@ fn scoped_gate(
             if let Some(gate) = session_gate(stream, &id) {
                 return Ok(gate);
             }
-            if scope.grant.send { Gate::Continue } else { send_not_granted(stream) }
+            if scope.may_send(&id) { Gate::Continue } else { send_not_granted(stream) }
+        }
+        // r290 P1
+        Scoped::ArtifactRead => {
+            use super::artifact_store::{read_target, ReadTarget};
+            let visible = |artifact_scope: &crate::artifacts::Scope| match artifact_scope.kind.as_str() {
+                "project" => scope.sees_project(&artifact_scope.id),
+                "session" => scope.sees_session(&artifact_scope.id),
+                _ => false,
+            };
+            match read_target(&request.method, path) {
+                None => owner_required(stream),
+                Some(ReadTarget::List) => {
+                    // r290 P1: the handler's own parser (decoded, no repeated
+                    // names; its 400 is written below), and the list always
+                    // runs restricted to the grant, never as the owner's.
+                    let params = super::artifact_store::query_params(request.path.split_once('?').map_or("", |(_, q)| q))
+                        .unwrap_or_default();
+                    let hidden = ["project", "session", "forSession"].into_iter()
+                        .filter_map(|key| params.get(key).map(|value| (key, value.trim())).filter(|(_, v)| !v.is_empty()))
+                        .find(|(key, value)| match *key {
+                            "project" => !scope.sees_project(value),
+                            _ => !scope.sees_session(value),
+                        });
+                    match hidden {
+                        Some(("project", _)) => not_found(stream, "project_not_found"),
+                        Some((_, id)) => session_not_found(stream, id),
+                        None => {
+                            let mut allowed: Vec<crate::artifacts::Scope> =
+                                scope.projects().iter().map(crate::artifacts::Scope::project).collect();
+                            allowed.extend(scope.sessions().iter().map(crate::artifacts::Scope::session));
+                            allowed.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+                            Gate::Handled(super::artifact_store::write_list_within(stream, request, allowed))
+                        }
+                    }
+                }
+                Some(ReadTarget::Artifact(id)) => match super::artifact_store::artifact_scope(&id)? {
+                    Some(artifact_scope) if visible(&artifact_scope) => Gate::Continue,
+                    _ => not_found(stream, "artifact_not_found"),
+                },
+            }
         }
         Scoped::EventPage => {
             let query = match srv::replay_query(request, false) {
@@ -956,6 +1057,11 @@ fn retain_array(value: &mut Value, key: &str, mut keep: impl FnMut(&Value) -> bo
     }
 }
 
+/// Query names the scoped gate decides on (r290 P1: refused when repeated).
+const GATE_QUERY_NAMES: &[&str] = &[
+    "includeHidden", "lifecycle", "updatedBefore", "cursor", "limit", "project", "session", "forSession",
+];
+
 fn rewrite_query(full_path: &str, key: &str, value: &str) -> String {
     let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
     let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
@@ -997,11 +1103,13 @@ enum AskTarget {
 /// session must be its requester or target.
 fn ask_command_target(
     state: &crate::asks::store::AskState,
+    method: &str,
     params: &Value,
     path_session: &str,
     scope: &Scope,
 ) -> AskTarget {
-    let (ask_id, missing) = if let Some(question) = params.get("questionId") {
+    let (ask_id, missing) = if method=="cutex/ask/respond" {
+        let Some(question)=params.get("questionId") else{return AskTarget::Invalid;};
         let Some(question) = question.as_str().filter(|id| !id.is_empty()) else {
             return AskTarget::Invalid;
         };
@@ -1028,6 +1136,19 @@ fn ask_command_target(
     } else {
         AskTarget::Hidden(missing)
     }
+}
+
+/// A sending user's P2 ask permission is scoped authority, not a Human owner
+/// proof. Reuse the HTTP gate's method, visibility and endpoint checks when
+/// entering the ask command handler without minting owner provenance.
+pub(super) fn scoped_ask_command_authorized(session:&str,method:&str,params:&Value)->anyhow::Result<bool> {
+    let Some(crate::management::users::Principal::User{grant,..})=crate::management::users::current_principal() else{return Ok(false);};
+    if !CUTEX_ASK.contains(&method) {return Ok(false);}
+    let scope=Scope::load(&grant)?;
+    if !scope.sees_session(session) || !scope.may_send(session) {return Ok(false);}
+    let inputs:Vec<&str>=["askId","questionId"].iter().filter_map(|key|params[*key].as_str()).collect();
+    let state=crate::asks::store::AskStore::open_default()?.lookup_snapshot(&inputs)?;
+    Ok(matches!(ask_command_target(&state,method,params,session,&scope),AskTarget::Allowed|AskTarget::Invalid))
 }
 
 /// Lazily loaded ask store snapshot for event filtering.

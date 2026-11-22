@@ -73,6 +73,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("delegation_read", Audience::Everyone),
     rule("delegation_notices_read", Audience::Everyone),
     rule("delegation_progress", Audience::Everyone),
+    rule("delegation_deliver", Audience::Everyone), // r290 P14
     rule("question_answer", Audience::Everyone),
     rule("agent_tell", Audience::Everyone),
     rule("delegation_await", Audience::Everyone),
@@ -86,6 +87,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("artifact_publish", Audience::Everyone),
     rule("artifact_list", Audience::Everyone),
     rule("artifact_read", Audience::Everyone),
+    rule("profile_list", Audience::ProjectManagers), // r290 P12.
     // Workflows (W1): an approved script fans out to one-shot step agents.
     // Step sessions are refused server-side (one level only).
     rule("workflow_start", Audience::Everyone),
@@ -95,6 +97,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     // Reminders.
     rule("alarm_set", Audience::Everyone),
     rule("alarm_list", Audience::Everyone),
+    rule("schedule_list", Audience::Everyone), // r290 P5: own-target read only.
     rule("alarm_cancel", Audience::Everyone),
     // Web services (registry; managed runtimes may need owner approval).
     rule("service_register", Audience::Everyone),

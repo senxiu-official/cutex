@@ -74,12 +74,16 @@ pub fn run(runtime: &dyn AskRuntime, store: &AskStore, command: &RuntimeCommand,
 /// Capture in the stop transaction before queueing StopAttempt. Never replace
 /// an existing intent: repeated actions must preserve dispatch uncertainty.
 pub fn capture_stop_intent(state: &mut super::store::AskState, ask_id: &str, attempt: u32, now: DateTime<Utc>) -> bool {
+    state.update_ask(ask_id, now, |ask| {
+        if let Some(record) = ask.current_attempt_mut().filter(|r| r.n == attempt && r.stop_deadline.is_none()) {
+            let since=record.stop_intent.as_ref().and_then(|intent|super::parse_time(&intent.requested_at)).unwrap_or(now);
+            record.stop_deadline = Some((since + chrono::Duration::seconds(super::stop_settlement::STOP_DEADLINE_SECS)).to_rfc3339());
+        }
+    });
     let Some(ask) = state.asks.get(ask_id) else { return false; };
     let Some(record) = ask.current_attempt().filter(|r| r.n == attempt && !r.state.is_terminal()) else { return false; };
-    if let Some(existing) = &record.stop_intent {
-        if matches!(existing.outcome, StopDispatchOutcome::Unsupported | StopDispatchOutcome::Stale) {
-            state.update_ask(ask_id, now, |ask| ask.current_attempt_mut().unwrap().stop_requested = false);
-        }
+    if record.stop_intent.is_some() {
+        // Preserve the stop and its deadline, including stale/unsupported dispatch.
         return true;
     }
     let intent = AttemptStopIntent {
@@ -117,9 +121,6 @@ fn finish_stop(state: &mut super::store::AskState, ask_id: &str, expected: &Atte
             if record.stop_intent.as_ref() != Some(expected) { return; }
             record.stop_intent.as_mut().unwrap().outcome = outcome;
             if let Some(error) = error { record.last_error = Some(error); }
-            if matches!(outcome, StopDispatchOutcome::Unsupported | StopDispatchOutcome::Stale) {
-                record.stop_requested = false;
-            }
         }
     });
 }
@@ -135,6 +136,13 @@ fn stop_state<T>(store: &AskStore, run: impl FnOnce(&mut super::store::AskState)
 /// or the roster authority fence. Deferred writes preserve original identity.
 fn stop_attempt(runtime: &dyn AskRuntime, store: &AskStore, ask_id: &str, attempt: u32, now: DateTime<Utc>) -> anyhow::Result<bool> {
     use super::pause_admission::Admission::{Ready, Deferred};
+    let stopped = stop_state(store, |state| {
+        super::stop_settlement::ensure_deadline(state, ask_id, attempt, now);
+        super::stop_settlement::expire(state, ask_id, attempt, now);
+        state.asks.get(ask_id).is_none_or(|ask| !ask.is_open()
+            || ask.attempts.iter().find(|r| r.n == attempt).is_none_or(|r| r.stop_unconfirmed))
+    })?;
+    match stopped { Ready(true) => return Ok(true), Deferred => return Ok(false), _ => {} }
     let intent = store.inspect(|state| state.asks.get(ask_id)
         .and_then(|ask| ask.attempts.iter().find(|r| r.n == attempt))
         .filter(|r| !r.state.is_terminal()).and_then(|r| r.stop_intent.clone()))?;
@@ -142,7 +150,6 @@ fn stop_attempt(runtime: &dyn AskRuntime, store: &AskStore, ask_id: &str, attemp
         // No original occurrence proof: never infer today's runtime binding.
         return Ok(matches!(stop_state(store, |state| { state.update_ask(ask_id, now, |ask| {
             if let Some(record) = ask.attempts.iter_mut().find(|r| r.n == attempt && !r.state.is_terminal()) {
-                record.stop_requested = false;
                 record.last_error = Some("stop_unsupported: original stop intent unavailable".into());
             }
         }); })?, Ready(())));

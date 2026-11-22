@@ -1,8 +1,11 @@
+import asyncio
 import json
 
 import pytest
 
 from cute_claude.subscription import SdkResponseError
+from cute_claude.queue_recovery import read
+from fake_sdk import materialize
 from test_persistent import ph
 
 
@@ -65,13 +68,27 @@ def test_repeated_overloaded_errors_are_classified(text):
     assert json.loads(e.additional_details)['httpStatusCode'] == 529
 
 
-async def test_connection_error_details_survive_durable_completion_with_bounded_silent_retry(ph):
+async def test_connection_error_details_survive_durable_unbounded_outage_retry(ph, monkeypatch):
     tid = await ph.thread()
     await ph.engine.start_runtime(tid)
     client = ph.sdk.clients[0]
+    native_inputs = []
+    backoff_observed = asyncio.Event()
+
+    async def fixture_backoff(event, delay):
+        if client.query_count >= 4:
+            backoff_observed.set()
+            await event.wait()
+        else:
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr('cute_claude.queue_recovery.wait_backoff', fixture_backoff)
+    monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 60)
 
     async def query(prompt):
         client.query_count += 1
+        text, _ = await materialize(prompt)
+        native_inputs.append(text)
         sid = ph.engine.session(tid)['session_id']
         await client.events.put({'type': 'assistant', 'error': 'server_error', 'content': [
             {'text': 'API Error: Connection dropped (ECONNRESET). private-provider-prose'}]})
@@ -80,11 +97,36 @@ async def test_connection_error_details_survive_durable_completion_with_bounded_
 
     client.query = query
     turn = await ph.turn(tid, 'original input')
-    await ph.drain()
-    error = ph.store.turn(turn)['error']
+    original = dict(ph.store.db.execute("SELECT * FROM inputs WHERE turn_id=?", (turn,)).fetchone())
+    async with asyncio.timeout(5):
+        while not backoff_observed.is_set():
+            assert ph.engine.workers, f'outage stopped retrying: {ph.store.turn(turn)}'
+            assert not ph.store.thread(tid)['halted'], ph.store.turn(turn)
+            await asyncio.sleep(0.001)
+    wire = ph.store.turn(turn)
+    assert wire['error'] is None and wire['claudeRetry']['willRetry']
+    error = wire['claudeRetry']['error']
+    assert json.loads(ph.store.db.execute('SELECT error FROM turns WHERE id=?', (turn,)).fetchone()[0]) == error
     assert error['codexErrorInfo'] == {'httpConnectionFailed': {'httpStatusCode': None}}
     assert json.loads(error['additionalDetails'])['category'] == 'ECONNRESET'
-    assert client.query_count == 3
-    final = [e['params']['turn'] for e in ph.out if e.get('method') == 'turn/completed'][-1]
-    assert final['error'] == error
+    assert client.query_count == 4
+    assert ph.store.turn(turn)['status'] == 'inProgress'
+    assert not [e for e in ph.out if e.get('method') == 'turn/completed']
+    assert not ph.store.thread(tid)['halted']
+    assert read(ph.store, tid)['probeCount'] >= 4 and not read(ph.store, tid)['held']
+    assert not any(e.get('method') == 'claude/queue/holdChanged' and e['params']['held'] for e in ph.out)
+    retry_errors = [e for e in ph.out if e.get('method') == 'error' and e['params'].get('turnId') == turn]
+    assert retry_errors and all(e['params']['willRetry'] for e in retry_errors)
+    retained = dict(ph.store.db.execute("SELECT * FROM inputs WHERE turn_id=?", (turn,)).fetchone())
+    assert retained['state'] == 'queued'
+    assert {k: v for k, v in retained.items() if k != 'state'} == {k: v for k, v in original.items() if k != 'state'}
+    assert ph.store.db.execute("SELECT COUNT(*) FROM inputs WHERE turn_id=?", (turn,)).fetchone()[0] == 1
+    assert sum('original input' in payload for payload in native_inputs) == 1, native_inputs
     assert 'private-provider-prose' not in json.dumps(error)
+    assert 'private-provider-prose' not in json.dumps(retry_errors)
+    # Inspect the durable diagnostic before explicit cancellation clears it.
+    async with asyncio.timeout(5):
+        await ph.call('turn/interrupt', {'threadId': tid, 'turnId': turn})
+        await ph.drain()
+    assert ph.store.turn(turn)['status'] == 'interrupted'
+    assert client.query_count == 4

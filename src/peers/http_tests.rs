@@ -72,9 +72,11 @@ fn context() -> ManagementRequestContext {
         handle_user_input: |_| panic!("unexpected user input"),
         flush_user_input_queue: |_, _, _| panic!("unexpected queue flush"),
         steer_user_input_queue: |_, _, _| panic!("unexpected queue steer"),
-        interrupt_active_turn: |_, _| panic!("unexpected interrupt"),
-        load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
+        interrupt_active_turn: |_, _, _| panic!("unexpected interrupt"),
+        load_bootstrap_state: |_, _, _| panic!("unexpected bootstrap"),
         load_latest_plan: |_| panic!("unexpected plan"),
+        // r290 P6
+        load_board_plan: |_| serde_json::Value::Null,
         load_latest_token_usage: |_| panic!("unexpected usage"),
         revert_session_history: |_, _, _| panic!("unexpected revert"),
         delete_session: |_, _| panic!("unexpected session delete"),

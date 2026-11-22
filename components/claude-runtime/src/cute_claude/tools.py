@@ -35,6 +35,7 @@ class ToolContext:
     turn_id: str
     call_id: str
     workspace: Path
+    native_subagent_id: str | None = None
 
 
 @dataclass

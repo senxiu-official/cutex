@@ -125,6 +125,14 @@ fn connection(path: &Path) -> anyhow::Result<Connection> {
         (json_extract(CAST(value_json AS TEXT),'$.requesterCutexSessionId'),{ASK_NOTICE_TIME},row_key) WHERE {ASK_PENDING_NOTICE};
         CREATE INDEX IF NOT EXISTS asks_pending_notice_ask ON hot_store_rows
         (json_extract(CAST(value_json AS TEXT),'$.askId'),{ASK_NOTICE_TIME},row_key) WHERE {ASK_PENDING_NOTICE};"))?;
+    // r290 P6: only today's closed asks are aggregated for the board.
+    db.execute_batch("CREATE INDEX IF NOT EXISTS asks_board_closed_time ON hot_store_rows
+        ((CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END),json_extract(CAST(value_json AS TEXT),'$.projectId'),row_key,json_extract(CAST(value_json AS TEXT),'$.closedAt'))
+        WHERE store='asks' AND collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL;")?;
+    // r290 P6: install the cold date index when upgrading an existing archive.
+    let cold:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asks_archive_rows')",[],|r|r.get(0))?;
+    if cold {db.execute_batch("CREATE INDEX IF NOT EXISTS asks_archive_board_closed_time ON asks_archive_rows
+        ((CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END),json_extract(CAST(value_json AS TEXT),'$.projectId'),row_key,json_extract(CAST(value_json AS TEXT),'$.closedAt')) WHERE collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL;")?;}
     Ok(db)
 }
 
@@ -162,8 +170,16 @@ pub(crate) fn owner_carry_keys(db: &Connection, session: &str, owner: &str) -> a
     Ok(ids)
 }
 
+/// Bound owner live-only occurrence retention without loading message history.
+pub(crate) fn live_discard_usage(database: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+    let (count,bytes): (i64,i64) = verified_snapshot(database,"agent_bus",|db,_| {
+        Ok(db.query_row("SELECT COUNT(*),COALESCE(SUM(length(value_json)),0) FROM hot_store_rows WHERE store='agent_bus' AND collection='live-discard'",[],|row|Ok((row.get(0)?,row.get(1)?)))?)
+    })?.unwrap_or((0,0));
+    Ok((count.try_into()?,bytes.try_into()?))
+}
+
 pub(crate) fn close_request_keys(db: &Connection, request: &str) -> anyhow::Result<Vec<String>> {
-    let mut statement = db.prepare("SELECT row_key FROM hot_store_rows WHERE store='agent_bus' AND collection='message' AND json_extract(CAST(value_json AS TEXT), '$.settlement.request.requestId')=?1 ORDER BY row_key")?;
+    let mut statement = db.prepare("SELECT row_key FROM hot_store_rows WHERE store='agent_bus' AND collection='message' AND (json_extract(CAST(value_json AS TEXT), '$.settlement.request.requestId')=?1 OR json_extract(CAST(value_json AS TEXT), '$.settlement.ownerRequest.actionId')=?1) ORDER BY row_key")?;
     let keys = statement
         .query_map([request], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -133,6 +133,7 @@ pub(super) fn dispatch(
                 cutex_session_id: session_id.to_string(),
                 thread_id: thread_id.to_string(),
                 params: UserInputSubmitParams {
+                interrupt_send: None,
                                         join_delegation: params.get("joinDelegation")
                         .map(super::user_input::parse_owner_join).transpose()
                         .map_err(|message| invalid_user_input_error(&message))?,
@@ -182,7 +183,7 @@ pub(super) fn dispatch(
                 session_id,
                 correlation.clone(),
                 "cutex/userInput/submitted",
-                with_image_delivery(json!({
+                with_image_delivery({let mut submitted=json!({
                     "managementRequestId": request.request_id,
                     "clientUserMessageId": item.client_user_message_id,
                     "origin": item.origin,
@@ -193,7 +194,7 @@ pub(super) fn dispatch(
                     "turnId": execution.turn_id,
                     "appServerAccepted": true,
                     "submittedAt": chrono::Utc::now().to_rfc3339(),
-                }), image_delivery),
+                });if let Some(report)=&execution.passive_notes {submitted["passiveNotes"]=json!(report);} submitted}, image_delivery),
             )
             .map_err(post_operation_persistence_error)?;
             let removed = queue
@@ -473,7 +474,7 @@ mod tests {
                         native_method: Some("turn/steer".into()),
                         turn_id: Some("turn".into()),
                         queue: None,
-                        queue_paused: false,
+                        queue_paused: false, passive_notes: None,
                     })
                 },
                 "session",
@@ -520,7 +521,7 @@ mod tests {
                 assert_eq!(command.params.input, params.input);
                 Ok(UserInputSubmitExecution { join_refusal:None, queued_reason:None, disposition,
                     app_server_accepted:true, native_request_id:Some(json!("native-image")),
-                    native_method:Some(method.into()), turn_id:Some("turn".into()), queue:None, queue_paused:false })
+                    native_method:Some(method.into()), turn_id:Some("turn".into()), queue:None, queue_paused: false, passive_notes: None, })
             }, "session", &json!({"native":{"threadId":"thread"},"runtime":{"backend":backend}}), &request).unwrap();
             assert_eq!(result["imageDelivery"], mode);
             assert!(f.list().1.is_empty());
@@ -560,7 +561,7 @@ mod tests {
                     disposition:if failure=="queued" { UserInputDisposition::Queued } else { UserInputDisposition::Steered },
                     app_server_accepted:failure!="unaccepted", native_request_id:None,
                     native_method:Some(if failure=="wrong-method" { "turn/start" } else { "turn/steer" }.into()),
-                    turn_id:Some("turn".into()),queue:None,queue_paused:false })
+                    turn_id:Some("turn".into()),queue:None,queue_paused: false, passive_notes: None, })
             }, "session", &json!({"native":{"threadId":"thread"},"runtime":{"backend":"claude_subscription"}}), &request);
             assert!(result.is_err(), "{failure}");
             assert_eq!(f.list(), before, "{failure}");
@@ -579,7 +580,7 @@ mod tests {
             assert_eq!(serde_json::to_value(command.params.join_delegation.as_ref().unwrap()).unwrap(), join);
             Ok(UserInputSubmitExecution { join_refusal: None, queued_reason: None, disposition: UserInputDisposition::Steered,
                 app_server_accepted:true, native_request_id:Some(json!("native-joined")), native_method:Some("turn/steer".into()),
-                turn_id:Some("turn".into()),queue:None,queue_paused:false })
+                turn_id:Some("turn".into()),queue:None,queue_paused: false, passive_notes: None, })
         }, "session", &json!({"native":{"threadId":"thread"}}), &request).unwrap();
         assert_eq!(result["disposition"], "steered");
         assert!(h.list().1.is_empty());

@@ -1348,3 +1348,14 @@ mod tests {
 
 #[path = "mcp_http_response.rs"]
 mod mcp_http_response;
+
+/// A separate child route: root fence is unchanged and child is not a model argument.
+pub fn submit_native_child_read(port:u16,token:&str,sender:&RuntimeAgentId,fence:&crate::agent_bus::mcp::CallerFence,child:&str,body:&Value)->anyhow::Result<Value> {
+    anyhow::ensure!(crate::agent_bus::native_subagent::valid_child(child),"invalid child id");
+    anyhow::ensure!(!token.trim().is_empty() && !token.contains(['\r','\n']),"invalid child read credential");
+    let bytes=serde_json::to_vec(body)?;
+    anyhow::ensure!(bytes.len()<=262144,"child read request too large");
+    let headers=format!("{}: {}\r\n",crate::agent_bus::native_subagent::CHILD_HEADER,child);
+    let response=submit_authenticated_agent_control_with_headers(port,token,sender,crate::agent_bus::native_subagent::PATH,&bytes,"native child read",Duration::from_secs(30),Some(fence),&headers)?;
+    Ok(serde_json::from_slice(&response)?)
+}

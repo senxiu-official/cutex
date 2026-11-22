@@ -132,6 +132,18 @@ async def test_without_the_descriptor_hold_the_facade_answers_at_once(tmp_path, 
     assert registry.tools['delegation_wait'].timeout == 150
 
 
+async def test_child_identity_is_runtime_context_not_arguments_or_inherited_env(tmp_path, monkeypatch):
+    registry, environments = _facade_fixture(tmp_path, monkeypatch, {})
+    monkeypatch.setenv('CUTEX_MCP_CHILD_ID', 'ambient-not-authority')
+    parent = SimpleNamespace(thread_id='thread', turn_id='turn', call_id='parent')
+    assert (await registry.tools['agent_tell'].handler({'childId':'model-not-authority'}, parent)).success
+    assert 'CUTEX_MCP_CHILD_ID' not in environments[-1]
+    child = SimpleNamespace(thread_id='thread', turn_id='turn', call_id='child', native_subagent_id='verified-child')
+    assert (await registry.tools['agent_tell'].handler({}, child)).success
+    assert environments[-1]['CUTEX_MCP_CHILD_ID']=='verified-child'
+    assert environments[-1]['CUTEX_MCP_THREAD_ID']=='thread'
+
+
 async def test_registry_uses_a_tool_timeout_over_the_default():
     import asyncio
     registry = ToolRegistry(SimpleNamespace(tool_timeout=0.05, max_tool_bytes=65536), include_builtins=False)

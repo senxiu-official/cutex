@@ -23,7 +23,7 @@ pub mod tells;
 #[cfg(test)]
 mod tells_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub mod token;
 pub mod wire;
 #[cfg(test)]

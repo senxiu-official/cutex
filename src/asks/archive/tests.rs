@@ -1276,3 +1276,41 @@ fn indexed_cold_lookup_matches_the_full_identity_scan_and_is_not_rebuilt_per_loo
     assert_eq!(brute(&[&hex[..8]]), BTreeSet::new());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn board_day_counts_use_indexed_hot_and_cold_without_loading_old_history() {
+    let (store,dir)=temp_store("board-counts");
+    let start=stamp("2026-11-16T16:00:00Z");let end=stamp("2026-11-17T16:00:00Z");
+    let mut state=AskState::default();
+    let cold=closed(&mut state,"board-cold");state.asks.get_mut(&cold).unwrap().closed_at=Some(start.to_rfc3339());
+    let hot=closed(&mut state,"board-hot");state.asks.get_mut(&hot).unwrap().closed_at=Some((end-chrono::Duration::seconds(1)).to_rfc3339());
+    let before=closed(&mut state,"board-before");state.asks.get_mut(&before).unwrap().closed_at=Some((start-chrono::Duration::seconds(1)).to_rfc3339());
+    let boundary=closed(&mut state,"board-end");state.asks.get_mut(&boundary).unwrap().closed_at=Some(end.to_rfc3339());
+    let fine=closed(&mut state,"board-fine");state.asks.get_mut(&fine).unwrap().closed_at=Some((end-chrono::Duration::nanoseconds(1)).to_rfc3339());
+    let outside=closed(&mut state,"board-outside");state.asks.get_mut(&outside).unwrap().closed_at=Some((start-chrono::Duration::nanoseconds(1)).to_rfc3339());
+    let malformed=closed(&mut state,"board-malformed");state.asks.get_mut(&malformed).unwrap().closed_at=Some("now".into());
+    store.with_state(|s|*s=state).unwrap();
+    let path=dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+    let generation=crate::management::v2::hot_store::generation(&path,"asks").unwrap().unwrap();
+    move_rows(&path,generation,&BTreeSet::from([("asks".into(),cold.clone())]),end+chrono::Duration::days(1),end).unwrap();
+    // Dedupe by ask identity even when a stale cold copy changes project/date.
+    let db=Connection::open(&path).unwrap();
+    for id in [&hot,&boundary] {
+        let mut duplicate=serde_json::to_value(&store.snapshot().unwrap().asks[id]).unwrap();
+        duplicate["projectId"]=serde_json::json!("stale-cold-project");
+        duplicate["closedAt"]=serde_json::json!((start+chrono::Duration::seconds(1)).to_rfc3339());
+        let bytes=serde_json::to_vec(&duplicate).unwrap();
+        db.execute("INSERT INTO asks_archive_rows(collection,row_key,value_json,sha256,archived_at,ask_group) VALUES('asks',?1,?2,?3,?4,?1)",params![id,bytes,super::super::sha256_hex(&bytes),super::super::now_rfc3339(end)]).unwrap();
+    }
+    drop(db);
+    let counts=store.board_closed_counts(start,end).unwrap();
+    assert_eq!(counts.get("alpha"),Some(&3));
+    assert!(!counts.contains_key("stale-cold-project"));
+    let connection=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    for (table,index,prefix) in [("hot_store_rows","asks_board_closed_time","store='asks' AND "),("asks_archive_rows","asks_archive_board_closed_time","")] {
+        let sql=format!("EXPLAIN QUERY PLAN SELECT row_key FROM {table} INDEXED BY {index} WHERE {prefix}collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)>=julianday(?1) AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)<julianday(?2)");
+        let detail:String=connection.query_row(&sql,params![start.to_rfc3339(),end.to_rfc3339()],|r|r.get(3)).unwrap();
+        assert!(detail.contains("SEARCH") && detail.contains(index),"{detail}");
+    }
+    drop(connection);drop(store);std::fs::remove_dir_all(dir).unwrap();
+}

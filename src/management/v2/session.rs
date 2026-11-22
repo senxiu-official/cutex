@@ -1940,6 +1940,7 @@ mod tests {
             launched_profile: Some("legacy-profile".to_string()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/tmp/legacy-profile.jsonl".to_string(),
             schema_version: "test".to_string(),

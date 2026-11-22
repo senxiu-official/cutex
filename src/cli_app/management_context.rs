@@ -28,6 +28,7 @@ pub(crate) fn load_management_v2_registry() -> anyhow::Result<ImRegistry> {
 pub(crate) fn management_request_context() -> ManagementRequestContext {
     // r274 cutex/input/interruptSend: the runtime half.
     cutex::management::v2::input_interrupt_send::install(super::app_server_user_input::interrupt_send_v2);
+    cutex::management::v2::input_interrupt_send::install_many(super::app_server_user_input::interrupt_send_many_v2);
     ManagementRequestContext {
         explicit_launch_action,
         adopt_saved_native,
@@ -47,6 +48,8 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         interrupt_active_turn: super::app_server_user_input::interrupt_active_turn_v2,
         load_bootstrap_state: load_management_bootstrap_state,
         load_latest_plan: super::session_history::latest_plan_for_management,
+        // r290 P6
+        load_board_plan: super::session_history::latest_plan_for_board,
         load_latest_token_usage: super::session_history::latest_token_usage_for_management,
         revert_session_history: super::session_history::revert_for_management,
         delete_session: delete_management_session,
@@ -1584,8 +1587,16 @@ impl cutex::agent_management::ProjectRuntimeObserver for ManagementProjectRuntim
 fn load_management_bootstrap_state(
     cutex_session_id: &str,
     runtime_generation: u64,
+    bus_window: Option<&cutex::management::v2::agent_bus_state::history::Window>,
 ) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::json!({
+    let bus = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+    let bus = if let Some(window) = bus_window {
+        bus.bounded_bootstrap(cutex_session_id, window)?
+    } else {
+        serde_json::json!({"agentBusMessages": bus.snapshot(cutex_session_id)?,
+            "agentBusSentMessages": bus.sent_snapshot(cutex_session_id, 200)?})
+    };
+    let mut state = serde_json::json!({
         "userInputQueue": cutex::management::v2::user_input::user_input_repository()?
             .snapshot(cutex_session_id)?,
         "userInputQueuePause": cutex::management::v2::user_input::user_input_repository()?
@@ -1597,12 +1608,9 @@ fn load_management_bootstrap_state(
             cutex_session_id,
             runtime_generation,
         )?,
-        "agentBusMessages": cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
-            .snapshot(cutex_session_id)?,
-        // Agent messaging v2: the latest 200 messages this session sent.
-        "agentBusSentMessages": cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
-            .sent_snapshot(cutex_session_id, 200)?,
-    }))
+    });
+    state.as_object_mut().expect("bootstrap state object").extend(bus.as_object().expect("bus state object").clone());
+    Ok(state)
 }
 
 /// Whole-store compare-and-swap attempts for one Management session
@@ -1637,6 +1645,12 @@ fn mutate_management_v2_session_using(
     let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     // Take the session capability before the whole-store lifecycle barrier.
     // Nested HTTP/profile/offline-start calls retain the same execution token.
+    // r290 P9: aliases must reserve the same lane as a conditional kit restore
+    // before taking the global barrier, including an already-offline stop.
+    let canonical = cutex::session::store::with_cutex_session_store(|store| {
+        cutex::session::service::cutex_session_key_for_user_id(store, cutex_session_id)
+    }).map_err(session_mutation_persistence_error)?;
+    let cutex_session_id = canonical.as_deref().unwrap_or(cutex_session_id);
     let lane = cutex::management::v2::user_input::session_input_lock(cutex_session_id)
         .map_err(session_mutation_invalid_error)?;
     let _operation = lane.reserve().map_err(|error| session_mutation_invalid_error(error.into()))?;
@@ -1977,6 +1991,14 @@ fn apply_management_v2_session_mutation(
             .map_err(session_mutation_invalid_error)?;
             apply_optional_string(patch, "model", &mut record.model_defaults)?;
             apply_optional_string(patch, "reasoningEffort", &mut record.reasoning_defaults)?;
+            if record.explicit_launch.is_some()
+                && (patch.contains_key("model") || patch.contains_key("reasoningEffort"))
+            {
+                // Validate the merged next-launch pair even while offline. A
+                // failed edit must not persist an unlaunchable model/effort.
+                cutex::launch::stock::current_configuration(record)
+                    .map_err(session_mutation_invalid_error)?;
+            }
             // session-fast-mode: stored for the next start / resume; clients
             // change a running thread with native thread/settings/update.
             apply_optional_string(patch, "serviceTier", &mut record.service_tier)?;
@@ -2433,9 +2455,44 @@ pub(crate) fn online_management_v2_session(
     id: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
-    let result = online_management_v2_session_inner(owner, id, params);
+    // r290 P9: kit restoration is conditional on the exact confirmed-offline
+    // record. Repeated owner offline can leave the generation unchanged.
+    let result = with_runtime_updated_at_fence(id, params.get("expectedRuntimeUpdatedAt"), || {
+        online_management_v2_session_inner(owner, id, params.clone())
+    });
     note_runtime_intent(id, "cutex/runtime/online", &result);
     result
+}
+
+// r290 P9: reserve the existing reentrant session lane across comparison and
+// launch. No new store or authority bypass; ordinary owner online omits this
+// optional maintenance precondition and keeps its current behavior.
+fn with_runtime_updated_at_fence<T>(
+    id: &str,
+    expected: Option<&serde_json::Value>,
+    run: impl FnOnce() -> Result<T, cutex::management::v2::user_input::UserInputExecutionError>,
+) -> Result<T, cutex::management::v2::user_input::UserInputExecutionError> {
+    let Some(expected) = expected else { return run(); };
+    let expected = expected.as_str().filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| session_mutation_invalid("expectedRuntimeUpdatedAt must be a non-empty string of at most 128 bytes"))?;
+    let current = cutex::session::store::shared_session_row(id).map_err(session_mutation_persistence_error)?
+        .ok_or_else(|| session_mutation_invalid("cutex session not found"))?;
+    let key = current.cutex_session_id.clone();
+    let lane = cutex::management::v2::user_input::session_input_lock(&key)
+        .map_err(session_mutation_invalid_error)?;
+    let _reservation = lane.reserve().map_err(|error| session_mutation_invalid_error(error.into()))?;
+    let record = cutex::session::store::shared_session_row(&key).map_err(session_mutation_persistence_error)?
+        .ok_or_else(|| session_mutation_invalid("agent disappeared"))?;
+    if record.updated_at != expected {
+        return Err(cutex::management::v2::user_input::UserInputExecutionError {
+            stage:"route".into(), code:"revision_conflict".into(),
+            message:"runtime intent changed after the kit's confirmed stop; owner action retained".into(),
+            retryable:false, outcome_unknown:false,
+            details:serde_json::json!({"reason":"runtime_intent_changed","expectedRuntimeUpdatedAt":expected,
+                                       "currentRuntimeUpdatedAt":record.updated_at}),
+        });
+    }
+    run()
 }
 
 /// Trusted daemon auto-wake provenance. This is deliberately a separate
@@ -2448,6 +2505,30 @@ pub(crate) fn automatic_online_management_v2_session(
         mutate_management_v2_runtime(key,"cutex/runtime/online",params));
     note_runtime_intent(id,"cutex/runtime/online",&result);
     result
+}
+
+// r290 P5: the owner authorized this schedule; use the existing automatic
+// pause-fenced start or exact owner-reviewed relaunch, never a new profile/review.
+pub(crate) fn scheduled_online_management_v2_session(id: &str, run_id: &str) -> anyhow::Result<()> {
+    // The scheduler's check may predate an owner stop. Recheck at this entry;
+    // both actual start adapters also recheck under their provider start fence.
+    if cutex::asks::store::AskStore::open_default()?.inspect(|state| state.owner_offline.contains(id))? {
+        return Err(cutex::schedules::runtime::OwnerStopped.into());
+    }
+    let record = cutex::session::store::shared_session_row(id)?.ok_or_else(|| cutex::schedules::runtime::Unavailable("target agent disappeared".into()))?;
+    anyhow::ensure!(!cutex::agent_management::agent_execution_blocked(&record), cutex::schedules::runtime::Unavailable("target agent is archived".into()));
+    let result = if record.explicit_launch.is_some() {
+        relaunch_reviewed_management_v2_session(id, &format!("owner-schedule:{run_id}"))
+    } else {
+        automatic_online_management_v2_session(id)
+    };
+    match result {
+        Ok(value) if value["status"] == "online" => Ok(()),
+        Ok(_) => anyhow::bail!("scheduled target did not become online"),
+        Err(error) if error.code == "owner_stopped" || error.message.starts_with("ownerStopped:") => Err(cutex::schedules::runtime::OwnerStopped.into()),
+        Err(error) if error.code == "agent_paused" || error.message.contains("agent_paused:") => Err(cutex::schedules::runtime::Paused.into()),
+        Err(error) => anyhow::bail!("{}: {}", error.code, error.message),
+    }
 }
 
 // Inject only the actual runtime effect in tests; production traverses this
@@ -2489,6 +2570,7 @@ fn automatic_online_management_v2_session_using(
 
 fn automatic_runtime_start_error(error:anyhow::Error)->cutex::management::v2::user_input::UserInputExecutionError {
     let code=if error.is::<cutex::asks::pause_admission::Deferred>() {Some("admission_deferred")}
+        else if error.is::<cutex::agent_management::AutomaticRuntimeStartOwnerStopped>() {Some("owner_stopped")}
         else if error.is::<cutex::agent_management::AutomaticRuntimeStartPaused>() {Some("agent_paused")}
         else {None};
     let mut result=runtime_mutation_error(error);
@@ -3323,6 +3405,13 @@ fn launch_profile_not_applied(
 fn runtime_mutation_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if cutex::runtime::claude::is_schema_start_refusal(&error) {
+        return cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(), code: cutex::runtime::claude::SCHEMA_START_REFUSAL_CODE.into(),
+            message: cutex::runtime::claude::SCHEMA_START_REFUSAL_DETAIL.into(),
+            retryable: false, details: serde_json::json!({"needsAction":true}), outcome_unknown: false,
+        };
+    }
     if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&error) {
         return cutex::management::v2::user_input::UserInputExecutionError {
             stage: "runtime".into(), code: "creator_paths_changed".into(), message: format!("{error:#}"),
@@ -3647,7 +3736,20 @@ fn forward_management_native_request(
 ) -> Result<serde_json::Value, ManagementNativeForwardError> {
     use cutex::app_server::client::AppServerClientError;
 
+    if message["method"]==cutex::agent_bus::native_subagent::PROOF_METHOD {
+        let principal:cutex::agent_bus::native_subagent::ChildPrincipal=serde_json::from_value(message["params"].clone())
+            .map_err(|_|ManagementNativeForwardError::BeforeForward("invalid child principal".into()))?;
+        if principal.parent_session_id!=cutex_session_id {return Ok(serde_json::json!(false));}
+        return super::app_server_runtime::verify_native_child_principal(&principal)
+            .map(serde_json::Value::Bool).map_err(|error|ManagementNativeForwardError::BeforeForward(error.to_string()));
+    }
     with_native_mutation_reservation(cutex_session_id, message, |message| {
+        if message["method"]=="turn/interrupt" {
+            if let Some(thread)=message["params"]["threadId"].as_str() {
+                super::asks_runtime::revoke_internal_interrupt(cutex_session_id,thread)
+                    .map_err(|error|ManagementNativeForwardError::BeforeForward(format!("{error:#}")))?;
+            }
+        }
         if message.get("method").and_then(serde_json::Value::as_str)
             .is_none_or(cutex::management::v2::request_idempotency::method_needs_idempotency) {
             super::management_archive::api::ensure_input_allowed(cutex_session_id)
@@ -3665,12 +3767,23 @@ fn forward_management_native_request(
                 return Ok(error);
             }
         }
+        let mut passive_notes=cutex::app_server::pre_turn_notes::Report::default();
+        if let Some(record) = super::asks_runtime::record(cutex_session_id) {
+            if let Some(thread) = record.app_server_thread_id() {
+                if cutex::memory::idle_note::transport::triggers_turn(&message, thread) ||
+                    message["method"] == "review/start" && message["params"]["threadId"] == thread {
+                    passive_notes=super::turn_notes::synchronize_in_lane(cutex_session_id, thread, Some(record.runtime_generation));
+                    if let Some(id)=message["params"]["clientUserMessageId"].as_str() {passive_notes.attach_to_input(cutex_session_id,id);}
+                }
+            }
+        }
         let handle = selected_native_manager(cutex_session_id)
             .map_err(|error| ManagementNativeForwardError::BeforeForward(format!("{error:#}")))?
             .handle(cutex_session_id)
             .map_err(|error| ManagementNativeForwardError::BeforeForward(format!("{error:#}")))?;
         handle
             .request_raw_message(message)
+            .map(|mut response| {if !passive_notes.is_empty() {response["passiveNotes"]=serde_json::json!(passive_notes);} response})
             .map_err(|error| match error {
                 AppServerClientError::RequestIdInUse(message) => {
                     ManagementNativeForwardError::NativeRequestIdInUse(message)
@@ -3773,6 +3886,89 @@ pub(crate) fn load_app_server_runtime_status(
 
 #[cfg(test)]
 mod tests {
+    // r290 P9: exercise the actual already-offline Claude producer as well
+    // as the conditional restore consumer, with no adapter process needed.
+    #[test]
+    fn maintenance_repeated_claude_offline_invalidates_confirmed_restore() {
+        let _home = super::super::test_home::IsolatedTestHome::new("p9-repeat-claude-stop").unwrap();
+        let id = format!("cutex.p9-repeat-{}", uuid::Uuid::new_v4());
+        let state_dir = std::env::temp_dir().join(&id);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut row = cutex::session::model::CutexSessionRecord::new(
+            id.clone(), None, cutex::platform::host::current_host_name(), state_dir.display().to_string(), None,
+        ).unwrap();
+        row.runtime_generation = 7;
+        row.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription;
+        let alias = format!("p9-owner-stop-{}", uuid::Uuid::new_v4());
+        row.display_name_hint = Some(alias.clone());
+        row.claude_session = Some(serde_json::from_value(serde_json::json!({
+            "deployment":{"python":state_dir.join("python"),"adapter_source":state_dir.join("adapter"),
+                "claude_cli":state_dir.join("cli"),"claude_home":state_dir.join("account"),"tui_binary":state_dir.join("tui")},
+            "thread_id":"thread", "state_dir":state_dir, "model":"sonnet"
+        })).unwrap());
+        let path = cutex::session::store::cutex_sessions_path().unwrap();
+        cutex::session::store::with_locked_session_rows(&path, |rows| {
+            rows.insert_session(&id, row.clone()); rows.commit()?; Ok(())
+        }).unwrap();
+        cutex::runtime::claude::close_expected(&id, Some(7)).unwrap();
+        let confirmed = cutex::session::store::shared_session_row(&id).unwrap().unwrap();
+        super::mutate_management_v2_session(&alias, "cutex/runtime/offline", serde_json::json!({
+            "expectedRuntimeGeneration":7
+        })).unwrap();
+        let current = cutex::session::store::shared_session_row(&id).unwrap().unwrap();
+        assert_ne!(confirmed.updated_at, current.updated_at);
+        assert_eq!(current.runtime_generation, 7);
+        assert!(current.runtime_pid.is_none());
+        assert_eq!(current.claude_session, confirmed.claude_session);
+        let error = super::with_runtime_updated_at_fence::<()>(&id, Some(&serde_json::json!(confirmed.updated_at)), || {
+            panic!("older kit confirmation reached launch after a repeated owner stop")
+        }).unwrap_err();
+        assert_eq!(error.details["reason"], "runtime_intent_changed");
+    }
+
+    // r290 P9: an owner can stop an already-offline runtime without changing
+    // its generation. The older kit confirmation must not start it again.
+    #[test]
+    fn maintenance_online_updated_at_fence_keeps_newer_owner_offline() {
+        let id = format!("cutex.p9-intent-{}", uuid::Uuid::new_v4());
+        let mut record = cutex::session::model::CutexSessionRecord::new(
+            id.clone(), None, "private".into(), std::env::temp_dir().display().to_string(), None,
+        ).unwrap();
+        record.runtime_generation = 7;
+        record.updated_at = "2026-11-17T00:00:00Z".into();
+        let path = cutex::session::store::cutex_sessions_path().unwrap();
+        cutex::session::store::with_locked_session_rows(&path, |rows| {
+            rows.insert_session(&id, record.clone()); rows.commit()?; Ok(())
+        }).unwrap();
+        let confirmed = serde_json::json!(record.updated_at);
+        cutex::session::store::with_locked_session_rows(&path, |rows| {
+            let current = rows.session_mut(&id).unwrap();
+            current.updated_at = "2026-11-17T00:00:01Z".into();
+            rows.commit()?; Ok(())
+        }).unwrap();
+        let error = super::with_runtime_updated_at_fence::<()>(&id, Some(&confirmed), || {
+            panic!("a stale maintenance request reached launch")
+        }).unwrap_err();
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(error.details["reason"], "runtime_intent_changed");
+        assert!(!error.outcome_unknown);
+        let current = serde_json::json!("2026-11-17T00:00:01Z");
+        super::with_runtime_updated_at_fence(&id, Some(&current), || Ok(())).unwrap();
+        // Omission keeps explicit normal owner start semantics unchanged.
+        super::with_runtime_updated_at_fence(&id, None, || Ok(())).unwrap();
+    }
+    #[test]
+    fn claude_schema_refusal_is_definite_and_sanitized() {
+        let error = super::runtime_mutation_error(
+            anyhow::Error::new(cutex::runtime::claude::ClaudeStartRefusal)
+                .context("private child diagnostic must not reach the client"));
+        assert_eq!(error.code, cutex::runtime::claude::SCHEMA_START_REFUSAL_CODE);
+        assert!(!error.retryable);
+        assert!(!error.outcome_unknown);
+        assert_eq!(error.details["needsAction"], true);
+        assert!(!error.message.contains("private child"));
+        assert!(super::runtime_mutation_error(anyhow::anyhow!("Claude adapter exited 1")).retryable);
+    }
     #[test]
     fn creator_path_errors_keep_code_and_session_through_runtime_context() {
         for mapper in [super::runtime_mutation_error, super::session_mutation_invalid_error] {
@@ -3808,6 +4004,95 @@ mod tests {
             mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":saved.revision,"patch":{"memoryInjection":true}})).unwrap();
             assert!(cutex::session::store::shared_session_row(&id).unwrap().unwrap().memory_injection);
         }
+    }
+
+    #[test]
+    fn offline_native_defaults_validate_merged_model_effort_before_persistence() {
+        use cutex::config::global_settings::ConfigValueUpdate::Set;
+        use cutex::profiles::{lifecycle, settings_api};
+        let home = super::super::test_home::IsolatedTestHome::new("offline-native-model-effort").unwrap();
+        let profile = lifecycle::create_profile(&lifecycle::NewProfile {
+            name:"offline-model-fixture".into(), kind:lifecycle::NewProfileKind::ApiKey,
+            preset:None, base_url:Some("http://127.0.0.1:9/v1".into()),
+            model:Some("gemini-4-argon".into()), api_key:Some(settings_api::ApiKey("fixture-key-not-real".into())),
+        }).unwrap();
+        let catalog = home.root().join("models.json");
+        let rows: Vec<_> = [("gemini-4-argon", "high"), ("other-model", "low")].into_iter().map(|(id, effort)| {
+            let models = cutex::profiles::model_discovery::ModelCatalog {
+                models:vec![id.into()], ..Default::default()
+            };
+            let mut row = cutex::profiles::model_discovery::preset(&models,None,None)["models"][0].clone();
+            row["supported_reasoning_levels"] = serde_json::json!([{"effort":effort,"description":"fixture"}]);
+            row["default_reasoning_level"] = serde_json::json!(effort);
+            row
+        }).collect();
+        cutex::config::atomic::write_private_pretty_json_atomic(&catalog, &serde_json::json!({"models":rows}), "offline-model-fixture").unwrap();
+        settings_api::update_profile(&profile.id, &settings_api::ProfileApiPatch {
+            codex_config:cutex::profiles::codex_profile::CodexProfileConfigPatch {
+                model_catalog_json:Set(catalog.to_string_lossy().into_owned()),
+                model_reasoning_effort:Set("high".into()), ..Default::default()
+            }, ..Default::default()
+        }).unwrap();
+        let native_id=uuid::Uuid::new_v4().to_string();
+        let id=format!("cutex.{native_id}");
+        let mut record=CutexSessionRecord::new(id.clone(),Some(native_id.clone()),"test".into(),home.root().to_string_lossy().into_owned(),Some(profile.name.clone())).unwrap();
+        record.runtime_backend=CutexSessionRuntimeBackend::Host;
+        record.permission_defaults=Some("read-only".into());
+        record.sandbox_mode=Some("read-only".into());
+        record.approval_policy=Some("never".into());
+        record.model_defaults=Some("gemini-4-argon".into());
+        record.reasoning_defaults=Some("high".into());
+        record.explicit_launch=Some(serde_json::from_value(serde_json::json!({
+            "version":4,"native_id":native_id,"native_home":home.root(),
+            "bundle_manifest":home.root().join("unused-bundle.json"),"bundle_sha256":"0".repeat(64)
+        })).unwrap());
+        cutex::launch::stock::current_configuration(&record).unwrap();
+        let mut store=load_cutex_session_store().unwrap();
+        store.sessions.insert(id.clone(),record.clone());
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let before=serde_json::to_value(cutex::session::store::shared_session_row(&id).unwrap().unwrap().as_ref()).unwrap();
+        for patch in [serde_json::json!({"reasoningEffort":"xhigh"}),serde_json::json!({"model":"other-model"})] {
+            let error=mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":record.revision,"patch":patch})).unwrap_err();
+            assert!(error.message.contains("not offered by model"),"{}",error.message);
+            assert_eq!(serde_json::to_value(cutex::session::store::shared_session_row(&id).unwrap().unwrap().as_ref()).unwrap(),before);
+        }
+        let local_before=serde_json::to_value(&store).unwrap();
+        let error=cutex::session::service::update_cutex_session_runtime_defaults(&mut store,&id,
+            cutex::session::runtime_defaults::CutexSessionRuntimeDefaultsPatch {
+                reasoning_defaults:cutex::session::runtime_defaults::CutexSessionValueUpdate::Set("xhigh".into()),
+                ..Default::default()
+            }).unwrap_err();
+        assert!(error.to_string().contains("not offered by model"));
+        assert_eq!(serde_json::to_value(&store).unwrap(),local_before);
+        // The CLI path validates all merged fields: repairing an old approval
+        // in the same model edit succeeds, while introducing one is atomic.
+        use cutex::session::runtime_defaults::{CutexSessionRuntimeDefaultsPatch, CutexSessionValueUpdate};
+        store.sessions.get_mut(&id).unwrap().approval_policy=Some("invalid-old-approval".into());
+        cutex::session::service::update_cutex_session_runtime_defaults(&mut store,&id,
+            CutexSessionRuntimeDefaultsPatch {
+                model_defaults:CutexSessionValueUpdate::Set("gemini-4-argon".into()),
+                approval_policy:CutexSessionValueUpdate::Set("never".into()),
+                sandbox_mode:CutexSessionValueUpdate::Set("workspace-write".into()),
+                runtime_backend:Some(CutexSessionRuntimeBackend::Host),
+                ..Default::default()
+            }).unwrap();
+        assert_eq!(store.sessions[&id].approval_policy.as_deref(),Some("never"));
+        assert_eq!(store.sessions[&id].sandbox_mode.as_deref(),Some("workspace-write"));
+        let merged_before=serde_json::to_value(&store).unwrap();
+        assert!(cutex::session::service::update_cutex_session_runtime_defaults(&mut store,&id,
+            CutexSessionRuntimeDefaultsPatch {
+                model_defaults:CutexSessionValueUpdate::Set("gemini-4-argon".into()),
+                approval_policy:CutexSessionValueUpdate::Set("invalid-new-approval".into()),
+                ..Default::default()
+            }).is_err());
+        assert_eq!(serde_json::to_value(&store).unwrap(),merged_before);
+        mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({
+            "expectedRevision":record.revision,"patch":{"model":"other-model","reasoningEffort":"low"}
+        })).unwrap();
+        let saved=cutex::session::store::shared_session_row(&id).unwrap().unwrap();
+        assert_eq!(saved.model_defaults.as_deref(),Some("other-model"));
+        assert_eq!(saved.reasoning_defaults.as_deref(),Some("low"));
+        assert_eq!(saved.runtime_generation,record.runtime_generation,"offline edit never starts the agent");
     }
 
 
@@ -3918,6 +4203,37 @@ mod tests {
             Ok(json!({"status":"online"}))
         }).unwrap();
         assert_eq!(result["status"],"online");
+    }
+
+    #[test]
+    fn scheduled_online_rechecks_owner_stop_for_both_launch_kinds() {
+        let _home=IsolatedTestHome::new_private("schedule-late-owner-stop").unwrap();
+        let id="cutex.schedule-late-owner-stop";
+        save_cas_fixture(id,"cutex.schedule-late-owner-stop-bystander");
+        let asks=cutex::asks::store::AskStore::open_default().unwrap();
+        for explicit in [false,true] {
+            let mut sessions=load_cutex_session_store().unwrap();
+            let record=sessions.sessions.get_mut(id).unwrap();
+            record.agent_enabled=true;
+            if explicit {
+                record.explicit_launch=Some(cutex::agent_management::ExplicitLaunchContract {
+                    version:4,migration_action_id:None,native_id:uuid::Uuid::new_v4().to_string(),
+                    native_home:_home.root().join("native"),bundle_manifest:_home.root().join("bundle.json"),
+                    bundle_sha256:cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+                });
+            }
+            save_cutex_session_store(&sessions).unwrap();
+            let before=serde_json::to_value(load_cutex_session_store().unwrap()).unwrap();
+            assert!(!asks.inspect(|state|state.owner_offline.contains(id)).unwrap());
+            cutex::schedules::runtime::validate_target(id).unwrap();
+            asks.with_state(|state|{state.owner_offline.insert(id.into());}).unwrap();
+            let error=super::scheduled_online_management_v2_session(id,"late-stop").unwrap_err();
+            assert!(error.is::<cutex::schedules::runtime::OwnerStopped>(),"{error:#}");
+            assert_eq!(serde_json::to_value(load_cutex_session_store().unwrap()).unwrap(),before);
+            asks.with_state(|state|{state.owner_offline.remove(id);}).unwrap();
+        }
+        let error=super::automatic_runtime_start_error(cutex::agent_management::AutomaticRuntimeStartOwnerStopped.into());
+        assert_eq!(error.code,"owner_stopped");
     }
 
     #[test]

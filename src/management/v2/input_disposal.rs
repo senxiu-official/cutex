@@ -299,6 +299,24 @@ fn settle_missing(session: &str, id: &str) -> Result<bool, String> {
     crate::asks::ledger::dismiss_input_id(&store, session, id, Utc::now())
 }
 
+// Unit fixtures counting a particular drain must exclude the process-wide worker.
+// Production keeps the same concurrent, idempotent cleanup behavior.
+#[cfg(test)]
+static TEST_WORKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(super) fn test_worker_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_WORKER.lock().unwrap_or_else(|e| e.into_inner())
+}
+#[cfg(test)]
+pub(super) fn test_worker_drain(notify: impl FnOnce(bool)) -> anyhow::Result<()> {
+    let _guard = match TEST_WORKER.try_lock() {
+        Ok(guard) => { notify(false); guard }
+        Err(std::sync::TryLockError::Poisoned(error)) => { notify(false); error.into_inner() }
+        Err(std::sync::TryLockError::WouldBlock) => { notify(true); test_worker_lock() }
+    };
+    drain_once()
+}
+
 pub(super) fn ensure_started() {
     static EXPIRY: std::sync::Once = std::sync::Once::new();
     EXPIRY.call_once(|| {
@@ -326,9 +344,13 @@ pub(super) fn ensure_started() {
         if let Err(error) = std::thread::Builder::new()
             .name("cutex-owner-disposal".into())
             .spawn(|| loop {
+                #[cfg(test)]
+                let _test_worker_guard = test_worker_lock();
                 if let Err(error) = drain_once() {
                     eprintln!("cutex owner disposal: {error:#}");
                 }
+                #[cfg(test)]
+                drop(_test_worker_guard);
                 std::thread::sleep(std::time::Duration::from_millis(500));
             })
         {

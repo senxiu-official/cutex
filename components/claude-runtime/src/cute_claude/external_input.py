@@ -186,7 +186,7 @@ class ExternalInputService:
         return {'externalInputVersion': 1, 'externalInputVersions': [1, 2],
                 'externalInputDeliveries': ['after_turn', 'passive'] + (['soon'] if self.settings.backend == 'subscription' else []),
                 'externalInputControlVersion': 1,
-                **({'ownerInputCarries': 1, 'ownerCarryReturn': 1} if self.settings.backend == 'subscription' else {})}
+                **({'ownerInputCarries': 1, 'ownerCarryReturn': 1, 'ownerInputBatch': 1} if self.settings.backend == 'subscription' else {})}
 
     def _binding(self, params: dict, *, submit=False) -> str:
         require(self.enabled, 'native external input requires a trusted host owner/runtime binding', -32011)
@@ -276,7 +276,7 @@ class ExternalInputService:
         elif state in {'uncertain', 'failed', 'interrupted', 'completed'}:
             processing = 'held'
             reason = 'interrupted' if state == 'interrupted' else ('no_output' if state == 'completed' else 'request_uncertain')
-        elif self.store.thread(tid)['halted']:
+        elif self.store.thread(tid)['halted'] and tid not in self.store.recovered_probes:
             processing, reason = 'held', 'interrupted'
         result['processing'] = {'state': processing, 'attemptId': attempt, 'reason': reason}
         return result
@@ -563,7 +563,7 @@ class ExternalInputService:
         require(not self.store.thread(tid)['archived'], 'thread is archived', -32009)
         if action == 'resume':
             reopened = bool(self.store.thread(tid)['halted'])
-            self.store.db.execute('UPDATE threads SET halted=0 WHERE id=?', (tid,))
+            self.store.resume_queue(tid)
             return {**self._response(tid), 'reopened': reopened}, lambda: self.server.engine.wake(tid)
         turn_id = text(params.get('turnId'), 'turnId', limit=256)
         was_halted = bool(self.store.thread(tid)['halted'])

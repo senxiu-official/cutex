@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.4 — Beautiful World** 新增主机确认的排队输入处置、分段文件读取和可配置的闹钟唤醒时机。提供改进连接重试的 Native 0.167.0-r61，以及支持有界临时故障重试和 UTF-8 标准输出的 Claude claude-r48（适配器 0.8.15、Agent SDK 0.2.180、CLI 2.1.321）。已有智能体保留运行时固定版本。0.2.3 引入的 worker 记录要求保留备份并明确确认单向升级；不要把包含后台应用记录的数据退回旧版。详见 [CHANGELOG.md](CHANGELOG.md) 和[已知问题](docs/KNOWN-ISSUES.md)。
+**0.2.5 — Beautiful World** 改进中断与恢复过程中的用户输入顺序、有界便条接收和 Linux 运行时监管，提供 Native 0.169.0-r65 与 Claude claude-r55（适配器 0.8.17、Agent SDK 0.2.180、内置 CLI 2.1.321）。已有智能体保留运行时选择。手动退回 0.2.4 前，须先用 0.2.5 停止并核验全部新增 Linux 运行时 scope；详见[运行时监管](docs/agent-management-provider.md)。既有单向迁移和 worker 记录限制仍然有效。另见[更新日志](CHANGELOG.md)和[已知问题](docs/KNOWN-ISSUES.md)。
 
 > **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。
@@ -204,3 +204,9 @@ cutex 原样使用了 Codex 0.154.0 的默认模型指令，见 [NOTICE](NOTICE)
 
 Apache License 2.0：见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。`components/claude-runtime/` 使用 MIT 许可证
 （[components/claude-runtime/LICENSE](components/claude-runtime/LICENSE)）。
+
+## Job Service 0.1.3 compatibility
+
+Job Service 0.1.3 can persist unconfirmed jobs when follow-up is ended. Job Service 0.1.2 cannot read that state. Retain an offline backup and do not downgrade the Job Service or restore older binaries over a store containing those records.
+
+Job Service 0.1.3 在结束后续处理时可持久保存 unconfirmed 作业。Job Service 0.1.2 无法读取该状态。请保留离线备份；包含这些记录后，不要降级 Job Service 或用旧二进制覆盖该存储。

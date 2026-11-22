@@ -95,7 +95,7 @@ pub(super) fn command(
         defaults.and_then(|d| d.model.as_ref()),
         defaults.and_then(|d| d.reasoning.as_ref()),
     )?;
-    cutex::profiles::model_variants::validate_runtime(&projection, &bundle, &deployment.native_home)?;
+    projection = cutex::profiles::model_variants::projection_for_runtime(&projection, &bundle, &deployment.native_home)?;
     if let Some(tui) = &projection.settings.tui {
         projection.status = Status::review(
             &files.custom_status_items_path,

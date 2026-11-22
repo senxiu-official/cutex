@@ -28,6 +28,23 @@ fn fixture() -> (store::Store, AskStore, AskRecord, store::Peer) {
     (peers, asks, ask, peer)
 }
 
+#[test]
+fn owner_follow_up_ended_remote_mirror_survives_removed_peer_and_late_snapshot() {
+    let (peers, asks, ask, peer)=fixture();let now=Utc::now();
+    let pending=asks.snapshot().unwrap().asks[&ask.ask_id].remote.as_ref().unwrap().sync.pending_ops.clone();
+    crate::asks::tools::close_ask(&asks,None,&ask.ask_id,"followUpEnded",now).unwrap();
+    peers.remove(&peer.peer_id).unwrap();
+    worker::maintain(&peers,&asks).unwrap();worker::send_peer(&peers,&asks,&peer.peer_id).unwrap();
+    let mut late=asks::snapshot(&asks.snapshot().unwrap(),&ask);
+    late.revision+=100;late.execution=ExecutionState::Running;late.closed=None;
+    asks::apply(&asks,&peer,late).unwrap();
+    let state=asks.snapshot().unwrap();let current=&state.asks[&ask.ask_id];
+    assert!(current.follow_up_ended);assert_eq!(current.closed,Some(CloseOutcome::Stopped));
+    assert!(current.remote.as_ref().unwrap().sync.local_terminal);
+    assert_eq!(current.remote.as_ref().unwrap().sync.pending_ops,pending,"old operations are retained as evidence, not sent");
+    assert!(state.commands.is_empty());
+}
+
 fn inbound(asks: &AskStore, mut ask: AskRecord, peer: &store::Peer) -> AskRecord {
     let request = ask.remote.take().unwrap().request;
     ask.requester = Requester::Peer {

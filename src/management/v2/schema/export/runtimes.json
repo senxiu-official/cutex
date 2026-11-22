@@ -32,7 +32,7 @@
     },
     "entry": {
       "type": "object",
-      "description": "native: one registry version (release r50, version 0.160.0-r50) or an unregistered pinned executable (no version); claude: one runtime directory (release claude-r5).",
+      "description": "native: one exact executable SHA (distinct builds stay separate even with the same version), with its registry version (release r50, version 0.160.0-r50) or an unregistered pinned executable (no version); claude: one runtime directory (release claude-r5).",
       "required": ["release", "selected", "missing", "agents", "agentCount"],
       "properties": {
         "release": { "type": "string" },
@@ -44,7 +44,10 @@
         "latest": { "type": "boolean", "description": "Native registry latest runtime." },
         "missing": { "type": "boolean", "description": "The recorded files no longer exist." },
         "agents": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/agentRef" } },
-        "agentCount": { "type": "integer", "minimum": 0 },
+        "agentCount": { "type": "integer", "minimum": 0, "description": "Total roster-backed persistent agents; if the roster is unavailable, counts durable persistent session rows and omits the split fields. Excludes local-only and ephemeral sessions." },
+        "activeAgentCount": { "type": "integer", "minimum": 0, "description": "Exact non-retired agent count, including offline agents, independent of capped agents list." },
+        "archivedAgentCount": { "type": "integer", "minimum": 0, "description": "Exact retired agent count; active plus archived equals agentCount." },
+        "verificationPending": { "type": "boolean", "description": "Optional true for a selected or pinned native entry without a verified disk observation. Unverified historical artifacts are omitted. Requests never hash historical executables; last verified/missing observations remain available while refreshing after 30 seconds. Unavailable paths retry with bounded backoff; launch authority does not use this advisory snapshot." },
         "selectedManaged": { "type": "boolean", "description": "Present for a selected native executable when managed-root information is available." },
         "externalAgentCount": { "type": "integer", "minimum": 0, "description": "Agents pinned to executables outside runtime/native; old pins remain valid." },
         "managedAgentCount": { "type": "integer", "minimum": 0 }

@@ -17,6 +17,7 @@ pub mod live_settings;
 pub mod manager;
 pub mod participants;
 pub mod presentation;
+pub mod pre_turn_notes;
 pub mod protocol;
 mod delta_coalesce;
 pub mod single_writer;

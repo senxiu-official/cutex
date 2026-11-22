@@ -541,6 +541,7 @@ mod endpoint_tests {
             launched_profile: Some("default".into()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/tmp/runtime-4/journal".into(),
             schema_version: "test".into(),

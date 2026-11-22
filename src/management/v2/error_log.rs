@@ -4,6 +4,13 @@ use serde_json::{json, Value};
 thread_local! { static REQUEST:RefCell<Value>=const {RefCell::new(Value::Null)}; }
 static LOCK:Mutex<()>=Mutex::new(());
 pub struct Scope(Value);
+/// Attach path-free operation diagnostics to the same eventId returned as diagnosticId.
+pub fn operation_scope(key: &str, value: Value) -> Scope {
+    let mut context = REQUEST.with(|r| r.borrow().clone());
+    if !context.is_object() { context = json!({}); }
+    context[key] = value;
+    Scope(REQUEST.with(|r| r.replace(context)))
+}
 impl Drop for Scope {fn drop(&mut self){REQUEST.with(|r|*r.borrow_mut()=self.0.take());}}
 pub fn scope(request:&crate::http::server::SimpleHttpRequest)->Scope {
     // This endpoint carries the owner's linking secret. Even malformed

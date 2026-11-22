@@ -507,12 +507,16 @@ impl StateFile {
                 "turnId": pending.turn_id,
                 "scheduledAt": pending.scheduled_at,
                 "estimated": pending.estimated,
+                // A pending check is not evidence that asks were redelivered.
+                "asksRedelivered": false,
+                "probeCount": entry.unknown_probes,
             })),
             "last": entry.last.as_ref().map(|last| json!({
                 "at": last.at,
                 "result": last.result,
                 "reason": last.reason,
                 "resetAt": last.reset_at.and_then(unix_rfc3339),
+                "asksRedelivered": last.reason.as_deref() == Some("asksRedelivered"),
             })),
         })
     }
@@ -1091,6 +1095,24 @@ mod tests {
         state.cancel(S, "owner", at(1_500));
         assert_valid("quota-auto-continue", "quotaAutoContinueChanged",
             &json!({"cutexSessionId": S, "reason": "cancelled", "quotaAutoContinue": state.view(S), "hostId": "h"}));
+    }
+
+    #[test]
+    fn pending_probe_is_not_a_redelivery_promise_and_last_records_redelivery() {
+        let mut state = StateFile::default();
+        state.hold(S, None, 7, at(1_000));
+        state.sessions.get_mut(S).unwrap().unknown_probes = 3;
+        let view = state.view(S);
+        assert_eq!(view["pending"]["estimated"], true);
+        assert_eq!(view["pending"]["probeCount"], 3);
+        assert_eq!(view["pending"]["asksRedelivered"], false);
+        state.record(S, "skipped", Some("asksRedelivered"), Some(2_000), at(1_100));
+        let view = state.view(S);
+        assert_eq!(view["pending"]["asksRedelivered"], false);
+        assert_eq!(view["last"]["asksRedelivered"], true);
+        super::super::schema_export::assert_valid("quota-auto-continue", "quotaAutoContinue", &view);
+        state.record(S, "cancelled", Some("owner"), Some(2_000), at(1_101));
+        assert_eq!(state.view(S)["last"]["asksRedelivered"], false);
     }
 
     #[test]

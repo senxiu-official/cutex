@@ -234,6 +234,7 @@ impl AppServerRuntimeLayout {
             launched_profile: None,
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: self
                 .auth_token_path
                 .as_ref()

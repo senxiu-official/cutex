@@ -125,7 +125,7 @@ impl Spend {
             _ => 12.0,
         };
         let model = self.model.as_deref().unwrap_or_default().to_ascii_lowercase();
-        let model_factor = if model.contains("opus") {
+        let model_factor = if model.contains("opus") || model.contains("astra") { // r290 P12: large-model estimates.
             1.0
         } else if ["haiku", "mini", "flash", "air", "nano"].iter().any(|small| model.contains(small)) {
             0.25
@@ -151,6 +151,7 @@ pub fn window_hours(label: Option<&str>) -> Option<f64> {
         "month" | "monthly" => return Some(30.0 * 24.0),
         _ => {}
     }
+    let label=label.split_whitespace().find(|part|part.as_bytes().first().is_some_and(u8::is_ascii_digit)).unwrap_or(&label); // r290 P12: e.g. Opus 7d.
     let (number, unit) = label.split_at(label.find(|c: char| !c.is_ascii_digit())?);
     let number = number.parse::<f64>().ok()?;
     match unit {
@@ -476,7 +477,7 @@ fn live_pick(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    let open_agents = open_agents_by_profile();
+    let work = crate::profile_quota_agents::members().map_err(|_|refusal("load_unavailable","Current member load is unavailable; automatic placement was not guessed"))?; // r290 P12.
     let history = crate::management::v2::usage::read_quota_history_since(now - SLOPE_WINDOW_SECS - FRESH_SECS)
         .unwrap_or_default();
     let mut candidates = Vec::new();
@@ -491,32 +492,37 @@ fn live_pick(
             excluded.push(exclude("requires_approval"));
             continue;
         }
-        let windows = match live_windows(account, now, refresh_stale) {
+        // r290 P12: each alias of a shared account uses one pool's readings/load.
+        let pool=crate::profile_quota_agents::pool_id(account);
+        let aliases:Vec<_>=store.accounts.iter().filter(|a|crate::profile_quota_agents::pool_id(a)==pool).collect();
+        let pool_work:Vec<_>=work.iter().filter(|m|aliases.iter().any(|a|m.profile==a.id||m.profile==a.name)).cloned().collect();
+        let mut pooled=Vec::new();let mut reason="quota_stale";
+        for alias in &aliases {match live_windows(alias,now,refresh_stale) {Ok(w)=>pooled.extend(w.into_iter().map(|(w,at)|(w,at,&alias.id))),Err(why)=>reason=why}}
+        let windows = match (!pooled.is_empty()).then_some(pooled).ok_or(reason) {
             Ok(windows) => windows,
             Err(reason) => {
                 excluded.push(exclude(reason));
                 continue;
             }
         };
-        let windows = windows
-            .into_iter()
-            .map(|(mut window, observed_at)| {
-                window.burn_per_hour = history_slope(&history, &account.id, &window, observed_at);
-                window
-            })
-            .collect();
+        let mut merged:BTreeMap<String,(WindowReading,i64)> = BTreeMap::new();
+        for (mut window,observed_at,profile_id) in windows {
+            let history_rate=history_slope(&history,profile_id,&window,observed_at);
+            window.burn_per_hour=Some(crate::profile_quota_agents::load::rate(history_rate,observed_at,window.label.as_deref(),&pool_work));
+            let replace=merged.get(&window.gauge_id).is_none_or(|(old,at)|observed_at>*at||(observed_at==*at&&window.remaining_percent<old.remaining_percent));
+            if replace {merged.insert(window.gauge_id.clone(),(window,observed_at));}
+        }
+        let windows=merged.into_values().map(|(w,_)|w).collect();
         candidates.push(Candidate {
             profile_id: account.id.clone(),
             profile: account.name.clone(),
             windows,
-            active_agents: open_agents
-                .get(&account.name)
-                .or_else(|| open_agents.get(&account.id))
-                .copied()
-                .unwrap_or(0),
+            active_agents: pool_work.len(),
         });
     }
-    pick_from(requested, provider, spend, &candidates, excluded, now)
+    let mut pick=pick_from(requested, provider, spend, &candidates, excluded, now)?;
+    for candidate in &mut pick.candidates {candidate.burn_source="history_or_weighted_work".into()}
+    Ok(pick)
 }
 
 /// Fresh subscription windows of a profile with their observation time.
@@ -531,7 +537,7 @@ fn live_windows(
             .filter(|gauge| gauge.kind == "window" && gauge.error.is_none() && !gauge.stale)
             .filter_map(|gauge| {
                 let observed = gauge.observed_at?;
-                (now - observed <= FRESH_SECS).then_some(())?;
+                (0..=FRESH_SECS).contains(&(now-observed)).then_some(())?; // r290 P12: future observations are unknown.
                 Some((
                     WindowReading {
                         gauge_id: gauge.id.clone(),
@@ -545,7 +551,7 @@ fn live_windows(
             })
             .collect()
     };
-    let read = crate::management::v2::profile_quota::read_gauges(account, false).map_err(|_| "quota_read_failed")?;
+    let read = if refresh_stale {crate::management::v2::profile_quota::read_gauges(account,false)}else{crate::management::v2::profile_quota::cached_gauges(account)}.map_err(|_| "quota_read_failed")?; // r290 P12: previews never poll providers.
     // Claude subscription and ChatGPT login profiles always have windows,
     // even before their first reading.
     let subscription = matches!(read.source, Some("claude" | "native"));
@@ -554,12 +560,13 @@ fn live_windows(
         return Err("no_subscription_windows");
     }
     let windows = fresh(&read.gauges);
-    if !windows.is_empty() || !refresh_stale {
-        return if windows.is_empty() { Err("quota_stale") } else { Ok(windows) };
+    let complete=windows.len()==read.gauges.iter().filter(|g|g.kind=="window").count(); // r290 P12: an unknown weekly window cannot look healthy.
+    if (!windows.is_empty()&&complete) || !refresh_stale {
+        return if windows.is_empty()||!complete { Err("quota_stale") } else { Ok(windows) };
     }
     let read = crate::management::v2::profile_quota::read_gauges(account, true).map_err(|_| "quota_read_failed")?;
     let windows = fresh(&read.gauges);
-    if windows.is_empty() {
+    if windows.is_empty()||windows.len()!=read.gauges.iter().filter(|g|g.kind=="window").count() {
         Err("quota_stale")
     } else {
         Ok(windows)
@@ -587,23 +594,6 @@ fn history_slope(
     points.sort_by_key(|point| point.0);
     points.push((observed_at, window.remaining_percent));
     slope(&points)
-}
-
-/// Open (not retired, agent-enabled) sessions by profile name or ID.
-fn open_agents_by_profile() -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    let Ok(sessions) = crate::session::store::load_cutex_session_store_shared() else {
-        return counts;
-    };
-    for record in sessions.sessions.values() {
-        if record.archive_state != crate::session::model::CutexSessionArchiveState::Active || !record.agent_enabled {
-            continue;
-        }
-        if let Some(profile) = record.profile.as_deref().filter(|profile| !profile.is_empty()) {
-            *counts.entry(profile.to_string()).or_insert(0) += 1;
-        }
-    }
-    counts
 }
 
 // ------------------------------------------------------- explanation file

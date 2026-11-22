@@ -266,6 +266,16 @@ pub fn preset_refreshed(catalog: &ModelCatalog, existing: Option<&Value>, select
             changes.extend(crate::profiles::known_models::refresh_row(&mut row, &pinned, tracked));
             apply_known_model_metadata_overlays(&mut row);
             if let Some(model) = catalog.metadata.get(id) { apply_discovered_metadata(&mut row, model); }
+            // r290 P13: refreshed unpinned fields update catalog defaults, not owner originals.
+            if row.get("context_settings").is_some() {
+                let values=super::model_context::settings_values(&row);
+                for key in super::model_context::LIMIT_KEYS {
+                    if !pinned.iter().any(|p|p==key) {
+                        if let Some(value)=values.get(key) {row["context_settings"]["catalog"][key]=value.clone();}
+                        else if let Some(defaults)=row["context_settings"]["catalog"].as_object_mut(){defaults.remove(key);}
+                    }
+                }
+            }
             return row;
         }
         let mut row = template_row(id);

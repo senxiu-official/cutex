@@ -124,6 +124,36 @@ fn command_titles_strip_shell_wrappers_and_truncate() {
 }
 
 #[test]
+fn native_approval_needs_clear_on_disconnect_and_do_not_return_for_old_generation() {
+    for method in ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"] {
+        let pending = || vec![("cutex.a".to_string(), 1, json!({"id":7,"method":method,"params":{"command":"cargo test"}}),
+                              "2026-11-17T00:00:00Z".to_string())];
+        let mut agent = session("cutex.a", true, Some("turn"));
+        let synth = |agent: &Value| {
+            let sources = NeedSources { native: answerable_native_requests(&[agent.clone()], pending()), ..Default::default() };
+            synthesize(&[agent.clone()], &HashMap::new(), &BTreeMap::new(), &sources, &HashMap::new())
+        };
+        let online = synth(&agent);
+        assert_eq!(online.needs_you_count, 1);
+        assert_eq!(online.agents[0]["needs"][0]["kind"], "approval");
+        for status in ["error", "offline", "closing"] {
+            agent["runtime"]["status"] = json!(status);
+            let gone = synth(&agent);
+            assert_eq!(gone.needs_you_count, 0, "{method}: {status}");
+            assert_eq!(gone.agents[0]["needs"], json!([]));
+            let old = BTreeMap::from([("cutex.a".to_string(), online.agents[0].clone())]);
+            let (events, _) = diff_rows(&old, &gone.agents, &|_| false);
+            assert!(events.iter().any(|(name, data)| name == "cutex/summary/agentChanged" && data["agent"]["needs"] == json!([])));
+        }
+        agent["runtime"]["status"] = json!("online");
+        agent["runtime"]["runtimeGeneration"] = json!(2);
+        assert_eq!(synth(&agent).needs_you_count, 0);
+        agent["runtime"]["runtimeGeneration"] = json!(1);
+        assert_eq!(synth(&agent).needs_you_count, 1);
+    }
+}
+
+#[test]
 fn native_requests_of_offline_or_errored_runtimes_are_not_needs() {
     let sessions = vec![
         session("cutex.live", true, Some("t")),
@@ -234,6 +264,8 @@ fn synthesize_builds_rows_status_needs_and_counts() {
             unread_turns: 3,
             preview: Some("from events".into()),
             read_at: None,
+            board_goal:None,
+            board_plan:None,
         },
     )]);
     let synthesis = synthesize(&sessions, &meta, &projects, &sources, &projections);
@@ -537,9 +569,11 @@ fn bench_context() -> ManagementRequestContext {
         handle_user_input: |_| panic!("unexpected user input"),
         flush_user_input_queue: |_, _, _| panic!("unexpected queue flush"),
         steer_user_input_queue: |_, _, _| panic!("unexpected queue steer"),
-        interrupt_active_turn: |_, _| panic!("unexpected interrupt"),
-        load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
+        interrupt_active_turn: |_, _, _| panic!("unexpected interrupt"),
+        load_bootstrap_state: |_, _, _| panic!("unexpected bootstrap"),
         load_latest_plan: |_| panic!("unexpected plan"),
+        // r290 P6
+        load_board_plan: |_| serde_json::Value::Null,
         load_latest_token_usage: |_| panic!("unexpected usage"),
         revert_session_history: |_, _, _| panic!("unexpected revert"),
         delete_session: |_, _| panic!("unexpected session delete"),
@@ -739,4 +773,35 @@ fn tick_keeps_the_journal_state_it_commits() {
     let removed = hub.lock().page_after(0, 100).unwrap();
     assert!(removed.iter().any(|event| event.name == "cutex/summary/agentRemoved"
         && event.data["id"] == "cutex.agent-002"));
+}
+
+#[test]
+fn board_goal_notifications_are_bound_persisted_and_clear_without_runtime_io(){
+    let mut projections=HashMap::new();
+    let mut event=envelope("cutex.a",Some(json!({"method":"thread/goal/updated","params":{"threadId":"thread","goal":{"objective":"ship board","status":"active"}}})),None);
+    event.correlation.runtime_generation=Some(7);event.correlation.thread_id=Some("thread".into());
+    reduce(&mut projections,&event);
+    assert_eq!(projections["cutex.a"].board_goal.as_ref().unwrap().goal.as_ref().unwrap()["objective"],"ship board");
+    let dir=TempDir::new("board-goal");let path=dir.0.join("summary.sqlite3");
+    let mut journal=Journal::open(&path).unwrap();journal.commit(&projections,None,&[],&[]).unwrap();drop(journal);
+    let journal=Journal::open(&path).unwrap();assert_eq!(journal.load_projections().unwrap(),projections);drop(journal);
+    event.correlation.thread_id=Some("foreign".into());event.native.as_mut().unwrap().message["params"]["goal"]["objective"]=json!("bad");
+    reduce(&mut projections,&event);assert_eq!(projections["cutex.a"].board_goal.as_ref().unwrap().goal.as_ref().unwrap()["objective"],"ship board");
+    event.correlation.thread_id=Some("thread".into());event.native.as_mut().unwrap().message=json!({"method":"thread/goal/cleared","params":{"threadId":"thread"}});
+    reduce(&mut projections,&event);assert!(projections["cutex.a"].board_goal.as_ref().unwrap().goal.is_none());
+    event.source=EventSource::Cutex;event.native.as_mut().unwrap().message=json!({"method":"thread/goal/updated","params":{"threadId":"thread","goal":{"objective":"forged"}}});
+    reduce(&mut projections,&event);assert!(projections["cutex.a"].board_goal.as_ref().unwrap().goal.is_none());
+}
+
+#[test]
+fn board_plan_projection_is_compact_generation_fenced_and_invalidated_on_revert(){
+    let mut projections=HashMap::new();
+    let mut event=envelope("cutex.plan",Some(json!({"method":"turn/plan/updated","params":{"threadId":"thread","turnId":"turn","plan":[{"step":"design","status":"completed"},{"step":"checks","status":"inProgress"}]}})),None);
+    event.correlation.runtime_generation=Some(9);event.correlation.thread_id=Some("thread".into());
+    reduce(&mut projections,&event);let plan=projections["cutex.plan"].board_plan.as_ref().unwrap();
+    assert_eq!(plan.progress["done"],1);assert_eq!(plan.progress["total"],2);assert_eq!(plan.progress["currentStep"],"checks");assert!(plan.progress.get("plan").is_none());
+    event.correlation.runtime_generation=Some(8);event.native.as_mut().unwrap().message["params"]["plan"][0]["status"]=json!("pending");
+    reduce(&mut projections,&event);assert_eq!(projections["cutex.plan"].board_plan.as_ref().unwrap().progress["done"],1);
+    let reverted=envelope("cutex.plan",None,Some((crate::management::v2::history_revert::EVENT,json!({}))));
+    reduce(&mut projections,&reverted);assert!(projections["cutex.plan"].board_plan.is_none());
 }

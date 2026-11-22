@@ -115,7 +115,7 @@ class PhaseTests(unittest.TestCase):
         (self.op / 'manual-online.json').write_text(json.dumps(rows), encoding='utf-8')
 
     def phase(self, api, plan=None, memory=lambda: None):
-        plan = {'autoOnline': {'pollSeconds': 0.001, 'onlineTimeoutSeconds': 0.2, **((plan or {}).get('autoOnline') or {})}}
+        plan = {'home': (plan or {}).get('home'), 'autoOnline': {'pollSeconds': 0.001, 'onlineTimeoutSeconds': 0.2, **((plan or {}).get('autoOnline') or {})}}
         return kit.Phase(self.op, plan, api, memory_probe=memory, out=self.lines.append, token='secret-token')
 
     def result(self):
@@ -123,6 +123,55 @@ class PhaseTests(unittest.TestCase):
 
     def by_id(self):
         return {a['id']: a for a in self.result()['agents']}
+
+    def test_preserved_outdated_pin_is_not_moved_before_conditional_online(self):
+        stopped = row('a', 'A');stopped['runtimeUpdatedAtAfterOffline'] = 'confirmed-stop'
+        self.manual([stopped]);api = FakeApi(['a'], outdated=['a'])
+        api.sessions['a']['updatedAt'] = 'confirmed-stop'
+        self.phase(api, {'autoOnline': {'preserveExistingRuntimePins': True}}).run()
+        self.assertEqual([sid for sid, _ in api.online_requests], ['a'])
+        self.assertFalse(any(path.startswith('/v2/runtime-packages') for _, path, _ in api.calls))
+        self.assertEqual(self.result()['runtimePackages']['runIds'], [])
+        self.assertEqual(self.result()['runtimePackages']['policy'], 'preserve-existing-runtime-pins')
+
+    def test_preserved_pin_still_respects_a_newer_owner_stop(self):
+        stopped = row('a', 'A');stopped['runtimeUpdatedAtAfterOffline'] = 'confirmed-stop'
+        self.manual([stopped]);api = FakeApi(['a'], outdated=['a'])
+        api.sessions['a']['updatedAt'] = 'newer-owner-stop'
+        self.phase(api, {'autoOnline': {'preserveExistingRuntimePins': True}}).run()
+        self.assertEqual(self.by_id()['a']['code'], 'runtimeIntentChanged')
+        self.assertFalse(api.online_requests)
+        self.assertFalse(any(path.startswith('/v2/runtime-packages') for _, path, _ in api.calls))
+
+    # r290 P9: r289 already-offline Claude can keep updatedAt unchanged.
+    # Its real stop receipt replacement must still supersede the kit stop.
+    def test_repeated_predecessor_stop_receipt_supersedes_unchanged_session_row(self):
+        import hashlib
+        path = self.root / 'runtime/runtime-stops' / (hashlib.sha256(b'a').hexdigest() + '-3.json')
+        path.parent.mkdir(parents=True)
+        raw = json.dumps({'session':'a','generation':3,'state':'offline'})
+        path.write_text(raw)
+        stopped = row('a','A');stopped['runtimeUpdatedAtAfterOffline']='unchanged'
+        stopped['runtimeStopReceiptAfterOffline']=kit.runtime_stop_marker(self.root,'a',3)
+        self.assertTrue(stopped['runtimeStopReceiptAfterOffline']['available'])
+        self.manual([stopped]);api=FakeApi(['a']);api.sessions['a']['updatedAt']='unchanged'
+        # The predecessor's RequestedStop::finish atomically replaces this
+        # path with identical contents; no artificial sleep/clock is needed.
+        replacement=path.with_suffix('.new');replacement.write_text(raw);os.replace(replacement,path)
+        self.assertNotEqual(kit.runtime_stop_marker(self.root,'a',3),stopped['runtimeStopReceiptAfterOffline'])
+        self.phase(api,{'home':str(self.root)}).run()
+        self.assertEqual(self.by_id()['a']['code'],'runtimeIntentChanged')
+        self.assertFalse(api.online_requests)
+
+    def test_unchanged_confirmed_receipt_restores_but_unverifiable_receipt_does_not(self):
+        import hashlib
+        path=self.root/'runtime/runtime-stops'/(hashlib.sha256(b'a').hexdigest()+'-3.json')
+        path.parent.mkdir(parents=True);path.write_text(json.dumps({'session':'a','generation':3,'state':'offline'}))
+        stopped=row('a','A');stopped['runtimeUpdatedAtAfterOffline']='unchanged';stopped['runtimeStopReceiptAfterOffline']=kit.runtime_stop_marker(self.root,'a',3)
+        unknown=row('b','B');unknown['runtimeStopReceiptAfterOffline']=kit.runtime_stop_marker(self.root,'b',3)
+        self.manual([stopped,unknown]);api=FakeApi(['a','b']);api.sessions['a']['updatedAt']='unchanged';self.phase(api,{'home':str(self.root)}).run()
+        self.assertEqual([sid for sid,_ in api.online_requests],['a'])
+        self.assertEqual(self.by_id()['b']['code'],'runtimeIntentUnverifiable')
 
     def test_only_agents_this_operation_confirmed_offline_are_started(self):
         self.manual([row('a', 'A'), row('b', 'B'), row('inherited', 'I', outcome=None, selected=False),
@@ -136,6 +185,80 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(result['counts']['online'], 2)
         self.assertEqual({e['id'] for e in result['excluded']}, {'inherited', 'planned', 'requested'})
         self.assertTrue(any(line.startswith('AUTO ONLINE completed: 2 back online, 0 failed, 3 skipped') for line in self.lines))
+
+    # r290 P9: explicit maintenance online does not mean owner resume.
+    def test_online_paused_is_restored_paused_and_original_offline_is_excluded(self):
+        self.manual([row('a', 'A'), row('offline', 'Offline', outcome=None, selected=False)])
+        api = FakeApi(['a', 'offline'])
+        for session in api.sessions.values():
+            session.update(agentPause={'by':'owner','requestedAt':'2026-11-17T00:00:00Z','phase':'paused'},
+                           pauseReasons=[{'kind':'agent','phase':'paused'}])
+        self.phase(api).run()
+        agent = self.by_id()['a']
+        self.assertEqual(agent['status'], 'online')
+        self.assertEqual(agent['pauseBeforeOnline'], agent['pauseAfterOnline'])
+        self.assertEqual(agent['pauseAfterOnline']['agentPause']['by'], 'owner')
+        self.assertEqual([sid for sid, _ in api.online_requests], ['a'])
+
+    # r290 P9: retain both observations, never repair by a synthetic resume.
+    def test_online_pause_loss_is_reported_without_repair(self):
+        self.manual([row('a', 'A')])
+        api = FakeApi(['a'])
+        api.sessions['a'].update(agentPause={'by':'owner','requestedAt':'2026-11-17T00:00:00Z'},
+                                 pauseReasons=[{'kind':'agent'}])
+        def request(path, method='GET', body=None, timeout=60):
+            result = api(path, method, body, timeout)
+            if method == 'POST' and body.get('method') == 'cutex/runtime/online':
+                api.sessions['a'].update(agentPause=None, pauseReasons=[])
+            return result
+        self.phase(request).run()
+        agent = self.by_id()['a']
+        self.assertEqual(agent['code'], 'pauseChanged')
+        self.assertEqual(len(api.online_requests), 1)
+        self.assertFalse(agent['pauseAfterOnline']['agentPause'])
+
+    # r290 P9: generation is unchanged by a second stop of an offline agent.
+    def test_newer_owner_offline_after_our_confirmation_is_not_started(self):
+        stopped = row('a', 'A')
+        stopped['runtimeUpdatedAtAfterOffline'] = '2026-11-17T00:00:00Z'
+        self.manual([stopped])
+        api = FakeApi(['a'])
+        api.sessions['a']['updatedAt'] = '2026-11-17T00:00:01Z'
+        self.phase(api).run()
+        self.assertEqual(self.by_id()['a']['code'], 'runtimeIntentChanged')
+        self.assertEqual(api.online_requests, [])
+
+    # r290 P9: the daemon must recheck after the GET/POST race, too.
+    def test_online_carries_confirmed_stop_token_for_atomic_daemon_check(self):
+        stopped = row('a', 'A')
+        stopped['runtimeUpdatedAtAfterOffline'] = '2026-11-17T00:00:00Z'
+        self.manual([stopped])
+        api = FakeApi(['a'])
+        api.sessions['a']['updatedAt'] = stopped['runtimeUpdatedAtAfterOffline']
+        self.phase(api).run()
+        posts = [body for method, path, body in api.calls if method == 'POST' and body.get('method') == 'cutex/runtime/online']
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]['params']['expectedRuntimeUpdatedAt'], stopped['runtimeUpdatedAtAfterOffline'])
+
+    # r290 P9: newer owner offline after GET is caught by the daemon fence.
+    def test_racing_owner_stop_refusal_is_skipped_once_without_replay(self):
+        stopped = row('a', 'A')
+        stopped['runtimeUpdatedAtAfterOffline'] = '2026-11-17T00:00:00Z'
+        self.manual([stopped])
+        api = FakeApi(['a'])
+        api.sessions['a']['updatedAt'] = stopped['runtimeUpdatedAtAfterOffline']
+        posts = []
+        def request(path, method='GET', body=None, timeout=60):
+            if method == 'POST':
+                posts.append(body)
+                raise kit.HttpError(409, {'error': {'code':'revision_conflict',
+                    'message':'new owner stop', 'details':{'reason':'runtime_intent_changed'}}})
+            return api(path, method, body, timeout)
+        self.phase(request).run()
+        self.assertEqual(self.by_id()['a']['status'], 'skipped')
+        self.assertEqual(self.by_id()['a']['code'], 'runtimeIntentChanged')
+        self.assertEqual(len(posts), 1)
+        self.assertFalse(api.online('a'))
 
     def test_outdated_targets_move_through_one_runtime_run_and_failures_still_start(self):
         self.manual([row('a', 'A'), row('bad', 'Bad'), row('c', 'C')])

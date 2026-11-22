@@ -6,7 +6,7 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.2.4 — Beautiful World** adds authoritative queued-input disposal, bounded file reads and configurable alarm wake timing. It includes Native 0.167.0-r61 with connection retry handling and Claude claude-r48 (adapter 0.8.15, Agent SDK 0.2.180, bundled CLI 2.1.321) with bounded transient retries and UTF-8 direct stdio. Existing agents keep their runtime pins. Worker records introduced in 0.2.3 require an explicit one-way upgrade confirmation and a backup; do not downgrade a store containing worker services. See [CHANGELOG.md](CHANGELOG.md) and [Known issues](docs/KNOWN-ISSUES.md).
+**0.2.5 — Beautiful World** preserves ordered owner inputs through interruption and recovery, adds bounded note admission and improves Linux runtime supervision. It includes Native 0.169.0-r65 and Claude claude-r55 (adapter 0.8.17, Agent SDK 0.2.180, bundled CLI 2.1.321). Existing agents keep their runtime selections. Before manually returning to 0.2.4, stop and verify all new Linux runtime scopes using 0.2.5; see [runtime supervision](docs/agent-management-provider.md). Historical one-way migrations and worker-record restrictions remain in effect. See [CHANGELOG.md](CHANGELOG.md) and [Known issues](docs/KNOWN-ISSUES.md).
 
 > **Current limitations:**
 > - **Phone push / pairing a phone**: there is no public phone app yet.
@@ -252,3 +252,9 @@ Codex agents run on cute-codex, a fork of [OpenAI Codex](https://github.com/open
 
 Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). `components/claude-runtime/` is under the MIT
 License ([components/claude-runtime/LICENSE](components/claude-runtime/LICENSE)).
+
+## Job Service 0.1.3 compatibility
+
+Job Service 0.1.3 can persist unconfirmed jobs when follow-up is ended. Job Service 0.1.2 cannot read that state. Retain an offline backup and do not downgrade the Job Service or restore older binaries over a store containing those records.
+
+Job Service 0.1.3 在结束后续处理时可持久保存 unconfirmed 作业。Job Service 0.1.2 无法读取该状态。请保留离线备份；包含这些记录后，不要降级 Job Service 或用旧二进制覆盖该存储。

@@ -1,4 +1,7 @@
 //! Git scans have their own budget and share work only after root authorization.
+//! A dirty flight still delivers its snapshot (`possiblyStale`); the next
+//! request starts one shared successor. New-scan queue admission uses WAIT;
+//! bounded joiners share the longer running-scan deadline.
 use crate::management::v2::workspace::{WorkspaceError, WorkspaceResult};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -10,6 +13,7 @@ use std::time::{Duration, Instant};
 pub(super) const SCANS: usize = 2;
 const QUEUED: usize = 8;
 const WAIT: Duration = Duration::from_secs(2);
+pub(super) const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const REUSE: Duration = Duration::from_secs(1);
 const CACHED_ROOTS: usize = 8;
 
@@ -32,14 +36,26 @@ struct Flight {
 }
 impl Flight {
     fn new() -> Self { Self { state: Mutex::new(ResultState { result: None, expires: Instant::now() }), ready: Condvar::new(), dirty: AtomicBool::new(false) } }
-    fn finish(&self, result: Shared) {
+    fn finish(&self, mut result: Shared) -> Shared {
+        // Reserve room for the optional stale flag; walk outside both the
+        // flight lock and the global map lock used by invalidation/selection.
+        let reuse = result.as_ref().is_ok_and(|v| cacheable(v, &mut (4 * 1024 * 1024 - 128)));
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Deliver the snapshot even when writes overlapped this scan. Only a
+        // later request needs a successor; all existing waiters share this one.
+        if self.dirty.load(Ordering::Acquire) {
+            if let Ok(value) = &mut result {
+                if let Some(object) = Arc::make_mut(value).as_object_mut() {
+                    object.insert("possiblyStale".into(), Value::Bool(true));
+                }
+            }
+        }
         // Large results still coalesce while in flight, but do not become a
         // persistent multi-root cache. Responses share the Value through Arc.
-        let reuse = result.as_ref().is_ok_and(|v| cacheable(v, &mut (4 * 1024 * 1024)));
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expires = Instant::now() + if reuse { REUSE } else { Duration::ZERO };
-        state.result = Some(result);
+        state.result = Some(result.clone());
         self.ready.notify_all();
+        result
     }
     fn wait(&self, deadline: Instant) -> WorkspaceResult<Shared> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -62,7 +78,7 @@ fn cacheable(value: &Value, budget: &mut usize) -> bool {
         _ => true,
     }
 }
-struct PoolState { active: usize, next: u64, queue: VecDeque<u64> }
+struct PoolState { active: usize, joiners: usize, next: u64, queue: VecDeque<u64> }
 struct Pool { state: Mutex<PoolState>, ready: Condvar }
 struct Scan<'a>(&'a Pool);
 impl Drop for Scan<'_> {
@@ -72,12 +88,26 @@ impl Drop for Scan<'_> {
         self.0.ready.notify_all();
     }
 }
+struct Joiner<'a>(&'a Pool);
+impl Drop for Joiner<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.joiners -= 1;
+        self.0.ready.notify_all();
+    }
+}
 impl Pool {
-    fn new() -> Self { Self { state: Mutex::new(PoolState { active: 0, next: 0, queue: VecDeque::new() }), ready: Condvar::new() } }
+    fn new() -> Self { Self { state: Mutex::new(PoolState { active: 0, joiners: 0, next: 0, queue: VecDeque::new() }), ready: Condvar::new() } }
+    fn join(&self) -> WorkspaceResult<Joiner<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.queue.len() + state.joiners >= QUEUED { return Err(busy()); }
+        state.joiners += 1;
+        Ok(Joiner(self))
+    }
     fn acquire(&self, deadline: Instant) -> WorkspaceResult<Scan<'_>> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.active < SCANS && state.queue.is_empty() { state.active += 1; return Ok(Scan(self)); }
-        if state.queue.len() >= QUEUED { return Err(busy()); }
+        if state.queue.len() + state.joiners >= QUEUED { return Err(busy()); }
         let ticket = state.next; state.next = state.next.wrapping_add(1); state.queue.push_back(ticket);
         loop {
             if state.active < SCANS && state.queue.front() == Some(&ticket) {
@@ -92,7 +122,7 @@ impl Pool {
 }
 struct Complete(Arc<Flight>, bool);
 impl Drop for Complete {
-    fn drop(&mut self) { if !self.1 { self.0.finish(Err(Arc::new(busy()))); } }
+    fn drop(&mut self) { if !self.1 { let _ = self.0.finish(Err(Arc::new(busy()))); } }
 }
 struct Coordinator {
     flights: Mutex<HashMap<Key, Arc<Flight>>>,
@@ -102,9 +132,9 @@ struct Coordinator {
 }
 impl Coordinator {
     fn new() -> Self { Self { flights: Mutex::new(HashMap::new()), pool: Pool::new(), scans: AtomicU64::new(0), coalesced: AtomicU64::new(0) } }
-    fn get(&self, key: Key, mut load: impl FnMut() -> WorkspaceResult<Value>) -> WorkspaceResult<Arc<Value>> {
+    fn get(&self, key: Key, load: impl FnOnce() -> WorkspaceResult<Value>) -> WorkspaceResult<Arc<Value>> {
         let deadline = Instant::now() + WAIT;
-        loop {
+        {
             let (flight, leader) = {
                 let mut flights = self.flights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = Instant::now();
@@ -132,29 +162,38 @@ impl Coordinator {
                     Ok(_scan) => { self.scans.fetch_add(1, Ordering::Relaxed); load().map(Arc::new).map_err(Arc::new) }
                     Err(error) => Err(Arc::new(error)),
                 };
-                flight.finish(result.clone()); completion.1 = true; result
-            } else { flight.wait(deadline)? };
-            // A workspace change invalidates both reuse and an older in-flight
-            // result. One successor scan serves callers requesting fresh state.
-            if flight.dirty.load(Ordering::Acquire) {
-                if Instant::now() >= deadline { return Err(busy()); }
-                continue;
-            }
+                let result = flight.finish(result); completion.1 = true; result
+            } else {
+                let completed = flight.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result.clone();
+                if let Some(completed) = completed { completed } else {
+                    let _joiner = self.pool.join()?;
+                    flight.wait(Instant::now() + SCAN_TIMEOUT)?
+                }
+            };
+            // Dirty completed flights are retired on the next request. That
+            // request alone creates the coalesced follow-up; callers already
+            // waiting never loop or spend another admission budget.
             return result.map_err(|e| WorkspaceError::new(e.status, e.code, e.message.clone()));
         }
     }
     fn invalidate(&self, root: &Path) {
         let root = crate::artifacts::paths::key(root);
         let flights = self.flights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (key, flight) in flights.iter() { if key.root == root { flight.dirty.store(true, Ordering::Release); } }
+        for (key, flight) in flights.iter() {
+            if key.root == root {
+                // Order invalidation against publication of the stale flag.
+                let _state = flight.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                flight.dirty.store(true, Ordering::Release);
+            }
+        }
     }
     fn diagnostics(&self) -> Value {
         let state = self.pool.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        serde_json::json!({"scansActive":state.active,"scansWaiting":state.queue.len(),"scanLimit":SCANS,"scanQueueLimit":QUEUED,"waitMs":WAIT.as_millis(),"resultReuseMs":REUSE.as_millis(),"scansStarted":self.scans.load(Ordering::Relaxed),"coalesced":self.coalesced.load(Ordering::Relaxed)})
+        serde_json::json!({"scansActive":state.active,"scansWaiting":state.queue.len(),"joinersWaiting":state.joiners,"waiterLimit":QUEUED,"joinWaitMs":SCAN_TIMEOUT.as_millis(),"scanLimit":SCANS,"scanQueueLimit":QUEUED,"waitMs":WAIT.as_millis(),"scanTimeoutMs":SCAN_TIMEOUT.as_millis(),"resultReuseMs":REUSE.as_millis(),"scansStarted":self.scans.load(Ordering::Relaxed),"coalesced":self.coalesced.load(Ordering::Relaxed)})
     }
 }
 fn global() -> &'static Coordinator { static GLOBAL: OnceLock<Coordinator> = OnceLock::new(); GLOBAL.get_or_init(Coordinator::new) }
-pub(super) fn get(root: &Path, load: impl FnMut() -> WorkspaceResult<Value>) -> WorkspaceResult<Arc<Value>> {
+pub(super) fn get(root: &Path, load: impl FnOnce() -> WorkspaceResult<Value>) -> WorkspaceResult<Arc<Value>> {
     let full=crate::management::listeners::current_client_token().is_none_or(|token|token.scope.is_full());
     let mut key=Key::new(root, crate::management::users::request_has_owner_local_secret_access());
     key.narrowed=!full;

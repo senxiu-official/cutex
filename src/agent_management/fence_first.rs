@@ -411,17 +411,22 @@ mod tests {
             held_rx.recv().unwrap();
             // The fence is busy first: that wait does not use the budget.
             let fence = provider.store().lock_mutations().unwrap();
+            let (started_tx, started_rx) = channel();
             let waiter = {
                 let id = id.clone();
                 std::thread::spawn(move || {
                     let provider = AgentManagementProvider::open_default().unwrap();
                     let started = Instant::now();
+                    started_tx.send(()).unwrap();
                     (
                         fence_first_start(&provider, &id, Some(extra)),
                         started.elapsed(),
                     )
                 })
             };
+            // Provider initialization and thread scheduling precede the waiter clock.
+            // Start the measured fence hold only after that clock is running.
+            started_rx.recv().unwrap();
             std::thread::sleep(Duration::from_millis(300));
             drop(fence);
             let probe = std::thread::spawn(|| {

@@ -44,12 +44,16 @@ def live_supported(cli_version: str | None, environ=os.environ) -> bool:
     return tuple(int(part) for part in version.split('.')) >= LIVE_MIN_CLI
 
 
-def _value(window, percent) -> tuple[int, int] | None:
+# r290 P13: no fixed window still carries a valid compaction percentage.
+def _value(window, percent) -> tuple[int | None, int] | None:
+    if isinstance(window, bool) or isinstance(percent, bool):
+        return None
     try:
-        window, percent = int(window), int(percent)
+        window = None if window is None or window == '' else int(window)
+        percent = int(percent)
     except (TypeError, ValueError):
         return None
-    if isinstance(window, bool) or window not in WINDOW_RANGE or percent not in PERCENT_RANGE:
+    if (window is not None and window not in WINDOW_RANGE) or percent not in PERCENT_RANGE:
         return None
     return window, percent
 
@@ -60,8 +64,8 @@ class Compaction:
 
     def __init__(self, environ=os.environ):
         self.default = _value(environ.get(WINDOW_ENV), environ.get(PERCENT_ENV)) \
-            if environ.get(WINDOW_ENV) and environ.get(PERCENT_ENV) else None
-        self.models: dict[str, tuple[int, int]] = {}
+            if environ.get(PERCENT_ENV) else None
+        self.models: dict[str, tuple[int | None, int]] = {}
         raw = environ.get(MODELS_ENV)
         try:
             table = json.loads(raw) if raw else {}
@@ -73,7 +77,7 @@ class Compaction:
                 if isinstance(model, str) and model and value is not None:
                     self.models[model] = value
 
-    def for_model(self, model: str | None) -> tuple[int, int] | None:
+    def for_model(self, model: str | None) -> tuple[int | None, int] | None:
         return self.models.get(model or '', self.default)
 
     def child_env(self, model: str | None) -> dict[str, str]:
@@ -81,7 +85,7 @@ class Compaction:
         value = self.for_model(model)
         if value is None or value == self.default:
             return {}
-        return {WINDOW_ENV: str(value[0]), PERCENT_ENV: str(value[1])}
+        return {WINDOW_ENV: '' if value[0] is None else str(value[0]), PERCENT_ENV: str(value[1])}
 
     def differs(self, old: str | None, new: str | None) -> bool:
         return self.for_model(old) != self.for_model(new)
@@ -93,4 +97,4 @@ class Compaction:
         value = self.for_model(new)
         if value is None:
             return {WINDOW_ENV: '', PERCENT_ENV: ''}
-        return {WINDOW_ENV: str(value[0]), PERCENT_ENV: str(value[1])}
+        return {WINDOW_ENV: '' if value[0] is None else str(value[0]), PERCENT_ENV: str(value[1])}

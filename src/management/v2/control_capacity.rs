@@ -41,6 +41,14 @@ pub enum WorkClass {
 
 pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    // Child ancestry RPCs may wait for native I/O; preserve control capacity.
+    if request.method=="POST" && matches!(path,crate::agent_bus::native_subagent::PATH|crate::agent_bus::native_subagent::PROOF_PATH) {
+        return WorkClass::HeavyRead;
+    }
+
+    if matches!(request.method.as_str(), "GET" | "HEAD") && super::artifact_store::raw::is_path(path) {
+        return WorkClass::FileTransfer;
+    }
     if request.method == "GET" && super::file_transfer::is_path(path) {
         return WorkClass::FileTransfer;
     }
@@ -79,6 +87,7 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
             || (path.starts_with("/v2/sessions/") && super::server::session_id_from_path(path).is_none())
             || path == "/v2/summary"
             || path == "/v2/events"
+            || path == "/v2/usage/quota-attribution" // r290 P8: preserve control capacity during indexed scans.
             || path.starts_with("/v2/artifacts")
             || path.starts_with("/v2/documents")
             || path == "/v2/storage"
@@ -559,6 +568,15 @@ pub fn snapshot() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // r290 P8: selectors cannot bypass heavy-read admission; nearby control routes stay control.
+    #[test]
+    fn quota_attribution_uses_heavy_read_capacity() {
+        for path in ["/v2/usage/quota-attribution", "/v2/usage/quota-attribution?profile=p&window=7d"] {
+            assert_eq!(classify(&request("GET", path, "")), WorkClass::HeavyRead);
+        }
+        assert_eq!(classify(&request("GET", "/v2/usage/quota-attribution-other", "")), WorkClass::Control);
+        assert_eq!(classify(&request("GET", "/v2/host", "")), WorkClass::Control);
+    }
     #[test]
     fn file_transfers_have_dedicated_capacity_and_preserve_control_reads_and_watches() {
         for path in [

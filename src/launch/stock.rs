@@ -471,15 +471,18 @@ impl StockBundle {
         );
         let mut bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
-        let raw = std::fs::read_to_string(&bundle.shared_config.path)?;
+        let raw = std::fs::read_to_string(&bundle.shared_config.path)
+            .with_context(|| format!("read stock shared config {}", bundle.shared_config.path.display()))?;
         bundle.validate_shared_configuration(&raw)?;
         // Config is user-editable state, not an immutable build artifact.
         // Old manifest hashes remain historical evidence, never launch gates.
         bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
         bundle.validate_components()?;
         ensure!(
-            bundle.shared_config.path.canonicalize()?
-                == native_home.join("config.toml").canonicalize()?,
+            bundle.shared_config.path.canonicalize()
+                .with_context(|| format!("resolve stock shared config {}", bundle.shared_config.path.display()))?
+                == native_home.join("config.toml").canonicalize()
+                    .with_context(|| format!("resolve native home config {}", native_home.join("config.toml").display()))?,
             "wrong shared config/home"
         );
         bundle
@@ -548,7 +551,9 @@ impl StockBundle {
             "stock companion must be beside executable"
         );
         let schema: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&bundle.schema.path)?)?;
+            serde_json::from_slice(&std::fs::read(&bundle.schema.path)
+                .with_context(|| format!("read stock protocol schema {}", bundle.schema.path.display()))?)
+                .with_context(|| format!("parse stock protocol schema {}", bundle.schema.path.display()))?;
         ensure!(schema.is_object(), "invalid stock protocol schema");
         Ok(())
     }
@@ -731,7 +736,7 @@ fn frontend_only_upgrade_keeps_backend_selection_and_rejects_mismatched_neighbor
 
 pub fn canonical(path: &Path) -> anyhow::Result<()> {
     ensure!(path.is_absolute(), "absolute stock path required");
-    let resolved = path.canonicalize()?;
+    let resolved = path.canonicalize().with_context(|| format!("resolve stock path {}", path.display()))?;
     #[cfg(not(windows))]
     ensure!(resolved == path, "canonical existing stock path required");
     #[cfg(windows)]

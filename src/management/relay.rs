@@ -71,8 +71,25 @@ pub fn request_gate(
     path: &str,
 ) -> Option<GateError> {
     current_peer()?;
+    // r290 P10 (B6): an owner device on the relay reaches the owner-device
+    // relay routes (`owner_device_relay_route`); `handle` gates them.
+    // r290 P10 (B3): a grace connection (expired leaf) reaches only its own
+    // certificate routes.
+    if grace_peer() {
+        let renewal = (request.method == "GET" && path == "/v2/relay-certificate")
+            || (request.method == "POST" && path == "/v2/relay-certificate/renew");
+        if !renewal {
+            refusal("grace_path");
+            return Some((
+                403,
+                "Forbidden",
+                "relay_certificate_expired",
+                "the relay certificate has expired: only GET /v2/relay-certificate and POST /v2/relay-certificate/renew are open",
+            ));
+        }
+    }
     if request.method == "OPTIONS"
-        || path == "/v2/pair"
+        || !owner_device_relay_route(&request.method, path) && (path == "/v2/pair"
         || path == "/v2/pairing-codes"
         || path == "/v2/pairing/invites"
         || path.starts_with("/v2/pairing/invites/")
@@ -80,7 +97,7 @@ pub fn request_gate(
         || path.starts_with("/v2/relay-enrollment/")
         || path == "/v2/relay"
         || path.starts_with("/v2/relay/")
-        || !(path == "/v2" || path.starts_with("/v2/"))
+        || !(path == "/v2" || path.starts_with("/v2/")))
     {
         refusal("path");
         return Some((
@@ -101,6 +118,58 @@ pub fn request_gate(
     }
     None
 }
+// r290 P10 (B3): the current relay connection presented an expired (grace) leaf.
+thread_local! { static GRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(crate) fn grace_peer() -> bool {
+    current_peer().is_some() && GRACE.with(std::cell::Cell::get)
+}
+pub(super) fn set_grace(grace: bool) {
+    GRACE.with(|g| g.set(grace));
+}
+
+// r290 P10 (B6) ------------------------------------------------------------
+/// What an owner request to `handle` is (see users::OWNER_TURN_OFF_ACTIONS /
+/// OWNER_WIDENING_ACTIONS). Anything else stays owner-local only.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerRelayAction {
+    /// GET of status / invites / certificates / enrollments / switch.
+    Read,
+    TurnOff(&'static str),
+    Widen(&'static str),
+    /// setup, tailnet, rotate-server, bootstrap configuration.
+    LocalOnly,
+}
+fn owner_relay_action(method: &str, path: &str, body: &[u8]) -> OwnerRelayAction {
+    use OwnerRelayAction::*;
+    let invite = path.strip_prefix("/v2/pairing/invites/").map(|rest| rest.split('/').collect::<Vec<_>>());
+    match (method, path) {
+        ("GET", "/v2/relay/status" | "/v2/relay/pairing" | "/v2/relay/certificates" | "/v2/relay/enrollments" | "/v2/pairing/invites") => Read,
+        ("POST", "/v2/relay/pairing") => {
+            match serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|b| b["enabled"].as_bool()) {
+                Some(false) => TurnOff("publicPairingOff"),
+                // Malformed bodies are refused by the handler (400) after the gate.
+                _ => Widen("publicPairingOn"),
+            }
+        }
+        ("DELETE", _) if path.starts_with("/v2/relay/certificates/") => TurnOff("relayCertificateRevoke"),
+        ("POST", "/v2/relay/certificates") => Widen("relayCertificateApprove"),
+        ("POST", "/v2/pairing/invites") => Widen("pairingInvite"),
+        _ => match invite.as_deref() {
+            Some([_]) if method == "DELETE" => TurnOff("pairingInviteCancel"),
+            Some([_, "deny"]) if method == "POST" => TurnOff("pairingInviteCancel"),
+            Some([_, "approve"]) if method == "POST" => Widen("pairingInviteApprove"),
+            _ => LocalOnly,
+        },
+    }
+}
+/// Owner-device routes open on the relay listener (`request_gate`); the
+/// enrollment approval and host configuration stay off the relay.
+fn owner_device_relay_route(method: &str, path: &str) -> bool {
+    !matches!((method, path), ("POST", "/v2/relay/certificates"))
+        && !matches!(owner_relay_action(method, path, b""), OwnerRelayAction::LocalOnly)
+}
+// r290 P10 (B6) end
+
 pub fn token_gate(token: Option<&VerifiedClientToken>) -> Option<GateError> {
     let peer = current_peer()?;
     let error = match token {
@@ -176,6 +245,17 @@ struct Registry {
     schema: String,
     certificates: Vec<CertificateRecord>,
 }
+// r290 P10 (B3): a device leaf lives 30 days, is renewable from its
+// half-life (the last 15 days), and for 30 days after it expired the device
+// may still renew it with the SAME key over a restricted grace connection,
+// provided the certificate is unrevoked and the device token still exists
+// (both checked live, as for an active leaf). 30 days: one month of travel
+// or an unopened app; a stolen phone is stopped by revoking the device,
+// which ends grace as well, so a longer window adds nothing a live
+// revocation check does not already cover.
+pub(crate) const LEAF_DAYS: i64 = 30;
+pub(crate) const RENEW_BEFORE_EXPIRY_DAYS: i64 = 15;
+pub(crate) const RENEW_GRACE_DAYS: i64 = 30;
 const REGISTRY_SCHEMA: &str = "cutex.relay-registry.v1";
 const IDENTITY_SCHEMA: &str = "cutex.relay-identity.v1";
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -524,13 +604,24 @@ impl Store {
         csr_pem: &str,
         parent: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
+        self.issue_locked_replacing(device_id, csr_pem, parent, None)
+    }
+    /// r290 P10 (a): `issue_locked` where the key may also belong to
+    /// `replaces` (the device a re-pairing replaces) or to a device whose
+    /// token no longer exists. A revoked key stays refused.
+    fn issue_locked_replacing(
+        &self,
+        device_id: &str,
+        csr_pem: &str,
+        parent: Option<&str>,
+        replaces: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
         if csr_pem.len() > 16384 {
             bail!("CSR too large");
         }
         let (_, key_sha256) = credentials::csr_fingerprints(csr_pem)?;
-        if !self
-            .tokens
-            .list()?
+        let devices = self.tokens.list()?;
+        if !devices
             .iter()
             .any(|t| t.token_id == device_id && t.kind == KIND_DEVICE)
         {
@@ -578,7 +669,7 @@ impl Store {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.not_before = now - time::Duration::minutes(5);
-        params.not_after = (now + time::Duration::days(30)).min(ca_expiry);
+        params.not_after = (now + time::Duration::days(LEAF_DAYS)).min(ca_expiry);
         params.serial_number = Some(uuid::Uuid::new_v4().as_bytes().to_vec().into());
         let expires_at = chrono::DateTime::from_timestamp(params.not_after.unix_timestamp(), 0)
             .context("invalid certificate expiry")?
@@ -599,6 +690,9 @@ impl Store {
             !r.key_sha256.is_empty()
                 && r.key_sha256 == record.key_sha256
                 && r.device_id != record.device_id
+                // r290 P10 (a)
+                && Some(r.device_id.as_str()) != replaces
+                && devices.iter().any(|t| t.token_id == r.device_id)
         }) {
             bail!(ApiError(
                 409,
@@ -651,18 +745,31 @@ impl Store {
                     "renewal is blocked; use trusted enrollment with a fresh key",
                 )
             };
-            let parent = self.active_uncached(parent_id)?.ok_or_else(fail)?;
+            // r290 P10 (B3): an active leaf, or an expired one still in its
+            // grace window (unrevoked, device present) renewed with the same key.
+            let (parent, grace) = match self.active_uncached(parent_id)? {
+                Some(parent) => (parent, false),
+                None => (self.grace_uncached(parent_id)?.ok_or_else(fail)?, true),
+            };
             let expiry = chrono::DateTime::parse_from_rfc3339(&parent.expires_at)?;
-            if chrono::Utc::now() < expiry - chrono::Duration::days(7) {
+            if chrono::Utc::now() < expiry - chrono::Duration::days(RENEW_BEFORE_EXPIRY_DAYS) {
                 bail!(ApiError(
                     409,
                     "Conflict",
                     "relay_renewal_too_early",
-                    "renew during the final seven days"
+                    "renew during the final fifteen days"
                 ));
             }
             let records = self.registry()?.certificates;
             let (_, key) = credentials::csr_fingerprints(csr)?;
+            if grace && (parent.key_sha256.is_empty() || parent.key_sha256 != key) {
+                bail!(ApiError(
+                    409,
+                    "Conflict",
+                    "relay_grace_key_mismatch",
+                    "an expired certificate renews only with the same key"
+                ));
+            }
             // Revocation is a durable boundary, including legacy records with
             // no lineage metadata. Revoking a successor must never reopen its parent.
             if records.iter().any(|r| {
@@ -752,6 +859,77 @@ impl Store {
             .any(|t| t.token_id == cert.device_id && t.kind == KIND_DEVICE)
             .then_some(cert))
     }
+    /// r290 P10 (B3): an expired leaf still inside its renewal grace window:
+    /// unrevoked, no newer certificate for the device revoked, and its
+    /// device token still present. Uncached (handshake and renewal).
+    pub(super) fn grace_uncached(&self, id: &str) -> anyhow::Result<Option<CertificateRecord>> {
+        let registry = self.registry()?;
+        let Some(cert) = registry
+            .certificates
+            .iter()
+            .find(|c| c.certificate_id == id && !c.revoked)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let expiry = chrono::DateTime::parse_from_rfc3339(&cert.expires_at)?;
+        let now = chrono::Utc::now();
+        if expiry > now || expiry + chrono::Duration::days(RENEW_GRACE_DAYS) <= now {
+            return Ok(None);
+        }
+        // A revoked successor is a durable boundary (as in `renew`).
+        if registry.certificates.iter().any(|r| {
+            r.device_id == cert.device_id && r.revoked && r.renewed_from.as_deref() == Some(id)
+        }) {
+            return Ok(None);
+        }
+        Ok(self
+            .tokens
+            .list()?
+            .iter()
+            .any(|t| t.token_id == cert.device_id && t.kind == KIND_DEVICE)
+            .then_some(cert))
+    }
+    /// r290 P10 (B3): per device, its newest unrevoked certificate as shown
+    /// on device rows: `{certificateId, expiresAt, renewableFrom,
+    /// graceUntil, state: active|renewable|grace|expired}`.
+    pub(crate) fn device_certificates(&self) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
+        let now = chrono::Utc::now();
+        let mut newest: std::collections::HashMap<String, (chrono::DateTime<chrono::FixedOffset>, &CertificateRecord)> = Default::default();
+        let registry = self.registry()?;
+        for cert in registry.certificates.iter().filter(|c| !c.revoked) {
+            let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&cert.expires_at) else { continue };
+            if newest.get(&cert.device_id).is_none_or(|(at, _)| *at < expiry) {
+                newest.insert(cert.device_id.clone(), (expiry, cert));
+            }
+        }
+        Ok(newest
+            .into_iter()
+            .map(|(device, (expiry, cert))| {
+                let renewable_from = expiry - chrono::Duration::days(RENEW_BEFORE_EXPIRY_DAYS);
+                let grace_until = expiry + chrono::Duration::days(RENEW_GRACE_DAYS);
+                let state = if now >= grace_until {
+                    "expired"
+                } else if now >= expiry {
+                    "grace"
+                } else if now >= renewable_from {
+                    "renewable"
+                } else {
+                    "active"
+                };
+                (
+                    device,
+                    json!({
+                        "certificateId": cert.certificate_id,
+                        "expiresAt": cert.expires_at,
+                        "renewableFrom": renewable_from.with_timezone(&chrono::Utc).to_rfc3339(),
+                        "graceUntil": grace_until.with_timezone(&chrono::Utc).to_rfc3339(),
+                        "state": state,
+                    }),
+                )
+            })
+            .collect())
+    }
     fn active(&self, id: &str) -> anyhow::Result<Option<CertificateRecord>> {
         let stamp = |path: &std::path::Path| -> anyhow::Result<_> {
             let meta = std::fs::metadata(path)?;
@@ -804,6 +982,15 @@ impl Store {
         )
     }
 }
+/// r290 P10 (B3): `relayCertificate` of each device row (token id → view);
+/// empty when the relay is not configured or its state is unreadable.
+pub fn device_certificate_views() -> std::collections::HashMap<String, serde_json::Value> {
+    Store::open()
+        .ok()
+        .filter(|store| store.dir.join("certificates.json").exists())
+        .and_then(|store| store.device_certificates().ok())
+        .unwrap_or_default()
+}
 pub(super) fn fingerprint(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -846,19 +1033,27 @@ pub fn handle(
 ) -> anyhow::Result<()> {
     use crate::http::server::write_json_response;
     use crate::management::v2::server::write_v2_error;
-    if !super::users::request_is_owner_local() {
-        let e = super::users::owner_local_only("relayCertificates");
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    // r290 P10 (B6): reads and turning off are open to a full-scope owner
+    // device on any listener; widening needs its fresh confirm; host relay
+    // configuration stays owner-local only.
+    let gate = match owner_relay_action(&request.method, path, &request.body) {
+        OwnerRelayAction::Read | OwnerRelayAction::TurnOff(_) if super::users::owner_may_turn_off() => Ok(()),
+        OwnerRelayAction::Widen(action) => super::users::owner_widening_gate(action, request),
+        _ if super::users::request_is_owner_local() => Ok(()),
+        _ => Err(super::users::owner_local_only("relayCertificates")),
+    };
+    if let Err(e) = gate {
         return write_v2_error(
             stream,
-            403,
-            "Forbidden",
+            e.status,
+            super::users::reason_phrase(e.status),
             e.code,
             &e.message,
             false,
             e.details,
         );
     }
-    let path = request.path.split('?').next().unwrap_or(&request.path);
     let store = Store::open()?;
     let body =
         || serde_json::from_slice::<serde_json::Value>(&request.body).context("expected JSON body");

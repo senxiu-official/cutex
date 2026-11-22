@@ -5,7 +5,7 @@ use crate::asks::{
 };
 use serde_json::json;
 
-pub(super) fn peer() -> store::Peer {
+pub(crate) fn peer() -> store::Peer {
     store::Peer {
         peer_id: format!("ci-{}", uuid::Uuid::new_v4().simple()),
         user_id: store::OWNER_USER_ID.into(),

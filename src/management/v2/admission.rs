@@ -470,12 +470,13 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
         };
         AdmissionNextStep {
             id: delivery.delivery_id.clone(), delivery_kind: kind.into(), label: Some(label.into()),
-            enqueued_at: delivery.created_at.clone(), timing, next_step_at, held: held.clone(),
+            enqueued_at: delivery.created_at.clone(), timing, next_step_at,
+            held: if crate::asks::returns::native_held(delivery).is_some() { Some(crate::asks::control::HELD_OWNER_STOP.into()) }
+                else if crate::asks::returns::delivery_admissible(state,session,delivery) { None } else { held.clone() },
             wait_reason: (delivery.state == DeliveryState::QueuedAsEvent).then(|| "nativeReceipt".into()),
             ask_id: Some(delivery.ask_id.clone()), from, from_host: None, from_cutex_session_id, preview,
             settlement: None,
-            eligible: !state.pauses.contains_key(session)
-                && !crate::asks::agent_pause::is_paused(state, session)
+            eligible: crate::asks::returns::delivery_admissible(state, session, delivery)
                 && crate::asks::delivery::actionable(state, delivery),
         }
     }).collect()
@@ -1172,6 +1173,7 @@ mod tests {
         assert!(queue.owner_may_start(&session, None).unwrap(), "decision 1: the owner first");
         assert!(may_start(&answer), "no owner input waiting: the ride-along may go");
         let params = UserInputSubmitParams {
+                interrupt_send: None,
             client_user_message_id: "owner-1".into(),
             origin: UserInputOrigin { kind: UserInputOriginKind::Backend, client_id: "c".into() },
             strategy: UserInputStrategy::Queue,

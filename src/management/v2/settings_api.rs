@@ -31,6 +31,8 @@ pub const PATH: &str = "/v2/settings";
 const RESTART_REQUIRED: &[&str] = &["agentBusEnabled", "agentBusPort", "managementListen"];
 /// Fields only the loopback listener may change (a remote device token must
 /// not open or close network listeners or widen CORS).
+/// r290 P10 (B6): except a patch that is exactly `{peers: {enabled}}` from a
+/// full-scope owner device (off always, on after the owner confirm).
 const LOOPBACK_ONLY: &[&str] = &["managementListen", "managementCorsOrigins", "peers"];
 /// Fields applied when a runtime is next launched (running agents keep theirs).
 const NEW_RUNTIMES_ONLY: &[&str] = &["proxy", "claudeCli", "claudeUsageRefreshMinutes", "agentHarness", "promptCacheKey"];
@@ -49,6 +51,8 @@ const PATCH_FIELDS: &[&str] = &[
     "claudeUsageRefreshMinutes",
     "profileQuotaRefreshMinutes",
     "archiveDeleteEmpty",
+    // r290 P10 (B4/A8)
+    "ownerShares",
     "queue",
     "imageInput",
     "autoThreadTitles",
@@ -112,10 +116,12 @@ pub(crate) fn proxy_view(proxy: Option<&ProxyConfig>) -> Value {
     })
 }
 
-/// Proxy settings change where traffic goes: only the root credential (this machine, an SSH
-/// tunnel, the desktop's host token) may change them, never a client / device token.
+/// Proxy settings change where traffic goes: only the owner on the host may change them: the
+/// root credential, or a full-scope owner token issued on the host (`client-token issue`, as an
+/// SSH-connected desktop uses), on a loopback listener. Never a paired device, a narrowed token or
+/// a remote listener. // r290 P10 (B2): was "no client token at all", which refused the SSH desktop.
 pub(crate) fn proxy_editable() -> bool {
-    crate::management::listeners::current_client_token().is_none()
+    crate::management::users::request_has_owner_local_secret_access()
 }
 
 pub(crate) fn proxy_owner_required(stream: &mut TcpStream) -> anyhow::Result<()> {
@@ -124,7 +130,7 @@ pub(crate) fn proxy_owner_required(stream: &mut TcpStream) -> anyhow::Result<()>
         403,
         "Forbidden",
         "proxy_owner_credential_required",
-        "proxy settings can only be changed with the host's own credential (not a client or device token)",
+        "proxy settings can only be changed by the owner on the host (this machine or SSH), not from a paired or narrowed device",
         false,
         json!({ "field": "proxy" }),
     )
@@ -284,6 +290,10 @@ pub fn settings_view(config: &CodezConfig) -> Value {
         "restartRequiredFields": RESTART_REQUIRED,
         "newRuntimesOnlyFields": NEW_RUNTIMES_ONLY,
     });
+    // r290 P10 (B4/A8): network shares open to the owner's requests (besides \\wsl$ and
+    // \\wsl.localhost); editable only by the owner on the host (as the proxy).
+    view["ownerShares"] = json!(config.owner_shares);
+    view["ownerSharesEditable"] = json!(crate::management::users::request_has_owner_local_secret_access());
     view["imageInput"] = json!(config.image_input);
     view["imageInputDefault"] = json!(super::user_input::image_steering::ImageInputSettings::default());
     view["claudeCli"] = json!(config.claude_cli);
@@ -816,6 +826,18 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
                 .map_err(|_| "imageInput: requires busyBehavior queue or steer, with no unknown fields")?);
         }
     }
+    // r290 P10 (B4/A8): the whole list (null clears it).
+    if let Some(value) = body.get("ownerShares") {
+        let entries: Vec<String> = match value {
+            Value::Null => Vec::new(),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string).ok_or("ownerShares: must be an array of strings"))
+                .collect::<Result<_, _>>()?,
+            _ => return Err("ownerShares: must be an array of strings or null".into()),
+        };
+        patch.owner_shares = Some(crate::artifacts::paths::normalize_owner_shares(&entries)?);
+    }
     if let Some(value) = body.get("queue") {
         let queue = value.as_object().ok_or("queue: must be an object")?;
         if let Some(unknown) = queue.keys().find(|key| key.as_str() != "ownerMayPassAsks") {
@@ -1201,6 +1223,18 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
             if parsed.proxy.is_some() && !proxy_editable() {
                 return proxy_owner_required(stream);
             }
+            // r290 P10 (B4/A8): widening which network paths open is the owner's on the host.
+            if parsed.patch.owner_shares.is_some() && !crate::management::users::request_has_owner_local_secret_access() {
+                return super::server::write_v2_error(
+                    stream,
+                    403,
+                    "Forbidden",
+                    "owner_shares_owner_local_only",
+                    "network shares can only be changed by the owner on the host (this machine or SSH), not from a paired or narrowed device",
+                    false,
+                    crate::management::users::owner_local_details(json!({ "field": "ownerShares" })),
+                );
+            }
             if let Some(services) = parsed.services.take() {
                 let store = crate::services::store::ServiceStore::open_default()?;
                 return match store.update_settings(services) {
@@ -1226,13 +1260,21 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
             }
             // owner-local-only: turning cross-host peers on is a root-identity
             // action (turning them off stays open to owner principals).
-            if parsed.peers.as_ref().is_some_and(|peers| peers.get("enabled") == Some(&Value::Bool(true)))
-                && !crate::management::users::request_is_owner_local()
-            {
-                let error = crate::management::users::owner_local_only("peersEnable");
-                return super::server::write_v2_error(stream, 403, "Forbidden", error.code, &error.message, false, error.details);
+            // r290 P10 (B6): turning peers on from an owner device that is not
+            // owner-local needs a fresh confirm (428 owner_confirm_required,
+            // repeat with ?ownerConfirm=). A patch that is exactly the peers
+            // switch ({peers:{enabled}}) is open to a full-scope owner device
+            // on a remote listener too (off always; on after the confirm).
+            if parsed.peers.as_ref().is_some_and(|peers| peers.get("enabled") == Some(&Value::Bool(true))) {
+                if let Err(error) = crate::management::users::owner_widening_gate("peersEnable", request) {
+                    return super::server::write_v2_error(stream, error.status, crate::management::users::reason_phrase(error.status), error.code, &error.message, false, error.details);
+                }
             }
-            if !crate::management::listeners::current_request_is_loopback() {
+            let peers_switch_only = parsed.touched.len() == 1
+                && parsed.peers.as_ref().and_then(Value::as_object).is_some_and(|peers| peers.len() == 1 && peers.get("enabled").is_some_and(Value::is_boolean));
+            let remote_peers_switch = peers_switch_only && crate::management::users::owner_may_turn_off();
+            // r290 P10 (B6) end
+            if !crate::management::listeners::current_request_is_loopback() && !remote_peers_switch {
                 // The daemon fetches usage.catalogUrl itself: only from this machine.
                 let catalog_url = parsed
                     .usage
@@ -2210,8 +2252,37 @@ mod tests {
         assert!(socks["warning"].as_str().unwrap().contains("SOCKS"));
     }
 
+    // r290 P10 (B2): who may change the proxy.
     #[test]
-    fn proxy_writes_need_the_root_credential() {
+    fn proxy_is_editable_by_the_owner_on_the_host_only() {
+        use crate::management::client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken};
+        use crate::management::listeners::{set_current_client_token, set_current_connection, ConnectionInfo};
+        let ssh_desktop = VerifiedClientToken::test_token("mct-ssh-desktop");
+        let mut paired = VerifiedClientToken::test_token("mct-paired");
+        paired.issued_via = IssuedVia::Pairing;
+        let mut narrowed = VerifiedClientToken::test_token("mct-narrowed");
+        narrowed.scope = DeviceScope::Chat;
+        let mut unbound = VerifiedClientToken::test_token("mct-unbound");
+        unbound.principal = crate::management::users::Principal::Pending;
+        let editable_with = |token: Option<VerifiedClientToken>| {
+            set_current_client_token(token);
+            let editable = proxy_editable();
+            set_current_client_token(None);
+            editable
+        };
+        assert!(editable_with(None), "root credential on loopback");
+        assert!(editable_with(Some(ssh_desktop.clone())), "owner token issued on the host (SSH desktop)");
+        assert!(!editable_with(Some(paired)), "a paired device");
+        assert!(!editable_with(Some(narrowed)), "a narrowed owner token");
+        assert!(!editable_with(Some(unbound)), "a token without an owner binding");
+        set_current_connection(Some(ConnectionInfo { remote: true, peer: "100.64.0.9:5000".parse().unwrap() }));
+        let remote = editable_with(Some(ssh_desktop));
+        set_current_connection(None);
+        assert!(!remote, "a remote listener");
+    }
+
+    #[test]
+    fn proxy_writes_refuse_a_paired_device() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2222,9 +2293,9 @@ mod tests {
             text
         });
         let (mut stream, _) = listener.accept().unwrap();
-        crate::management::listeners::set_current_client_token(Some(
-            crate::management::client_tokens::VerifiedClientToken::test_token("mct-proxy-test"),
-        ));
+        let mut paired = crate::management::client_tokens::VerifiedClientToken::test_token("mct-proxy-test");
+        paired.issued_via = crate::management::client_tokens::IssuedVia::Pairing;
+        crate::management::listeners::set_current_client_token(Some(paired));
         let request = SimpleHttpRequest {
             method: "PATCH".into(),
             path: PATH.into(),
@@ -2239,5 +2310,76 @@ mod tests {
         assert_eq!(editable, false);
         assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
         assert!(response.contains("\"proxy_owner_credential_required\""), "{response}");
+    }
+
+
+    // r290 P10 (B4/A8): ownerShares parse, view and apply.
+    #[test]
+    fn owner_shares_patch_validates_and_applies() {
+        let parsed = parse_patch(br#"{"ownerShares":["\\\\NAS\\Docs","z:","\\\\nas\\docs"]}"#).unwrap();
+        assert_eq!(parsed.patch.owner_shares, Some(vec![r"\\NAS\Docs".to_string(), "Z:".into()]));
+        let mut config = CodezConfig::default();
+        assert!(settings_view(&config)["ownerShares"].as_array().unwrap().is_empty());
+        assert!(crate::config::global_settings::apply_global_config_patch(&mut config, &parsed.patch).unwrap());
+        assert_eq!(settings_view(&config)["ownerShares"], json!([r"\\NAS\Docs", "Z:"]));
+        assert_eq!(parse_patch(br#"{"ownerShares":null}"#).unwrap().patch.owner_shares, Some(Vec::new()));
+        for bad in [
+            r#"{"ownerShares":"\\\\nas\\docs"}"#,
+            r#"{"ownerShares":[1]}"#,
+            r#"{"ownerShares":["\\\\nas\\docs\\sub"]}"#,
+            r#"{"ownerShares":["\\\\.\\pipe\\x"]}"#,
+            r#"{"ownerShares":["\\\\?\\UNC\\nas\\docs"]}"#,
+            r#"{"ownerShares":["\\\\localhost\\C$"]}"#,
+            r#"{"ownerShares":["C:\\x"]}"#,
+        ] {
+            assert!(parse_patch(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..33).map(|i| format!(r"\\nas\s{i}")).collect();
+        assert!(parse_patch(json!({ "ownerShares": many }).to_string().as_bytes()).is_err());
+    }
+
+    // r290 P10 (B4/A8): widening the shares is owner-local (as the proxy).
+    #[test]
+    fn owner_shares_writes_refuse_paired_narrowed_and_unbound_tokens() {
+        use crate::management::client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken};
+        let mut paired = VerifiedClientToken::test_token("mct-shares-paired");
+        paired.issued_via = IssuedVia::Pairing;
+        let mut narrowed = VerifiedClientToken::test_token("mct-shares-narrowed");
+        narrowed.scope = DeviceScope::Chat;
+        let mut unbound = VerifiedClientToken::test_token("mct-shares-unbound");
+        unbound.principal = crate::management::users::Principal::Pending;
+        for token in [paired, narrowed, unbound] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                let mut text = String::new();
+                stream.read_to_string(&mut text).unwrap();
+                text
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            let label = token.token_id.clone();
+            crate::management::listeners::set_current_client_token(Some(token));
+            let editable = settings_view(&CodezConfig::default())["ownerSharesEditable"].clone();
+            let request = SimpleHttpRequest {
+                method: "PATCH".into(),
+                path: PATH.into(),
+                headers: Default::default(),
+                body: br#"{"ownerShares":["\\\\nas\\docs"]}"#.to_vec(),
+            };
+            handle(&mut stream, &request).unwrap();
+            crate::management::listeners::set_current_client_token(None);
+            drop(stream);
+            let response = client.join().unwrap();
+            assert_eq!(editable, false, "{label}");
+            assert!(response.starts_with("HTTP/1.1 403 "), "{label}: {response}");
+            assert!(response.contains("\"owner_shares_owner_local_only\""), "{label}: {response}");
+        }
+        crate::management::listeners::set_current_client_token(Some(VerifiedClientToken::test_token("mct-shares-ssh")));
+        let editable = settings_view(&CodezConfig::default())["ownerSharesEditable"].clone();
+        crate::management::listeners::set_current_client_token(None);
+        assert_eq!(editable, true, "an owner token issued on the host (SSH desktop) on loopback");
+        assert_eq!(settings_view(&CodezConfig::default())["ownerSharesEditable"], true, "the root credential");
     }
 }

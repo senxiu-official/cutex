@@ -167,6 +167,23 @@ fn dispatch(
     match method {
         "capabilities" => service.capabilities(token),
         "humanList" => service.human_list(token, params),
+        "humanQuery" => {
+            let p: HumanQueryParams = serde_json::from_value(params)?;
+            if p.job_id.is_empty() || p.job_id.len() > 160 {
+                return Err(JobError::Invalid("invalid jobId".into()));
+            }
+            Ok(serde_json::to_value(service.query(token, &p.job_id)?)?)
+        }
+        "humanCloseFollowUp" => {
+            let p: crate::CloseFollowUpParams = serde_json::from_value(params)?;
+            let (job, committed) = service.human_close_follow_up_with_commit(
+                token, &p.job_id, p.expected_revision, p.reason,
+            )?;
+            let mut result = serde_json::to_value(job)?;
+            // Per-call receipt only; never persisted or returned by humanQuery.
+            result["followUpCommitted"] = json!(committed);
+            Ok(result)
+        }
         // Root-token human operations (no caller grant), bridged by Cutex
         // Management v2 for the owner's desktop only.
         "humanCancel" => {
@@ -352,8 +369,59 @@ struct HumanMarkExternalParams {
     note: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HumanQueryParams {
+    job_id: String,
+}
+
 #[cfg(test)]
 mod external_actor_tests {
+    #[test]
+    fn human_query_requires_root_credential_and_never_writes_state() {
+        use crate::service::follow_up_tests::{fixture, API};
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "registered");
+        let before = std::fs::read(root.path().join("state.json")).unwrap();
+        let params = serde_json::json!({"jobId":id});
+        assert!(matches!(super::dispatch(&service, b"wrong-token", "humanQuery", params.clone()), Err(crate::JobError::Unauthorized(_))));
+        let record = super::dispatch(&service, API, "humanQuery", params).unwrap();
+        assert_eq!(record["jobId"], id);
+        assert_eq!(record["request"]["subscriberCutexSessionId"], "cutex.test");
+        assert_eq!(record["state"], "registered");
+        assert_eq!(std::fs::read(root.path().join("state.json")).unwrap(), before);
+        assert!(super::dispatch(&service, API, "humanQuery", serde_json::json!({"jobId":id,"callerGrant":{}})).is_err());
+    }
+
+    #[test]
+    fn close_receipt_marks_only_the_first_durable_commit() {
+        use crate::service::follow_up_tests::{fixture, API};
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        let params = serde_json::json!({"jobId":id,"expectedRevision":3,"reason":"done"});
+        let committed = super::dispatch(&service, API, "humanCloseFollowUp", params.clone()).unwrap();
+        assert_eq!(committed["followUpCommitted"], true);
+        let replay = super::dispatch(&service, API, "humanCloseFollowUp", params).unwrap();
+        assert_eq!(replay["followUpCommitted"], false);
+        assert_eq!(replay["revision"], committed["revision"]);
+        let query = super::dispatch(&service, API, "humanQuery", serde_json::json!({"jobId":id})).unwrap();
+        assert_eq!(query["terminalReason"], "followUpEnded");
+        assert!(query.get("followUpCommitted").is_none());
+    }
+    #[test]
+    fn close_follow_up_socket_body_requires_the_owner_contract() {
+        let valid = serde_json::json!({"jobId":"job_1","expectedRevision":3,"reason":"done"});
+        assert!(serde_json::from_value::<crate::CloseFollowUpParams>(valid.clone()).is_ok());
+        for key in ["jobId", "expectedRevision", "reason"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<crate::CloseFollowUpParams>(invalid).is_err());
+        }
+        let mut forged = valid;
+        forged["callerGrant"] = serde_json::json!({});
+        assert!(serde_json::from_value::<crate::CloseFollowUpParams>(forged).is_err());
+    }
+
     #[test]
     fn socket_caller_cannot_claim_another_credential_identity() {
         let request = serde_json::json!({"jobId":"job_1","expectedRevision":1,"state":"exited","exitCode":0,

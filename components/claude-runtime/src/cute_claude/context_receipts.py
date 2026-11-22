@@ -111,8 +111,9 @@ class ContextReceipts:
             if (not isinstance(binding, tuple) or len(binding) != 2
                     or not all(isinstance(x, str) and x for x in binding)
                     or not isinstance(call_id, str) or not call_id
-                    or not isinstance(hook_name, str) or not hook_name.startswith('PostToolUse:')
-                    or not hook_name[len('PostToolUse:'):].strip()
+                    or not isinstance(hook_name, str)
+                    or hook_name.partition(':')[0] not in {'PostToolUse', 'PostToolUseFailure'}
+                    or not hook_name.partition(':')[2].strip()
                     or not isinstance(context, str) or not context
                     or not mids or not all(isinstance(x, str) and x for x in mids)):
                 return
@@ -209,7 +210,7 @@ class ContextReceipts:
         return (record.get('type') == 'attachment'
                 and isinstance(attachment, dict)
                 and attachment.get('type') == 'hook_additional_context'
-                and attachment.get('hookEvent') == 'PostToolUse'
+                and attachment.get('hookEvent') == offer.hook_name.partition(':')[0]
                 and attachment.get('hookName') == offer.hook_name
                 and attachment.get('toolUseID') == offer.call_id
                 and isinstance(attachment.get('content'), list)

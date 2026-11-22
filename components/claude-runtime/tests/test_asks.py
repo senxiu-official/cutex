@@ -14,7 +14,8 @@ def ask(tid, mid='ask-msg-1', *, asks=('ask-1',), attempt=1, event='ASK', text='
 
 async def test_capabilities_offer_exclusive_admission(h):
     caps = await h.call('claude/capabilities')
-    assert caps['input']['admissions'] == ['exclusive_turn']
+    assert caps['input']['admissions'] == ['exclusive_turn', 'stop_answer']
+    assert caps['input']['externalInputStopAnswer'] == 1
     assert caps['input']['askEvents'] == ['ASK', 'ANSWER', 'QUESTION']
     assert caps['input']['policy'] == 'fifo-separate-turns'
 

@@ -80,6 +80,8 @@ pub const EDITABLE_KEYS: &[&str] = &[
     "display_name",
     "context_window",
     "max_context_window",
+    // r290 P13
+    "auto_compact_percent",
     "auto_compact_token_limit",
     "effective_context_window_percent",
     "input_modalities",
@@ -139,6 +141,9 @@ pub struct Entry {
     pub hidden: bool,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub overrides: Map<String, Value>,
+    // r290 P13: keep upgrade compatibility separate from the owner original.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub context_preserved: Map<String, Value>,
 }
 
 /// Effective rows plus overlay entries that no longer resolve.
@@ -283,6 +288,20 @@ pub fn resolve(upstream: &[Value], overlay: &Overlay) -> Resolved {
     Resolved { rows, unavailable }
 }
 
+// r290 P13: materialize explicit provenance only for actual owner settings.
+pub fn resolve_context(upstream: &[Value], overlay: &Overlay) -> Resolved {
+    let mut result=resolve(upstream,overlay);
+    for row in &mut result.rows {
+        let Some(entry)=overlay.entries.iter().find(|entry|Some(entry.id.as_str())==slug(row)) else {continue};
+        let catalog=upstream_base(upstream,entry.request_model.as_deref().unwrap_or(&entry.id)).unwrap_or(row);
+        let owner=super::model_context::settings_values(&Value::Object(entry.overrides.clone()));
+        if entry.overrides.keys().any(|key|super::model_context::LIMIT_KEYS.contains(&key.as_str())) || !entry.context_preserved.is_empty() {
+            *row=super::model_context::with_settings(row,catalog,&owner,&Value::Object(entry.context_preserved.clone()));
+        }
+    }
+    result
+}
+
 /// The overlay that turns `upstream` into `edited` (pure; the one-time
 /// migration of a whole snapshot, edits use [`edit`]). With `hide_missing`,
 /// upstream rows absent from `edited` become hidden entries; migration passes
@@ -298,7 +317,7 @@ pub fn diff(upstream: &[Value], edited: &[Value], previous: &Overlay, hide_missi
                     Some(base) => editable_diff(&config_row(base, id, target), row),
                     None => editable_values(row),
                 };
-                entries.push(Entry { id: id.into(), request_model: Some(target.into()), hidden: false, overrides });
+                entries.push(Entry { id: id.into(), request_model: Some(target.into()), hidden: false, overrides, ..Entry::default() });
             }
             None => {
                 let overrides = match upstream_base(upstream, id) {
@@ -306,7 +325,7 @@ pub fn diff(upstream: &[Value], edited: &[Value], previous: &Overlay, hide_missi
                     None => editable_values(row),
                 };
                 if !overrides.is_empty() {
-                    entries.push(Entry { id: id.into(), request_model: None, hidden: false, overrides });
+                    entries.push(Entry { id: id.into(), request_model: None, hidden: false, overrides, ..Entry::default() });
                 }
             }
         }
@@ -382,16 +401,30 @@ fn edited_entry(
         }
         (Change::Reset | Change::Remove, _, _) => editable_diff(&reference, row),
     };
+    // r290 P13: a field edit supersedes only its preserved compatibility value.
+    let mut context_preserved=stored.map(|entry|entry.context_preserved.clone()).unwrap_or_default();
+    match change {
+        Change::Patch {pinned,..} => {
+            if pinned.contains(&"context_window") {context_preserved.remove("context_window");}
+            if pinned.iter().any(|key|["auto_compact_percent","auto_compact_token_limit"].contains(key)) {
+                context_preserved.remove("auto_compact_percent");context_preserved.remove("auto_compact_token_limit");
+            }
+        }
+        Change::Reset | Change::Remove => context_preserved.clear(),
+    }
     if request_model.is_none() && overrides.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Entry { id: id.into(), request_model: request_model.map(Into::into), hidden: false, overrides }))
+    Ok(Some(Entry { id: id.into(), request_model: request_model.map(Into::into), hidden: false, overrides, context_preserved }))
 }
 
 /// Official Codex profiles use an overlay; API-key custom profiles keep their
 /// own discovered catalog files.
 pub fn uses_overlay(account: &StoredAccount) -> bool {
-    account.cli_kind == CliKind::Codex && !catalog_api::discovery_supported(account)
+    if account.cli_kind!=CliKind::Codex || catalog_api::discovery_supported(account) {return false;}
+    // r290 P13: an untracked legacy snapshot remains catalog data, not inferred owner edits.
+    let snapshot=settings_api::codex_snapshot(account);
+    !(snapshot.model_context_settings_v1 && snapshot.model_catalog_json.is_some() && matches!(load(account),Ok(None)))
 }
 
 fn overlay_path(account: &StoredAccount) -> anyhow::Result<PathBuf> {
@@ -461,7 +494,7 @@ fn materialize(account: &StoredAccount, overlay: &Overlay, upstream: &[Value]) -
         }
         return Ok(None);
     }
-    let catalog = json!({ "models": resolve(upstream, overlay).rows });
+    let catalog = json!({ "models": if settings_api::codex_snapshot(account).model_context_settings_v1 {resolve_context(upstream, overlay).rows} else {resolve(upstream,overlay).rows}, "reserved_model_ids":overlay.entries.iter().filter(|entry|entry.request_model.is_some()).map(|entry|entry.id.clone()).collect::<Vec<_>>() });
     catalog_api::validate_catalog(&catalog)?;
     let path = write_effective_file(&catalog_api::profile_dir(account)?, &catalog)?;
     let pointer = path.to_string_lossy().into_owned();
@@ -538,6 +571,92 @@ fn migrate_locked(account: &StoredAccount) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+// r290 P13: an explicit first-model edit creates a new custom catalog; it
+// must not require the catalog that automatic migration deliberately waits for.
+// There are no readable stored rows to migrate. Keep Profile defaults intact
+// and commit the new owner-defined row and v1 marker in the same config write.
+pub fn bootstrap_context_catalog(account: &StoredAccount, id: &str, patch: &catalog_api::ModelPatch) -> anyhow::Result<Option<bool>> {
+    if !catalog_api::discovery_supported(account) || !super::model_variants::context_supported(account) {
+        return Ok(None);
+    }
+    let initial = catalog_api::load(account)?;
+    if initial.snapshot.model_context_settings_v1 || initial.catalog.is_some() { return Ok(None); }
+    let _guard = lock(account)?;
+    let _profile_guard = crate::profiles::lifecycle::lock();
+    let state = catalog_api::load(account)?;
+    if state.snapshot.model_context_settings_v1 || state.catalog.is_some() { return Ok(None); }
+    let mut contextual_patch=patch.clone();let mut profile=state.snapshot.clone();profile.model_context_settings_v1=true;
+    contextual_patch.validation_profile=Some(profile);let patch=&contextual_patch;
+    let mut rows = Vec::new();
+    let created = super::model_variants::patch_row(&mut rows, id, patch, false)?;
+    for row in &mut rows {super::model_context::edit_settings(row,None,&catalog_api::pinned_keys(patch));}
+    let catalog = json!({"models":rows});
+    catalog_api::validate_catalog(&catalog)?;
+    let path = write_effective_file(&catalog_api::profile_dir(account)?, &catalog)?;
+    let mut edits = catalog_api::load_edits(account).unwrap_or_else(||
+        super::model_discovery::ModelEdits::starting_from(None));
+    edits.pin(id, &catalog_api::pinned_keys(patch));
+    catalog_api::save_edits(account, &edits)?;
+    let update = ProfileApiPatch { codex_config: CodexProfileConfigPatch {
+        model_catalog_json: ConfigValueUpdate::Set(path.to_string_lossy().into_owned()),
+        model_context_settings_v1: ConfigValueUpdate::Set(true), ..Default::default()
+    }, ..Default::default() };
+    settings_api::update_profile_locked(&account.id, &update)?;
+    Ok(Some(created))
+}
+
+// r290 P13: model migration fault seam, after immutable preparation and before config commit.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_CONTEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// r290 P13: lock order is overlay -> lifecycle, matching ordinary overlay edits.
+// The source overlay is written first. Until the final pointer+marker commit the
+// legacy Profile override still yields the same numbers, so a retry is safe.
+pub fn ensure_context_migrated(account: &StoredAccount) -> anyhow::Result<bool> {
+    if !crate::profiles::model_variants::context_supported(account) { return Ok(false); }
+    let _guard = lock(account)?;
+    // B does not turn an unknown-origin snapshot diff into proof of an owner edit.
+    let _profile_guard = crate::profiles::lifecycle::lock();
+    migrate_context_locked(account)
+}
+
+fn migrate_context_locked(account: &StoredAccount) -> anyhow::Result<bool> {
+    let state=catalog_api::load(account)?;
+    if state.snapshot.model_context_settings_v1 {return Ok(false);}
+    let stored=if uses_overlay(account) {load(account)?}else{None};
+    let upstream=if uses_overlay(account)&&(stored.is_some()||state.catalog.is_none()){Some(upstream_rows(account)?)}else{None};
+    let previous=stored.unwrap_or_default();
+    let catalog=if let Some(upstream)=&upstream {
+        ensure!(resolve(upstream,&previous).unavailable.is_empty(),"restore unavailable models before migrating their effective limits");
+        let mut visible=previous.clone();for entry in &mut visible.entries {entry.hidden=false;}
+        json!({"models":resolve_context(upstream,&visible).rows})
+    }else{
+        let catalog=state.catalog.clone().context("model catalog unavailable; legacy context settings retained")?;
+        super::model_context::custom_provenance(&catalog,catalog_api::load_edits(account).as_ref())
+    };
+    let migrated=super::model_context::migrate_catalog(&catalog,&state.snapshot)?;
+    let effective=if let Some(upstream)=&upstream {
+        let mut next=previous.clone();
+        for row in migrated["models"].as_array().context("catalog models missing")? {
+            if let Some(entry)=next.entries.iter_mut().find(|entry|row["slug"].as_str()==Some(entry.id.as_str())) {
+                entry.context_preserved=row["context_settings"]["preserved"].as_object().cloned().unwrap_or_default();
+            }
+        }
+        let effective=json!({"models":resolve_context(upstream,&next).rows,"reserved_model_ids":next.entries.iter().filter(|entry|entry.request_model.is_some()).map(|entry|entry.id.clone()).collect::<Vec<_>>()});
+        catalog_api::validate_catalog(&effective)?;save(account,&next)?;effective
+    }else{migrated};
+    catalog_api::validate_catalog(&effective)?;
+    let pointer=if upstream.is_some()&&previous.entries.is_empty() {ConfigValueUpdate::Clear}else{
+        ConfigValueUpdate::Set(write_effective_file(&catalog_api::profile_dir(account)?,&effective)?.to_string_lossy().into_owned())
+    };
+    let patch=ProfileApiPatch {codex_config:CodexProfileConfigPatch {model_catalog_json:pointer,model_context_settings_v1:ConfigValueUpdate::Set(true),..Default::default()},..Default::default()};
+    #[cfg(test)] if FAIL_CONTEXT_COMMIT.with(|fail|fail.replace(false)){anyhow::bail!("injected model context migration interruption before config commit");}
+    settings_api::update_profile_locked(&account.id,&patch)?;
+    Ok(true)
+}
+
 pub fn ensure_migrated(account: &StoredAccount) -> anyhow::Result<bool> {
     let _guard = lock(account)?;
     migrate_locked(account)
@@ -589,7 +708,7 @@ pub fn edit<T>(
             }
         }
     }
-    let mut catalog = json!({ "models": resolve(&upstream, &previous).rows });
+    let mut catalog = json!({ "models": if settings_api::codex_snapshot(account).model_context_settings_v1 {resolve_context(&upstream,&previous).rows}else{resolve(&upstream,&previous).rows} });
     let find = |catalog: &Value| {
         catalog.get("models").and_then(Value::as_array)
             .and_then(|rows| rows.iter().find(|row| slug(row) == Some(id)).cloned())
@@ -615,6 +734,17 @@ pub fn edit<T>(
 }
 
 /// Drop an overlay entry that no longer resolves (its model left upstream).
+// r290 P13: restore only removes compatibility, retaining owner originals.
+pub fn restore_preserved(account: &StoredAccount,id: &str,window: bool,auto: bool) -> anyhow::Result<()> {
+    let _guard=lock(account)?;
+    let mut overlay=load(account)?.context("model overlay missing")?;
+    let entry=overlay.entries.iter_mut().find(|entry|entry.id==id).context("model override missing")?;
+    if window {entry.context_preserved.remove("context_window");}
+    if auto {entry.context_preserved.remove("auto_compact_percent");entry.context_preserved.remove("auto_compact_token_limit");}
+    let upstream=upstream_rows(account)?;
+    save(account,&overlay)?;materialize(account,&overlay,&upstream)?;Ok(())
+}
+
 /// Returns false when `id` is not such an entry.
 pub fn remove_unavailable(account: &StoredAccount, id: &str) -> anyhow::Result<bool> {
     let _guard = lock(account)?;
@@ -640,9 +770,8 @@ pub fn refresh_for_launch(profile: &str) {
     let result = (|| -> anyhow::Result<()> {
         let store = settings_api::load_store()?;
         let Some(account) = settings_api::find(&store, profile) else { return Ok(()) };
-        if !uses_overlay(account) {
-            return Ok(());
-        }
+        ensure_context_migrated(account)?;
+        if !uses_overlay(account) { return Ok(()); }
         let _guard = lock(account)?;
         migrate_locked(account)?;
         let Some(overlay) = load(account)? else { return Ok(()) };

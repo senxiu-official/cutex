@@ -1006,3 +1006,149 @@ fn review_stalled_reader_expires_and_close_notify_fin_is_not_a_slot_leak() {
     assert!(worker.is_finished());
     worker.join().unwrap().unwrap();
 }
+
+// r290 P10 (B3) ---------------------------------------------------------------
+fn r290_set_expiry(f: &Fixture, id: &str, expires_at: chrono::DateTime<chrono::Utc>) {
+    let mut registry = f.store.registry().unwrap();
+    for record in &mut registry.certificates {
+        if record.certificate_id == id {
+            record.expires_at = expires_at.to_rfc3339();
+        }
+    }
+    crate::config::atomic::write_private_pretty_json_atomic(&f.store.dir.join("certificates.json"), &registry, "r290 expiry").unwrap();
+}
+fn r290_csr(key: &KeyPair) -> String {
+    CertificateParams::default().serialize_request(key).unwrap().pem().unwrap()
+}
+#[test]
+fn r290_p10_renewal_opens_at_half_life() {
+    let f = Fixture::new();
+    let id = fingerprint(&f.cert);
+    r290_set_expiry(&f, &id, chrono::Utc::now() + chrono::Duration::days(16));
+    let error = f.store.renew(&id, &round2_csr()).unwrap_err();
+    assert_eq!(error.downcast_ref::<ApiError>().map(|e| e.2), Some("relay_renewal_too_early"));
+    r290_set_expiry(&f, &id, chrono::Utc::now() + chrono::Duration::days(14));
+    let renewed = f.store.renew(&id, &round2_csr()).unwrap();
+    assert_ne!(renewed["certificateId"], json!(id));
+    let expires = chrono::DateTime::parse_from_rfc3339(renewed["expiresAt"].as_str().unwrap()).unwrap();
+    assert!(expires > chrono::Utc::now() + chrono::Duration::days(29));
+}
+#[test]
+fn r290_p10_expired_leaf_renews_only_with_same_key_unrevoked_inside_grace() {
+    let f = Fixture::new();
+    let id = fingerprint(&f.cert);
+    r290_set_expiry(&f, &id, chrono::Utc::now() - chrono::Duration::days(1));
+    assert!(f.store.active_uncached(&id).unwrap().is_none());
+    assert!(f.store.grace_uncached(&id).unwrap().is_some());
+    // A fresh key needs trusted enrollment, not grace.
+    let error = f.store.renew(&id, &round2_csr()).unwrap_err();
+    assert_eq!(error.downcast_ref::<ApiError>().map(|e| e.2), Some("relay_grace_key_mismatch"));
+    let renewed = f.store.renew(&id, &r290_csr(&f.key)).unwrap();
+    assert_eq!(renewed["deviceId"], json!(f.device));
+    assert!(f.store.active_uncached(renewed["certificateId"].as_str().unwrap()).unwrap().is_some());
+    // Idempotent retry with the same key returns the same successor.
+    assert_eq!(f.store.renew(&id, &r290_csr(&f.key)).unwrap()["certificateId"], renewed["certificateId"]);
+    // Outside the window, revoked, or with the device gone: no grace.
+    let g = Fixture::new();
+    let gid = fingerprint(&g.cert);
+    r290_set_expiry(&g, &gid, chrono::Utc::now() - chrono::Duration::days(RENEW_GRACE_DAYS + 1));
+    assert!(g.store.grace_uncached(&gid).unwrap().is_none());
+    assert!(g.store.renew(&gid, &r290_csr(&g.key)).is_err());
+    r290_set_expiry(&g, &gid, chrono::Utc::now() - chrono::Duration::days(1));
+    g.store.revoke(&gid).unwrap();
+    assert!(g.store.grace_uncached(&gid).unwrap().is_none());
+    assert!(g.store.renew(&gid, &r290_csr(&g.key)).is_err());
+    let h = Fixture::new();
+    let hid = fingerprint(&h.cert);
+    r290_set_expiry(&h, &hid, chrono::Utc::now() - chrono::Duration::days(1));
+    h.store.tokens.revoke(&h.device).unwrap();
+    assert!(h.store.grace_uncached(&hid).unwrap().is_none());
+    // Device rows: state per window.
+    let views = f.store.device_certificates().unwrap();
+    assert_eq!(views[&f.device]["state"], "active");
+    assert_eq!(views[&f.device]["certificateId"], renewed["certificateId"]);
+}
+fn r290_grace_probe(mut stream: TcpStream, _info: ConnectionInfo, _slot: ConnectionSlot) {
+    let _ = stream.write_all(if super::grace_peer() { b"G" } else { b"N" });
+}
+#[test]
+fn r290_p10_grace_tls_connection_is_restricted_to_renewal() {
+    let f = Fixture::new();
+    let (key, cert) = f.custom_leaf(true, true, true);
+    let id = fingerprint(&cert);
+    // Register the expired leaf as the device's, with its key and real expiry.
+    let mut registry = f.store.registry().unwrap();
+    let record = registry.certificates.iter_mut().find(|r| r.certificate_id == id).unwrap();
+    record.expires_at = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    record.key_sha256 = credentials::csr_fingerprints(&r290_csr(&key)).unwrap().1;
+    crate::config::atomic::write_private_pretty_json_atomic(&f.store.dir.join("certificates.json"), &registry, "grace leaf").unwrap();
+    let client = f.client(Some(&key), Some(cert.clone()));
+    let (mut stream, worker) = f.connect(client.clone(), "home.relay.test", r290_grace_probe);
+    let mut byte = [0u8; 1];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"G");
+    drop(stream);
+    let _ = worker.join();
+    // The ordinary leaf is not a grace connection.
+    let (mut stream, worker) = f.connect(f.client(Some(&f.key), Some(f.cert.clone())), "home.relay.test", r290_grace_probe);
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"N");
+    drop(stream);
+    let _ = worker.join();
+    // Only the certificate routes pass the relay gate on a grace connection.
+    set_peer(Some(RelayPeer { device_id: f.device.clone(), certificate_id: id.clone() }));
+    set_grace(true);
+    let request = |method: &str, path: &str| crate::http::server::SimpleHttpRequest {
+        method: method.into(),
+        path: path.into(),
+        headers: [("authorization".to_string(), "Bearer cxm1.x".to_string())].into_iter().collect(),
+        body: vec![],
+    };
+    for (method, path) in [("GET", "/v2/users/me"), ("POST", "/v2/sessions"), ("GET", "/v2/relay/status")] {
+        let refused = request_gate(&request(method, path), path).map(|e| e.2);
+        assert_eq!(refused, Some("relay_certificate_expired"), "{method} {path}");
+    }
+    for (method, path) in [("GET", "/v2/relay-certificate"), ("POST", "/v2/relay-certificate/renew")] {
+        assert_ne!(request_gate(&request(method, path), path).map(|e| e.2), Some("relay_certificate_expired"), "{method} {path}");
+    }
+    set_grace(false);
+    // Owner-device relay routes pass the relay path gate; host config does not.
+    for (method, path, open) in [
+        ("POST", "/v2/relay/pairing", true),
+        ("DELETE", "/v2/relay/certificates/aa", true),
+        ("POST", "/v2/pairing/invites", true),
+        ("POST", "/v2/relay/certificates", false),
+        ("POST", "/v2/relay/setup", false),
+        ("POST", "/v2/pairing-codes", false),
+    ] {
+        let refused = request_gate(&request(method, path), path).map(|e| e.2) == Some("relay_path_forbidden");
+        assert_eq!(refused, !open, "{method} {path}");
+    }
+    set_peer(None);
+    // Revocation ends grace: the handshake is refused.
+    f.store.revoke(&id).unwrap();
+    rejected(&f, client, "home.relay.test");
+}
+#[test]
+fn r290_p10_owner_relay_actions_are_classified() {
+    use OwnerRelayAction::*;
+    assert_eq!(owner_relay_action("POST", "/v2/relay/pairing", br#"{"enabled":false}"#), TurnOff("publicPairingOff"));
+    assert_eq!(owner_relay_action("POST", "/v2/relay/pairing", br#"{"enabled":true}"#), Widen("publicPairingOn"));
+    assert_eq!(owner_relay_action("POST", "/v2/relay/pairing", b"garbage"), Widen("publicPairingOn"));
+    assert_eq!(owner_relay_action("DELETE", "/v2/relay/certificates/ab", b""), TurnOff("relayCertificateRevoke"));
+    assert_eq!(owner_relay_action("DELETE", "/v2/pairing/invites/rpi-1", b""), TurnOff("pairingInviteCancel"));
+    assert_eq!(owner_relay_action("POST", "/v2/pairing/invites/rpi-1/deny", b""), TurnOff("pairingInviteCancel"));
+    assert_eq!(owner_relay_action("POST", "/v2/pairing/invites/rpi-1/approve", b""), Widen("pairingInviteApprove"));
+    assert_eq!(owner_relay_action("POST", "/v2/pairing/invites", b""), Widen("pairingInvite"));
+    assert_eq!(owner_relay_action("POST", "/v2/relay/certificates", b""), Widen("relayCertificateApprove"));
+    assert_eq!(owner_relay_action("GET", "/v2/relay/certificates", b""), Read);
+    for (method, path) in [("POST", "/v2/relay/setup"), ("POST", "/v2/relay/tailnet"), ("POST", "/v2/relay/rotate-server"), ("POST", "/v2/relay/bootstrap")] {
+        assert_eq!(owner_relay_action(method, path, b""), LocalOnly, "{method} {path}");
+    }
+    for action in ["publicPairingOff", "relayCertificateRevoke", "pairingInviteCancel"] {
+        assert!(crate::management::users::OWNER_TURN_OFF_ACTIONS.contains(&action));
+    }
+    for action in ["publicPairingOn", "pairingInviteApprove", "pairingInvite", "relayCertificateApprove"] {
+        assert!(crate::management::users::OWNER_WIDENING_ACTIONS.contains(&action));
+    }
+}

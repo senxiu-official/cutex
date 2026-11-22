@@ -38,7 +38,8 @@
       "properties": {
         "code": { "type": "string" },
         "deviceName": { "type": "string" },
-        "platform": { "type": "string", "description": "android | ios | web | other (anything else is stored as other)" }
+        "platform": { "type": "string", "description": "android | ios | web | other (anything else is stored as other)" },
+        "previousToken": { "type": "string", "description": "The device token this device held before (capability device-repair-replaces): a device token of the same user is revoked once the new one is issued." }
       }
     },
     "device": {
@@ -62,7 +63,8 @@
         "token": { "type": "string", "pattern": "^cxm1\\." },
         "hostId": { "type": "string" },
         "hostName": { "type": "string" },
-        "instanceId": { "type": "string" }
+        "instanceId": { "type": "string" },
+        "replacedTokenId": { "type": ["string", "null"], "description": "The device token this pairing replaced and revoked (capability device-repair-replaces)." }
       }
     },
     "clientToken": {

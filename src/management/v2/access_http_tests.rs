@@ -18,6 +18,115 @@ use std::{
 const ROOT: &str = "access-http-test-root-credential";
 
 #[test]
+fn scoped_offline_submit_http_never_receives_owner_runtime_review_authority() {
+    use std::sync::atomic::{AtomicUsize,Ordering};
+    static OWNER_STARTS:AtomicUsize=AtomicUsize::new(0);
+    static SCOPED_STARTS:AtomicUsize=AtomicUsize::new(0);
+    let _home_lock=crate::config::paths::test_home_env_lock();let instance=PrivateInstance::new();
+    let ids=["cutex.offline-http-owner","cutex.offline-http-scoped"];
+    let mut sessions=crate::session::model::CutexSessionStore::default();
+    for sid in ids {
+        let mut record=crate::session::model::CutexSessionRecord::new(sid.into(),Some(uuid::Uuid::new_v4().to_string()),
+            crate::platform::host::current_host_name(),instance.root.to_string_lossy().into_owned(),None).unwrap();
+        record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;
+        sessions.sessions.insert(sid.into(),record);
+    }
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let users=UserStore::open_default().unwrap();let tokens=ClientTokenStore::open_default().unwrap();
+    let user=users.create_user("Offline sender",None,Grant{standalone_agents:ids.iter().map(|id|(*id).into()).collect(),send:true,..Grant::default()},"root").unwrap();
+    let token=tokens.issue_scoped("offline-sender",crate::management::client_tokens::DeviceScope::Chat).unwrap();
+    users.bind_token(&token.token_id,Some(&user.id),"root").unwrap();
+    OWNER_STARTS.store(0,Ordering::SeqCst);SCOPED_STARTS.store(0,Ordering::SeqCst);
+    let mut ctx=p2_context();
+    ctx.handle_user_input=|command|{
+        use crate::management::v2::user_input::{self,QueueEnqueueDecision,UserInputSubmitExecution,UserInputDisposition};
+        let decision=user_input::user_input_repository().unwrap().enqueue(&command.cutex_session_id,&command.thread_id,
+            &command.management_request_id,&command.params).unwrap();
+        let queue=match decision {QueueEnqueueDecision::Queued(item)|QueueEnqueueDecision::Deduplicated(item)=>item,
+            _=>panic!("private input identity unexpectedly conflicted")};
+        Ok(UserInputSubmitExecution{disposition:UserInputDisposition::Queued,app_server_accepted:false,
+            native_request_id:None,native_method:None,turn_id:None,queue:Some(queue),queue_paused: false, passive_notes: None,join_refusal:None,queued_reason:None})
+    };
+    ctx.online_session=|owner,_,_|{
+        if owner.is_some(){OWNER_STARTS.fetch_add(1,Ordering::SeqCst);}else{SCOPED_STARTS.fetch_add(1,Ordering::SeqCst);}
+        Err(crate::management::v2::user_input::UserInputExecutionError{stage:"route".into(),code:"fixture_no_runtime_effect".into(),
+            message:"record authority only; no runtime launched".into(),retryable:false,outcome_unknown:false,details:json!({})})
+    };
+    for (n,bearer) in [ROOT,token.token.as_str()].into_iter().enumerate() {
+        let sid=ids[n];
+        let body=json!({"requestId":format!("offline-http-{n}"),"method":"cutex/userInput/submit","params":{
+            "clientUserMessageId":format!("offline-input-{n}"),"origin":{"kind":"other","clientId":"private-test"},
+            "strategy":"auto","startIfOffline":true,"input":[{"type":"text","text":"private fixture"}]}});
+        let(status,_,bytes)=exchange_with(ctx,"POST",&format!("/v2/sessions/{sid}/cutex/requests"),Some(bearer),
+            body.to_string().into_bytes(),"application/json","");
+        assert_eq!(status,200,"{}",String::from_utf8_lossy(&bytes));
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        while !matches!(super::super::super::offline_submit::start_outcome(sid),Some(super::super::super::offline_submit::StartOutcome::Failed{..})) {
+            assert!(std::time::Instant::now()<deadline,"background authority callback did not settle");std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(OWNER_STARTS.load(Ordering::SeqCst),1,"scoped request inherited an owner-only runtime review proof");
+        assert_eq!(SCOPED_STARTS.load(Ordering::SeqCst),n);
+    }
+    // A scoped offline steer must not acquire the owner-only automatic
+    // review/run path either. Keeping the item queued is safe when no live
+    // runtime can be reconnected.
+    let _ledger=crate::management::v2::input_ledger::pin_enabled(Some(true));
+    ctx.steer_user_input_queue=|_,_,_|Err(crate::management::v2::user_input::UserInputExecutionError{
+        stage:"route".into(),code:"session_offline".into(),message:"private offline fixture".into(),
+        retryable:true,outcome_unknown:false,details:json!({})});
+    let sid=ids[1];let queue=crate::management::v2::user_input::user_input_repository().unwrap();
+    let item=queue.list(sid).unwrap().1.remove(0);
+    let body=json!({"requestId":"scoped-offline-steer","method":"cutex/userInput/queue/steer","params":{
+        "queueId":item.queue_id,"expectedRevision":item.revision,"ifIdle":"start"}});
+    let(status,_,bytes)=exchange_with(ctx,"POST",&format!("/v2/sessions/{sid}/cutex/requests"),Some(&token.token),
+        body.to_string().into_bytes(),"application/json","");
+    let response:Value=serde_json::from_slice(&bytes).unwrap();assert_ne!(status,200,"{response}");
+    assert_eq!(response["error"]["code"],"session_offline");
+    assert_ne!(response["error"]["details"]["runtimeStarting"],true);
+    assert_eq!(OWNER_STARTS.load(Ordering::SeqCst),1);
+    assert_eq!(SCOPED_STARTS.load(Ordering::SeqCst),1);
+    assert_eq!(queue.list(sid).unwrap().1.len(),1);
+}
+
+#[test]
+fn scoped_stop_http_provenance_survives_client_token_bearer_normalization() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock=crate::config::paths::test_home_env_lock();
+    let instance=PrivateInstance::new();
+    let sid="cutex.stop-http-principal";
+    let mut sessions=crate::session::model::CutexSessionStore::default();
+    let mut record=crate::session::model::CutexSessionRecord::new(sid.into(),None,
+        crate::platform::host::current_host_name(),instance.root.to_string_lossy().into_owned(),None).unwrap();
+    record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;
+    record.exposed_to_backend=false;
+    sessions.sessions.insert(sid.into(),record);
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let users=UserStore::open_default().unwrap();let tokens=ClientTokenStore::open_default().unwrap();
+    let sender=users.create_user("Scoped Stop sender",None,Grant{standalone_agents:vec![sid.into()],send:true,..Grant::default()},"root").unwrap();
+    let chat=tokens.issue_scoped("scoped-stop-chat",DeviceScope::Chat).unwrap();
+    let full=tokens.issue("scoped-stop-full-device").unwrap();
+    let owner=tokens.issue_scoped("owner-stop-chat",DeviceScope::Chat).unwrap();
+    for token in [&chat,&full] {users.bind_token(&token.token_id,Some(&sender.id),"root").unwrap();}
+    users.bind_token(&owner.token_id,Some(OWNER),"root").unwrap();
+    let store=crate::asks::store::AskStore::open_default().unwrap();
+    // Alternate owner/scoped requests on one session: the scoped request
+    // must revoke an earlier owner's proof, including on a full device.
+    for (index,(bearer,is_owner)) in [(ROOT,true),(chat.token.as_str(),false),
+        (owner.token.as_str(),true),(full.token.as_str(),false)].into_iter().enumerate() {
+        let (status,_,bytes)=exchange_with(p2_context(),"GET","/v2/capabilities",Some(bearer),vec![],"application/json","");
+        let capabilities:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(status,200,"{capabilities}");
+        assert_eq!(capabilities["user"]["isOwner"],is_owner);
+        let body=json!({"requestId":format!("stop-principal-{index}"),"method":"cutex/turn/stop","params":{}});
+        let (status,_,bytes)=exchange_with(p2_context(),"POST",&format!("/v2/sessions/{sid}/cutex/requests"),
+            Some(bearer),body.to_string().into_bytes(),"application/json","");
+        let response:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(status,200,"{response}");
+        let state=store.snapshot().unwrap();let pause=&state.pauses[sid];
+        assert!(pause.stop_hold);assert_eq!(pause.stop_answer_authorized,is_owner,"{response}");
+        assert_eq!(pause.origin.as_deref(),Some(crate::asks::control::ORIGIN_OWNER_STOP));
+    }
+}
+
+#[test]
 fn path_reapproval_requires_full_owner_and_persists_a_fresh_snapshot() {
     use crate::management::client_tokens::DeviceScope;
     use crate::session::model::{CutexSessionRecord, CutexSessionStore, SessionCreatedBy};
@@ -67,11 +176,14 @@ fn path_reapproval_requires_full_owner_and_persists_a_fresh_snapshot() {
 }
 #[path = "archive_api_http_tests.rs"]
 mod archive_api_http_tests;
+// r290 P10 (A1)
+#[path = "project_action_receipts_http_tests.rs"]
+mod project_action_receipts_http_tests;
 #[path = "user_layout_http_tests.rs"]
 mod user_layout_http_tests;
 
 #[test]
-fn event_blobs_follow_session_read_grants_without_exposing_owner_history_media() {
+fn media_attachments_and_pending_requests_follow_session_read_grants() {
     use crate::management::client_tokens::DeviceScope;
     let _home_lock=crate::config::paths::test_home_env_lock();
     let instance=PrivateInstance::new();
@@ -100,7 +212,29 @@ fn event_blobs_follow_session_read_grants_without_exposing_owner_history_media()
     assert_eq!(get("cutex.blob-a",None).0,401);
     assert_eq!(get("cutex.blob-b",Some(&token.token)).0,404,"no grant for the same hash in this visible session");
     assert_eq!(get("cutex.blob-hidden",Some(&token.token)).0,404,"hidden session stays hidden even with a blob grant");
-    assert_eq!(exchange_raw("GET",&format!("/v2/sessions/cutex.blob-a/media/{id}"),Some(&token.token),&json!({}),"").0,403);
+    for (session, status) in [("cutex.blob-a",200),("cutex.blob-b",404),("cutex.blob-hidden",404)] {
+        let (actual, _, bytes) = exchange_with(p2_context(),"GET",&format!("/v2/sessions/{session}/media/{id}"),Some(&token.token),vec![],"application/json","");
+        assert_eq!(actual,status,"{}",String::from_utf8_lossy(&bytes));
+        if status == 200 { assert_eq!(bytes,b"image bytes"); }
+    }
+    let png = b"\x89PNG\r\n\x1a\nimage fixture";
+    let root = crate::management::v2::attachments::attachments_root().unwrap();
+    let (_, attachment) = crate::management::v2::attachments::store_upload(&root,"cutex.blob-a",Some("image/png"),png,Default::default()).unwrap();
+    let attachment_id = attachment["attachmentId"].as_str().unwrap();
+    for bearer in [token.token.as_str(), ROOT] {
+        let read_context = if bearer == ROOT { context() } else { p2_context() };
+        let (status, _, bytes) = exchange_with(read_context,"GET",&format!("/v2/sessions/cutex.blob-a/attachments/{attachment_id}"),Some(bearer),vec![],"application/json","");
+        assert_eq!(status,200,"{}",String::from_utf8_lossy(&bytes));
+        assert_eq!(bytes,png);
+        let (status, _, bytes) = exchange_with(p2_context(),"GET","/v2/sessions/cutex.blob-a/server-requests",Some(bearer),vec![],"application/json","");
+        assert_eq!(status,200,"{}",String::from_utf8_lossy(&bytes));
+        let body:Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["requests"],json!([])); // offline; no bootstrap/native callback
+    }
+    for suffix in [format!("attachments/{attachment_id}"),"server-requests".to_owned()] {
+        let (status, _, _) = exchange_with(p2_context(),"GET",&format!("/v2/sessions/cutex.blob-hidden/{suffix}"),Some(&token.token),vec![],"application/json","");
+        assert_eq!(status,404);
+    }
 }
 
 #[test]
@@ -356,9 +490,11 @@ fn context() -> ManagementRequestContext {
         handle_user_input: |_| panic!("unexpected user input"),
         flush_user_input_queue: |_, _, _| panic!("unexpected queue flush"),
         steer_user_input_queue: |_, _, _| panic!("unexpected queue steer"),
-        interrupt_active_turn: |_, _| panic!("unexpected interrupt"),
-        load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
+        interrupt_active_turn: |_, _, _| panic!("unexpected interrupt"),
+        load_bootstrap_state: |_, _, _| panic!("unexpected bootstrap"),
         load_latest_plan: |_| panic!("unexpected plan"),
+        // r290 P6
+        load_board_plan: |_| serde_json::Value::Null,
         load_latest_token_usage: |_| panic!("unexpected usage"),
         revert_session_history: |_, _, _| panic!("unexpected revert"),
         delete_session: |_, _| panic!("unexpected session delete"),
@@ -477,12 +613,19 @@ fn exchange_with_tokens(
     request.extend_from_slice(extra.as_bytes());
     request.extend_from_slice(b"\r\n");
     request.extend_from_slice(&body);
+    let label = format!("{method} {path}");
     let client = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let mut stream = TcpStream::connect(address).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // The main-thread handler owns the server socket and closes it below.
+        // Drain until that EOF: native Git scans have their own 30-second budget,
+        // so a shorter client timer can abort a valid response under host load.
         stream.write_all(&request).unwrap();
         let mut response = vec![];
-        stream.read_to_end(&mut response).unwrap();
+        stream.read_to_end(&mut response).unwrap_or_else(|error| panic!("{label} client read after {:?}: {error}", started.elapsed()));
+        if started.elapsed() >= Duration::from_secs(10) {
+            eprintln!("HTTP test completed {label} after {:?}", started.elapsed());
+        }
         response
     });
     let (mut server, _) = listener.accept().unwrap();
@@ -500,7 +643,7 @@ fn exchange_with_tokens(
     listeners::set_current_client_token(None);
     crate::management::users::set_current_principal(None);
     drop(server);
-    handled.unwrap();
+    handled.unwrap_or_else(|error| panic!("{method} {path} handler: {error:#}"));
     let response = client.join().unwrap();
     let split = response.windows(4).position(|v| v == b"\r\n\r\n").unwrap();
     let headers = std::str::from_utf8(&response[..split]).unwrap();
@@ -523,7 +666,7 @@ fn owner_user_and_pending_tokens_get_exactly_their_rights() {
     assert_eq!(users.principal_for_token(&owner.token_id), crate::management::users::Principal::Owner);
     let pending = tokens.issue("ssh-device").unwrap();
     let user2 = users
-        .create_user("User 2", None, Grant { projects: Projects::Only(vec!["p1".into()]), standalone_agents: vec![], send: false }, "root")
+        .create_user("User 2", None, Grant { projects: Projects::Only(vec!["p1".into()]), standalone_agents: vec![], send: false, ..Grant::default() }, "root")
         .unwrap();
     let device = tokens.issue("device-c").unwrap();
     users.bind_token(&device.token_id, Some(&user2.id), "root").unwrap();
@@ -578,6 +721,7 @@ fn owner_user_and_pending_tokens_get_exactly_their_rights() {
         ("GET", "/v2/sessions/cutex.hidden", json!({})),
         ("GET", "/v2/sessions/cutex.hidden/bootstrap", json!({})),
         ("GET", "/v2/sessions/cutex.hidden/history", json!({})),
+        ("GET", "/v2/sessions/cutex.hidden/bus-messages", json!({})),
         ("POST", "/v2/sessions/cutex.hidden/cutex/requests", json!({"requestId": "r", "method": "cutex/session/get", "params": {}})),
         ("POST", "/v2/sessions/cutex.hidden/app-server/requests", json!({"requestId": "r", "native": {"message": {"id": 1, "method": "thread/read"}}})),
         ("GET", "/v2/events?cutexSessionId=cutex.hidden", json!({})),
@@ -1372,10 +1516,27 @@ fn p2_users_read_workspaces_send_own_images_and_act_on_visible_asks() {
     new.requester = agent("cutex.p2-solo");
     new.target_cutex_session_id = "cutex.p2-other".into();
     let (hidden_ask, _) = asks.with_state(|state| state.create_ask(new, chrono::Utc::now())).unwrap().unwrap();
+    asks.with_state(|state|{
+        let question:crate::asks::model::QuestionRecord=serde_json::from_value(json!({
+            "questionId":"q-visible-mixed-target","askId":visible_ask.ask_id,"attempt":1,"runtimeGeneration":1,
+            "native":{"threadId":"t","turnId":"u","itemId":"i","requestId":1},
+            "questions":[],"route":"owner","state":"open","createdAt":"2026-11-17T00:00:00Z"
+        })).unwrap();
+        let mut hidden_question=question.clone();hidden_question.question_id="q-hidden-mixed-target".into();
+        hidden_question.ask_id=hidden_ask.ask_id.clone();
+        state.questions.insert(question.question_id.clone(),question);
+        state.questions.insert(hidden_question.question_id.clone(),hidden_question);
+    }).unwrap();
     let command = |method: &str, params: Value| json!({"requestId": format!("r-{method}"), "method": method, "params": params});
     for (bearer, session, body, expected) in [
         (&read_token.token, "cutex.p2-solo", command("cutex/ask/stop", json!({"askId": visible_ask.ask_id})), (403, "send_not_granted")),
         (&send_token.token, "cutex.p2-solo", command("cutex/ask/stop", json!({"askId": hidden_ask.ask_id})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/stop", json!({"askId":hidden_ask.ask_id,"questionId":"q-visible-mixed-target"})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/reopen", json!({"askId":hidden_ask.ask_id,"questionId":"q-visible-mixed-target","note":"private scope-confusion test"})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/close", json!({"askId":hidden_ask.ask_id,"questionId":"q-visible-mixed-target","outcome":"abandoned"})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/retry", json!({"askId":hidden_ask.ask_id,"questionId":"q-visible-mixed-target"})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/resume", json!({"askId":hidden_ask.ask_id,"questionId":"q-visible-mixed-target"})), (404, "ask_not_found")),
+        (&send_token.token, "cutex.p2-solo", command("cutex/ask/respond", json!({"askId":visible_ask.ask_id,"questionId":"q-hidden-mixed-target","answers":{}})), (404, "question_not_found")),
         (&send_token.token, "cutex.p2-other", command("cutex/ask/stop", json!({"askId": visible_ask.ask_id})), (404, "session_not_found")),
         (&send_token.token, "cutex.p2-solo", command("cutex/ask/respond", json!({"questionId": "q-missing", "answers": {}})), (404, "question_not_found")),
         (&send_token.token, "cutex.p2-solo", command("cutex/ask/create", json!({"text": "x", "actionId": "a"})), (403, "owner_required")),
@@ -1756,7 +1917,8 @@ fn root_identity_actions_are_owner_local_only() {
     REMOTE.with(|remote| remote.set(false));
 
     let local_only = |value: &Value, action: &str| {
-        assert_eq!(any_code(value), "owner_local_only", "{value}");
+        // r290 P10 (B6): a full-scope owner device is asked to confirm (428).
+        assert_eq!(any_code(value), "owner_confirm_required", "{value}");
         let details = value.pointer("/error/details").or_else(|| value.get("details")).unwrap();
         assert_eq!(details["action"], action, "{value}");
     };
@@ -1767,11 +1929,14 @@ fn root_identity_actions_are_owner_local_only() {
     let settings = "/v2/users/settings";
     for bearer in refused {
         let (status, value) = exchange("PATCH", settings, Some(bearer), &json!({"ownerRequiresApproval": false}));
-        assert_eq!(status, 403, "{value}");
+        assert_eq!(status, 428, "{value}"); // r290 P10 (B6)
         local_only(&value, "disableOwnerApproval");
     }
     let (_, value) = exchange("PATCH", settings, Some(&paired.token), &json!({"ownerRequiresApproval": false}));
-    assert_eq!(value["error"]["details"], json!({"action": "disableOwnerApproval", "clientToken": true, "issuedVia": "pairing"}));
+    // r290 P10 (B6): the 428 details also carry summary, confirmToken, expiresAt, ttlSeconds.
+    for (key, expected) in [("action", json!("disableOwnerApproval")), ("clientToken", json!(true)), ("issuedVia", json!("pairing"))] {
+        assert_eq!(value["error"]["details"][key], expected, "{value}");
+    }
     let (status, value) = exchange("PATCH", settings, Some(&paired.token), &json!({"ownerRequiresApproval": true}));
     assert_eq!(status, 200, "{value}");
     for bearer in allowed {
@@ -1787,7 +1952,7 @@ fn root_identity_actions_are_owner_local_only() {
     assert_eq!((status, code(&value)), (403, "owner_required"), "{value}");
     REMOTE.with(|remote| remote.set(true));
     let (status, value) = exchange("PATCH", settings, Some(&ssh.token), &json!({"ownerRequiresApproval": false}));
-    assert_eq!(status, 403);
+    assert_eq!(status, 428); // r290 P10 (B6)
     local_only(&value, "disableOwnerApproval");
     REMOTE.with(|remote| remote.set(false));
 
@@ -1800,7 +1965,7 @@ fn root_identity_actions_are_owner_local_only() {
     ] {
         for bearer in refused {
             let (status, value) = exchange(method, path, Some(bearer), &body);
-            assert_eq!(status, 403, "{method} {path}: {value}");
+            assert_eq!(status, 428, "{method} {path}: {value}"); // r290 P10 (B6)
             local_only(&value, action);
         }
         for bearer in allowed {
@@ -1859,7 +2024,7 @@ fn root_identity_actions_are_owner_local_only() {
     }
     for bearer in refused {
         let (status, value) = exchange("POST", "/v2/pairing-codes", Some(bearer), &json!({}));
-        assert_eq!(status, 403, "{value}");
+        assert_eq!(status, 428, "{value}"); // r290 P10 (B6)
         local_only(&value, "pairingCode");
     }
     REMOTE.with(|remote| remote.set(true));
@@ -2456,13 +2621,14 @@ fn relay_certificate_api_requires_owner_local_and_issues_only_registered_devices
     assert_eq!(enroll_status,200,"{enrollment}");assert_eq!(enrollment["deviceId"],device.token_id);
     let body = json!({"enrollmentId":enrollment["enrollmentId"],"csrSha256":enrollment["csrSha256"],"keySha256":enrollment["keySha256"],"confirm":true});
     let (status, value) = exchange("POST", "/v2/relay/certificates", Some(&device.token), &body);
-    assert_eq!((status, code(&value)), (403, "owner_local_only"));
+    // r290 P10 (B6): a full-scope owner device must confirm first.
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"));
     REMOTE.with(|c| c.set(true));
     let host_cli = tokens.issue("owner desktop").unwrap();
     users.bind_token(&host_cli.token_id, Some(OWNER), "root").unwrap();
     let (status, value) = exchange("POST", "/v2/relay/certificates", Some(&host_cli.token), &body);
     REMOTE.with(|c| c.set(false));
-    assert_eq!((status, code(&value)), (403, "owner_local_only"));
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required")); // r290 P10 (B6)
     let (status, value) = exchange("POST", "/v2/relay/certificates", Some(ROOT), &body);
     assert_eq!(status, 201, "{value}");
     assert_eq!(value["schema"], "cutex.relay-certificate.v1");
@@ -2599,4 +2765,556 @@ fn creator_path_refusal_has_a_stable_code_and_session_id_on_the_wire() {
     assert_eq!(status, 409, "{body}");
     assert_eq!(code(&body), "creator_paths_changed");
     assert_eq!(body["error"]["details"]["cutexSessionId"], "cutex.refused");
+}
+
+#[test]
+fn artifact_raw_download_keeps_content_owner_and_device_access_rules() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let user = users.create_user("Artifact member", None, Grant::default(), "root").unwrap();
+    let token = tokens.issue("artifact-member").unwrap();
+    users.bind_token(&token.token_id, Some(&user.id), "root").unwrap();
+    let base = "/v2/artifact-store/af-00000000000000000000000000000000/versions/latest";
+    for suffix in ["content", "raw"] {
+        // r290 P1: artifact reads are scoped; an artifact outside the user's
+        // visible projects / agents does not exist for it.
+        let (status, body) = exchange("GET", &format!("{base}/{suffix}"), Some(&token.token), &json!({}));
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["error"]["code"], "artifact_not_found");
+        assert_eq!(exchange("GET", &format!("{base}/{suffix}"), None, &json!({})).0, 401);
+        let owner = tokens.issue_scoped(&format!("artifact-owner-{suffix}"), DeviceScope::Read).unwrap();
+        users.bind_token(&owner.token_id, Some(OWNER), "root").unwrap();
+        assert_eq!(exchange("GET", &format!("{base}/{suffix}"), Some(&owner.token), &json!({})).0, 404);
+    }
+}
+
+#[test]
+fn artifact_raw_owner_read_device_downloads_twenty_mb_through_dispatcher() {
+    use crate::artifacts::{store::{ArtifactStore, Content}, Scope as ArtifactScope};
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let owner = tokens.issue_scoped("artifact-download-owner", DeviceScope::Read).unwrap();
+    users.bind_token(&owner.token_id, Some(OWNER), "root").unwrap();
+    let bytes = vec![0x5au8; 20 * 1024 * 1024];
+    let sha = crate::asks::sha256_hex(&bytes);
+    let mut new = crate::artifacts::store::tests::blob(&ArtifactScope::session("cutex.download"), "app.apk", "", crate::artifacts::Producer::owner());
+    new.media_type = "application/vnd.android.package-archive".into();
+    new.source_path = "app.apk".into();
+    new.content = Content::Blob { bytes: bytes.clone(), sha256: sha.clone() };
+    let outcome = ArtifactStore::open_default().unwrap().publish(new, 64 * 1024 * 1024, chrono::Utc::now()).unwrap();
+    let path = format!("/v2/artifact-store/{}/versions/1/raw", outcome.artifact.artifact_id);
+    let (status, headers, body) = exchange_raw("GET", &path, Some(&owner.token), &Value::Null, "");
+    assert_eq!(status, 200, "{headers}");
+    assert_eq!(body.len(), bytes.len());
+    assert_eq!(crate::asks::sha256_hex(&body), sha);
+    assert!(headers.contains(&format!("X-Cutex-Sha256: {sha}")));
+    let (status, headers, body) = exchange_raw("HEAD", &path, Some(&owner.token), &Value::Null, "Range: bytes=0-1\r\n");
+    assert_eq!(status, 200); assert!(body.is_empty()); assert!(headers.contains("Content-Length: 20971520"));
+    let (status, _, body) = exchange_raw("GET", &path, Some(&owner.token), &Value::Null, "Range: bytes=7-15\r\n");
+    assert_eq!(status, 206); assert_eq!(body, vec![0x5a; 9]);
+    let user = users.create_user("Artifact denied", None, Grant::default(), "root").unwrap();
+    let guest = tokens.issue("artifact-denied").unwrap(); users.bind_token(&guest.token_id, Some(&user.id), "root").unwrap();
+    // r290 P1: not visible to a user without that agent: 404 (scoped read).
+    let (status, body) = exchange("GET", &path, Some(&guest.token), &Value::Null);
+    assert_eq!((status, code(&body)), (404, "artifact_not_found"), "{body}");
+}
+
+/// Owner powers on cutex requests (r289): a shared-access user with send
+/// rights keeps its granted behaviour but never acts on the owner's state.
+/// Callers in order: a scoped user's full device, the owner's chat device,
+/// root. Returns each caller's bearer and whether it is the owner.
+fn owner_power_callers(ids: &[&str]) -> Vec<(String, bool)> {
+    use crate::management::client_tokens::DeviceScope;
+    let users = UserStore::open_default().unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let sender = users.create_user("Owner-power sender", None, Grant {
+        standalone_agents: ids.iter().map(|id| (*id).into()).collect(), send: true, ..Grant::default()
+    }, "root").unwrap();
+    let scoped = tokens.issue("owner-power-scoped-device").unwrap();
+    users.bind_token(&scoped.token_id, Some(&sender.id), "root").unwrap();
+    let owner = tokens.issue_scoped("owner-power-owner-chat", DeviceScope::Chat).unwrap();
+    users.bind_token(&owner.token_id, Some(OWNER), "root").unwrap();
+    vec![(scoped.token, false), (owner.token, true), (ROOT.to_string(), true)]
+}
+
+fn owner_power_sessions(instance: &PrivateInstance, ids: &[&str], class: crate::agent_bus::model::AgentRegistrationClass) {
+    let mut sessions = crate::session::model::CutexSessionStore::default();
+    for sid in ids {
+        let mut record = crate::session::model::CutexSessionRecord::new((*sid).into(), Some(uuid::Uuid::new_v4().to_string()),
+            crate::platform::host::current_host_name(), instance.root.to_string_lossy().into_owned(), None).unwrap();
+        record.registration_class = class;
+        record.exposed_to_backend = false;
+        sessions.sessions.insert((*sid).into(), record);
+    }
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+}
+
+/// A submit the runtime started (no native runtime in the fixture).
+fn started_submit_context() -> ManagementRequestContext {
+    let mut ctx = p2_context();
+    ctx.handle_user_input = |_| {
+        use crate::management::v2::user_input::{UserInputDisposition, UserInputSubmitExecution};
+        Ok(UserInputSubmitExecution { disposition: UserInputDisposition::Started, app_server_accepted: true,
+            native_request_id: Some(json!("owner-power-native")), native_method: Some("turn/start".into()),
+            turn_id: Some("owner-power-turn".into()), queue: None,
+            queue_paused: false, passive_notes: None, join_refusal: None, queued_reason: None })
+    };
+    ctx
+}
+
+fn owner_power_submit(ctx: ManagementRequestContext, sid: &str, bearer: &str, tag: &str, extra: Value) -> (u16, Value) {
+    let mut params = json!({"clientUserMessageId": format!("owner-power-{tag}"),
+        "origin": {"kind": "other", "clientId": "private-test"}, "strategy": "auto",
+        "input": [{"type": "text", "text": "private fixture"}]});
+    for (key, value) in extra.as_object().unwrap() { params[key] = value.clone(); }
+    let body = json!({"requestId": format!("owner-power-req-{tag}"), "method": "cutex/userInput/submit", "params": params});
+    let (status, _, bytes) = exchange_with(ctx, "POST", &format!("/v2/sessions/{sid}/cutex/requests"), Some(bearer),
+        body.to_string().into_bytes(), "application/json", "");
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Item 1: an offline submit with `startIfOffline` goes out past the
+/// owner's queue pause only for the owner; a scoped user's input waits.
+#[test]
+fn scoped_offline_submit_does_not_bypass_the_owners_queue_pause() {
+    use crate::management::v2::user_input::{self, UserInputOrigin, UserInputOriginKind, UserInputStrategy, UserInputSubmitParams};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let ids = ["cutex.owner-power-bypass-scoped", "cutex.owner-power-bypass-owner", "cutex.owner-power-bypass-root"];
+    owner_power_sessions(&instance, &ids, crate::agent_bus::model::AgentRegistrationClass::Persistent);
+    let callers = owner_power_callers(&ids);
+    let queue = user_input::user_input_repository().unwrap();
+    let mut ctx = p2_context();
+    ctx.handle_user_input = |command| {
+        use crate::management::v2::user_input::{QueueEnqueueDecision, UserInputDisposition, UserInputSubmitExecution};
+        let decision = user_input::user_input_repository().unwrap().enqueue(&command.cutex_session_id, &command.thread_id,
+            &command.management_request_id, &command.params).unwrap();
+        let item = match decision { QueueEnqueueDecision::Queued(item) | QueueEnqueueDecision::Deduplicated(item) => item,
+            _ => panic!("private input identity unexpectedly conflicted") };
+        Ok(UserInputSubmitExecution { disposition: UserInputDisposition::Queued, app_server_accepted: false,
+            native_request_id: None, native_method: None, turn_id: None, queue: Some(item), queue_paused: true, passive_notes: None,
+            join_refusal: None, queued_reason: None })
+    };
+    ctx.online_session = |_, _, _| Err(crate::management::v2::user_input::UserInputExecutionError { stage: "route".into(),
+        code: "fixture_no_runtime_effect".into(), message: "no runtime in the fixture".into(), retryable: false,
+        outcome_unknown: false, details: json!({}) });
+    for (n, (bearer, is_owner)) in callers.iter().enumerate() {
+        let sid = ids[n];
+        // The owner paused this agent's queue behind an earlier message.
+        queue.enqueue(sid, "owner-power-thread", &format!("owner-earlier-{n}"), &UserInputSubmitParams {
+                interrupt_send: None,
+            client_user_message_id: format!("owner-earlier-{n}"),
+            origin: UserInputOrigin { kind: UserInputOriginKind::Other, client_id: "private-test".into() },
+            strategy: UserInputStrategy::Queue, input: vec![json!({"type": "text", "text": "earlier"})],
+            expected_turn_id: None, join_delegation: None }).unwrap();
+        assert!(matches!(queue.pause(sid, "owner_stop", None).unwrap(), user_input::QueuePauseDecision::Paused { .. }));
+        let (status, response) = owner_power_submit(ctx, sid, bearer, &format!("bypass-{n}"), json!({"startIfOffline": true}));
+        assert_eq!(status, 200, "{response}");
+        let result = &response["cutex"]["result"];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(super::super::super::offline_submit::start_outcome(sid), Some(super::super::super::offline_submit::StartOutcome::Failed { .. })) {
+            assert!(std::time::Instant::now() < deadline, "background start did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (_, items) = queue.list(sid).unwrap();
+        let sent_id = format!("owner-power-bypass-{n}");
+        let sent = items.iter().find(|item| item.client_user_message_id == sent_id).unwrap();
+        assert_eq!(sent.bypass_pause, *is_owner, "caller {n}: {response}");
+        assert!(items.iter().filter(|item| item.client_user_message_id != sent_id).all(|item| !item.bypass_pause));
+        assert_eq!(result["paused"], json!(!is_owner), "caller {n}: {response}");
+    }
+}
+
+/// Item 2: a started message lifts the owner's delegation pause and Stop
+/// hold (and reopens the native gate) only when the owner sent it.
+#[test]
+fn scoped_message_does_not_lift_the_owners_pause_or_stop_hold() {
+    use crate::asks::{control, store::{AskStore, RuntimeCommand}};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let ids = ["cutex.owner-power-hold-scoped", "cutex.owner-power-hold-owner", "cutex.owner-power-hold-root"];
+    owner_power_sessions(&instance, &ids, crate::agent_bus::model::AgentRegistrationClass::Persistent);
+    let callers = owner_power_callers(&ids);
+    let store = AskStore::open_default().unwrap();
+    let is_gate = |command: &RuntimeCommand, sid: &str|
+        matches!(command, RuntimeCommand::ResumeGate { cutex_session_id } if cutex_session_id == sid);
+    for stop in [false, true] {
+        for (n, (bearer, is_owner)) in callers.iter().enumerate() {
+            let sid = ids[n];
+            store.with_state(|state| {
+                let now = chrono::Utc::now();
+                if stop { control::owner_stop(state, sid, now); } else { control::owner_pause(state, sid, now); }
+                state.commands.retain(|queued| !is_gate(&queued.command, sid));
+            }).unwrap();
+            let (status, response) = owner_power_submit(started_submit_context(), sid, bearer, &format!("hold-{stop}-{n}"), json!({}));
+            assert_eq!(status, 200, "{response}");
+            assert_eq!(response["cutex"]["result"]["disposition"], "started", "{response}");
+            let state = store.snapshot().unwrap();
+            let gates = state.commands.iter().filter(|queued| is_gate(&queued.command, sid)).count();
+            assert_eq!(state.pauses.contains_key(sid), !is_owner, "stop={stop} caller {n}: {response}");
+            if *is_owner {
+                assert!(gates > 0, "the owner's message reopens the native gate");
+            } else {
+                assert_eq!(state.pauses[sid].stop_hold, stop);
+                assert_eq!(gates, 0, "a scoped message reopened the native gate");
+            }
+            store.with_state(|state| { state.pauses.remove(sid); }).unwrap();
+        }
+    }
+}
+
+/// Item 3: a message ends a pending quota continuation only when the owner
+/// sent it.
+#[test]
+fn scoped_message_does_not_cancel_the_owners_quota_continuation() {
+    use crate::management::v2::quota_continue;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let ids = ["cutex.owner-power-quota-scoped", "cutex.owner-power-quota-owner", "cutex.owner-power-quota-root"];
+    owner_power_sessions(&instance, &ids, crate::agent_bus::model::AgentRegistrationClass::Persistent);
+    let callers = owner_power_callers(&ids);
+    let store = quota_continue::Store::open_default().unwrap();
+    for (n, (bearer, is_owner)) in callers.iter().enumerate() {
+        let sid = ids[n];
+        let now = chrono::Utc::now();
+        assert!(store.with_state(|state| state.schedule(sid, now.timestamp() + 3600, None, Some("quota-turn".into()), 1, now)).unwrap());
+        let (status, response) = owner_power_submit(started_submit_context(), sid, bearer, &format!("quota-{n}"), json!({}));
+        assert_eq!(status, 200, "{response}");
+        let pending = store.snapshot().unwrap().sessions.get(sid).and_then(|entry| entry.pending.clone());
+        assert_eq!(pending.is_some(), !is_owner, "caller {n}: {response}");
+    }
+}
+
+/// Item 4: only the owner addresses a hidden (unlisted) durable agent by
+/// exact ID; a scoped user with a grant for it gets session_not_found.
+#[test]
+fn scoped_user_cannot_resolve_a_hidden_session() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let ids = ["cutex.owner-power-hidden-scoped", "cutex.owner-power-hidden-owner", "cutex.owner-power-hidden-root"];
+    owner_power_sessions(&instance, &ids, crate::agent_bus::model::AgentRegistrationClass::LocalOnly);
+    let callers = owner_power_callers(&ids);
+    for (n, (bearer, is_owner)) in callers.iter().enumerate() {
+        let (status, response) = owner_power_submit(started_submit_context(), ids[n], bearer, &format!("hidden-{n}"), json!({}));
+        if *is_owner {
+            assert_eq!(status, 200, "caller {n}: {response}");
+            assert_eq!(response["cutex"]["result"]["disposition"], "started");
+        } else {
+            assert_eq!((status, any_code(&response)), (404, "session_not_found"), "caller {n}: {response}");
+        }
+    }
+}
+
+/// A shared-access user's explicit queue flush does not send items held by
+/// the owner's queue pause; the owner and root still send past it.
+#[test]
+fn scoped_flush_does_not_send_items_held_by_the_owners_queue_pause() {
+    use crate::management::v2::user_input::{self, UserInputOrigin, UserInputOriginKind, UserInputStrategy, UserInputSubmitParams};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let ids = ["cutex.owner-power-flush-scoped", "cutex.owner-power-flush-owner", "cutex.owner-power-flush-root"];
+    owner_power_sessions(&instance, &ids, crate::agent_bus::model::AgentRegistrationClass::Persistent);
+    let callers = owner_power_callers(&ids);
+    let queue = user_input::user_input_repository().unwrap();
+    let mut ctx = p2_context();
+    // "Sends" every queued item (no runtime in the fixture).
+    ctx.flush_user_input_queue = |sid, _, explicit| {
+        assert!(explicit, "an HTTP flush is explicit");
+        let queue = user_input::user_input_repository().unwrap();
+        let (_, items) = queue.list(sid).unwrap();
+        for item in &items { queue.remove(sid, &item.queue_id, item.revision).unwrap().unwrap(); }
+        Ok(items.len())
+    };
+    let flush = |sid: &str, bearer: &str, tag: &str| {
+        let revision = queue.list(sid).unwrap().0;
+        let body = json!({"requestId": format!("owner-power-flush-{tag}"), "method": "cutex/userInput/queue/flush",
+            "params": {"expectedQueueRevision": revision}});
+        let (status, _, bytes) = exchange_with(ctx, "POST", &format!("/v2/sessions/{sid}/cutex/requests"), Some(bearer),
+            body.to_string().into_bytes(), "application/json", "");
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+    };
+    for (n, (bearer, is_owner)) in callers.iter().enumerate() {
+        let sid = ids[n];
+        queue.enqueue(sid, "owner-power-thread", &format!("owner-held-{n}"), &UserInputSubmitParams {
+                interrupt_send: None,
+            client_user_message_id: format!("owner-held-{n}"),
+            origin: UserInputOrigin { kind: UserInputOriginKind::Other, client_id: "private-test".into() },
+            strategy: UserInputStrategy::Queue, input: vec![json!({"type": "text", "text": "held"})],
+            expected_turn_id: None, join_delegation: None }).unwrap();
+        assert!(matches!(queue.pause(sid, "manual", None).unwrap(), user_input::QueuePauseDecision::Paused { .. }));
+        let (status, response) = flush(sid, bearer, &format!("paused-{n}"));
+        if *is_owner {
+            assert_eq!(status, 200, "caller {n}: {response}");
+            assert_eq!(response["cutex"]["result"]["affectedQueueIds"].as_array().unwrap().len(), 1, "{response}");
+            assert!(queue.list(sid).unwrap().1.is_empty());
+        } else {
+            assert_eq!((status, any_code(&response)), (403, "owner_required"), "caller {n}: {response}");
+            assert_eq!(response["error"]["details"]["reason"], "queue_paused", "{response}");
+            assert_eq!(queue.list(sid).unwrap().1.len(), 1, "the held item was not sent");
+            assert!(queue.pause_state(sid).unwrap().is_some(), "the owner's pause stays");
+            // Without the owner's pause the shared-access flush still sends.
+            queue.resume(sid).unwrap().unwrap();
+            let (status, response) = flush(sid, bearer, &format!("resumed-{n}"));
+            assert_eq!(status, 200, "{response}");
+            assert_eq!(response["cutex"]["result"]["affectedQueueIds"].as_array().unwrap().len(), 1, "{response}");
+            assert!(queue.list(sid).unwrap().1.is_empty());
+        }
+    }
+}
+
+// r290 P1
+#[path = "access_project_roles_tests.rs"]
+mod project_roles;
+
+// r290 P6
+#[test]
+fn board_http_refuses_nonowner_before_loading_roster_or_runtime_data() {
+    let _lock=crate::config::paths::test_home_env_lock();let _instance=PrivateInstance::new();
+    assert_eq!(exchange("GET","/v2/board",None,&json!({})).0,401);
+    let users=UserStore::open_default().unwrap();let tokens=ClientTokenStore::open_default().unwrap();
+    let user=users.create_user("Board member",None,Grant::default(),"root").unwrap();let token=tokens.issue("board-member").unwrap();
+    users.bind_token(&token.token_id,Some(&user.id),"root").unwrap();
+    assert_eq!(exchange("GET","/v2/board",Some(&token.token),&json!({})).0,403);
+    assert_eq!(exchange("POST","/v2/board",Some(ROOT),&json!({})).0,405);
+}
+
+// r290 P6: exercise HTTP headers and the cached read through the owner gate.
+#[test]
+fn board_http_owner_get_and_conditional_read_use_one_roster_snapshot() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static READS: AtomicUsize = AtomicUsize::new(0);
+    let _lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    READS.store(0, Ordering::SeqCst);
+    let mut ctx = p2_context();
+    ctx.list_management_projects = |_| {
+        READS.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::management::control_plane::HumanManagementProjectCollection {
+            schema: crate::management::control_plane::HumanManagementProjectSchema::V1,
+            projects: vec![], archived_projects: vec![], available_agents: vec![],
+        })
+    };
+    let (status, headers, bytes) = exchange_with(ctx, "GET", "/v2/board", Some(ROOT), vec![], "application/json", "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    crate::management::v2::schema_export::assert_valid("board", "snapshot", &body);
+    let etag = body["etag"].as_str().unwrap();
+    assert!(headers.contains(&format!("ETag: {etag}")));
+    let mut denied = context();
+    // Every data loader panics: a fresh conditional request must touch no stores.
+    denied.list_management_projects = |_| panic!("cached board reloaded projects");
+    let (status, headers, bytes) = exchange_with(denied, "GET", "/v2/board", Some(ROOT), vec![], "application/json", &format!("If-None-Match: W/{etag}\r\n"));
+    assert_eq!(status, 304, "{headers}");
+    assert!(bytes.is_empty());
+    assert_eq!(READS.load(Ordering::SeqCst), 1);
+}
+
+// r290 P10 (B6 / B3 / a) ------------------------------------------------------
+
+/// B6: a full-scope owner device may turn things off on a remote listener;
+/// widening needs a fresh single-use confirm bound to the token and action
+/// and is announced to every owner device; narrowed / member / pending
+/// tokens stay refused; host relay configuration stays owner-local.
+#[test]
+fn r290_p10_owner_device_turns_off_remotely_and_widens_only_after_confirm() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    // These allowed mutations may refresh recovery state after preceding
+    // tests; provide the fixture's empty registry rather than a deny-only callback.
+    let exchange = |method: &str, path: &str, bearer: Option<&str>, body: &Value| {
+        let (status, _, bytes) = exchange_with(p2_context(), method, path, bearer, body.to_string().into_bytes(), "application/json", "");
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+    };
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    users.snapshot().unwrap();
+    let (phone, _) = tokens.issue_device("owner-phone", "Pixel", "android").unwrap();
+    users.bind_token(&phone.token_id, Some(OWNER), "pairing-code").unwrap();
+    let (tablet, _) = tokens.issue_device("owner-tablet", "Tab", "android").unwrap();
+    users.bind_token(&tablet.token_id, Some(OWNER), "pairing-code").unwrap();
+    let (chat, _) = tokens.issue_device_scoped("owner-chat", "Chat", "android", DeviceScope::Chat).unwrap();
+    users.bind_token(&chat.token_id, Some(OWNER), "pairing-code").unwrap();
+    let member = users.create_user("Member", None, Grant::default(), "root").unwrap();
+    let (member_phone, _) = tokens.issue_device("member-phone", "M", "android").unwrap();
+    users.bind_token(&member_phone.token_id, Some(&member.id), "root").unwrap();
+    let (pending, _) = tokens.issue_device("pending", "P", "android").unwrap();
+    let (status, setup) = exchange("POST", "/v2/relay/setup", Some(ROOT), &json!({"bind":"127.0.0.1:39491", "serverNames":["p10.test"]}));
+    assert_eq!(status, 201, "{setup}");
+    let repository = crate::management::v2::repository::management_v2_repository().unwrap();
+    let checkpoint = repository.checkpoint().unwrap();
+    struct Local;
+    impl Drop for Local { fn drop(&mut self) { REMOTE.with(|r| r.set(false)); } }
+    let _local = Local;
+    REMOTE.with(|r| r.set(true));
+
+    // Turning off: open to the full owner device on a remote listener.
+    let off = json!({"peers": {"enabled": false}});
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(&phone.token), &off);
+    assert_eq!(status, 200, "{value}");
+    for (method, path, body) in [("PATCH", "/v2/peers/peer-1", json!({"enabled": false})), ("DELETE", "/v2/peers/peer-1", json!({}))] {
+        let (_, value) = exchange(method, path, Some(&phone.token), &body);
+        assert!(!["loopback_only", "owner_local_only", "owner_confirm_required"].contains(&any_code(&value)), "{method} {path}: {value}");
+    }
+    let revoke = format!("/v2/relay/certificates/{}", "a".repeat(64));
+    assert_eq!(exchange_raw("DELETE", &revoke, Some(&phone.token), &json!({}), "").0, 204);
+    let (status, value) = exchange("GET", "/v2/relay/certificates", Some(&phone.token), &json!({}));
+    assert_eq!(status, 200, "{value}");
+    // ... but not for narrowed, member or pending tokens.
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(&chat.token), &off);
+    assert_eq!((status, code(&value)), (403, "device_scope_denied"), "{value}");
+    assert_eq!(exchange_raw("DELETE", &revoke, Some(&chat.token), &json!({}), "").0, 403);
+    for bearer in [&member_phone.token, &pending.token] {
+        let (status, value) = exchange("PATCH", "/v2/settings", Some(bearer), &off);
+        assert_eq!(status, 403, "{value}");
+        assert_eq!(exchange_raw("DELETE", &revoke, Some(bearer), &json!({}), "").0, 403);
+    }
+    // Other remote writes keep their old rules.
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(&phone.token), &json!({"peers": {"enabled": false}, "managementCorsOrigins": []}));
+    assert_eq!((status, code(&value)), (403, "loopback_only"), "{value}");
+    let (_, value) = exchange("PATCH", "/v2/peers/peer-1", Some(&phone.token), &json!({"label": "x"}));
+    assert_eq!(any_code(&value), "loopback_only", "{value}");
+    let (status, value) = exchange("POST", "/v2/relay/tailnet", Some(&phone.token), &json!({"tailnetBind": null}));
+    assert_eq!((status, code(&value)), (403, "owner_local_only"), "{value}");
+
+    // Widening: 428 with a confirm token, then the confirmed repeat runs.
+    let on = json!({"peers": {"enabled": true}});
+    let (status, first) = exchange("PATCH", "/v2/settings", Some(&phone.token), &on);
+    assert_eq!((status, code(&first)), (428, "owner_confirm_required"), "{first}");
+    let details = &first["error"]["details"];
+    assert_eq!(details["action"], "peersEnable");
+    assert_eq!(details["ttlSeconds"], 120);
+    assert!(details["summary"].as_str().is_some_and(|s| !s.is_empty()));
+    let confirm = details["confirmToken"].as_str().unwrap().to_string();
+    // Bound to the token and the action.
+    let (status, value) = exchange("PATCH", &format!("/v2/settings?ownerConfirm={confirm}"), Some(&tablet.token), &on);
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    let (status, value) = exchange("PATCH", &format!("/v2/users/settings?ownerConfirm={confirm}"), Some(&phone.token), &json!({"ownerRequiresApproval": false}));
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    // The same action cannot consume a confirmation for a changed body or query.
+    let changed = json!({"peers": {"enabled": true}, "archiveDeleteEmpty": false});
+    let (status, value) = exchange("PATCH", &format!("/v2/settings?ownerConfirm={confirm}"), Some(&phone.token), &changed);
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    let (status, value) = exchange("PATCH", &format!("/v2/settings?x=changed&ownerConfirm={confirm}"), Some(&phone.token), &on);
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    let (status, value) = exchange("PATCH", &format!("/v2/settings?ownerConfirm={confirm}"), Some(&phone.token), &on);
+    assert_eq!(status, 200, "{value}");
+    // Single use.
+    let (status, value) = exchange("PATCH", &format!("/v2/settings?ownerConfirm={confirm}"), Some(&phone.token), &on);
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    let notices = host_events(&checkpoint, crate::management::users::OWNER_REMOTE_ACTION);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!((&notices[0]["action"], &notices[0]["tokenId"], &notices[0]["connection"]), (&json!("peersEnable"), &json!(phone.token_id), &json!("remote")));
+    assert_eq!(notices[0]["phase"], "confirmed");
+    // Public pairing on: the same flow on the relay owner route.
+    let (status, value) = exchange("POST", "/v2/relay/pairing", Some(&phone.token), &json!({"enabled": true}));
+    assert_eq!((status, code(&value)), (428, "owner_confirm_required"), "{value}");
+    assert_eq!(value["error"]["details"]["action"], "publicPairingOn");
+    // Narrowed / member / pending devices never get a confirm.
+    for bearer in [&chat.token, &member_phone.token, &pending.token] {
+        let (status, value) = exchange("PATCH", "/v2/settings", Some(bearer), &on);
+        assert_eq!(status, 403, "{value}");
+    }
+    REMOTE.with(|r| r.set(false));
+    // Owner-local keeps today's behaviour: no confirm.
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(ROOT), &off);
+    assert_eq!(status, 200, "{value}");
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(ROOT), &on);
+    assert_eq!(status, 200, "{value}");
+}
+
+/// B6: the turning-off / widening lists are explicit and disjoint.
+#[test]
+fn r290_p10_owner_action_lists_are_explicit() {
+    let off = crate::management::users::OWNER_TURN_OFF_ACTIONS;
+    let widen = crate::management::users::OWNER_WIDENING_ACTIONS;
+    assert!(off.iter().all(|a| !widen.contains(a)));
+    for a in ["peerDisable", "peerRemove", "peersDisable", "publicPairingOff", "relayCertificateRevoke", "pairingInviteCancel"] {
+        assert!(off.contains(&a), "{a}");
+    }
+    for a in ["pairingCode", "pairingInvite", "pairingInviteApprove", "relayCertificateApprove", "peerPair", "peerEnable", "peersEnable", "publicPairingOn", "disableOwnerApproval"] {
+        assert!(widen.contains(&a), "{a}");
+    }
+    assert_eq!(crate::management::users::owner_confirm_param("/v2/settings?x=1&ownerConfirm=oc-abc"), Some("oc-abc"));
+    assert_eq!(crate::management::users::owner_confirm_param("/v2/settings?ownerConfirm="), None);
+    assert_eq!(crate::management::users::owner_confirm_param("/v2/settings"), None);
+}
+
+/// (a) Re-pairing with the old device token replaces it; another user's
+/// token is never revoked by it.
+#[test]
+fn r290_p10_repair_with_previous_token_replaces_the_old_device() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    users.snapshot().unwrap();
+    let (old, _) = tokens.issue_device("phone", "Pixel", "android").unwrap();
+    users.bind_token(&old.token_id, Some(OWNER), "pairing-code").unwrap();
+    let member = users.create_user("Member", None, Grant::default(), "root").unwrap();
+    let (other, _) = tokens.issue_device("member", "M", "android").unwrap();
+    users.bind_token(&other.token_id, Some(&member.id), "root").unwrap();
+    let pair = |previous: &str| {
+        let (status, code_value) = exchange("POST", "/v2/pairing-codes", Some(ROOT), &json!({}));
+        assert_eq!(status, 201, "{code_value}");
+        let (status, paired) = exchange("POST", "/v2/pair", None, &json!({"code": code_value["code"], "deviceName": "Pixel", "platform": "android", "previousToken": previous}));
+        assert_eq!(status, 200, "{paired}");
+        crate::management::v2::schema_export::assert_valid("pair", "pairResponse", &paired);
+        paired
+    };
+    let ids = || tokens.list().unwrap().into_iter().map(|t| t.token_id).collect::<Vec<_>>();
+    // Another user's token: kept, nothing replaced.
+    let paired = pair(&other.token);
+    assert_eq!(paired["replacedTokenId"], Value::Null);
+    assert!(ids().contains(&other.token_id));
+    // The device's own previous token: revoked, the new one works.
+    let paired = pair(&old.token);
+    assert_eq!(paired["replacedTokenId"], json!(old.token_id));
+    assert!(!ids().contains(&old.token_id));
+    assert!(ids().contains(&paired["device"]["tokenId"].as_str().unwrap().to_string()));
+    assert_eq!(exchange("GET", "/v2/users/me", Some(&old.token), &json!({})).0, 401);
+    assert_eq!(exchange("GET", "/v2/users/me", Some(paired["token"].as_str().unwrap()), &json!({})).0, 200);
+}
+
+/// B3: device rows carry the relay certificate expiry, renewable-from and
+/// grace end.
+#[test]
+fn r290_p10_device_rows_show_relay_certificate_expiry() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::beside(&tokens);
+    let (device, _) = tokens.issue_device("phone", "phone", "android").unwrap();
+    users.bind_token(&device.token_id, Some(OWNER), "root").unwrap();
+    let (status, value) = exchange("GET", "/v2/users", Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{value}");
+    assert!(value["tokens"].as_array().unwrap().iter().all(|t| t["relayCertificate"].is_null()), "{value}");
+    let (status, value) = exchange("POST", "/v2/relay/setup", Some(ROOT), &json!({"bind":"127.0.0.1:39492", "serverNames":["rows.test"]}));
+    assert_eq!(status, 201, "{value}");
+    let key = rcgen::KeyPair::generate().unwrap();
+    let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+    let (_, enrollment) = exchange("POST", "/v2/relay-enrollment", Some(&device.token), &json!({"csrPem": csr}));
+    let (status, issued) = exchange("POST", "/v2/relay/certificates", Some(ROOT), &json!({"enrollmentId":enrollment["enrollmentId"],"csrSha256":enrollment["csrSha256"],"keySha256":enrollment["keySha256"],"confirm":true}));
+    assert_eq!(status, 201, "{issued}");
+    for path in ["/v2/users", "/v2/client-tokens"] {
+        let (status, value) = exchange("GET", path, Some(ROOT), &json!({}));
+        assert_eq!(status, 200, "{value}");
+        if path == "/v2/users" {
+            crate::management::v2::schema_export::assert_valid("users", "userList", &value);
+        }
+        let row = value["tokens"].as_array().unwrap().iter().find(|t| t["tokenId"] == device.token_id).unwrap().clone();
+        let cert = &row["relayCertificate"];
+        assert_eq!((&cert["certificateId"], &cert["expiresAt"], &cert["state"]), (&issued["certificateId"], &issued["expiresAt"], &json!("active")), "{row}");
+        let expires = chrono::DateTime::parse_from_rfc3339(cert["expiresAt"].as_str().unwrap()).unwrap();
+        let renewable = chrono::DateTime::parse_from_rfc3339(cert["renewableFrom"].as_str().unwrap()).unwrap();
+        let grace = chrono::DateTime::parse_from_rfc3339(cert["graceUntil"].as_str().unwrap()).unwrap();
+        assert_eq!(expires - renewable, chrono::Duration::days(15));
+        assert_eq!(grace - expires, chrono::Duration::days(30));
+    }
 }

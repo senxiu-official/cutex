@@ -2099,6 +2099,7 @@ mod tests {
             launched_profile: Some("profile".to_string()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
             schema_version: "test".to_string(),
@@ -2858,5 +2859,60 @@ mod tests {
                 pid: None,
             }
         );
+    }
+}
+
+/// Read-only child proof uses one exact live handle, never reconnects or starts.
+pub(crate) fn verify_native_child_principal(principal:&cutex::agent_bus::native_subagent::ChildPrincipal)->anyhow::Result<bool> {
+    principal.validate()?;
+    let record=cutex::session::store::shared_session_row(&principal.parent_session_id)?.context("parent missing")?;
+    if record.runtime_generation!=principal.generation || !record.agent_enabled || record.current_runtime_agent_id.is_none()
+        || cutex::agent_management::agent_execution_blocked(&record) {return Ok(false);}
+    let root=record.app_server_thread_id().context("parent native thread missing")?;
+    if principal.child_id==root {return Ok(false);}
+    let manager=if record.claude_session.is_some(){super::claude_runtime::manager()}else{runtime_manager()};
+    let handle=manager.handle_for_generation(&principal.parent_session_id,principal.generation)
+        .map_err(|_|anyhow::anyhow!("parent generation unavailable"))?;
+    let verified=if let Some(claude)=record.claude_session.as_ref() {
+        let response=handle.request_raw_message(serde_json::json!({"id":format!("child-proof-{}",uuid::Uuid::new_v4()),
+            "method":"claude/subagent/verify","params":{"threadId":root,"childId":principal.child_id}}))?;
+        let result=&response["result"];
+        result["verified"]==true && result["parentThreadId"]==root && result["childId"]==principal.child_id
+            && claude.native_session_id.as_deref().is_some_and(|sid|result["nativeSessionId"]==sid)
+    }else{
+        cutex::agent_bus::native_subagent::native_ancestry(root,&principal.child_id,|thread|{
+            let response=handle.request_raw_message(serde_json::json!({"id":format!("child-proof-{}",uuid::Uuid::new_v4()),
+                "method":"thread/read","params":{"threadId":thread,"includeTurns":false}}))?;
+            Ok(response["result"]["thread"].clone())
+        })?
+    };
+    // A restart during RPC invalidates the proof, even when the child id is reused.
+    let current=cutex::session::store::shared_session_row(&principal.parent_session_id)?;
+    Ok(verified && manager.handle_for_generation(&principal.parent_session_id,principal.generation).is_ok()
+        && current.is_some_and(|r|r.runtime_generation==principal.generation && r.app_server_thread_id()==Some(root)
+            && r.current_runtime_agent_id==record.current_runtime_agent_id && !cutex::agent_management::agent_execution_blocked(&r)))
+}
+
+#[cfg(test)]
+mod native_child_principal_tests {
+    use super::*;
+    #[test] fn stale_generation_or_missing_live_handle_never_starts_runtime() {
+        // The CLI runner supplies its marked private HOME; no live manager is connected.
+        let previous=cutex::session::store::load_cutex_session_store().unwrap();
+        let id="cutex.018e0000-0000-7000-8000-0000b0009ae1";
+        let root="018e0000-0000-7000-8000-0000b0009ae4";
+        let mut record=CutexSessionRecord::new_at(id.into(),Some(root.into()),current_host_name(),"/fixture".into(),None,"2026-11-15T00:00:00Z".into()).unwrap();
+        record.runtime_generation=7;record.agent_enabled=true;record.current_runtime_agent_id=Some("child-test-parent".into());
+        let mut store=previous.clone();store.sessions.insert(id.into(),record);
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let mut principal=cutex::agent_bus::native_subagent::ChildPrincipal {parent_session_id:id.into(),generation:6,child_id:"child".into()};
+        assert!(!verify_native_child_principal(&principal).unwrap());
+        principal.generation=7;principal.child_id=root.into();assert!(!verify_native_child_principal(&principal).unwrap());
+        principal.child_id="forged".into();assert!(verify_native_child_principal(&principal).is_err());
+        assert!(runtime_manager().handle_for_generation(id,7).is_err(),"proof must not connect or start");
+        let mut cleanup=cutex::session::store::load_cutex_session_store().unwrap();
+        cleanup.sessions.remove(id);
+        if let Some(record)=previous.sessions.get(id) {cleanup.sessions.insert(id.into(),record.clone());}
+        cutex::session::store::save_cutex_session_store(&cleanup).unwrap();
     }
 }

@@ -150,6 +150,7 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
     if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
         return SubmitOutcome::Unsupported(format!("{error:#}"));
     }
+    super::turn_notes::synchronize_in_lane(session, &thread_id, Some(generation)).attach_to_input(session,&submission.message_id);
     super::asks_claude::submit_outcome(handle.request("dsh/input/submit", submit_params(&thread_id, submission)))
 }
 

@@ -28,6 +28,9 @@ use crate::platform::host::current_host_name;
 const AGENT_BUS_STATE_FILE: &str = "agent-bus-message-state.json";
 const AGENT_BUS_LOCK_FILE: &str = "agent-bus-message-state.lock";
 
+#[path = "agent_bus_history.rs"]
+pub mod history;
+
 #[path = "agent_bus_settlement_state.rs"]
 mod settlement_state;
 use settlement_state::{settlement_closed, settlement_view, validate_settlement_record};
@@ -178,6 +181,9 @@ pub struct AgentBusMessageMeta {
     pub context_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
+    /// Controller diagnostics only; never part of the canonical model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_progress: Option<Value>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -193,7 +199,32 @@ struct AgentBusMessageStore {
         BTreeMap<String, crate::app_server::external_recovery::RecoveryReceipt>,
     #[serde(default)]
     messages: BTreeMap<String, StoredAgentBusMessage>,
+    #[serde(default)]
+    live_discards: BTreeMap<String, LiveDiscard>,
 }
+
+/// Stable occurrence tombstone. Producers have no bounded redrive horizon, so
+/// retention is unbounded (expiresAt=null), including across daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiveDiscard {
+    message_id: String,
+    semantic_sha256: Option<String>,
+    reason: String,
+    by: String,
+    discarded_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+/// A full retention budget must refuse before a live queue is withdrawn.
+#[derive(Debug)]
+pub struct LiveDiscardCapacity;
+impl std::fmt::Display for LiveDiscardCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Owner discard retention is full (10000 records or 16 MiB); this message was not discarded or withdrawn. Existing dispositions remain enforced.")
+    }
+}
+impl std::error::Error for LiveDiscardCapacity {}
 
 pub struct AgentBusMessageRepository {
     read_only: bool,
@@ -378,6 +409,22 @@ fn owner_carry_candidate(stored: &StoredAgentBusMessage, session: &str) -> bool 
     !stored.owner_hold && owner_holdable(stored, session)
 }
 
+fn passive_note(row: &StoredAgentBusMessage, session: &str) -> bool {
+    row.snapshot.to_cutex_session_id == session && row.snapshot.delivery_mode == "passive"
+        && row.canonical_envelope.as_ref().is_some_and(|message|
+            message.to_cutex_session_id.as_deref() == Some(session)
+                && message.kind == crate::agent_bus::model::AgentBusEnvelopeKind::Message
+                && message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::Passive
+                && (message.from_cutex_session_id.is_some() || crate::agent_bus::peer_tell::is_peer_tell(message)))
+}
+
+fn stale_release_allowed(row: &StoredAgentBusMessage) -> bool {
+    row.snapshot.state == "stale_held" && !row.snapshot.may_have_reached_runtime()
+        && row.snapshot.external_input_last_observed.is_none()
+        && !row.owner_hold && row.owner_carry.is_none()
+        && row.snapshot.semantic_sha256.is_some()
+}
+
 fn owner_holdable(stored: &StoredAgentBusMessage, session: &str) -> bool {
     let snapshot = &stored.snapshot;
     snapshot.to_cutex_session_id == session
@@ -406,6 +453,67 @@ pub fn native_id_matches_source(source: &str, native: &str) -> bool {
 }
 
 impl AgentBusMessageRepository {
+    pub fn record_note_attempt(&self, owner: &str, id: &str, error: Option<&str>, waiting_for: &str) -> anyhow::Result<()> {
+        self.record_note_attempt_kind(owner, id, "nativeAdmission", error, waiting_for)
+    }
+
+    pub fn record_note_attempt_kind(&self, owner: &str, id: &str, kind: &str, error: Option<&str>, waiting_for: &str) -> anyhow::Result<()> {
+        self.mutate_message(id, |store| {
+            let row = store.messages.get_mut(id).context("note source absent")?;
+            anyhow::ensure!(row.snapshot.to_cutex_session_id == owner, "note recipient changed");
+            if !passive_note(row, owner) || settlement_closed(row) { return Ok(()); }
+            let progress = row.meta.get_or_insert_with(Default::default).delivery_progress.get_or_insert_with(|| json!({}));
+            progress["lastAttemptAt"] = json!(Utc::now().to_rfc3339());
+            progress["lastAttemptKind"] = json!(kind);
+            progress["waitingFor"] = json!(waiting_for);
+            if let Some(error) = error { progress["lastError"] = json!(error); }
+            Ok(())
+        })
+    }
+
+    /// Durable pre-native failure diagnostics, projected through the existing
+    /// waiting/stalled ledger. No new envelope or terminal disposition.
+    pub fn record_projection_failure(&self, owner: &str, id: &str, error: Option<&str>) -> anyhow::Result<()> {
+        self.mutate_message(id, |store| {
+            let row = store.messages.get_mut(id).context("projection source absent")?;
+            anyhow::ensure!(row.snapshot.to_cutex_session_id == owner, "projection recipient changed");
+            if row.snapshot.state != "pending" || row.snapshot.may_have_reached_runtime()
+                || row.snapshot.external_input_last_observed.is_some() || settlement_closed(row) { return Ok(()); }
+            let previous = row.snapshot.error.as_ref().filter(|e| e["code"] == "external_projection_failed" || e["code"] == "external_projection_blocked");
+            match error {
+                Some(message) => {
+                    let now = Utc::now().to_rfc3339();
+                    let failed = previous.filter(|e| e["code"] == "external_projection_failed");
+                    let attempts = failed.and_then(|e| e["attempts"].as_u64()).unwrap_or(0).saturating_add(1);
+                    let since = failed.and_then(|e| e["since"].as_str()).unwrap_or(&now).to_string();
+                    row.snapshot.error = Some(json!({"code":"external_projection_failed","message":message,
+                        "retryable":true,"attempts":attempts,"since":since,"lastAttemptAt":now}));
+                    row.updated_at = now;
+                }
+                None if previous.is_some() => { row.snapshot.error = None; row.updated_at = Utc::now().to_rfc3339(); }
+                None => {}
+            }
+            Ok(())
+        })
+    }
+
+    pub fn record_projection_blocked(&self, owner: &str, id: &str, blocker: &str) -> anyhow::Result<()> {
+        self.mutate_message(id, |store| {
+            let row = store.messages.get_mut(id).context("projection source absent")?;
+            anyhow::ensure!(row.snapshot.to_cutex_session_id == owner && id != blocker, "invalid projection blocker");
+            if row.snapshot.state != "pending" || row.snapshot.may_have_reached_runtime()
+                || row.snapshot.external_input_last_observed.is_some() || settlement_closed(row) { return Ok(()); }
+            let now = Utc::now().to_rfc3339();
+            let previous = row.snapshot.error.as_ref().filter(|e| e["code"] == "external_projection_blocked" && e["blockedByInputId"] == blocker);
+            let since = previous.and_then(|e| e["since"].as_str()).unwrap_or(&now).to_owned();
+            row.snapshot.error = Some(json!({"code":"external_projection_blocked","blockedByInputId":blocker,
+                "message":format!("Waiting for earlier message {blocker} to pass projection"),"retryable":true,
+                "attempts":0,"since":since,"lastObservedAt":now}));
+            row.updated_at = now;
+            Ok(())
+        })
+    }
+
     /// Prefetch the builder's sender/view sidecars by recipient, before reserve
     /// acquires the non-reentrant source lock. No whole-host metadata walk.
     pub fn owner_carry_metadata(&self, session: &str) -> anyhow::Result<BTreeMap<String, AgentBusMessageMeta>> {
@@ -526,12 +634,26 @@ impl AgentBusMessageRepository {
         Ok(self.get(input_id)?.is_some_and(|row| row.snapshot.to_cutex_session_id == session && row.owner_carry.is_some()))
     }
 
+    /// The recipient's ledger control uses the same exact pre-native release
+    /// as operator recovery. A stale hold belongs to the sender's durable row,
+    /// while the owner acts on the recipient's queue; check both identities.
+    pub fn release_stale_input(&self, session: &str, input_id: &str) -> anyhow::Result<bool> {
+        let row = self.get(input_id)?.context("bus input absent")?;
+        anyhow::ensure!(row.snapshot.to_cutex_session_id == session, "bus input recipient mismatch");
+        anyhow::ensure!(!row.owner_hold && row.owner_carry.is_none()
+            && !row.snapshot.may_have_reached_runtime()
+            && row.snapshot.external_input_last_observed.is_none(), "bus input may already have reached the runtime");
+        let digest = row.snapshot.semantic_sha256.as_deref().context("bus input digest absent")?;
+        self.release_stale_held_checked(&row.owner_cutex_session_id, input_id, digest, Some(session), Utc::now())
+    }
+
     /// Explicit per-input hold. Session resume must not call this method.
     pub fn set_owner_hold(&self, session: &str, input_id: &str, held: bool) -> anyhow::Result<bool> {
         self.update_message(input_id, |store| {
             let row = store.messages.get_mut(input_id).context("bus input absent")?;
             anyhow::ensure!(row.snapshot.to_cutex_session_id == session, "bus input recipient mismatch");
-            anyhow::ensure!(owner_holdable(row, session),
+            let stale_unpause = !held && row.owner_hold && row.snapshot.state == "stale_held";
+            anyhow::ensure!(owner_holdable(row, session) || stale_unpause,
                 "bus input is no longer safely unsent");
             if row.owner_hold == held { return Ok((false, false)); }
             row.owner_hold = held;
@@ -646,6 +768,17 @@ pub fn agent_bus_message_repository() -> anyhow::Result<&'static AgentBusMessage
     )
 }
 
+/// Stable producer retries consult durable disposition before taking the bus mutex.
+pub fn live_discarded_default(message_id: &str) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    require_private_test_home()?;
+    let root = runtime_dir()?.join("management-v2");
+    if !root.join(super::hot_store::DATABASE_FILE).is_file() {
+        return Ok(false);
+    }
+    AgentBusMessageRepository::open_read_only(root).live_discarded(message_id)
+}
+
 /// Receipt response reads do not create/migrate an absent or legacy bus store.
 /// Uses a separate read cache: never invokes the writer opener/ACL setup.
 pub fn receipt_read_inputs_default(
@@ -691,6 +824,62 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    pub fn live_discarded(&self, message_id: &str) -> anyhow::Result<bool> {
+        self.read_selected(Some(&[message_id.into()]), |store| {
+            Ok(store.live_discards.contains_key(message_id))
+        })
+    }
+
+    pub fn discard_live_occurrence(
+        &self,
+        message_id: &str,
+        semantic: Option<&str>,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !message_id.is_empty()
+                && message_id.len() <= 512
+                && !reason.trim().is_empty()
+                && reason.len() <= 1024,
+            "invalid live discard identity or reason"
+        );
+        if let Some(sha) = semantic {
+            validate_semantic_sha256(sha)?;
+        }
+        self.update_message(message_id, |store| {
+            if let Some(prior) = store.live_discards.get(message_id) {
+                anyhow::ensure!(
+                    semantic.is_none() || prior.semantic_sha256.as_deref() == semantic,
+                    "live discard digest changed"
+                );
+                return Ok((false, false));
+            }
+            anyhow::ensure!(
+                !store.messages.contains_key(message_id),
+                "message acquired durable identity; refresh before discard"
+            );
+            let tombstone = LiveDiscard {
+                message_id: message_id.into(),
+                semantic_sha256: semantic.map(str::to_string),
+                reason: reason.trim().into(),
+                by: "owner".into(),
+                discarded_at: now,
+                expires_at: None,
+            };
+            let (count, bytes) =
+                super::hot_store::live_discard_usage(&self.root.join(super::hot_store::DATABASE_FILE))?;
+            if count >= 10_000
+                || bytes + serde_json::to_vec(&tombstone)?.len() as u64 > 16 * 1024 * 1024
+            {
+                return Err(LiveDiscardCapacity.into());
+            }
+            store.live_discards.insert(message_id.into(), tombstone);
+            store.version = store.version.max(10);
+            Ok((true, true))
+        })
+    }
+
     /// Owner diagnostics must not initialize directories/locks, migrate legacy
     /// rows, publish an outbox, or change permissions just to display state.
     pub fn open_read_only(root: impl Into<PathBuf>) -> Self {
@@ -1067,6 +1256,7 @@ impl AgentBusMessageRepository {
         }
         let dirty_message_id = message.message_id.clone();
         self.update_message(&dirty_message_id, |store| {
+            if store.live_discards.contains_key(&message.message_id){return Ok((false,false));}
             if let Some(existing) = store.messages.get(&message.message_id) {
                 if existing.owner_cutex_session_id == message.owner_cutex_session_id
                     && existing.snapshot.from_cutex_session_id == message.from_cutex_session_id
@@ -1401,6 +1591,92 @@ impl AgentBusMessageRepository {
         })
     }
 
+    /// A read-now click captures identities, not message bodies. Startup-held
+    /// and closed entries need their own explicit owner disposition first.
+    pub fn pending_note_ids(&self, session: &str) -> anyhow::Result<Vec<String>> {
+        self.read_admission(session, |rows| {
+            let mut rows: Vec<_> = rows.filter(|row| passive_note(row, session)
+                && !settlement_closed(row)
+                && matches!(row.snapshot.state.as_str(), "pending" | "inbox_accepted"))
+                .map(|row| (row.queued_at.clone(), row.snapshot.message_id.clone())).collect();
+            rows.sort();
+            Ok(rows.into_iter().map(|(_, id)| id).collect())
+        })
+    }
+
+    /// Admission cutoff for a new turn. Accepted/frozen identities are never
+    /// submitted again here; holds, owner reservations and closed rows wait
+    /// for their own reconciliation/disposition.
+    pub fn unsubmitted_note_ids(&self, session: &str) -> anyhow::Result<Vec<String>> {
+        self.read_admission(session, |rows| {
+            let mut rows: Vec<_> = rows.filter(|row| passive_note(row, session)
+                && row.snapshot.state == "pending" && !settlement_closed(row)
+                && !row.owner_hold && row.owner_carry.is_none()
+                && !row.snapshot.may_have_reached_runtime() && row.snapshot.external_input_last_observed.is_none())
+                .map(|row| (row.queued_at.clone(), row.snapshot.message_id.clone())).collect();
+            rows.sort();
+            Ok(rows.into_iter().map(|(_, id)| id).collect())
+        })
+    }
+
+    /// Only previously unsubmitted selected notes get a new reservation.
+    /// Accepted identities stay in their existing inbox; a frozen/unknown
+    /// identity is never silently replayed or detached from another owner.
+    pub fn reserve_note_carries(
+        &self, session: &str, owner: &str, thread: &str, generation: u64, ids: &[String],
+        mut make: impl FnMut(&AgentBusMessage, Option<&AgentBusMessageMeta>) -> anyhow::Result<crate::app_server::external_input::Envelope>,
+    ) -> anyhow::Result<Vec<crate::app_server::external_input::Envelope>> {
+        anyhow::ensure!(!owner.trim().is_empty() && ids.len() < super::input_ledger::MAX_BATCH_ITEMS
+            && ids.iter().collect::<std::collections::BTreeSet<_>>().len() == ids.len(), "invalid note read batch");
+        self.update_inner(DirtyRows::Messages(ids.to_vec()), false, |store| {
+            let mut planned = Vec::new();
+            for id in ids {
+                let row = store.messages.get(id).context("selected note absent")?;
+                anyhow::ensure!(passive_note(row, session), "selected note recipient or kind changed");
+                if settlement_closed(row) || matches!(row.snapshot.state.as_str(), "delivered" | "discarded" | "quarantined") { continue; }
+                anyhow::ensure!(!row.owner_hold && row.owner_carry.is_none(), "selected note already reserved");
+                let s = &row.snapshot;
+                if let Some(status) = &s.external_input_last_observed {
+                    anyhow::ensure!(status.processing.state != crate::app_server::external_input::ProcessingState::Held,
+                        "selected note has a native hold; inspect its original input");
+                }
+                if s.state == "inbox_accepted" || s.local_inbox_receipt.is_some()
+                    || s.external_input_last_observed.as_ref().is_some_and(|status|
+                        matches!(status.delivery_state, crate::app_server::external_input::DeliveryState::Pending
+                            | crate::app_server::external_input::DeliveryState::ContextPersisted)
+                        && status.processing.state != crate::app_server::external_input::ProcessingState::Held) {
+                    if let Some(envelope) = &s.external_input {
+                        anyhow::ensure!(envelope.owner_id == session && envelope.thread_id == thread
+                            && envelope.runtime_generation == generation, "selected note belongs to another runtime binding");
+                    }
+                    if let Some(receipt) = &s.local_inbox_receipt {
+                        anyhow::ensure!(receipt["threadId"].as_str() == Some(thread), "selected note inbox binding changed");
+                    }
+                    continue;
+                }
+                anyhow::ensure!(s.state == "pending" && !s.may_have_reached_runtime()
+                    && s.external_input_last_observed.is_none(), "selected note needs native reconciliation");
+                let envelope = make(row.canonical_envelope.as_ref().context("selected note provenance absent")?, row.meta.as_ref())?;
+                envelope.validate()?;
+                anyhow::ensure!(envelope.owner_id == session && envelope.thread_id == thread
+                    && envelope.runtime_generation == generation && envelope.message.id == *id
+                    && envelope.message.delivery == crate::app_server::external_input::Delivery::Passive,
+                    "selected note projection changed identity or delivery");
+                planned.push((id.clone(), envelope));
+            }
+            // Build and validate the complete batch before changing any row.
+            for (id, envelope) in &planned {
+                let row = store.messages.get_mut(id).expect("planned note");
+                row.snapshot.external_input = Some(envelope.clone());
+                row.owner_carry = Some(owner.to_string());
+                row.updated_at = Utc::now().to_rfc3339();
+            }
+            let changed = !planned.is_empty();
+            if changed { store.version = store.version.max(8); }
+            Ok((planned.into_iter().map(|(_, envelope)| envelope).collect(), changed))
+        })
+    }
+
     /// The message's state and whether a local inbox receipt is recorded.
     pub fn message_state(&self, message_id: &str) -> anyhow::Result<Option<(String, bool)>> {
         Ok(self.get(message_id)?.map(|stored| {
@@ -1439,58 +1715,7 @@ impl AgentBusMessageRepository {
 
     /// Messages `cutex_session_id` sent (latest `limit`, oldest first).
     pub fn sent_snapshot(&self, cutex_session_id: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
-        self.read(|store| {
-            let mut sent: Vec<&StoredAgentBusMessage> = store
-                .messages
-                .values()
-                .filter(|m| m.snapshot.from_cutex_session_id.as_deref() == Some(cutex_session_id))
-                .collect();
-            sent.sort_by_key(|m| {
-                (
-                    m.canonical_envelope.as_ref().map_or(0, |c| c.created_at_epoch_secs),
-                    m.snapshot.message_id.clone(),
-                )
-            });
-            let skip = sent.len().saturating_sub(limit);
-            Ok(sent
-                .into_iter()
-                .skip(skip)
-                .map(|m| {
-                    let fields = stored_agent_fields(m);
-                    let mut entry = json!({
-                        "messageId": m.snapshot.message_id,
-                        "toCutexSessionId": m.snapshot.to_cutex_session_id,
-                        "recipient": fields.get("recipient"),
-                        "deliveryMode": m.snapshot.delivery_mode,
-                        "deliveryKind": fields.get("deliveryKind"),
-                        "body": m.snapshot.content,
-                        "state": m.snapshot.state,
-                        "sentAt": sent_at(m),
-                    });
-                    if let Some(meta) = &m.meta {
-                        if let Some(turn) = &meta.context_turn_id {
-                            entry["contextTurnId"] = json!(turn);
-                        }
-                        if let Some(at) = &meta.delivered_at {
-                            entry["deliveredAt"] = json!(at);
-                        }
-                        if meta.facts.wake_downgraded {
-                            entry["wakeDowngraded"] = json!(true);
-                        }
-                        if let Some(turn) = &meta.facts.sender_turn_id {
-                            entry["senderTurnId"] = json!(turn);
-                        }
-                    }
-                    if let Some(error) = &m.snapshot.error {
-                        entry["error"] = error.clone();
-                    }
-                    if let Some(view) = settlement_view(m, Utc::now()) {
-                        entry["settlement"] = json!(view);
-                    }
-                    entry
-                })
-                .collect())
-        })
+        self.read(|store| history::full_sent(store, cutex_session_id, limit))
     }
 
     /// The newest wake `from → to` that was read into `to`'s turn
@@ -1516,7 +1741,7 @@ impl AgentBusMessageRepository {
         message_id: &str,
         error: &str,
     ) -> anyhow::Result<()> {
-        let desired = json!({"code":"external_input_pending", "message":error});
+        let desired = json!({"code": if error.starts_with("gate_closed:") { "gate_closed" } else { "external_input_pending" }, "message":error});
         // Called after every retained-pending delivery attempt: the usual
         // same-error case reads the cached state and writes nothing.
         self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), true, |store| {
@@ -1524,7 +1749,11 @@ impl AgentBusMessageRepository {
                 .messages
                 .get_mut(message_id)
                 .context("canonical message absent")?;
-            if stored.snapshot.state == "pending" {
+            if matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted") {
+                let mut desired = desired.clone();
+                if let Some(notice) = stored.snapshot.error.as_ref().and_then(|value| value.get("runtimeGateNotice")) {
+                    desired["runtimeGateNotice"] = notice.clone();
+                }
                 if stored.snapshot.error.as_ref() == Some(&desired) {
                     return Ok(((), false));
                 }
@@ -1533,6 +1762,23 @@ impl AgentBusMessageRepository {
                 return Ok(((), true));
             }
             Ok(((), false))
+        })
+    }
+
+    /// Persist notice bookkeeping without changing delivery state or receipts.
+    pub(crate) fn record_runtime_gate_notice(&self, message_id: &str, source: &str,
+        target: &str, epoch: &str) -> anyhow::Result<()> {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_owned()]), true, |store| {
+            let stored = store.messages.get_mut(message_id).context("canonical message absent")?;
+            if !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted") {
+                return Ok(((), false));
+            }
+            let mut desired = stored.snapshot.error.clone().unwrap_or_else(|| json!({}));
+            desired["runtimeGateNotice"] = json!({"source":source,"target":target,"epoch":epoch});
+            if stored.snapshot.error.as_ref() == Some(&desired) { return Ok(((), false)); }
+            stored.snapshot.error = Some(desired);
+            stored.updated_at = Utc::now().to_rfc3339();
+            Ok(((), true))
         })
     }
 
@@ -1604,12 +1850,31 @@ impl AgentBusMessageRepository {
                     && observed.semantic_sha256 == frozen.semantic_sha256,
                 "native observation CAS conflict"
             );
-            if stored.snapshot.external_input_last_observed.as_ref() == Some(observed) {
-                return Ok(((), false));
-            }
+            let context = observed.processing.state == crate::app_server::external_input::ProcessingState::OutputObserved
+                || observed.delivery_state == crate::app_server::external_input::DeliveryState::ContextPersisted;
+            let context_time_known = stored.meta.as_ref().and_then(|m|m.delivery_progress.as_ref()).is_some_and(|p|p["contextSince"].is_string());
+            let last_error = stored.meta.as_ref().and_then(|m|m.delivery_progress.as_ref()).is_some_and(|p|!p["lastError"].is_null());
+            if stored.snapshot.external_input_last_observed.as_ref() == Some(observed)
+                && stored.inbox_accepted_at.is_some() && (!context || context_time_known) && !last_error { return Ok(((), false)); }
             stored.snapshot.external_input_last_observed = Some(observed.clone());
+            if matches!(observed.delivery_state, crate::app_server::external_input::DeliveryState::Pending | crate::app_server::external_input::DeliveryState::ContextPersisted) {
+                stored.inbox_accepted_at.get_or_insert_with(|| Utc::now().to_rfc3339());
+                let progress = stored.meta.get_or_insert_with(Default::default).delivery_progress.get_or_insert_with(|| json!({}));
+                progress["lastError"] = Value::Null;
+                progress["waitingFor"] = Value::Null;
+                if context {
+                    if progress.get("contextSince").is_none() { progress["contextSince"] = json!(Utc::now().to_rfc3339()); }
+                }
+            }
             Ok(((), true))
-        })
+        })?;
+        if crate::agent_bus::runtime_gate_notice::held_status(observed) {
+            crate::agent_bus::runtime_gate_notice::best_effort(|| {
+                let message = self.canonical_message(message_id)?;
+                crate::agent_bus::runtime_gate_notice::report_existing_hold(self, &message, &frozen.owner_id)
+            });
+        }
+        Ok(())
     }
 
     pub fn record_delivered(
@@ -1670,7 +1935,7 @@ impl AgentBusMessageRepository {
                 // submit response is recorded.
                 anyhow::ensure!(matches!(stored.snapshot.state.as_str(), "pending" | "delivered"), "message is no longer pending");
                 stored.snapshot.local_inbox_receipt = Some(stable);
-                stored.inbox_accepted_at = Some(Utc::now().to_rfc3339());
+                stored.inbox_accepted_at.get_or_insert_with(|| Utc::now().to_rfc3339());
                 if stored.snapshot.state == "pending" {
                     stored.snapshot.state = "inbox_accepted".into();
                 }
@@ -1699,6 +1964,7 @@ impl AgentBusMessageRepository {
                 .get_mut(message_id)
                 .context("agent-bus message disappeared")?;
             stored.snapshot.a2_submission_id = Some(native_submission_id.to_string());
+            stored.inbox_accepted_at.get_or_insert_with(|| submitted_at.to_rfc3339());
             stored.updated_at = submitted_at.to_rfc3339();
             Ok(())
         })?;
@@ -2064,6 +2330,13 @@ impl AgentBusMessageRepository {
         expected_semantic_sha256: &str,
         at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
+        self.release_stale_held_checked(owner_cutex_session_id, message_id, expected_semantic_sha256, None, at)
+    }
+
+    fn release_stale_held_checked(
+        &self, owner_cutex_session_id: &str, message_id: &str, expected_semantic_sha256: &str,
+        recipient: Option<&str>, at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
         self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
@@ -2073,16 +2346,14 @@ impl AgentBusMessageRepository {
                 stored.owner_cutex_session_id == owner_cutex_session_id,
                 "agent-bus message owner session changed"
             );
+            anyhow::ensure!(recipient.is_none_or(|session| stored.snapshot.to_cutex_session_id == session),
+                "bus input recipient changed before release");
             anyhow::ensure!(
                 stored.snapshot.semantic_sha256.as_deref() == Some(expected_semantic_sha256),
                 "agent-bus message semantic digest changed"
             );
             anyhow::ensure!(
-                stored.snapshot.state == "stale_held"
-                    && stored.snapshot.a2_submission_id.is_none()
-                    && stored.snapshot.a4_receipt.is_none()
-                    && stored.snapshot.external_input.is_none()
-                    && stored.snapshot.external_input_receipt.is_none(),
+                stale_release_allowed(stored),
                 "only a pre-native stale-held message may be released"
             );
             stored.snapshot.state = "pending".into();
@@ -2402,6 +2673,7 @@ impl AgentBusMessageRepository {
         message_id: &str,
     ) -> anyhow::Result<bool> {
         self.read_selected(Some(&[message_id.to_owned()]), |store| {
+            if store.live_discards.contains_key(message_id) {return Ok(true);}
             let Some(stored) = store.messages.get(message_id) else {
                 return Ok(false);
             };
@@ -2503,7 +2775,7 @@ impl AgentBusMessageRepository {
         Ok(ids.into_iter().filter_map(|id|store.messages.get(id).map(|stored| {
             let terminal = stored.settlement.as_ref().or(stored.observed_settlement.as_ref())
                 .filter(|record|validate_settlement_record(stored, record).is_ok())
-                .map(|record|record.evidence.clone());
+                .and_then(|record|record.evidence.clone());
             (id.clone(), ReceiptReadInput {snapshot:stored.snapshot.clone(), terminal,
                 observer:None,status_unavailable:false})
         })).collect())
@@ -2556,6 +2828,7 @@ impl AgentBusMessageRepository {
     ) -> anyhow::Result<Vec<crate::app_server::external_input::Envelope>> {
         self.read_selected(None, |store| {
             Ok(store.messages.values()
+                .filter(|stored| !stored.settlement.as_ref().is_some_and(|record| record.owner_request.is_some()))
                 .filter(|stored| stored.snapshot.to_cutex_session_id == cutex_session_id
                     && matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted"))
                 .filter_map(|stored| stored.snapshot.external_input.clone())
@@ -2564,42 +2837,7 @@ impl AgentBusMessageRepository {
     }
 
     pub fn snapshot(&self, cutex_session_id: &str) -> anyhow::Result<Vec<Value>> {
-        self.read(|store| {
-            store
-                .messages
-                .values()
-                .filter(|stored| stored.owner_cutex_session_id == cutex_session_id)
-                .map(|stored| {
-                    let mut value = serde_json::to_value(&stored.snapshot)?;
-                    if let Some(view) = settlement_view(stored, Utc::now()) {
-                        value["settlement"] = serde_json::to_value(view)?;
-                    }
-                    let peer = stored_peer_tell_fields(stored);
-                    // Agent messaging v2 additions for agent-sourced messages
-                    // (a cross-host tell: `name@host` sender and `remote`).
-                    if stored.snapshot.from_cutex_session_id.is_some() || peer.is_some() {
-                        if let Some(object) = value.as_object_mut() {
-                            object.extend(stored_agent_fields(stored));
-                            object.extend(peer.unwrap_or_default());
-                            object.insert("queuedAt".into(), json!(sent_at(stored)));
-                            if let Some(meta) = &stored.meta {
-                                if let Some(turn) = &meta.context_turn_id {
-                                    object.insert("contextTurnId".into(), json!(turn));
-                                }
-                                if let Some(at) = &meta.delivered_at {
-                                    object.insert("deliveredAt".into(), json!(at));
-                                }
-                            }
-                        }
-                    } else if let (Some(object), Some(canonical)) =
-                        (value.as_object_mut(), stored.canonical_envelope.as_ref())
-                    {
-                        object.extend(system_sender_fields(canonical));
-                    }
-                    Ok(value)
-                })
-                .collect()
-        })
+        self.read(|store| history::full_received(store, cutex_session_id))
     }
 
     pub fn migrate_legacy_v1(&self) -> anyhow::Result<()> {
@@ -2700,6 +2938,7 @@ impl AgentBusMessageRepository {
                 Some(ids) => {
                     let mut rows = super::hot_store::Rows::new();
                     for id in ids {
+                        if let Some(bytes)=super::hot_store::verified_row(db,"agent_bus","live-discard",id)? {rows.insert(("live-discard".into(),id.clone()),bytes);}
                         if let Some(bytes) =
                             super::hot_store::verified_row(db, "agent_bus", "message", id)?
                         {
@@ -2784,6 +3023,7 @@ impl AgentBusMessageRepository {
             let mut keys = vec![("state".into(), "version".into())];
             match dirty {
                 DirtyRows::Messages(ids) => {
+                    keys.extend(ids.iter().cloned().map(|id| ("live-discard".into(), id)));
                     keys.extend(ids.iter().cloned().map(|id| ("message".into(), id)))
                 }
                 DirtyRows::Recovery(ids) => {
@@ -3270,13 +3510,15 @@ fn with_agent_fields(
 }
 
 fn stored_agent_fields(stored: &StoredAgentBusMessage) -> serde_json::Map<String, Value> {
-    agent_fields(
+    let mut fields = agent_fields(
         &stored.snapshot.delivery_mode,
         &stored.snapshot.content,
         stored.snapshot.from_cutex_session_id.as_deref(),
         &stored.snapshot.to_cutex_session_id,
         stored.meta.as_ref(),
-    )
+    );
+    if let Some(diagnostic) = note_delivery_diagnostics(stored) { fields.insert("deliveryDiagnostics".into(), diagnostic); }
+    fields
 }
 
 /// A Management event for one or more session streams: (sessions,
@@ -3396,10 +3638,51 @@ pub use super::input_ledger_bus::{
     tell_refused as input_ledger_tell_refused,
 };
 
+fn note_delivery_diagnostics(stored: &StoredAgentBusMessage) -> Option<Value> {
+    use crate::app_server::external_input::{DeliveryState, ProcessingState};
+    if !passive_note(stored, &stored.snapshot.to_cutex_session_id) { return None; }
+    let s = &stored.snapshot;
+    let progress = stored.meta.as_ref().and_then(|m| m.delivery_progress.as_ref());
+    let observed = s.external_input_last_observed.as_ref();
+    let context = s.state == "delivered" || observed.is_some_and(|o| o.delivery_state == DeliveryState::ContextPersisted || o.processing.state == ProcessingState::OutputObserved);
+    let inbox = s.local_inbox_receipt.is_some() || s.a2_submission_id.is_some() || s.state == "inbox_accepted"
+        || observed.is_some_and(|o| matches!(o.delivery_state, DeliveryState::Pending | DeliveryState::ContextPersisted));
+    let stage = if context { "context" } else if inbox { "inbox" } else { "bus" };
+    let queued_at = stored.queued_at.clone().unwrap_or_else(|| sent_at(stored));
+    let since = if context { progress.and_then(|p| p["contextSince"].as_str()).or_else(|| stored.meta.as_ref().and_then(|m| m.delivered_at.as_deref())) }
+        else if inbox { stored.inbox_accepted_at.as_deref() } else { Some(queued_at.as_str()) };
+    let held = observed.is_some_and(|o| o.processing.state == ProcessingState::Held);
+    let blocked_by = s.error.as_ref().and_then(|e| e.get("blockedByInputId"));
+    let waiting = if s.state == "delivered" { "complete" }
+        else if stored.owner_hold { "ownerResume" }
+        else if s.state == "stale_held" { "staleReview" }
+        else if blocked_by.is_some() { "earlierInput" }
+        else if held { "nativeRelease" }
+        else if context { "contextReceipt" }
+        else if inbox { "nextInputBoundary" }
+        else if s.external_input.is_some() { "nativeReconciliation" }
+        else { progress.and_then(|p| p["waitingFor"].as_str()).unwrap_or("nativeInbox") };
+    let projection = s.error.as_ref().filter(|e| e["code"] == "external_projection_failed");
+    let last_attempt = progress.and_then(|p| p.get("lastAttemptAt")).or_else(|| projection.and_then(|p| p.get("lastAttemptAt")));
+    let last_error = progress.and_then(|p| p.get("lastError")).filter(|e| !e.is_null()).cloned().or_else(||
+        s.error.as_ref().filter(|e| stage == "bus" || !e["code"].as_str().unwrap_or_default().starts_with("external_projection_"))
+            // The bridge's ordinary pending-without-receipt control flow is
+            // explained by waitingFor/nativeReason, not a failed delivery.
+            .filter(|e| !(e["code"] == "external_input_pending" && e["message"].as_str().is_some_and(|m|m.starts_with("native pending: "))))
+            .and_then(|e| e.get("message")).cloned());
+    Some(json!({"stage":stage,"since":since,"sinceEvidence":if stage=="bus" {"durableQueue"} else {"firstRecordedNativeEvidence"},
+        "lastAttemptAt":last_attempt,"lastAttemptKind":progress.and_then(|p|p.get("lastAttemptKind")),"lastError":last_error,
+        "waitingFor":waiting,"blockedByInputId":blocked_by,"binding":s.external_input.as_ref().map(|e|json!({"threadId":e.thread_id,"runtimeGeneration":e.runtime_generation})),
+        "nativeReason":observed.and_then(|o|o.processing.reason.as_ref())}))
+}
+
 fn ledger_facts(stored: &StoredAgentBusMessage) -> super::input_ledger_bus::BusFacts {
     let snapshot = &stored.snapshot;
     super::input_ledger_bus::BusFacts {
         state: snapshot.state.clone(),
+        stale_release_allowed: stale_release_allowed(stored),
+        projection_failure: snapshot.error.as_ref().filter(|e| e["code"] == "external_projection_failed" || e["code"] == "external_projection_blocked").cloned(),
+        delivery_diagnostics: note_delivery_diagnostics(stored),
         timing: super::input_ledger_bus::timing_of(stored.canonical_envelope.as_ref(), &snapshot.message_id, &snapshot.delivery_mode),
         frozen: snapshot.external_input.is_some(),
         a2: snapshot.a2_submission_id.is_some(),
@@ -3504,6 +3787,9 @@ impl AgentBusMessageRepository {
     /// 054 §2.9 `sending`: the bridge is about to submit this message to the
     /// native runtime (after the freeze, before the submit call).
     pub fn input_ledger_sending(&self, owner: &str, message_id: &str) {
+        if let Err(error) = self.record_note_attempt(owner, message_id, None, "nativeAcceptance") {
+            eprintln!("note admission diagnostic {owner}/{message_id}: {error:#}");
+        }
         if !super::input_ledger_bus::active() {
             return;
         }
@@ -3802,6 +4088,7 @@ fn bus_store_rows(store: &AgentBusMessageStore) -> anyhow::Result<super::hot_sto
     for (key, value) in &store.external_recovery_actions {
         rows.insert(("recovery".into(), key.clone()), serde_json::to_vec(value)?);
     }
+    for (key,value) in &store.live_discards { rows.insert(("live-discard".into(),key.clone()),serde_json::to_vec(value)?); }
     for (key, value) in &store.messages {
         rows.insert(("message".into(), key.clone()), serde_json::to_vec(value)?);
     }
@@ -3823,6 +4110,7 @@ fn bus_store_from_rows(source: &super::hot_store::Rows) -> anyhow::Result<AgentB
             "recovery" => {
                 store.external_recovery_actions.insert(key.clone(), serde_json::from_slice(value)?);
             }
+            "live-discard" => {store.live_discards.insert(key.clone(),serde_json::from_slice(value)?);}
             "message" => {
                 store.messages.insert(key.clone(), serde_json::from_slice(value)?);
             }
@@ -3888,6 +4176,7 @@ fn bus_changes(
                     &id,
                     store.messages.get(&id).map(serde_json::to_vec).transpose()?,
                 );
+                put_or_delete(&mut changes,"live-discard",&id,store.live_discards.get(&id).map(serde_json::to_vec).transpose()?);
             }
         }
         DirtyRows::Recovery(ids) => {
@@ -3944,6 +4233,7 @@ fn dirty_rows(store: &AgentBusMessageStore, dirty: &DirtyRows) -> anyhow::Result
     match dirty {
         DirtyRows::Messages(ids) => {
             for id in ids.iter().collect::<std::collections::BTreeSet<_>>() {
+                if let Some(t)=store.live_discards.get(id){rows.insert(("live-discard".into(),(*id).clone()),serde_json::to_vec(t)?);}
                 if let Some(message) = store.messages.get(id) {
                     rows.insert(("message".into(), (*id).clone()), serde_json::to_vec(message)?);
                 }
@@ -4545,6 +4835,9 @@ fn fresh_store<'a>(
                                         entry.store.messages.remove(&key);
                                     }
                                 }
+                                "live-discard" => {
+                                    if let Some(row)=changed.live_discards.remove(&key){entry.store.live_discards.insert(key,row);}else{entry.store.live_discards.remove(&key);}
+                                }
                                 "recovery" => {
                                     if let Some(row) =
                                         changed.external_recovery_actions.remove(&key)
@@ -4623,12 +4916,19 @@ fn empty_store() -> AgentBusMessageStore {
         external_recovery_actions: BTreeMap::new(),
         version: 2,
         messages: BTreeMap::new(),
+        live_discards: BTreeMap::new(),
     }
 }
 
 fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessageStore> {
-    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) {
+    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
+    }
+    for (id,tombstone) in &store.live_discards {
+        anyhow::ensure!(store.version>=10 && id==&tombstone.message_id && !id.is_empty() && id.len()<=512
+            && !tombstone.reason.trim().is_empty() && tombstone.reason.len()<=1024 && tombstone.by=="owner"
+            && tombstone.expires_at.is_none(),"invalid live-only owner discard");
+        if let Some(sha)=&tombstone.semantic_sha256 {validate_semantic_sha256(sha)?;}
     }
     if store.version < 5
         && store
@@ -4649,6 +4949,7 @@ fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessage
         }
         if let Some(settlement) = &m.settlement {
             anyhow::ensure!(store.version >= 8, "message settlement requires Bus state v8");
+            anyhow::ensure!(settlement.owner_request.is_none() || store.version>=10,"owner follow-up requires Bus state v10");
             validate_settlement_record(m, settlement)?;
         }
         if let Some(canonical) = &m.canonical_envelope {
@@ -6771,6 +7072,41 @@ mod tests {
     /// the whole store (47 MB, ~50 ms each on the Linux host); only a real
     /// change does.
     #[test]
+    fn notice_failure_does_not_abort_native_observation_or_change_receipts() {
+        use crate::app_server::external_input as ei;
+        let root = std::env::temp_dir().join(format!("cutex-notice-observation-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let queued = system_queued_message("held source");
+        let owner = queued.owner_cutex_session_id.clone();
+        repository.record_queued_isolated(queued).unwrap();
+        let frozen = repository.freeze_external_input(&owner, "jsc_stable", |message| {
+            let mut envelope = ei::Envelope {
+                version: 1, owner_id: owner.clone(), thread_id: "thread".into(), runtime_generation: 1,
+                message: ei::Message {
+                    id: message.id.clone(), source: ei::Source { kind: ei::SourceKind::Service, id: "cutex-alarm".into() },
+                    event_type: "alarm".into(), delivery: ei::Delivery::Passive, text: message.content.clone(),
+                }, view: None, semantic_sha256: String::new(),
+            };
+            envelope.semantic_sha256 = envelope.digest();
+            Ok(envelope)
+        }).unwrap();
+        let held = ei::Status {
+            message_id: frozen.message.id.clone(), semantic_sha256: frozen.semantic_sha256.clone(),
+            delivery_state: ei::DeliveryState::Unknown, receipt: None,
+            processing: ei::ProcessingStatus { state: ei::ProcessingState::Held, attempt_id: Some("failed-turn".into()), reason: Some(ei::HoldReason::Interrupted) },
+        };
+        crate::agent_bus::runtime_gate_notice::with_notice_failure(|| {
+            repository.observe_external_input("jsc_stable", &frozen, &held).unwrap();
+        });
+        let snapshot = repository.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(snapshot.external_input_last_observed, Some(held));
+        assert_eq!(snapshot.state, "pending");
+        assert!(snapshot.a4_receipt.is_none() && snapshot.external_input_receipt.is_none());
+        drop(repository);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn repeated_freeze_and_same_observation_do_not_serialize_the_store() {
         use crate::app_server::external_input as ei;
         let root = std::env::temp_dir().join(format!("cutex-sweep-serialize-{}", uuid::Uuid::new_v4()));
@@ -7520,7 +7856,8 @@ mod owner_discard_tests {
             agent_bus_stuck::discard(&repository, &bus, &request("ghost", false), Utc::now(), &audit)
                 .unwrap()
                 .unwrap();
-        assert_eq!(ghost["durable"], Value::Null);
+        assert_eq!(ghost["durable"]["liveOnly"], true);
+        assert!(repository.live_discarded("ghost").unwrap());
         assert_eq!(ghost["changed"], true);
         let refused = agent_bus_stuck::discard(
             &repository,

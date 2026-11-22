@@ -99,14 +99,19 @@ async def test_failed_reconnect_rejects_unexecuted_controls_without_success_rece
 
 async def test_child_callbacks_need_registration_and_share_host_bridge(ph):
     tid, turn, bridge = await begin(ph)
+    from cute_claude.tools import ToolResult
+    async def listed(args, context):
+        assert context.native_subagent_id == 'child-1'
+        return ToolResult('persistent fixture list')
+    ph.tools.register('agent_list', 'fixture read-only list', {'type':'object'}, listed, read_only=True)
     data = {'session_id': bridge.sid, 'agent_id': 'child-1',
-            'tool_name': 'mcp__cutex__read_file', 'tool_input': {'arguments': {'path': 'hello.txt'}}}
+            'tool_name': 'mcp__cutex__agent_list', 'tool_input': {'arguments': {}}}
     denied = await bridge.pre_tool(data, 'child-read', {})
     assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
     await bridge.subagent_start({'session_id': bridge.sid, 'agent_id': 'child-1'}, None, {})
     permit = await bridge.pre_tool(data, 'child-read', {})
     args = permit['hookSpecificOutput']['updatedInput']
-    result = await bridge.execute('read_file', args)
+    result = await bridge.execute('agent_list', args)
     assert not result['is_error'] and 'persistent fixture' in result['content'][0]['text']
     row = ph.store.db.execute('SELECT turn_id FROM tool_calls WHERE call_id=?', ('child-read',)).fetchone()
     assert row[0] == turn
@@ -189,8 +194,9 @@ async def test_task_lifecycle_uses_origin_turn_and_handles_updated_killed(ph):
     snapshot = await ph.engine.runtime_control(tid, 'task_list')
     assert snapshot['tasks'][0]['status'] == 'killed' and not snapshot['completeInventory']
     assert 'secret' not in str(snapshot)
-    with pytest.raises(ProviderError, match='known running'):
-        await ph.engine.runtime_control(tid, 'task_stop', task_id='task-a')
+    receipt = await ph.engine.runtime_control(tid, 'task_stop', task_id='task-a')
+    assert receipt['outcome'] == 'refused' and receipt['reason'] == 'taskNotRunning'
+    assert receipt['stopRequested'] is False and receipt['terminalConfirmed'] is False
 
 
 async def test_resumed_child_retains_identity_with_new_origin_turn(ph):

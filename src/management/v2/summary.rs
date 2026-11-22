@@ -64,6 +64,11 @@ pub struct LastTurn {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProjection {
+    // r290 P6: trusted native goal observation; missing means unknown.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub board_goal:Option<BoardGoal>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub board_plan:Option<BoardPlan>,
     #[serde(default)]
     pub last_turn: Option<LastTurn>,
     #[serde(default)]
@@ -74,6 +79,31 @@ pub struct AgentProjection {
     /// ended at or before it are not unread, whenever they are consumed.
     #[serde(default)]
     pub read_at: Option<String>,
+}
+
+// r290 P6
+#[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
+#[serde(rename_all="camelCase")]
+pub struct BoardGoal {
+    pub thread_id:String,
+    pub runtime_generation:u64,
+    pub goal:Option<Value>,
+    pub updated_at:String,
+}
+
+#[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
+#[serde(rename_all="camelCase")]
+pub struct BoardPlan {
+    pub thread_id:String,
+    pub runtime_generation:u64,
+    pub turn_id:Option<String>,
+    pub progress:Value,
+    pub updated_at:String,
+}
+
+pub(super) fn board_projections()->anyhow::Result<Option<HashMap<String,AgentProjection>>> {
+    let Some(hub)=hub() else {return Ok(None);};
+    Ok(Some(hub.lock().load_projections()?))
 }
 
 fn timestamp(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -133,6 +163,42 @@ pub fn reduce(
         }
         let method = native.message["method"].as_str().unwrap_or_default();
         let params = &native.message["params"];
+        // r290 P6: a confirmed history change invalidates the display cache.
+        if matches!(method,"thread/reverted"|"thread/rolledBack") && event.source==super::model::EventSource::AppServer {
+            if let Some(projection)=projections.get_mut(&id) {
+                if projection.board_plan.as_ref().is_some_and(|plan|params["threadId"]==plan.thread_id
+                    && event.correlation.runtime_generation.is_none_or(|g|g>=plan.runtime_generation)) {projection.board_plan=None;}
+            }
+            return None;
+        }
+        // r290 P6: persist only compact counts/current step, not an entire plan timeline.
+        if method=="turn/plan/updated" && event.source==super::model::EventSource::AppServer {
+            if let (Some(thread),Some(generation))=(params["threadId"].as_str(),event.correlation.runtime_generation) {
+                if event.correlation.thread_id.as_deref().is_some_and(|id|id!=thread){return None;}
+                if projections.get(&id).and_then(|p|p.board_plan.as_ref()).is_some_and(|p|p.runtime_generation>generation){return None;}
+                let mut plan=params.clone();plan["updatedAt"]=json!(event.received_at);
+                if let Some(progress)=crate::asks::board_progress::plan_progress(&plan) {
+                    projections.entry(id).or_default().board_plan=Some(BoardPlan {thread_id:thread.into(),runtime_generation:generation,
+                        turn_id:params["turnId"].as_str().map(str::to_string),progress,updated_at:event.received_at.clone()});
+                }
+            }
+            return None;
+        }
+        // r290 P6: cache only bound, trusted native goal notifications.
+        if matches!(method,"thread/goal/updated"|"thread/goal/cleared") {
+            if event.source!=super::model::EventSource::AppServer {return None;}
+            if let (Some(thread),Some(generation))=(params["threadId"].as_str(),event.correlation.runtime_generation) {
+                if event.correlation.thread_id.as_deref().is_some_and(|id|id!=thread) {return None;}
+                if projections.get(&id).and_then(|p|p.board_goal.as_ref()).is_some_and(|p|p.runtime_generation>generation){return None;}
+                let goal=if method=="thread/goal/cleared" {None} else {
+                    let objective=params.pointer("/goal/objective").and_then(Value::as_str)?;
+                    Some(json!({"objective":objective.chars().take(1000).collect::<String>(),"status":params.pointer("/goal/status").and_then(Value::as_str).map(|s|s.chars().take(64).collect::<String>())}))
+                };
+                projections.entry(id.clone()).or_default().board_goal=Some(BoardGoal {thread_id:thread.into(),runtime_generation:generation,goal:goal.clone(),updated_at:event.received_at.clone()});
+                return None; // Existing native host feed remains the refresh hint.
+            }
+            return None;
+        }
         match method {
             "item/completed" if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") => {
                 if let Some(text) = params.pointer("/item/text").and_then(Value::as_str) {
@@ -176,6 +242,11 @@ pub fn reduce(
             _ => None,
         }
     } else if let Some(cutex) = &event.cutex {
+        // r290 P6: use the bounded current-rollout fallback after a revert.
+        if cutex.method==super::history_revert::EVENT {
+            if let Some(projection)=projections.get_mut(&id){projection.board_plan=None;}
+            return None;
+        }
         if cutex.method == crate::owner_notify::CREATED_EVENT {
             return message_to_owner(&id, &cutex.params["notification"]);
         }

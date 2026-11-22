@@ -986,6 +986,7 @@ fn stale_public_evidence_view_carries_proof_and_legacy_omits_it() {
     assert!(serde_json::from_value::<SettlementView>(legacy_json)
         .unwrap()
         .evidence
+        .as_ref().unwrap()
         .stale_ack
         .is_none());
 
@@ -1015,14 +1016,14 @@ fn stale_public_evidence_view_carries_proof_and_legacy_omits_it() {
         .settlement_view_by_id("stale-view", evidence.observed_at)
         .unwrap()
         .unwrap();
-    assert_eq!(view.evidence.stale_ack, evidence.stale_ack);
+    assert_eq!(view.evidence.as_ref().unwrap().stale_ack, evidence.stale_ack);
     let request = f.request("stale-view", "view-close");
     let closed = f
         .repo
         .close_settlement(&request, "owner", &evidence, evidence.observed_at)
         .unwrap()
         .unwrap();
-    assert_eq!(closed.settlement.evidence.stale_ack, evidence.stale_ack);
+    assert_eq!(closed.settlement.evidence.as_ref().unwrap().stale_ack, evidence.stale_ack);
 }
 
 #[test]

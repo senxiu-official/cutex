@@ -533,6 +533,33 @@ fn constraints_expand(old: &RuleConstraints, new: &RuleConstraints) -> bool {
     profiles_expand || workflow_expand
 }
 
+/// r290 P10 (B8): `draft` re-enables the paused `old` rule with exactly its
+/// stored content (subject, project, kinds, constraints, high-risk kinds,
+/// expiry mode and turn binding; the hour/today deadline is the stored one
+/// and must still lie ahead). An expired rule is never "unchanged".
+fn unchanged_resume(old: &ApprovalRule, draft: &ApprovalRuleDraft, now: DateTime<Utc>) -> bool {
+    let deadline_ahead = match old.expiry.mode {
+        ExpiryMode::Hour | ExpiryMode::Today => old
+            .expiry
+            .expires_at
+            .as_deref()
+            .and_then(crate::approvals::timestamp)
+            .is_some_and(|at| at > now),
+        ExpiryMode::Turn | ExpiryMode::Revoked => old.expiry.expires_at.is_none(),
+    };
+    !old.enabled
+        && !old.expired
+        && draft.enabled
+        && deadline_ahead
+        && draft.subject == old.subject
+        && draft.project_id == old.project_id
+        && draft.kinds == old.kinds
+        && draft.constraints == old.constraints
+        && draft.high_risk_kinds_explicit == old.high_risk_kinds_explicit
+        && draft.expiry.mode == old.expiry.mode
+        && draft.expiry.turn == old.expiry.turn
+}
+
 fn expiry_expands(old: &RuleExpiry, new: &RuleExpiry) -> bool {
     match (old.mode, new.mode) {
         (ExpiryMode::Revoked, _) => false,
@@ -890,6 +917,35 @@ impl ApprovalStore {
         token: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(u64, ApprovalRule), RuleError> {
+        self.replace_rule_with(id, expected_revision, draft, token, now, false)
+    }
+
+    /// r290 P10 (B8): the owner's resume gesture (`ownerResume: true` on the
+    /// root-only PATCH). Re-enabling a paused rule whose content is exactly
+    /// the stored one needs no typed token (it was typed when the rule was
+    /// created or widened). Anything else (a changed or widened rule, an
+    /// expired or already-past deadline, a different turn) is the ordinary
+    /// replace and still needs the typed confirmation.
+    pub fn replace_rule_owner_resume(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        draft: ApprovalRuleDraft,
+        token: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(u64, ApprovalRule), RuleError> {
+        self.replace_rule_with(id, expected_revision, draft, token, now, true)
+    }
+
+    fn replace_rule_with(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        draft: ApprovalRuleDraft,
+        token: Option<&str>,
+        now: DateTime<Utc>,
+        owner_resume: bool,
+    ) -> Result<(u64, ApprovalRule), RuleError> {
         if id.starts_with("aar-role-director-") {
             return self.replace_director_rule(id, expected_revision, draft, now);
         }
@@ -920,8 +976,14 @@ impl ApprovalStore {
                 draft.expiry.expires_at = old.expiry.expires_at.clone();
             }
             let expands = authority_expands || expiry_expands(&old.expiry, &draft.expiry);
-            if expands && !draft.high_risk_kinds_explicit.is_empty() {
+            // r290 P10 (B8): an unchanged resume by the owner skips the token.
+            let resumed_unchanged = owner_resume && unchanged_resume(&old, &draft, now);
+            if expands && !draft.high_risk_kinds_explicit.is_empty() && !resumed_unchanged {
                 consume_confirmation(store, token, &draft, now)?;
+            }
+            if resumed_unchanged {
+                // Resume keeps the stored deadline: a resume never extends it.
+                draft.expiry.expires_at = old.expiry.expires_at.clone();
             }
             store.rules_revision += 1;
             let rule = ApprovalRule {
@@ -950,6 +1012,10 @@ impl ApprovalStore {
             );
             row.rule_id = Some(rule.rule_id.clone());
             row.rule_revision = Some(rule.revision);
+            if resumed_unchanged {
+                // r290 P10 (B8): audit shows the token-free owner resume.
+                row.details = json!({ "ownerResume": true });
+            }
             append_audit(store, row);
             Ok((store.rules_revision, rule))
         })
@@ -1484,6 +1550,69 @@ mod tests {
                 Some(&token),
                 now
             ),
+            Err(RuleError::ConfirmationRequired(_))
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // r290 P10 (B8) ------------------------------------------------------
+    #[test]
+    fn owner_resume_of_an_unchanged_paused_high_rule_needs_no_typed_token() {
+        let dir = std::env::temp_dir().join(format!("approval-rules-{}", uuid::Uuid::new_v4()));
+        let store = ApprovalStore::at(dir.join("approvals.json"));
+        let now = Utc::now();
+        let high = draft(ApprovalKind::ManagedService, ExpiryMode::Revoked);
+        assert!(!high.high_risk_kinds_explicit.is_empty());
+        let (token, _) = store.confirm_rule(high.clone(), &confirmation_phrase(&high), now).unwrap();
+        let (revision, rule) = store.create_rule(0, high.clone(), Some(&token), now).unwrap();
+        let paused = ApprovalRuleDraft { enabled: false, ..high.clone() };
+        let (revision, _) = store.replace_rule(&rule.rule_id, revision, paused.clone(), None, now).unwrap();
+        // The plain PATCH still needs the typed token.
+        assert!(matches!(
+            store.replace_rule(&rule.rule_id, revision, high.clone(), None, now),
+            Err(RuleError::ConfirmationRequired(_))
+        ));
+        // A changed rule with the owner gesture still needs it.
+        let mut wider = high.clone();
+        wider.project_id = None;
+        assert!(matches!(
+            store.replace_rule_owner_resume(&rule.rule_id, revision, wider, None, now),
+            Err(RuleError::ConfirmationRequired(_))
+        ));
+        let mut more_kinds = high.clone();
+        more_kinds.kinds.insert(ApprovalKind::ServiceLifetime);
+        assert!(matches!(
+            store.replace_rule_owner_resume(&rule.rule_id, revision, more_kinds, None, now),
+            Err(RuleError::ConfirmationRequired(_))
+        ));
+        // Unchanged + owner gesture: resumed without a token, audited.
+        let (revision, resumed) = store.replace_rule_owner_resume(&rule.rule_id, revision, high.clone(), None, now).unwrap();
+        assert!(resumed.enabled);
+        let audit = store.rule_audit(0, 10).unwrap().0;
+        assert!(audit.iter().any(|row| row.details["ownerResume"] == true && row.rule_id.as_deref() == Some(rule.rule_id.as_str())));
+        // Creating a new high rule never takes the gesture path.
+        assert!(matches!(store.create_rule(revision, high, None, now), Err(RuleError::ConfirmationRequired(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owner_resume_keeps_the_deadline_and_refuses_a_lapsed_one() {
+        let dir = std::env::temp_dir().join(format!("approval-rules-{}", uuid::Uuid::new_v4()));
+        let store = ApprovalStore::at(dir.join("approvals.json"));
+        let now = Utc::now();
+        let high = draft(ApprovalKind::ManagedService, ExpiryMode::Hour);
+        let (token, _) = store.confirm_rule(high.clone(), &confirmation_phrase(&high), now).unwrap();
+        let (revision, rule) = store.create_rule(0, high.clone(), Some(&token), now).unwrap();
+        let deadline = rule.expiry.expires_at.clone().expect("hour rule has a deadline");
+        let paused = ApprovalRuleDraft { enabled: false, ..high.clone() };
+        let (revision, _) = store.replace_rule(&rule.rule_id, revision, paused.clone(), None, now).unwrap();
+        let later = now + Duration::minutes(10);
+        let (revision, resumed) = store.replace_rule_owner_resume(&rule.rule_id, revision, high.clone(), None, later).unwrap();
+        assert_eq!(resumed.expiry.expires_at.as_deref(), Some(deadline.as_str()), "a resume never extends the deadline");
+        let (revision, _) = store.replace_rule(&rule.rule_id, revision, paused, None, later).unwrap();
+        let lapsed = now + Duration::hours(2);
+        assert!(matches!(
+            store.replace_rule_owner_resume(&rule.rule_id, revision, high, None, lapsed),
             Err(RuleError::ConfirmationRequired(_))
         ));
         let _ = std::fs::remove_dir_all(dir);

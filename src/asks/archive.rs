@@ -431,7 +431,11 @@ fn schema(db: &Connection) -> anyhow::Result<()> {
         PRIMARY KEY(collection,row_key)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS asks_archive_group ON asks_archive_rows(ask_group);
         CREATE INDEX IF NOT EXISTS asks_archive_identity ON asks_archive_rows(row_key);
-        CREATE INDEX IF NOT EXISTS asks_archive_action ON asks_archive_rows(json_extract(CAST(value_json AS TEXT),'$.actionId')) WHERE collection='asks';")?;
+        CREATE INDEX IF NOT EXISTS asks_archive_action ON asks_archive_rows(json_extract(CAST(value_json AS TEXT),'$.actionId')) WHERE collection='asks';
+        -- r290 P6
+        CREATE INDEX IF NOT EXISTS asks_archive_board_closed_time ON asks_archive_rows
+        ((CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END),json_extract(CAST(value_json AS TEXT),'$.projectId'),row_key,json_extract(CAST(value_json AS TEXT),'$.closedAt'))
+        WHERE collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL;")?;
     Ok(())
 }
 
@@ -1181,3 +1185,35 @@ pub fn promote_many(path: &Path, expected: u64, identities: &[&str]) -> anyhow::
 
 #[cfg(test)]
 mod tests;
+
+// r290 P6: read scalar counts in one hot+cold SQLite snapshot. Never decode history.
+pub fn board_closed_counts(path:&Path,start:DateTime<Utc>,end:DateTime<Utc>)->anyhow::Result<Option<BTreeMap<String,u64>>> {
+    use crate::management::v2::hot_store;
+    hot_store::verified_snapshot(path,"asks",|db,_| {
+        let cold:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asks_archive_rows')",[],|r|r.get(0))?;
+        let indexed:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='asks_board_closed_time')",[],|r|r.get(0))?;
+        anyhow::ensure!(indexed,"board hot date index is unavailable until the next store writer initializes it");
+        if cold {
+            let schema:i64=db.query_row("SELECT schema_version FROM asks_archive_meta WHERE singleton=1",[],|r|r.get(0))?;
+            anyhow::ensure!(schema==ARCHIVE_SCHEMA,"unsupported board archive format");
+            let indexed:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='asks_archive_board_closed_time')",[],|r|r.get(0))?;
+            anyhow::ensure!(indexed,"board cold date index is unavailable until the next store writer initializes it");
+        }
+        let hot="SELECT row_key,json_extract(CAST(value_json AS TEXT),'$.projectId') AS project,json_extract(CAST(value_json AS TEXT),'$.closedAt') AS closed_at FROM hot_store_rows INDEXED BY asks_board_closed_time WHERE store='asks' AND collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)>=julianday(?1)-1.0/86400000.0 AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)<=julianday(?2)+1.0/86400000.0";
+        let mut query=hot.to_string();
+        if cold {query.push_str(" UNION ALL SELECT row_key,json_extract(CAST(value_json AS TEXT),'$.projectId') AS project,json_extract(CAST(value_json AS TEXT),'$.closedAt') AS closed_at FROM asks_archive_rows AS cold INDEXED BY asks_archive_board_closed_time WHERE collection='asks' AND json_valid(CAST(value_json AS TEXT)) AND json_extract(CAST(value_json AS TEXT),'$.closed') IS NOT NULL AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)>=julianday(?1)-1.0/86400000.0 AND (CASE WHEN json_extract(CAST(value_json AS TEXT),'$.closedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.closedAt')) ELSE NULL END)<=julianday(?2)+1.0/86400000.0 AND NOT EXISTS (SELECT 1 FROM hot_store_rows AS hot WHERE hot.store='asks' AND hot.collection='asks' AND hot.row_key=cold.row_key)");}
+        let sql=format!("SELECT project,closed_at FROM ({query}) WHERE project IS NOT NULL");
+        let mut stmt=db.prepare(&sql)?;
+        let candidates=stmt.query_map(params![start.to_rfc3339(),end.to_rfc3339()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
+        let mut counts=BTreeMap::new();
+        // SQLite date arithmetic rounds sub-millisecond instants. Use the
+        // covering index as a conservative prefilter, then exact UTC bounds.
+        for row in candidates {
+            let (id,at)=row?;
+            if super::parse_time(&at).is_some_and(|at|at>=start && at<end) {
+                *counts.entry(id).or_insert(0)+=1;
+            }
+        }
+        Ok(counts)
+    })
+}

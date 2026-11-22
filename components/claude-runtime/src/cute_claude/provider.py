@@ -20,6 +20,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class TransportFailure(ProviderError):
+    transport_failure = True
+
+
 @dataclass
 class Completion:
     content: list[dict]

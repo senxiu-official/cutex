@@ -1,9 +1,11 @@
 //! Owner-only, explicit, per-version runtime deletion. GET is advisory; POST rechecks under fences.
 use super::runtime_prune_inventory::{self as inventory, Version};
-use crate::http::server::{SimpleHttpRequest, write_json_response};
-use anyhow::{Context, ensure};
+#[path = "runtime_prune_plan.rs"]
+mod plan;
+use crate::http::server::{write_json_response, SimpleHttpRequest};
+use anyhow::{ensure, Context};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +52,7 @@ fn prepare(version: &Version) -> Result<Staged, Value> {
     let mut moved = Vec::<(PathBuf, PathBuf)>::new();
     let result = (|| -> anyhow::Result<()> {
         for target in &version.targets {
-            inventory::target_bytes(target)?; // re-check root ownership immediately before rename
+            inventory::checked_root(target)?; // root identity only, never a recursive walk under a writer fence
             let parent = target.parent().context("runtime target parent missing")?;
             let quarantine = parent.join(format!(".runtime-prune-{}", uuid::Uuid::new_v4()));
             std::fs::rename(target, &quarantine)?;
@@ -151,6 +153,22 @@ fn delete(version: &Version) -> Value {
         .unwrap_or_else(|value| value)
 }
 
+fn inspect_snapshot<T>(
+    path: &Path,
+    inspect: impl FnOnce(&crate::session::store::RuntimeReferenceSnapshot) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let snapshot = crate::session::store::runtime_references_at(path)?;
+    let result = inspect(&snapshot)?;
+    crate::session::store::with_session_store_lock(path, || {
+        ensure!(
+            crate::session::store::runtime_references_at(path)? == snapshot,
+            "session references changed during inspection; retry"
+        );
+        Ok(())
+    })?;
+    Ok(result)
+}
+
 pub fn execute(ids: &[String]) -> anyhow::Result<Value> {
     ensure!(
         !ids.is_empty() && ids.len() <= 100,
@@ -177,30 +195,28 @@ pub fn execute(ids: &[String]) -> anyhow::Result<Value> {
         .transpose()?;
     let _references = crate::runtime::reference_guard::exclusive()?;
     let path = crate::session::store::cutex_sessions_path()?;
-    let slots = crate::session::store::with_locked_session_store(&path, |store| {
-        // One fresh authority snapshot under all writer fences. No GET estimate is trusted.
-        let current = inventory::inspect(&home, layout.as_ref(), store)?;
-        let mut slots = Vec::new();
-        for id in ids {
-            let slot = match current.versions.iter().find(|version| version.id == *id) {
-                None => {
-                    Err(json!({"id":id,"status":"refused","freedBytes":0,"reason":"not_found"}))
-                }
-                Some(version) if !version.can_prune => {
-                    Err(json!({"id":id,"status":"refused","freedBytes":0,
-                    "reason":version.blocked_reasons.first().map(String::as_str).unwrap_or("inspection_failed")}))
-                }
-                Some(version) => prepare(version),
-            };
-            slots.push(slot);
-        }
-        let context = current
-            .versions
-            .iter()
-            .flat_map(|v| v.targets.iter().cloned())
-            .collect::<Vec<_>>();
-        Ok(process_recheck(slots, &context))
+    // Snapshot under the store's normal read lock, then do all filesystem/process
+    // work outside the writer lock. Component/reference fences still exclude pins.
+    let current = inspect_snapshot(&path, |snapshot| {
+        inventory::inspect_reference_snapshot(&home, layout.as_ref(), snapshot, None)
     })?;
+    let mut slots = Vec::new();
+    for id in ids {
+        let slot = match current.versions.iter().find(|version| version.id == *id) {
+            None => Err(json!({"id":id,"status":"refused","freedBytes":0,"reason":"not_found"})),
+            Some(version) if !version.can_prune => Err(
+                json!({"id":id,"status":"refused","freedBytes":0,"reason":version.blocked_reasons.first().map(String::as_str).unwrap_or("inspection_failed")}),
+            ),
+            Some(version) => prepare(version),
+        };
+        slots.push(slot);
+    }
+    let context = current
+        .versions
+        .iter()
+        .flat_map(|v| v.targets.iter().cloned())
+        .collect::<Vec<_>>();
+    let slots = process_recheck(slots, &context);
     // Unlink outside the session writer lock. The reference + component fences still exclude new
     // references, while unrelated session persistence can proceed during a large directory removal.
     let results = slots
@@ -215,12 +231,24 @@ pub fn execute(ids: &[String]) -> anyhow::Result<Value> {
 }
 
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+    let trace = std::sync::Arc::new(inventory::timing::Trace::default());
+    let _timing_scope = inventory::timing::Scope::enter(trace.clone());
+    let mut timing = (request.method == "GET").then_some(trace);
     let result = match request.method.as_str() {
         "GET" => (|| {
             let home = crate::config::paths::runtime_dir()?;
+            let snapshot_stage = inventory::timing::stage("session_snapshot");
             let store = crate::session::store::load_cutex_session_store()?;
-            let list = inventory::inspect(&home, layout().as_ref(), &store)?;
-            Ok(json!({"versions":list.versions}))
+            drop(snapshot_stage);
+            let layout = layout();
+            let key = home.clone();
+            let job = plan::start(key, move |cancel| {
+                let _budget = inventory::budget::Scope::enter(plan::DEADLINE, cancel);
+                let list = inventory::inspect(&home, layout.as_ref(), &store)?;
+                Ok(json!({"versions":list.versions}))
+            })?;
+            timing = Some(job.trace.clone());
+            plan::wait(stream, &job, plan::DEADLINE)
         })(),
         "POST" => (|| {
             let body: Request = serde_json::from_slice(&request.body)?;
@@ -238,15 +266,25 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
             );
         }
     };
+    let _diagnostics =
+        timing.map(|trace| super::error_log::operation_scope("runtimePrune", trace.snapshot()));
     match result {
         Ok(body) => write_json_response(stream, 200, "OK", &body),
         Err(_) => super::server::write_v2_error(
             stream,
-            409,
-            "Conflict",
-            "runtime_prune_refused",
+            if request.method == "GET" { 503 } else { 409 },
+            if request.method == "GET" {
+                "Service Unavailable"
+            } else {
+                "Conflict"
+            },
+            if request.method == "GET" {
+                "runtime_prune_unavailable"
+            } else {
+                "runtime_prune_refused"
+            },
             "runtime cleanup could not establish current authority; refresh and retry",
-            false,
+            request.method == "GET",
             json!({}),
         ),
     }

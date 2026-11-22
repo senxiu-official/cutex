@@ -33,6 +33,54 @@ const SETTLE: Duration = Duration::from_secs(90);
 const STRICT: AssertOptions = AssertOptions { require_settled_at_end: true };
 const LOOSE: AssertOptions = AssertOptions { require_settled_at_end: false };
 
+fn interrupt_many_roundtrip(kind:Kind,draft:bool,supported:bool) {
+    let script=Script {pending_steer:true,owner_input_batch:supported,..auto(500)};
+    let w=World::start(&name(&format!("interrupt-many-{draft}-{supported}"),kind),WorldSpec::new(&[kind]).script(0,script));
+    let turn=w.fake(0).begin_turn();w.daemon.wait_active_turn(w.sid(0),true,T);
+    let ids=["many-a","many-b","many-c"];
+    for id in ids {w.submit(0,id,"auto",json!({})).unwrap();}
+    assert!(w.wait(T,|t|ids.iter().all(|id|t.latest(id).is_some_and(|r|r["state"]=="accepted"))));
+    let mut revs=serde_json::Map::new();for id in ids {revs.insert(id.into(),w.input_record(0,id)["rev"].clone());}
+    let delivery=w.daemon.cutex(w.sid(0),"cutex/input/list",json!({})).unwrap()["delivery"].clone();
+    let selection=json!({"inputIds":ids,"expectedRevs":revs,"expectedTurnId":turn,
+        "expectedRuntimeGeneration":delivery["runtimeGeneration"]});
+    let result=if draft {w.submit(0,"many-draft","interrupt",json!({"interruptSend":selection}))}
+        else {w.daemon.cutex(w.sid(0),"cutex/input/interruptSend",selection.clone())};
+    if !supported {
+        let error=result.unwrap_err();assert_eq!(error["body"]["error"]["code"],"interrupt_send_many_unsupported","{error}");
+        assert!(w.fake(0).calls_of("turn/interrupt").is_empty());assert!(w.fake(0).calls_of("turn/start").is_empty());
+        w.finish(LOOSE);return;
+    }
+    let result=result.unwrap();
+    assert_eq!(w.fake(0).calls_of("turn/interrupt").len(),1);
+    let starts=w.fake(0).calls_of("turn/start");assert_eq!(starts.len(),1);
+    let prefix=starts[0].params["ownerInputs"].as_array().unwrap();
+    let expected_prefix=if draft {ids.to_vec()} else {ids[..2].to_vec()};
+    assert_eq!(prefix.iter().map(|v|v["clientUserMessageId"].as_str().unwrap()).collect::<Vec<_>>(),expected_prefix);
+    assert_eq!(starts[0].params["clientUserMessageId"],if draft {"many-draft"} else {"many-c"});
+    for id in ids {assert_eq!(w.input_record(0,id)["state"],"inContext");}
+    let new_turn=w.fake(0).turns().into_iter().find(|t|t["id"]!=turn).unwrap();
+    let actual=new_turn["items"].as_array().unwrap().iter().filter(|i|i["type"]=="userMessage")
+        .map(|i|i["clientId"].as_str().unwrap()).collect::<Vec<_>>();
+    let mut expected=ids.to_vec();if draft {expected.push("many-draft");}
+    assert_eq!(actual,expected);
+    if !draft {
+        let again=w.daemon.cutex(w.sid(0),"cutex/input/interruptSend",selection).unwrap();
+        assert_eq!(again["submitted"],result["submitted"]);
+        assert_eq!(w.fake(0).calls_of("turn/interrupt").len(),1);assert_eq!(w.fake(0).calls_of("turn/start").len(),1);
+    }
+    w.finish(STRICT);
+}
+
+#[test] fn interrupt_many_three_unread_codex(){interrupt_many_roundtrip(Kind::Codex,false,true);}
+#[test] fn interrupt_many_three_unread_claude(){interrupt_many_roundtrip(Kind::Claude,false,true);}
+#[test] fn interrupt_many_three_plus_draft_codex(){interrupt_many_roundtrip(Kind::Codex,true,true);}
+#[test] fn interrupt_many_three_plus_draft_claude(){interrupt_many_roundtrip(Kind::Claude,true,true);}
+#[test] fn interrupt_many_old_pin_codex(){interrupt_many_roundtrip(Kind::Codex,false,false);}
+#[test] fn interrupt_many_old_pin_claude(){interrupt_many_roundtrip(Kind::Claude,false,false);}
+#[test] fn interrupt_many_old_pin_draft_codex(){interrupt_many_roundtrip(Kind::Codex,true,false);}
+#[test] fn interrupt_many_old_pin_draft_claude(){interrupt_many_roundtrip(Kind::Claude,true,false);}
+
 /// Production HTTP promotion + runtime reconnect + Bus + real cutex-mcp child.
 /// The app-server endpoint is the existing fake Codex fixture, not a model call.
 #[test]
@@ -1147,6 +1195,102 @@ one!(s10_claude_task_notice_during_a_slow_pass, s10_ctask_pass, Kind::Claude, gr
 
 // S11 ★ busy, passive note: pendingNotes → next turn accepted/inContext on the
 // timeline; appears once (RC2).
+fn pre_turn_durable_only_note(kind: Kind, trigger: &str) {
+    pre_turn_note_case(kind,trigger,"good");
+}
+fn pre_turn_note_case(kind:Kind, trigger:&str, mode:&str) {
+    use cutex::management::v2::agent_bus_state::{AgentBusMessageRepository,AgentBusQueuedMessage};
+    let w=World::start(&name(&format!("pre-turn-durable-only-{trigger}-{mode}"),kind),WorldSpec::new(&[kind,Kind::Codex]).bus()
+        .persistent(0).persistent(1).script(1,auto(300))
+        .script(0,Script {native_structured_notes:mode!="old",claude_native_ingress:mode!="old",..auto(300)}));
+    let repository=AgentBusMessageRepository::open(w.daemon.home.config_dir.join("runtime/management-v2")).unwrap();
+    let id=format!("durable-note-{}",uuid::Uuid::new_v4());
+    let sender=w.sid(1).to_string();let target=w.sid(0).to_string();
+    let message=serde_json::from_value(json!({"id":id,"kind":"message","from":if mode=="bad" {"AgentManagementSystem"} else {sender.as_str()},"to":w.agents[0].runtime_agent_id,
+        "controlType":if mode=="bad" {Some("cutex.agent_management.notice.v1")} else {None},
+        "fromCutexSessionId":sender,"toCutexSessionId":target,"content":"DURABLE-ONLY NOTE @literal-path",
+        "deliveryMode":"passive","triggerTurn":false,"createdAtEpochSecs":1,"senderKind":"agent"})).unwrap();
+    // Source-only write: deliberately no Agent Bus live queue entry. The
+    // observer cannot win this race by polling. The controller must find it.
+    repository.record_queued(AgentBusQueuedMessage {owner_cutex_session_id:sender.clone(),message_id:id.clone(),
+        from_cutex_session_id:Some(sender),to_cutex_session_id:target,from_runtime_agent_id:None,
+        to_runtime_agent_id:Some(w.agents[0].runtime_agent_id.clone()),delivery_mode:"passive".into(),
+        content:"DURABLE-ONLY NOTE @literal-path".into(),queued_at:chrono::Utc::now(),canonical_envelope:message,
+        semantic_sha256:"a".repeat(64)}).unwrap();
+    assert!(w.fake(0).inbox().is_empty());
+    assert!(w.fake(0).turns().is_empty(),"a durable passive note opens no turn");
+    let mut owner_reply=None;
+    match trigger {
+        "owner" => {owner_reply=Some(w.submit(0,"pre-turn-owner","auto",json!({})).expect("owner start must not be gated by passive notes"));}
+        "result" => {let _=agent_delegate(&w,0,1,"pre-turn result carrier");}
+        "wake" => {assert!(w.bus_send(1,0,"pre-turn wake carrier",&[]).status.success());}
+        "system" => {
+            let fake=w.fake(0);let task="s11ab1a2b3c4d5e6f7";
+            fake.emit("claude/task/updated",json!({"threadId":fake.thread,"task":{"background":true,"description":"pre-turn",
+                "status":"completed","taskId":task,"taskType":"local_agent","toolUseId":"toolu_pre_turn","turnId":null,
+                "notifyParent":{"description":"pre-turn","noticeId":task,"originTurnId":"pre-turn-origin","status":"completed",
+                    "summary":"pre-turn system carrier","summaryTruncated":false,"taskId":task,"taskType":"local_agent",
+                    "toolUseId":"toolu_pre_turn","transcript":format!("claude:fixture:task:{task}")}}}));
+        }
+        _=>panic!("unknown trigger"),
+    }
+    let until=Instant::now()+T;
+    loop {
+        let turns=w.fake(0).turns();
+        if let Some(turn)=turns.first() {
+            let has_note=turn["items"].as_array().unwrap().iter().any(|i|i["id"]==id);
+            assert_eq!(has_note,mode=="good","first turn passive-note outcome: {turn}");
+            break;
+        }
+        assert!(Instant::now()<until,"first turn never started");std::thread::sleep(Duration::from_millis(10));
+    }
+    if mode=="good" {
+        if trigger=="owner" {w.wait_settled(&[&id,"pre-turn-owner"],SETTLE);} else {w.wait_settled(&[&id],SETTLE);}
+    } else {
+        let expected=if mode=="old" {"runtimeCapabilityOrBinding"} else {"projection"};
+        let source=w.input_record(0,&id);
+        assert_eq!(source["details"]["deliveryDiagnostics"]["waitingFor"],expected,"{source}");
+        assert!(w.fake(0).calls_of("thread/externalInput/submit").iter().all(|c|c.params["message"]["id"]!=id),"skipped note never submitted");
+        if let Some(reply)=owner_reply {
+            assert_eq!(reply["disposition"],"started","{reply}");
+            let skipped=&reply["passiveNotes"]["skipped"];
+            assert!(skipped.as_array().unwrap().iter().any(|n|n["inputId"]==id && n["waitingFor"]==expected),"{reply}");
+            w.wait_settled(&["pre-turn-owner"],SETTLE);
+            let owner=w.input_record(0,"pre-turn-owner");
+            assert_eq!(owner["details"]["passiveNotes"]["skipped"],*skipped,"owner ledger preserves the same omissions");
+        }
+    }
+    let _=w.finish(LOOSE);
+}
+
+#[test]
+fn pre_turn_durable_only_note_codex() { pre_turn_durable_only_note(Kind::Codex,"owner"); }
+#[test]
+fn pre_turn_durable_only_note_claude() { pre_turn_durable_only_note(Kind::Claude,"owner"); }
+#[test]
+fn pre_turn_durable_only_note_result_codex() { pre_turn_durable_only_note(Kind::Codex,"result"); }
+#[test]
+fn pre_turn_durable_only_note_result_claude() { pre_turn_durable_only_note(Kind::Claude,"result"); }
+#[test]
+fn pre_turn_durable_only_note_wake_codex() { pre_turn_durable_only_note(Kind::Codex,"wake"); }
+#[test]
+fn pre_turn_durable_only_note_wake_claude() { pre_turn_durable_only_note(Kind::Claude,"wake"); }
+#[test]
+fn pre_turn_durable_only_note_system_claude() { pre_turn_durable_only_note(Kind::Claude,"system"); }
+
+#[test]
+fn pre_turn_old_pin_owner_codex() {pre_turn_note_case(Kind::Codex,"owner","old");}
+#[test]
+fn pre_turn_old_pin_owner_claude() {pre_turn_note_case(Kind::Claude,"owner","old");}
+#[test]
+fn pre_turn_bad_note_owner_codex() {pre_turn_note_case(Kind::Codex,"owner","bad");}
+#[test]
+fn pre_turn_bad_note_owner_claude() {pre_turn_note_case(Kind::Claude,"owner","bad");}
+#[test]
+fn pre_turn_bad_note_wake_codex() {pre_turn_note_case(Kind::Codex,"wake","bad");}
+#[test]
+fn pre_turn_bad_note_wake_claude() {pre_turn_note_case(Kind::Claude,"wake","bad");}
+
 fn s11(kind: Kind) {
     let w = World::start(&name("s11", kind), WorldSpec::new(&[kind, Kind::Codex]).bus().script(0, auto(300)));
     w.fake(0).begin_turn();

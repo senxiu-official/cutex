@@ -182,7 +182,9 @@ Capability: `input.backgroundSubagents` and `features.backgroundSubagents`.
 - Child tools. From then on the child's PreToolUse is admitted by agent id and native session, with
   or without a cutex turn: native tools and host-selected MCP tools run as usual (write / exec
   switches, MCP tool filters and plan mode's read-only rule apply), never written to a parent
-  timeline. Denied in a background child: cutex tools (`mcp__cutex__*`), `Agent` / `Task`,
+  timeline. Explicit read-only cutex tools use a trusted child principal; the daemon verifies
+  the current parent runtime before executing them. Denied in a background child:
+  cutex tools outside that set, `Agent` / `Task`,
   `AskUserQuestion`. Its PostToolUse never reads notes or busy inputs (only a main-agent tool id the
   live turn admitted can: `callback_valid`).
 - Approvals. Claude Code asks `can_use_tool` mid-run for a background child (`agent_id` set). Outside

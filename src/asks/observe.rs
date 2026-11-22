@@ -25,6 +25,7 @@ pub fn is_relevant(method: &str) -> bool {
     matches!(
         method,
         "turn/started"
+            | "error" // r290 P7: retain structured runtime errors until terminal completion.
             | "turn/completed"
             | "item/started"
             | "item/completed"
@@ -242,6 +243,19 @@ fn observe_inner(
         }
     }
     match method {
+        // r290 P7: retryable diagnostics alone do not end or notify a delegation.
+        "error" if params.get("willRetry").and_then(Value::as_bool) != Some(true) => {
+            store.with_records(&[&ask_id], |state| {
+                // r290 P7: a delayed diagnostic cannot alter a replacement lease.
+                if state.leases.get(session) != Some(&lease) || !attempt_open(state, &ask_id, attempt) { return; }
+                state.update_ask(&ask_id, now, |ask| {
+                    if let Some(record) = ask.attempts.iter_mut().find(|r| r.n == attempt) {
+                        record.handler_failure = Some(super::handler_failure::diagnostic(
+                            &params["error"], record.turn_id.as_deref(), &record.activity, now));
+                    }
+                });
+            })?;
+        }
         "turn/started" => {
             store.with_state(|state| {
                 state.update_ask(&ask_id, now, |ask| {
@@ -272,6 +286,17 @@ fn observe_inner(
                     let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) else {
                         return;
                     };
+                    // r290 P6: a tool can stay active longer than the quiet threshold.
+                    if is_tool_item(&kind) {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            if method == "item/started" {
+                                record.activity.in_flight_tools.entry(id.to_string()).or_insert_with(|| now_rfc3339(now));
+                            } else {
+                                record.activity.in_flight_tools.remove(id);
+                            }
+                        }
+                        record.activity.last_activity_at = Some(now_rfc3339(now));
+                    }
                     if method == "item/started" {
                         if is_tool_item(&kind) || kind == "agentMessage" {
                             record.activity.last_activity_at=Some(now_rfc3339(now));
@@ -333,6 +358,8 @@ fn observe_inner(
         }
         "turn/completed" => {
             let turn = params.get("turn").cloned().unwrap_or(Value::Null);
+            // r290 P7: quota requeue is still permitted, but its requester also
+            // receives the bounded failure diagnostic rather than only a hold.
             if crate::management::v2::quota_continue::quota_failure(&turn)
                 && requeue_quota_failure(store, session, &ask_id, attempt, &turn, requeue_on_quota, now, expected)?
             {
@@ -377,9 +404,13 @@ fn requeue_quota_failure(
         return Ok(false);
     };
     let stop_requested = ask.attempts.iter().find(|record| record.n == attempt).is_none_or(|record| record.stop_requested);
+    // r290 P7: owner Stop must not turn into a quota-failure wake either.
+    let owner_stopped = store.inspect(|state| ask.attempts.iter().find(|r|r.n == attempt)
+        .is_some_and(|record|super::handler_failure::owner_stopped(state, session, record)))?;
     if !ask.is_open()
         || ask.remote.is_some()
         || stop_requested
+        || owner_stopped
         || ask.options.if_busy == IfBusy::Fail
         || ask.quota_requeues >= super::QUOTA_REQUEUE_LIMIT
         || !requeue_on_quota()
@@ -389,6 +420,16 @@ fn requeue_quota_failure(
     // The runtime's text may say the failed input is not retried (true of
     // the runtime alone); cutex does redeliver it, so say so.
     let error = turn_outcome(turn).1.map(|error| format!("{error} {QUOTA_REQUEUED_NOTE}"));
+    // r290 P7
+    let record = ask.attempts.iter().find(|r|r.n == attempt).unwrap();
+    let schedule = super::handler_failure::quota_schedule(session, record.runtime_generation, record.turn_id.as_deref());
+    let mut failure = super::handler_failure::diagnostic(&turn["error"], record.turn_id.as_deref(), &record.activity, now);
+    failure.auto_requeued = true;
+    failure.resumes_at = schedule.resumes_at;
+    if failure.resets_at.is_none() { failure.resets_at = schedule.resets_at; }
+    failure.hold = Some(Hold::Blocked { by: BlockedReason::Quota });
+    failure.message = format!("{} {}", super::truncate_chars(&failure.message,
+        1200usize.saturating_sub(QUOTA_REQUEUED_NOTE.chars().count()+1)), QUOTA_REQUEUED_NOTE);
     store.with_state(|state| {
         // Another end-of-turn path already ended this attempt: nothing to
         // requeue (and not a second `quota_requeues` count).
@@ -397,7 +438,13 @@ fn requeue_quota_failure(
             || state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n == attempt)).is_some_and(|r| turn.get("id").and_then(Value::as_str).is_some_and(|id|r.turn_id.as_deref()!=Some(id))) {
             return true;
         }
+        // r290 P7: Stop can win while the quota callback runs outside this lock.
+        if state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n == attempt))
+            .is_some_and(|r|r.stop_requested || super::handler_failure::owner_stopped(state, session, r)) {
+            return false;
+        }
         let mut requeued = false;
+        failure.gate_closed = state.pauses.contains_key(session);
         state.update_ask(ask_id, now, |ask| {
             let Some(record) = ask.attempts.iter_mut().find(|item| item.n == attempt) else {
                 return;
@@ -405,6 +452,8 @@ fn requeue_quota_failure(
             record.ended_at = Some(now_rfc3339(now));
             record.last_error = error.clone();
             record.state = AttemptState::Failed;
+            // r290 P7
+            record.handler_failure = Some(failure.clone());
             ask.quota_requeues += 1;
             ask.hold = Some(Hold::Blocked { by: BlockedReason::Quota });
             // An await registered in the failed turn is void; a pending
@@ -429,8 +478,9 @@ fn requeue_quota_failure(
             }
         }
         if let Some(updated) = state.asks.get(ask_id).cloned() {
-            // Waiters learn it is held (as for any blocked hold).
-            super::delivery::record_state_delivery(state, &updated, "held", now);
+            // r290 P7: one actionable notice includes both failure and hold;
+            // a separate held notice invites a duplicate delegation.
+            super::delivery::record_handler_failure(state, &updated, attempt, now);
         }
         true
     })
@@ -462,6 +512,7 @@ pub(crate) fn attempt_open(state: &AskState, ask_id: &str, attempt: u32) -> bool
     state
         .asks
         .get(ask_id)
+        .filter(|ask|ask.is_open())
         .and_then(|ask| ask.attempts.iter().find(|record| record.n == attempt))
         .is_some_and(|record| !record.state.is_terminal())
         && !state.answers.values().any(|answer| answer.ask_id == ask_id && answer.attempt == attempt)
@@ -515,6 +566,23 @@ fn finalize_inner(
         || record.turn_id != lease.turn_id
         || !matches!(&lease.holder, LeaseHolder::Ask { ask_id: id, attempt: n } if id == ask_id && *n == attempt)) { return Ok(()); }
     if turn.get("id").and_then(Value::as_str).is_some_and(|id| record.turn_id.as_deref().is_some_and(|current| current != id)) { return Ok(()); }
+    let administrative_close = ask.follow_up_ended || (!ask.is_open()
+        && matches!(ask.closed,Some(CloseOutcome::Stopped | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
+        && ask.bounded_continuation.current.as_ref().is_some_and(|c|c.state==super::continuation::Phase::Cancelled));
+    if administrative_close {
+        store.with_records(&[ask_id],|state| {
+            if record.turn_id.as_deref().is_some_and(|id| turn.get("id").and_then(Value::as_str) == Some(id))
+                && state.asks.get(ask_id).is_some_and(|a| a.closed==ask.closed && a.follow_up_ended==ask.follow_up_ended)
+                && state.leases.get(session).is_some_and(|lease|
+                    lease.holder == (LeaseHolder::Ask { ask_id: ask_id.into(), attempt })
+                    && lease.runtime_generation == record.runtime_generation
+                    && lease.native_message_id == record.native_message_id
+                    && lease.turn_id == record.turn_id) {
+                state.leases.remove(session);
+            }
+        })?;
+        return Ok(());
+    }
     let (status, error) = turn_outcome(turn);
     // Items in `turn/completed` (Claude adapter) win over observed items.
     let items: Vec<Value> = turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -562,6 +630,10 @@ fn finalize_inner(
         .and_then(|(_, bytes)| super::views::preview(&String::from_utf8_lossy(&bytes)));
     let started = record.started_at.as_deref().and_then(super::parse_time);
     let bounded_context = super::continuation::runtime::attempt_identity(&ask, attempt);
+    // r290 P7: quota-store IO is outside the ask-store transaction.
+    let failure_schedule = if status == AnswerStatus::Failed {
+        super::handler_failure::quota_schedule(session, record.runtime_generation, record.turn_id.as_deref())
+    } else { Default::default() };
     let bounded_director = ask.bounded_continuation.current.as_ref()
         .and_then(|_| super::continuation::runtime::current_director(&ask));
     before_commit();
@@ -576,6 +648,12 @@ fn finalize_inner(
                 .is_some_and(|r| r.turn_id != record.turn_id || r.runtime_generation != record.runtime_generation) {
             return;
         }
+        // r290 P7: settle errors before bounded continuation can retain Running.
+        if interrupt_reason != Some(InterruptReason::OwnerStopped)
+            && interrupt_reason != Some(InterruptReason::Stopped)
+            && super::handler_failure::settle(state, session, ask_id, attempt, turn,
+                matches!(interrupt_reason, Some(InterruptReason::RuntimeRestart))
+                    && status == AnswerStatus::Interrupted, &failure_schedule, now) { return; }
         if let Some(context) = &bounded_context {
             let end = match status {
                 AnswerStatus::Completed if interrupt_reason.is_none() => super::continuation::EndKind::Normal,
@@ -590,6 +668,7 @@ fn finalize_inner(
         let revision = state.answers.values().filter(|answer| answer.ask_id == ask_id).count() as u32 + 1;
         let answer_id = new_id("ans");
         let metadata = AnswerMetadata {
+            delivered_from: None, // r290 P14
             turn_id: record.turn_id.clone(),
             duration_ms: started.map(|started| (now - started).num_milliseconds().max(0) as u64),
             token_usage: record.token_usage.clone(),
@@ -628,6 +707,9 @@ fn finalize_inner(
                 attempt_record.ended_at = Some(now_rfc3339(now));
                 attempt_record.compaction_reminder_pending = false;
                 attempt_record.last_error = error.clone();
+                // r290 P7: a cached diagnostic is not a failure notice when
+                // completion/owner Stop took the ordinary finalization path.
+                attempt_record.handler_failure = None;
                 attempt_record.state = match status {
                     AnswerStatus::Completed => AttemptState::Answered,
                     AnswerStatus::Failed => AttemptState::Failed,
@@ -730,6 +812,36 @@ mod tests {
 
     fn item(turn: &str, item: Value) -> Value {
         json!({"threadId": "t", "turnId": turn, "item": item})
+    }
+
+    #[test]
+    fn board_in_flight_tools_are_attempt_bound_durable_and_completed() {
+        let (world, dir) = world("board-tools");
+        let (store, store_dir) = temp_store("board-tools");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let started = now - chrono::Duration::minutes(20);
+        let id = store.with_state(|s|s.create_ask(new_ask("board-tools", "work"), started).unwrap().0.ask_id).unwrap();
+        crate::asks::scheduler::tick(&world, &runtime, &store, started).unwrap();
+        observe(&store, TARGET, "turn/started", &json!({"turn":{"id":"turn-1"}}), started).unwrap();
+        let tool = json!({"type":"mcpToolCall","id":"tool-a","tool":"delegation_wait"});
+        observe(&store, TARGET, "item/started", &item("other-turn",tool.clone()), started).unwrap();
+        assert!(store.snapshot().unwrap().asks[&id].attempts[0].activity.in_flight_tools.is_empty());
+        observe(&store, TARGET, "item/started", &item("turn-1",tool.clone()), started).unwrap();
+        observe(&store, TARGET, "item/started", &item("turn-1",tool.clone()), started+chrono::Duration::seconds(1)).unwrap();
+        let state=store.snapshot().unwrap();let ask=&state.asks[&id];
+        assert_eq!(ask.attempts[0].activity.in_flight_tools["tool-a"],now_rfc3339(started));
+        let session=json!({"native":{"threadId":"t"},"runtime":{"status":"online","runtimeGeneration":ask.attempts[0].runtime_generation,"activeTurnId":"turn-1"}});
+        let view=super::super::board_progress::delegation(ask,Some(&session),None,now);
+        assert_eq!(view["stalled"],false);assert_eq!(view["stallReason"],"longToolCall");assert!(view["toolCallStartedAt"].is_string());
+        drop(state);
+        observe(&store, TARGET, "item/completed", &item("other-turn",tool.clone()), now).unwrap();
+        assert_eq!(store.snapshot().unwrap().asks[&id].attempts[0].activity.in_flight_tools.len(),1);
+        observe(&store, TARGET, "item/completed", &item("turn-1",tool), now).unwrap();
+        let state=store.snapshot().unwrap();let ask=&state.asks[&id];
+        assert!(ask.attempts[0].activity.in_flight_tools.is_empty());
+        assert_eq!(super::super::board_progress::delegation(ask,Some(&session),None,now+chrono::Duration::seconds(901))["stalled"],true);
+        drop(state);drop(store);std::fs::remove_dir_all(store_dir).unwrap();let _=std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -996,8 +1108,8 @@ mod tests {
         assert_eq!(state.asks[&ask].execution, ExecutionState::Answered);
         assert_eq!(state.asks[&ask].closed, Some(CloseOutcome::Completed));
 
-        // Without the policy (Codex, auto-continue off) or past the limit:
-        // the attempt fails the delegation as before.
+        // r290 P7: without automatic requeue (or past its limit), the failed
+        // attempt leaves the delegation open for the controller to continue.
         for (requeue, used) in [(false, 0), (true, crate::asks::QUOTA_REQUEUE_LIMIT)] {
             let other = store.with_state(|state| state.create_ask(new_ask(&format!("b{used}{requeue}"), "y"), now).unwrap().0.ask_id).unwrap();
             store.with_state(|state| state.asks.get_mut(&other).unwrap().quota_requeues = used).unwrap();
@@ -1007,7 +1119,9 @@ mod tests {
             observe_with(&store, TARGET, "turn/completed", &quota_failed(&turn), now, &|| requeue).unwrap();
             let state = store.snapshot().unwrap();
             assert_eq!(state.asks[&other].execution, ExecutionState::Failed);
-            assert_eq!(state.asks[&other].closed, Some(CloseOutcome::Completed));
+            assert!(state.asks[&other].is_open());
+            assert!(state.deliveries.values().any(|d|d.ask_id == other
+                && d.ref_id.starts_with(super::super::handler_failure::PREFIX)));
         }
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);

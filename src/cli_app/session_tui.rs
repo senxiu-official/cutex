@@ -12475,6 +12475,7 @@ mod tests {
             launched_profile: Some("orchid".to_string()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
             schema_version: "test".to_string(),
@@ -17011,7 +17012,11 @@ mod tests {
             schema: cutex::launch::version_registry::REGISTRY_SCHEMA.to_string(),
             latest_cli: record_version("0.156.1-r36"),
             latest_runtime: record_version("0.156.1-r36"),
-            runtime_artifacts: BTreeMap::new(),
+            // r290 integration: live versions are identified by bytes, not path aliases.
+            runtime_artifacts: BTreeMap::from([(
+                cutex::agent_management::file_sha256(&executable).unwrap().as_str().to_owned(),
+                record_version("0.156.1-r35"),
+            )]),
             runtime_paths: BTreeMap::from([(
                 executable.to_str().unwrap().to_string(),
                 record_version("0.156.1-r35"),

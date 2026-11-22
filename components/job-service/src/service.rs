@@ -371,6 +371,8 @@ impl JobService {
             .clone()
             .unwrap_or_else(|| format!("external-job:{job_id}"));
         let record = JobRecord {
+            launch_pending: false,
+            follow_up_ended: None,
             external: Some(ExternalJob {
                 source: request.source,
                 remote_id: request.remote_id,
@@ -876,6 +878,8 @@ impl JobService {
         let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
         let output_reference = format!("job-output:{job_id}");
         let record = JobRecord {
+            launch_pending: true,
+            follow_up_ended: None,
             external: None,
             schema: CONTRACT.into(),
             job_id: job_id.clone(),
@@ -959,6 +963,16 @@ impl JobService {
             Err(error) => {
                 let mut state = self.inner.state.lock().expect("state mutex poisoned");
                 let job = state.jobs.get_mut(&job_id).expect("committed job exists");
+                job.launch_pending = false;
+                if job.follow_up_ended.is_some() {
+                    job.revision += 1;
+                    job.updated_at_epoch_secs = now_secs();
+                    let snapshot = job.clone();
+                    self.inner.store.save(&mut state)?;
+                    return Ok(SubmitReceipt {
+                        status: "committed".into(), job: snapshot, deduplicated: false,
+                    });
+                }
                 job.state = JobState::Failed;
                 job.revision += 1;
                 job.updated_at_epoch_secs = now_secs();
@@ -998,22 +1012,12 @@ impl JobService {
             .lock()
             .expect("live mutex poisoned")
             .insert(job_id.clone(), spawned.live);
-        {
-            let mut state = self.inner.state.lock().expect("state mutex poisoned");
-            let job = state.jobs.get_mut(&job_id).expect("committed job exists");
-            job.state = JobState::Running;
-            job.revision += 1;
-            job.updated_at_epoch_secs = now_secs();
-            job.process_id = Some(pid);
-            job.process_start_ticks = Some(start_ticks);
-            job.execution = Some(ExecutionObservation {
-                basis: process::EXECUTION_OBSERVATION_BASIS.into(),
-                start_observed_at_epoch_millis: spawned.execution_start.wall_epoch_millis,
-                exit_observed_at_epoch_millis: None,
-                observed_run_duration_millis: None,
-            });
-            self.inner.store.save(&mut state)?;
-        }
+        self.record_process_started(&job_id, pid, start_ticks, ExecutionObservation {
+            basis: process::EXECUTION_OBSERVATION_BASIS.into(),
+            start_observed_at_epoch_millis: spawned.execution_start.wall_epoch_millis,
+            exit_observed_at_epoch_millis: None,
+            observed_run_duration_millis: None,
+        })?;
         let inner = Arc::clone(&self.inner);
         let watcher_job_id = job_id.clone();
         std::thread::spawn(move || {
@@ -1036,6 +1040,11 @@ impl JobService {
             let Some(job) = state.jobs.get_mut(&watcher_job_id) else {
                 return;
             };
+            // The owner ended tracking, not execution. A late wait result must
+            // neither reopen the occurrence nor enqueue a completion turn.
+            if job.follow_up_ended.is_some() {
+                return;
+            }
             let observed_out = spawned
                 .stdout_observed
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1111,7 +1120,7 @@ impl JobService {
             "independentExecutionCwd":true,
             "sources":self.inner.config.external_sources,
             "externalNotifyFile":self.inner.config.external_notify_file.is_some(),
-            "humanOperations":["list","cancel","readOutput","markExternal"],"completionDelivery":{"enabled":self.inner.config.completion_enabled,"wireVersion":match self.inner.config.completion_wire_version { CompletionWireVersion::V1 => 1, CompletionWireVersion::V2 => 2 }}}),
+            "humanOperations":["list","query","cancel","readOutput","markExternal","closeFollowUp"],"completionDelivery":{"enabled":self.inner.config.completion_enabled,"wireVersion":match self.inner.config.completion_wire_version { CompletionWireVersion::V1 => 1, CompletionWireVersion::V2 => 2 }}}),
         )
     }
 
@@ -1185,8 +1194,12 @@ impl JobService {
         };
         let data: Vec<_> = jobs.into_iter().map(|j| serde_json::json!({
             "observedProcessState":observe_process(j),
+            // Tracking disposition is independent from process ownership.
+            "processAlive":self.local_process_alive(j),
+            "launchPending":j.launch_pending,
             "jobId":j.job_id, "actionId":j.request.action_id.chars().take(512).collect::<String>(),
             "sessionId":j.request.subscriber_cutex_session_id, "state":j.state,
+            "terminalReason":j.terminal_reason, "followUpEnded":j.follow_up_ended,
             "command":j.request.command_summary.as_deref().map(|c| c.chars().take(crate::model::COMMAND_SUMMARY_MAX_CHARS).collect::<String>()),
             "createdAt":j.created_at_epoch_secs, "updatedAt":j.updated_at_epoch_secs,
             "exitCode":j.exit_code, "cwd":j.request.cwd.chars().take(1024).collect::<String>(),
@@ -1235,6 +1248,97 @@ impl JobService {
         }
         job.observed_process_state = observe_process(&job);
         Ok(job)
+    }
+
+    fn local_process_alive(&self, job: &JobRecord) -> bool {
+        if job.external.is_some() {
+            return false;
+        }
+        if self.inner.live.lock().expect("live mutex poisoned").contains_key(&job.job_id) {
+            return true;
+        }
+        job.process_id.zip(job.process_start_ticks).is_some_and(|(pid, birth)| {
+            process::observed_process_state(pid, birth).is_some_and(|p| p.state != "exited")
+        })
+    }
+
+    fn record_process_started(&self, job_id: &str, pid: u32, birth: u64, observation: ExecutionObservation) -> Result<(), JobError> {
+        let mut state = self.inner.state.lock().expect("state mutex poisoned");
+        let job = state.jobs.get_mut(job_id).expect("committed job exists");
+        // Ending tracking never discards execution identity: maintenance still
+        // needs it, including when the close raced the launch handshake.
+        if job.follow_up_ended.is_none() { job.state = JobState::Running; }
+        job.launch_pending = false;
+        job.revision += 1;
+        job.updated_at_epoch_secs = now_secs();
+        job.process_id = Some(pid);
+        job.process_start_ticks = Some(birth);
+        job.execution = Some(observation);
+        self.inner.store.save(&mut state)
+    }
+
+    /// Owner disposition only. Do not acquire `live`, drop its sentinel, or
+    /// signal a process: execution ownership is unchanged by ending follow-up.
+    pub fn human_close_follow_up(
+        &self,
+        api_token: &[u8],
+        job_id: &str,
+        expected_revision: u64,
+        reason: String,
+    ) -> Result<JobRecord, JobError> {
+        self.human_close_follow_up_with_commit(api_token, job_id, expected_revision, reason)
+            .map(|(job, _)| job)
+    }
+
+    pub(crate) fn human_close_follow_up_with_commit(
+        &self,
+        api_token: &[u8],
+        job_id: &str,
+        expected_revision: u64,
+        reason: String,
+    ) -> Result<(JobRecord, bool), JobError> {
+        self.authenticate(api_token)?;
+        if job_id.is_empty() || job_id.len() > 160 || expected_revision == 0
+            || reason.trim().is_empty() || reason.len() > 2048
+            || reason.chars().any(char::is_control)
+        {
+            return Err(JobError::Invalid("invalid close follow-up request".into()));
+        }
+        let mut state = self.inner.state.lock().expect("state mutex poisoned");
+        let current = state.jobs.get(job_id)
+            .ok_or_else(|| JobError::NotFound(job_id.into()))?;
+        if let Some(ended) = &current.follow_up_ended {
+            return if ended.expected_revision == expected_revision && ended.reason == reason {
+                Ok((current.clone(), false))
+            } else {
+                Err(JobError::Conflict("follow-up already ended by another request".into()))
+            };
+        }
+        if current.revision != expected_revision {
+            return Err(JobError::Conflict("job revision mismatch".into()));
+        }
+        if current.state.terminal()
+            && current.state != JobState::Unconfirmed
+        {
+            return Ok((current.clone(), false));
+        }
+        let mut closed = current.clone();
+        closed.state = JobState::Unconfirmed;
+        closed.revision = closed.revision.checked_add(1)
+            .ok_or_else(|| JobError::Conflict("job revision exhausted".into()))?;
+        closed.updated_at_epoch_secs = now_secs();
+        closed.terminal_reason = Some("followUpEnded".into());
+        closed.completion_delivery.state = CompletionDeliveryState::Disabled;
+        closed.follow_up_ended = Some(FollowUpEnded {
+            expected_revision, reason, at_epoch_secs: closed.updated_at_epoch_secs,
+        });
+        let previous = state.jobs.insert(job_id.into(), closed.clone());
+        if let Err(error) = self.inner.store.save(&mut state) {
+            // A failed write must not leave a successful receipt in memory.
+            state.jobs.insert(job_id.into(), previous.expect("existing job"));
+            return Err(error);
+        }
+        Ok((closed, true))
     }
 
     pub fn cancel(
@@ -1315,7 +1419,9 @@ impl JobService {
             gap: omitted > 0,
             omitted_bytes: omitted,
             eof: bytes.is_empty()
-                && !matches!(job.state, JobState::Running | JobState::LaunchPending),
+                && !matches!(job.state, JobState::Running | JobState::LaunchPending)
+                && !job.launch_pending
+                && !self.local_process_alive(&job),
             truncated: summary.truncated,
         })
     }
@@ -1668,4 +1774,168 @@ fn agent_job_projection(mut job: JobRecord) -> JobRecord {
         external.human_audit.clear();
     }
     job
+}
+
+#[cfg(test)]
+pub(crate) mod follow_up_tests {
+    use super::*;
+    use serde_json::json;
+
+    pub(crate) const API: &[u8] = b"follow-up-private-api-token-at-least-32-bytes";
+
+    pub(crate) fn fixture(root: &std::path::Path, job_state: &str) -> (JobService, String) {
+        let executable = std::fs::canonicalize("/bin/true").unwrap();
+        let service = JobService::open(ServiceConfig {
+            state_root: root.into(), grant_key: vec![1; 32], api_token: API.into(),
+            runner_executable: executable.clone(), per_stream_output_bytes: 4096,
+            max_read_bytes: 4096, cancel_grace: Duration::from_millis(100),
+            max_jobs: 32, max_active_jobs: 4,
+            allowed_launchers: [(executable.to_string_lossy().into_owned(), crate::file_sha256(&executable).unwrap())].into(),
+            completion_wire_version: CompletionWireVersion::V2, completion_enabled: false,
+            external_sources: vec![], external_stale_after_secs: 86400, external_notify_file: None,
+        }).unwrap();
+        let job: JobRecord = serde_json::from_value(json!({
+            "schema":CONTRACT,"jobId":"job_no_owned_process","revision":3,"requestSha256":"digest",
+            "request":{"actionId":"test","argumentCount":1,"cwd":"/tmp","environmentNames":[],"subscriberCutexSessionId":"cutex.test"},
+            "state":job_state,"launchPending":job_state == "launch_pending","createdAtEpochSecs":1,"updatedAtEpochSecs":1,
+            "stdout":{"retainedBytes":0,"observedBytes":0,"truncated":false},
+            "stderr":{"retainedBytes":0,"observedBytes":0,"truncated":false},"outputReference":"output"
+        })).unwrap();
+        let id = job.job_id.clone();
+        let mut state = service.inner.state.lock().unwrap();
+        state.jobs.insert(id.clone(), job);
+        service.inner.store.save(&mut state).unwrap();
+        drop(state);
+        (service, id)
+    }
+
+    #[test]
+    fn running_without_owned_process_can_end_follow_up() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        assert!(matches!(service.cancel(API, &id, 3), Err(JobError::Conflict(_))));
+        let closed = service.human_close_follow_up(API, &id, 3, "execution unconfirmed".into()).unwrap();
+        assert_eq!(closed.state, JobState::Unconfirmed);
+        assert_eq!(closed.revision, 4);
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["followUpEnded"]["reason"], "execution unconfirmed");
+        assert!(service.inner.live.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn future_wire_states_become_terminal_unconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "future_state");
+        let job = service.query(API, &id).unwrap();
+        assert_eq!(job.state, JobState::Unconfirmed);
+        assert!(job.state.terminal());
+        assert_eq!(serde_json::to_value(job.state).unwrap(), "unconfirmed");
+        let closed = service.human_close_follow_up(API, &id, 3, "owner ended tracking".into()).unwrap();
+        assert_eq!(closed.terminal_reason.as_deref(), Some("followUpEnded"));
+    }
+
+    #[test]
+    fn ended_follow_up_retains_birth_checked_process_presence_without_live_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        let pid = std::process::id();
+        let birth = process::process_start_ticks(pid).unwrap();
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            let job = state.jobs.get_mut(&id).unwrap();
+            job.process_id = Some(pid);
+            job.process_start_ticks = Some(birth);
+        }
+        service.human_close_follow_up(API, &id, 3, "done".into()).unwrap();
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["processAlive"], true);
+        service.inner.state.lock().unwrap().jobs.get_mut(&id).unwrap().process_start_ticks = Some(birth + 1);
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["processAlive"], false);
+    }
+
+    #[test]
+    fn close_during_launch_keeps_admission_then_persists_the_process_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "launch_pending");
+        let closed = service.human_close_follow_up(API, &id, 3, "done".into()).unwrap();
+        assert!(closed.launch_pending);
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["launchPending"], true);
+        let pid = std::process::id();
+        let birth = process::process_start_ticks(pid).unwrap();
+        service.record_process_started(&id, pid, birth, ExecutionObservation {
+            basis: "test".into(), start_observed_at_epoch_millis: None,
+            exit_observed_at_epoch_millis: None, observed_run_duration_millis: None,
+        }).unwrap();
+        let launched = service.query(API, &id).unwrap();
+        assert!(!launched.launch_pending);
+        assert_eq!(launched.state, JobState::Unconfirmed);
+        assert_eq!(launched.follow_up_ended, closed.follow_up_ended);
+        assert_eq!(launched.process_id, Some(pid));
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["processAlive"], true);
+        assert_eq!(service.human_close_follow_up(API, &id, 3, "done".into()).unwrap(), launched);
+    }
+
+    #[test]
+    fn ended_pending_launch_reconciles_once_after_service_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "launch_pending");
+        let config = service.inner.config.clone();
+        let closed = service.human_close_follow_up(API, &id, 3, "done".into()).unwrap();
+        drop(service);
+        let service = JobService::open(config.clone()).unwrap();
+        let reconciled = service.query(API, &id).unwrap();
+        assert!(!reconciled.launch_pending);
+        assert_eq!(reconciled.state, JobState::Unconfirmed);
+        assert_eq!(reconciled.follow_up_ended, closed.follow_up_ended);
+        assert_eq!(reconciled.revision, closed.revision + 1);
+        drop(service);
+        let service = JobService::open(config).unwrap();
+        assert_eq!(service.human_close_follow_up(API, &id, 3, "done".into()).unwrap(), reconciled);
+    }
+
+    #[test]
+    fn close_follow_up_cas_allows_only_one_distinct_request() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads: Vec<_> = ["reason-a", "reason-b"].into_iter().map(|reason| {
+            let service = service.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                service.human_close_follow_up(API, &id, 3, reason.into())
+            })
+        }).collect();
+        barrier.wait();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Err(JobError::Conflict(_)))).count(), 1);
+        let closed = service.query(API, &id).unwrap();
+        let reason = closed.follow_up_ended.as_ref().unwrap().reason.clone();
+        assert_eq!(service.human_close_follow_up(API, &id, 3, reason).unwrap(), closed);
+        assert!(matches!(service.human_close_follow_up(API, &id, 4, "new request".into()), Err(JobError::Conflict(_))));
+    }
+
+    #[test]
+    fn failed_persist_does_not_create_successful_in_memory_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        let blocked_temp = root.path().join(format!(".state.{}.tmp", std::process::id()));
+        std::fs::write(&blocked_temp, b"owned-test-blocker").unwrap();
+        assert!(matches!(service.human_close_follow_up(API, &id, 3, "done".into()), Err(JobError::Io(_))));
+        assert_eq!(service.query(API, &id).unwrap().state, JobState::Running);
+        std::fs::remove_file(blocked_temp).unwrap();
+        assert_eq!(service.human_close_follow_up(API, &id, 3, "done".into()).unwrap().state, JobState::Unconfirmed);
+    }
+
+    #[test]
+    fn commit_receipt_is_false_on_replay_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "running");
+        let config = service.inner.config.clone();
+        assert!(service.human_close_follow_up_with_commit(API, &id, 3, "done".into()).unwrap().1);
+        drop(service);
+        let service = JobService::open(config).unwrap();
+        assert!(!service.human_close_follow_up_with_commit(API, &id, 3, "done".into()).unwrap().1);
+        assert!(matches!(service.human_close_follow_up_with_commit(API, &id, 3, "different".into()), Err(JobError::Conflict(_))));
+    }
 }

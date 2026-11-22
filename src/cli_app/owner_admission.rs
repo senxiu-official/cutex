@@ -34,14 +34,14 @@ pub(crate) fn held_execution() -> UserInputSubmitExecution {
         native_method: None,
         turn_id: None,
         queue: None,
-        queue_paused: false,
+        queue_paused: false, passive_notes: None,
         join_refusal: None,
         queued_reason: None,
     }
 }
 
 /// The submit params of `command` in their wire form (re-parsed on admission).
-fn wire_params(command: &UserInputSubmitCommand) -> Value {
+pub(crate) fn wire_params(command: &UserInputSubmitCommand) -> Value {
     let params = &command.params;
     let mut wire = json!({
         "clientUserMessageId": params.client_user_message_id,
@@ -148,19 +148,22 @@ pub(crate) type Submit<'a> =
 pub(crate) fn admit_one(submit: Submit<'_>) -> anyhow::Result<bool> {
     // Blocking FIFO wait for the fence; this thread holds no lane here.
     cutex::asks::pause_admission::acquire_worker_fence()?;
-    let result = (|| -> anyhow::Result<Option<(String, Option<String>)>> {
+    let result = (|| -> anyhow::Result<Option<(String, Option<String>,bool)>> {
         for session in owner_held::sessions_in_order()? {
             let lane = cutex::management::v2::session_coordination::session_lane(&session)?;
             let Ok(_lane) = lane.try_lock() else { continue };
             let Some(held) = owner_held::claim_head(&session)? else {
                 continue;
             };
-            return Ok(Some((session, admit(held, submit)?)));
+            let id=held.client_user_message_id.clone();
+            let landed=admit(held,submit)?;
+            let deferred=owner_held::find(&session,&id)?.is_some_and(|h|!h.claimed);
+            return Ok(Some((session,landed,deferred)));
         }
         Ok(None)
     })();
     cutex::asks::pause_admission::release_worker_fence();
-    let Some((session, landed)) = result? else {
+    let Some((session, landed, deferred)) = result? else {
         return Ok(false);
     };
     // The owner's held message landed: as for an HTTP submit, it ends the
@@ -170,7 +173,25 @@ pub(crate) fn admit_one(submit: Submit<'_>) -> anyhow::Result<bool> {
     if let Some(disposition) = landed {
         cutex::asks::control::owner_message_default(&session, &disposition);
     }
-    Ok(true)
+    Ok(!deferred)
+}
+
+/// Sets the current principal; the previous one is restored when dropped
+/// (also when the route panics).
+struct RestorePrincipal(Option<cutex::management::users::Principal>);
+
+impl RestorePrincipal {
+    fn set(principal: cutex::management::users::Principal) -> Self {
+        let previous = cutex::management::users::current_principal();
+        cutex::management::users::set_current_principal(Some(principal));
+        Self(previous)
+    }
+}
+
+impl Drop for RestorePrincipal {
+    fn drop(&mut self) {
+        cutex::management::users::set_current_principal(self.0.take());
+    }
 }
 
 /// Re-run the ordinary route for `held` (lane + fence held), publish its
@@ -185,7 +206,14 @@ fn admit(held: HeldOwnerInput, submit: Submit<'_>) -> anyhow::Result<Option<Stri
                     thread_id: held.thread_id.clone(),
                     params: params.clone(),
                 };
+                // r290 P1: re-run the route as a non-owner unless the record
+                // proves the owner held it (a shared-access user's input, or a
+                // record without provenance): it must not reopen a closed
+                // Claude input gate or release the owner's carries.
+                let principal = (!held.proven_owner())
+                    .then(|| RestorePrincipal::set(cutex::management::users::Principal::Pending));
                 let execution = submit(command);
+                drop(principal);
                 Some((params, execution))
             }
             Err(message) => {
@@ -201,6 +229,7 @@ fn admit(held: HeldOwnerInput, submit: Submit<'_>) -> anyhow::Result<Option<Stri
     cutex::asks::pause_admission::release_worker_fence();
     let mut landed = None;
     if let Some((params, execution)) = execution {
+        let deferred=execution.as_ref().is_ok_and(|result|result.disposition==UserInputDisposition::Held);
         let events = cutex::management::v2::repository::management_v2_repository()?;
         match cutex::management::v2::server::publish_submit_outcome(
             events,
@@ -211,7 +240,7 @@ fn admit(held: HeldOwnerInput, submit: Submit<'_>) -> anyhow::Result<Option<Stri
             held.claude_backend,
             execution,
         ) {
-            Ok(result) if cutex::management::v2::server::owner_message_landed(&result) => {
+            Ok(result) if held.proven_owner() && cutex::management::v2::server::owner_message_landed(&result) => {
                 landed = result
                     .get("disposition")
                     .and_then(Value::as_str)
@@ -222,6 +251,10 @@ fn admit(held: HeldOwnerInput, submit: Submit<'_>) -> anyhow::Result<Option<Stri
                 "owner admission: {}: {}: {}",
                 held.cutex_session_id, error.code, error.message
             ),
+        }
+        if deferred {
+            owner_held::unclaim(&held.cutex_session_id,&held.client_user_message_id)?;
+            return Ok(landed);
         }
     }
     owner_held::finish(&held.cutex_session_id, &held.client_user_message_id)?;

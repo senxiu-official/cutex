@@ -597,7 +597,7 @@ pub(crate) fn dispatch(session: &str, action: &str, params: Value) -> Result<Val
                 (state.thread.clone(), state.active_turn.clone())
             };
             if let Some(thread) = thread {
-                interrupt(&chat.handle, &thread, turn.as_deref())?;
+                interrupt(&chat.session,&chat.handle, &thread, turn.as_deref())?;
             }
             Ok(json!({"chat":snapshot(&chat,&*chat.state.lock().map_err(|_| poisoned())?)}))
         }
@@ -1287,7 +1287,8 @@ fn respond(chat: &Chat, params: &Value) -> Result<Value> {
     Ok(json!({"chat":snapshot(chat,&state)}))
 }
 
-fn interrupt(handle: &AppServerHandle, thread: &str, turn: Option<&str>) -> Result<()> {
+fn interrupt(session:&str,handle: &AppServerHandle, thread: &str, turn: Option<&str>) -> Result<()> {
+    super::asks_runtime::revoke_internal_interrupt(session,thread).map_err(native_error)?;
     let result = handle.request(
         "turn/interrupt",
         json!({"threadId":thread,"turnId":turn.unwrap_or_default()}),
@@ -1365,7 +1366,7 @@ fn close(chat: &Chat) -> Result<()> {
             ));
         }
         if let Some(thread) = &thread {
-            interrupt(&chat.handle, thread, turn.as_deref())?;
+            interrupt(&chat.session,&chat.handle, thread, turn.as_deref())?;
             chat.handle
                 .request("thread/unsubscribe", json!({"threadId":thread}))
                 .map_err(native_error)?;

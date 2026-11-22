@@ -180,6 +180,7 @@ mod tests {
             launched_profile: None,
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/missing/j".into(),
             schema_version: "v".into(),

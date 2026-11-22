@@ -21,9 +21,8 @@ pub struct NativeVersionRegistry {
     pub latest_runtime: NativeVersionRecord,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtime_artifacts: BTreeMap<String, NativeVersionRecord>,
-    /// Fast display-only mapping from immutable release artifact paths to the
-    /// version recorded for their exact bytes. Unknown paths still fall back to
-    /// hashing `/proc/<pid>/exe`.
+    /// Historical display path aliases. A path alone is not byte identity;
+    /// readers must verify its current SHA against `runtime_artifacts`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtime_paths: BTreeMap<String, NativeVersionRecord>,
 }
@@ -99,15 +98,9 @@ impl NativeVersionRegistry {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn runtime_version_for_pid(&self, pid: u32) -> Option<String> {
         #[cfg(target_os = "linux")]
-        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let executable = PathBuf::from(format!("/proc/{pid}/exe"));
         #[cfg(target_os = "macos")]
         let executable = crate::platform::macos_proc::exe(pid).ok()??;
-        if let Some(record) = executable
-            .to_str()
-            .and_then(|path| self.runtime_paths.get(path))
-        {
-            return Some(record.version.clone());
-        }
         self.runtime_version_for_executable(&executable)
     }
 
@@ -279,7 +272,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn runtime_version_uses_exact_executable_bytes() {
         let root =
@@ -311,7 +303,7 @@ mod tests {
             registry.runtime_version_for_executable(&executable),
             Some("0.156.1-r35".into())
         );
-        let test_executable = crate::platform::process::process_executable(std::process::id()).unwrap();
+        let test_executable = std::env::current_exe().unwrap();
         registry.runtime_paths.insert(
             test_executable.to_string_lossy().into_owned(),
             NativeVersionRecord {
@@ -321,8 +313,10 @@ mod tests {
         );
         assert_eq!(
             registry.runtime_version_for_pid(std::process::id()),
-            Some("0.156.1-r36".into())
+            None, "a path-only version cannot identify the current executable"
         );
+        std::fs::write(&executable, b"replacement-build").unwrap();
+        assert_eq!(registry.runtime_version_for_executable(&executable), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

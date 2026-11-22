@@ -1122,6 +1122,31 @@ pub fn gauges(a: &StoredAccount, force: bool) -> anyhow::Result<Vec<Gauge>> {
     Ok(gauges)
 }
 
+/// r290 P12: cache-only projection; never refresh, mutate the cache or call an endpoint.
+pub fn cached_gauges(a: &StoredAccount) -> anyhow::Result<Vec<Gauge>> {
+    let dir=crate::config::paths::runtime_dir()?.join("profile-quota");
+    let mut configs=Vec::new();
+    if a.options.quota.enabled {configs.push(("primary".to_string(),a.options.quota.resolve_for_account(a)?));}
+    for (index,config) in resolve_extras(a) {configs.push((format!("extra-{index}"),config?));}
+    let mut out=Vec::new();
+    for (id,c) in configs {
+        let auth=if matches!(c.auth,Auth::ProfileApiKey|Auth::ProfileApiKeyRaw){std::fs::read(auth_path(a)?).unwrap_or_default()}else{Vec::new()};
+        let fingerprint=cache_fingerprint(&c,&auth)?;
+        let profile=uuid::Uuid::parse_str(&a.id)?;
+        let stem=if id=="primary" {profile.to_string()}else{format!("{profile}-x{}",&fingerprint[..16])};
+        let cached=std::fs::read(dir.join(format!("{stem}.json"))).ok().and_then(|bytes|serde_json::from_slice::<Cache>(&bytes).ok()).filter(|v|v.fingerprint==fingerprint);
+        let display=cached.map(|v|v.display);
+        // Optional extras absent from the provider (e.g. Kimi's weekly window)
+        // stay absent until first observed, matching the normal quota reader.
+        if id!="primary"&&c.optional&&display.as_ref().is_none_or(|d|d.observed_at.is_none()&&d.remaining_percent.is_none()&&d.balance.is_none()){continue}
+        let mut gauge=Gauge{id,label:c.label.clone(),display_label:c.display_label.clone(),kind:gauge_kind(&c),
+            remaining_percent:display.as_ref().and_then(|d|d.remaining_percent),balance:display.as_ref().and_then(|d|d.balance.clone()),reset_at:display.as_ref().and_then(|d|d.reset_at),
+            window_label:c.window_label.clone(),observed_at:display.as_ref().and_then(|d|d.observed_at),stale:display.as_ref().is_none_or(|d|d.stale),error:None,used_percent:None,source:None};
+        gauge.invalidate_past_reset(chrono::Utc::now().timestamp());out.push(gauge);
+    }
+    Ok(out)
+}
+
 fn gauges_in(
     a: &StoredAccount,
     force: bool,

@@ -191,3 +191,77 @@ async def test_consumed_wake_retention_and_history_revert_preserve_identity(ph):
     assert status['receipt'] is None and status['processing']['reason'] == 'context_missing'
     local = await ph.call('claude/input/status', {'threadId': tid, 'messageId': 'wake'})
     assert local['contextPersisted'] is False and local['state'] == 'reverted'
+
+
+@pytest.mark.parametrize('owner_carry', [False, True])
+async def test_retired_daemon_batch_can_coexist_with_later_native_input(ph, owner_carry):
+    # The daemon may retire its old result reservation after owner dismissal.
+    # That does not withdraw a native input already accepted by this runtime.
+    from test_owner_carries import carried, owner
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    old = carried(tid, 'old-retired-batch') if owner_carry else soon(tid, 'old-retired-batch')
+    if owner_carry:
+        await ph.call('turn/steer', owner(tid, [old], client='old-carrier'))
+    else:
+        await invoke(service, ph, 'submit', old, after=False)
+    later = soon(tid, 'later-result-batch')
+    later['message']['text'] = 'LATER RESULT UNIQUE'
+    later['semanticSha256'] = semantic_digest(later)
+    await invoke(service, ph, 'submit', later, after=False)
+    # Duplicate submission never creates a second registration of that id.
+    await invoke(service, ph, 'submit', later, after=False)
+    rows = ph.store.db.execute('SELECT message_id FROM busy_inputs WHERE thread_id=?', (tid,)).fetchall()
+    assert {r[0] for r in rows} == ({'steer-old-carrier', 'later-result-batch'} if owner_carry
+                                   else {'old-retired-batch', 'later-result-batch'})
+    assert len(rows) == 2
+    hook, data = await hook_for(ph, bridge)
+    context = (await hook(data, 'tool-1', {}))['hookSpecificOutput']['additionalContext']
+    assert 'LATER RESULT UNIQUE' in context
+    assert ('NOTICE @not-an-owner-path' if owner_carry else 'hello') in context
+    assert await hook(data, 'tool-1', {}) == {}
+    # An old receipt must not accidentally acknowledge the later id.
+    await ph.server.busy_delivery.acknowledge_messages(tid, turn, ['old-retired-batch'])
+    old_status = service._status(tid, 'old-retired-batch', old['semanticSha256'])
+    assert old_status['receipt']['messageId'] == 'old-retired-batch'
+    assert old_status['receipt']['semanticSha256'] == old['semanticSha256']
+    assert service._status(tid, 'later-result-batch', later['semanticSha256'])['receipt'] is None
+    await ph.server.busy_delivery.acknowledge_messages(tid, turn, ['later-result-batch'])
+    later_status = service._status(tid, 'later-result-batch', later['semanticSha256'])
+    assert later_status['receipt']['messageId'] == 'later-result-batch'
+    assert later_status['receipt']['turnId'] == turn
+    assert later_status['receipt']['semanticSha256'] == later['semanticSha256']
+    ph.store.finish(tid, turn, 'completed')
+    assert ph.store.claim(tid) is None
+
+
+@pytest.mark.parametrize('busy', [False, True])
+async def test_alarm_input_runs_idle_or_enters_busy_tool_gap_once(ph, busy):
+    if busy:
+        tid, turn, bridge = await begin(ph)
+    else:
+        tid = await ph.thread()
+    service = install(ph, subscription=True)
+    value = envelope(tid, 'alarm-policy-reminder')
+    value['message'].update({'source': {'kind': 'service', 'id': 'Cutex Alarm'},
+                             'type': 'alarm', 'delivery': 'soon' if busy else 'after_turn',
+                             'text': 'ALARM POLICY MARKER'})
+    value['semanticSha256'] = semantic_digest(value)
+    await invoke(service, ph, 'submit', value, after=not busy)
+    if busy:
+        hook, data = await hook_for(ph, bridge)
+        context = (await hook(data, 'tool-1', {}))['hookSpecificOutput']['additionalContext']
+        assert 'ALARM POLICY MARKER' in context
+        assert await hook(data, 'tool-1', {}) == {}
+        await ph.server.busy_delivery.acknowledge_messages(tid, turn, ['alarm-policy-reminder'])
+        ph.store.finish(tid, turn, 'completed')
+    else:
+        await ph.drain()
+        turns = ph.store.db.execute('SELECT id FROM turns WHERE thread_id=?', (tid,)).fetchall()
+        assert len(turns) == 1, 'an idle alarm starts one clean turn'
+        turn = turns[0][0]
+        assert len(ph.sdk.clients[0].messages) == 1
+    receipt = service._status(tid, value['message']['id'], value['semanticSha256'])['receipt']
+    assert receipt['turnId'] == turn and receipt['messageId'] == value['message']['id']
+    assert receipt['semanticSha256'] == value['semanticSha256']
+    assert ph.store.claim(tid) is None

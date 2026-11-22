@@ -163,11 +163,20 @@ pub(crate) fn status(
 ) -> anyhow::Result<Status> {
     let mut params = binding_params(&envelope.owner_id, &envelope.thread_id, generation);
     params["messages"] = json!([envelope.key()]);
-    validate_status(
-        handle.request("thread/externalInput/status", params)?,
-        envelope,
-        generation,
-    )
+    let result = (|| validate_status(handle.request("thread/externalInput/status", params)?, envelope, generation))();
+    if let Err(error) = &result {
+        // Read failures are diagnostics, never evidence that a frozen input
+        // was absent. Retain the exact source/native attempt association.
+        let diagnostic = (|| -> anyhow::Result<()> {
+            let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+            if let Some(source) = repository.source_id_for_native(&envelope.owner_id, &envelope.message.id)? {
+                repository.record_note_attempt_kind(&envelope.owner_id, &source, "nativeStatus", Some(&format!("{error:#}")), "nativeReconciliation")?;
+            }
+            Ok(())
+        })();
+        if let Err(diagnostic) = diagnostic { eprintln!("Claude note status diagnostic: {diagnostic:#}"); }
+    }
+    result
 }
 
 /// `thread/externalInput/returnCarries`. Only a status that could still mean

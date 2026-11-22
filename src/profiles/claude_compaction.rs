@@ -5,9 +5,9 @@
 //! `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from it, so a change applies at the
 //! profile's agents' next runtime start. No file = Claude Code decides.
 //!
-//! Claude Code 2.1.301 compacts at `min(E × percent / 100, E − 13000)` with
-//! `E = min(window, model context) − min(max output, 20000)`, so "compact at
-//! about N tokens" is `window = N + 33000, percent = 100`.
+//! r290 P13: percentages apply to Claude's usable window after runtime
+//! reserves. The exact trigger is runtime-owned; do not derive it from
+//! nominal window times percent or from the SDK's base threshold.
 //!
 //! The file keeps `deny_unknown_fields`: binaries before this feature read
 //! the same file and refuse unknown keys, so nothing else is ever written
@@ -26,23 +26,33 @@ pub const FILE_NAME: &str = "claude-runtime.json";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeCompaction {
-    pub auto_compact_window: u32,
+    // r290 P13: absent window follows the model/Claude Code context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_window: Option<u32>,
     pub auto_compact_percent: u8,
 }
 
 impl ClaudeCompaction {
     pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(WINDOW_RANGE.contains(&self.auto_compact_window), "Claude auto_compact_window must be 100000..1000000 tokens");
+        ensure!(self.auto_compact_window.is_none_or(|window| WINDOW_RANGE.contains(&window)), "Claude auto_compact_window must be 100000..1000000 tokens");
         ensure!(PERCENT_RANGE.contains(&self.auto_compact_percent), "Claude auto_compact_percent must be 1..100");
         Ok(())
     }
 
     /// The launch environment of the Claude adapter (inherited by Claude Code).
-    pub fn envs(&self) -> [(&'static str, String); 2] {
-        [
-            ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", self.auto_compact_window.to_string()),
-            ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", self.auto_compact_percent.to_string()),
-        ]
+    pub fn envs(&self) -> Vec<(&'static str, String)> {
+        let mut envs=Vec::new();
+        if let Some(window)=self.auto_compact_window {
+            envs.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW",window.to_string()));
+        }
+        envs.push(("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",self.auto_compact_percent.to_string()));
+        envs
+    }
+
+    // r290 P13: percent-only means model window, even if the host had a fixed override.
+    pub fn apply_env(&self, command: &mut std::process::Command) {
+        if self.auto_compact_window.is_none() {command.env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW");}
+        command.envs(self.envs());
     }
 
     /// API shape: `{window, percent}`.
@@ -194,14 +204,27 @@ pub fn models_json(table: &ModelTable) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    // r290 P13
+    #[test]
+    fn percent_only_roundtrip_removes_inherited_window() {
+        let value: ClaudeCompaction = serde_json::from_str(r#"{"auto_compact_percent":75}"#).unwrap();
+        value.validate().unwrap();
+        assert_eq!(value.to_json(),serde_json::json!({"window":null,"percent":75}));
+        assert_eq!(serde_json::to_value(value).unwrap(),serde_json::json!({"auto_compact_percent":75}));
+        let mut command=std::process::Command::new("unused");
+        command.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW","533000");
+        value.apply_env(&mut command);
+        assert!(command.get_envs().any(|(key,value)|key=="CLAUDE_CODE_AUTO_COMPACT_WINDOW" && value.is_none()));
+    }
+
     #[test]
     fn model_table_file_api_and_adapter_shapes() {
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         let id = "claude-test-models";
         assert_eq!(read_models_id(id).unwrap(), None);
         let table: ModelTable = [
-            ("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: 233_000, auto_compact_percent: 100 }),
-            ("claude-opus-5-5".to_string(), ClaudeCompaction { auto_compact_window: 533_000, auto_compact_percent: 100 }),
+            ("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: Some(233_000), auto_compact_percent: 100 }),
+            ("claude-opus-5-5".to_string(), ClaudeCompaction { auto_compact_window: Some(533_000), auto_compact_percent: 100 }),
         ].into();
         assert!(write_models_id(id, Some(table.clone())).unwrap());
         assert!(!write_models_id(id, Some(table.clone())).unwrap(), "same table: no change");
@@ -210,7 +233,7 @@ mod tests {
         assert_eq!(read_models_id(id).unwrap(), Some(table.clone()));
         assert_eq!(models_json(&table)["claude-sonnet-5-5"], serde_json::json!({"window":233000,"percent":100}));
         assert!(path_for_id(id).unwrap() != models_path_for_id(id).unwrap(), "claude-runtime.json is untouched");
-        let bad: ModelTable = [("has space".to_string(), ClaudeCompaction { auto_compact_window: 233_000, auto_compact_percent: 100 })].into();
+        let bad: ModelTable = [("has space".to_string(), ClaudeCompaction { auto_compact_window: Some(233_000), auto_compact_percent: 100 })].into();
         assert!(write_models_id(id, Some(bad)).is_err());
         assert!(write_models_id(id, Some(ModelTable::new())).unwrap(), "empty removes the file");
         assert_eq!(read_models_id(id).unwrap(), None);
@@ -224,7 +247,7 @@ mod tests {
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         let new = |name: &str, kind| create_profile(&NewProfile { name: name.into(), kind, preset: None, base_url: None, model: None, api_key: None }).unwrap();
         let claude = new("Claude", NewProfileKind::Claude);
-        let table: ModelTable = [("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: 233_000, auto_compact_percent: 100 })].into();
+        let table: ModelTable = [("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: Some(233_000), auto_compact_percent: 100 })].into();
         let set = |value: ModelTable| ProfileApiPatch { claude_compaction_models: ConfigValueUpdate::Set(value), ..Default::default() };
         assert!(update_profile(&claude.id, &set(table.clone())).unwrap().1);
         assert_eq!(models_view(&claude), (Some(table.clone()), None));
@@ -241,7 +264,7 @@ mod tests {
 
     #[test]
     fn file_shape_is_the_one_older_binaries_read() {
-        let value = ClaudeCompaction { auto_compact_window: 533_000, auto_compact_percent: 100 };
+        let value = ClaudeCompaction { auto_compact_window: Some(533_000), auto_compact_percent: 100 };
         let raw = serde_json::to_value(value).unwrap();
         assert_eq!(raw, serde_json::json!({"auto_compact_window":533000,"auto_compact_percent":100}));
         assert!(serde_json::from_str::<ClaudeCompaction>(r#"{"auto_compact_window":500000,"auto_compact_percent":90,"models":{}}"#).is_err());
@@ -250,7 +273,7 @@ mod tests {
 
     #[test]
     fn ranges() {
-        let ok = |w, p| ClaudeCompaction { auto_compact_window: w, auto_compact_percent: p }.validate().is_ok();
+        let ok = |w, p| ClaudeCompaction { auto_compact_window: Some(w), auto_compact_percent: p }.validate().is_ok();
         assert!(ok(100_000, 1) && ok(1_000_000, 100));
         assert!(!ok(99_999, 50) && !ok(1_000_001, 50) && !ok(500_000, 0) && !ok(500_000, 101));
     }
@@ -266,16 +289,16 @@ mod tests {
         let path = path_for_id(&claude.id).unwrap();
         assert_eq!(view(&claude), (None, None));
         let set = |value| ProfileApiPatch { claude_compaction: ConfigValueUpdate::Set(value), ..Default::default() };
-        let value = ClaudeCompaction { auto_compact_window: 533_000, auto_compact_percent: 100 };
+        let value = ClaudeCompaction { auto_compact_window: Some(533_000), auto_compact_percent: 100 };
         assert!(update_profile(&claude.id, &set(value)).unwrap().1);
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
             serde_json::json!({"auto_compact_window":533000,"auto_compact_percent":100}));
         assert_eq!(view(&claude).0, Some(value));
         assert!(!update_profile(&claude.id, &set(value)).unwrap().1, "same value: no change");
-        assert!(update_profile(&claude.id, &set(ClaudeCompaction { auto_compact_window: 50_000, auto_compact_percent: 100 })).is_err());
+        assert!(update_profile(&claude.id, &set(ClaudeCompaction { auto_compact_window: Some(50_000), auto_compact_percent: 100 })).is_err());
         // A file written by hand (the 10-22 rollout) shows up as is.
         std::fs::write(&path, br#"{"auto_compact_window":500000,"auto_compact_percent":90}"#).unwrap();
-        assert_eq!(view(&claude).0, Some(ClaudeCompaction { auto_compact_window: 500_000, auto_compact_percent: 90 }));
+        assert_eq!(view(&claude).0, Some(ClaudeCompaction { auto_compact_window: Some(500_000), auto_compact_percent: 90 }));
         // An invalid file is reported, and a write replaces it.
         std::fs::write(&path, br#"{"auto_compact_window":5}"#).unwrap();
         assert!(view(&claude).1.is_some());

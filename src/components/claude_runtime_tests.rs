@@ -208,6 +208,112 @@ fn r29_release_policy_bundles_an_unmodified_cli_by_default_and_keeps_the_off_swi
 }
 
 #[test]
+fn kit_cli_status_fallback_recognizes_all_three_sdk_layouts_without_a_prepare_receipt() {
+    let root = temp_root("kit-cli-status");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(BUNDLED_CLAUDE_CLI_METADATA),
+        r#"{"schema":"cutex/claude-cli-runtime/v1","sdk":"0.1.50","bundled":true}"#).unwrap();
+    for relative in [
+        "prepared/venv/Lib/site-packages/claude_agent_sdk/_bundled/claude.exe",
+        "prepared/venv/lib/python3.13/site-packages/claude_agent_sdk/_bundled/claude",
+        "prepared/venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude",
+    ] {
+        let cli = root.join(relative);
+        // No executable is needed: reconstruction must never probe it.
+        let status = fallback_cli_status(&root, &json!({"claude_cli": cli}));
+        assert_eq!(status["selected"], "bundled", "{status}");
+        assert_eq!(status["bundled"]["path"], json!(cli));
+        assert!(status["system"].is_null());
+        assert_eq!(cli_choice_wire(&status), json!({
+            "selected": "bundled", "bundled": {"version": null}, "system": null
+        }));
+    }
+    std::fs::remove_file(root.join(BUNDLED_CLAUDE_CLI_METADATA)).unwrap();
+    let cli = root.join("prepared/venv/Lib/site-packages/claude_agent_sdk/_bundled/claude.exe");
+    let status = fallback_cli_status(&root, &json!({"claude_cli": cli}));
+    assert_eq!(status["selected"], "bundled", "missing metadata must not imply system");
+    assert!(status["bundled"]["version"].is_null());
+    let source_cli = root.join("src/claude_agent_sdk/_bundled/claude");
+    assert_eq!(fallback_cli_status(&root, &json!({"claude_cli": source_cli}))["selected"], "bundled");
+    let system = root.join("system/bin/claude");
+    let status = fallback_cli_status(&root, &json!({"claude_cli": system}));
+    assert_eq!(status["selected"], "system");
+    assert_eq!(status["system"], json!({"path": system, "version": null}));
+    assert!(status["bundled"].is_null());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kit_cli_status_fallback_uses_only_explicit_packaged_cli_version_and_keeps_system_choice() {
+    let root = temp_root("kit-cli-version");
+    std::fs::create_dir_all(prepared_dir(&root)).unwrap();
+    let bundled = root.join("prepared/venv/lib/python3.13/site-packages/claude_agent_sdk/_bundled/claude");
+    std::fs::write(prepared_dir(&root).join(PREPARE_RECEIPT),
+        serde_json::to_vec(&json!({"bundledClaudeCli": bundled, "sdk": "0.1.50"})).unwrap()).unwrap();
+    let metadata_path = root.join(BUNDLED_CLAUDE_CLI_METADATA);
+    std::fs::write(&metadata_path,
+        r#"{"schema":"cutex/claude-cli-runtime/v1","sdk":"0.1.50","bundled":true,"cliVersion":"2.1.299"}"#).unwrap();
+    let status = fallback_cli_status(&root, &json!({"claude_cli": bundled}));
+    assert_eq!(status["bundled"]["version"], "2.1.299");
+    // A similarly prefixed directory is outside prepared; system stays system.
+    let system = root.join("prepared-external/bin/claude");
+    let status = fallback_cli_status(&root, &json!({"claude_cli": system}));
+    assert_eq!(status["selected"], "system");
+    assert_eq!(status["system"], json!({"path": system, "version": null}));
+    assert_eq!(status["bundled"]["version"], "2.1.299");
+    std::fs::write(&metadata_path,
+        r#"{"schema":"unrecognized","bundled":true,"cliVersion":"2.1.299"}"#).unwrap();
+    assert!(fallback_cli_status(&root, &json!({"claude_cli": bundled}))["bundled"]["version"].is_null());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kit_cli_status_reads_are_size_bounded() {
+    let root = temp_root("kit-cli-bounded");
+    std::fs::create_dir_all(prepared_dir(&root)).unwrap();
+    let status_path = prepared_dir(&root).join(CLAUDE_CLI_STATUS_FILE);
+    std::fs::write(&status_path, format!("{}{{}}", " ".repeat(64 * 1024))).unwrap();
+    assert!(read_cli_status(&root).is_null(), "valid oversized JSON must not be consumed");
+    std::fs::write(&status_path, r#"{"selected":"bundled","bundled":{"version":"2.1.299"}}"#).unwrap();
+    assert_eq!(read_cli_status(&root)["bundled"]["version"], "2.1.299");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kit_cli_status_probe_without_select_receipts_reports_bundled_and_writes_nothing() {
+    let _home = TestHome::new();
+    let root = temp_root("kit-cli-probe");
+    fake_runtime(&root);
+    std::fs::write(root.join("component.json"), r#"{"version":"claude-r50"}"#).unwrap();
+    for name in [BUNDLED_PYTHON_METADATA, BUNDLED_PYTHON_PAYLOAD, BUNDLED_PYTHON_LICENSE] {
+        std::fs::write(root.join(name), "fixture").unwrap();
+    }
+    let python = venv_python(&root);
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(&python, "never executed").unwrap();
+    std::fs::write(prepared_dir(&root).join(VENV_DIR).join(VENV_READY), "ok").unwrap();
+    let cli = prepared_dir(&root).join("venv/Lib/site-packages/claude_agent_sdk/_bundled/claude.exe");
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    std::fs::write(&cli, "never executed").unwrap();
+    let tui = root.join("tui-fixture");
+    std::fs::write(&tui, "never executed").unwrap();
+    let claude_home = crate::config::paths::config_dir().unwrap().join("claude-home");
+    std::fs::create_dir_all(&claude_home).unwrap();
+    ClaudeDeployment { python, adapter_source: root.clone(), claude_cli: cli,
+        claude_home, tui_binary: tui }.install().unwrap();
+    let before = std::fs::read_dir(prepared_dir(&root)).unwrap().count();
+    let probe = probe_dir(&root);
+    assert_eq!(probe["state"], states::READY, "{probe}");
+    assert_eq!(probe["claudeCli"]["selected"], "bundled", "{probe}");
+    assert_eq!(probe["selected"]["claudeCliChoice"], "bundled");
+    assert!(probe["claudeCli"]["bundled"]["version"].is_null());
+    assert_eq!(std::fs::read_dir(prepared_dir(&root)).unwrap().count(), before);
+    assert!(!prepared_dir(&root).join(CLAUDE_CLI_STATUS_FILE).exists());
+    assert!(!prepared_dir(&root).join(PREPARE_RECEIPT).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn venv_lives_in_prepared() {
     let python = venv_python(Path::new("/x"));
     if cfg!(windows) {

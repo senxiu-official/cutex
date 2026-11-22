@@ -309,6 +309,13 @@ stores![
         "sqlite"
     ),
     (
+        "submitted-input-index",
+        "management",
+        "runtime/management-v2/submitted-input-index.sqlite3",
+        "internal",
+        "sqlite"
+    ),
+    (
         "request-idempotency",
         "management",
         "runtime/management-v2/request-idempotency.sqlite3",
@@ -1121,6 +1128,23 @@ mod tests {
             assert_eq!(store.id,"input-dispositions");assert_eq!(store.rule,"forever");
             assert_eq!(store.group,"management");assert_eq!(store.kind,"sqlite");
         }
+    }
+
+    #[test]
+    fn submitted_input_index_and_sidecars_have_their_own_storage_report_row() {
+        let home=home();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path=format!("runtime/management-v2/submitted-input-index.sqlite3{suffix}");
+            let store=classify(&path);
+            assert_eq!(store.id,"submitted-input-index");assert_eq!(store.rule,"internal");
+            assert_eq!(store.group,"management");assert_eq!(store.kind,"sqlite");
+            file(&home,&path,b"synthetic index bytes");
+        }
+        scan(&home);
+        let report=overview(&home,&Default::default()).unwrap();
+        assert_eq!(row(&report,"submitted-input-index")["bytes"],4*b"synthetic index bytes".len());
+        assert_eq!(row(&report,"other")["bytes"],0);
+        let _=fs::remove_dir_all(home);
     }
 
     #[test]

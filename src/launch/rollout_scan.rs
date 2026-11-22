@@ -64,6 +64,21 @@ pub(crate) fn latest<S: LineScanner, R: Clone>(
     budget: u64,
     finish: impl Fn(S) -> R,
 ) -> anyhow::Result<R> {
+    latest_with_history(cache, home, current, thread_id, budget, true, finish)
+}
+
+// r290 P6: board reads never enumerate inherited-history directories.
+pub(crate) fn latest_current<S: LineScanner, R: Clone>(
+    cache: &'static Cache<R>, home: &Path, current: &Path, thread_id: &str,
+    budget: u64, finish: impl Fn(S) -> R,
+) -> anyhow::Result<R> {
+    latest_with_history(cache, home, current, thread_id, budget, false, finish)
+}
+
+fn latest_with_history<S: LineScanner, R: Clone>(
+    cache: &'static Cache<R>, home: &Path, current: &Path, thread_id: &str,
+    budget: u64, follow_history: bool, finish: impl Fn(S) -> R,
+) -> anyhow::Result<R> {
     let cache = cache.get_or_init(Default::default);
     let metadata = std::fs::metadata(current)?;
     let stamp = (metadata.len(), metadata.modified().ok());
@@ -95,12 +110,14 @@ pub(crate) fn latest<S: LineScanner, R: Clone>(
             } else if scanner.neutral() {
                 result
             } else {
-                scan_chain(home, current, &mut file, from, &mut scanner, &mut budget)?;
+                if follow_history { scan_chain(home, current, &mut file, from, &mut scanner, &mut budget)?; }
+                else { scan_segment(&mut file, 0, from, &mut scanner, &mut budget)?; }
                 finish(scanner)
             }
         }
         None => {
-            scan_chain(home, current, &mut file, length, &mut scanner, &mut budget)?;
+            if follow_history { scan_chain(home, current, &mut file, length, &mut scanner, &mut budget)?; }
+            else { scan_segment(&mut file, 0, length, &mut scanner, &mut budget)?; }
             finish(scanner)
         }
     };

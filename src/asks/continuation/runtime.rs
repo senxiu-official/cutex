@@ -185,8 +185,7 @@ pub fn resume_limited(
     let director = authority.current_director.map(str::to_owned);
     let receipt = state
         .update_ask(ask_id, now, |ask| {
-            ask.bounded_continuation
-                .reset_budget(authority, request, guards, now)
+            ask.bounded_continuation.reset_budget(authority, request, guards, now)
         })
         .ok_or_else(|| ask_error(Error::NotLimited))?
         .map_err(ask_error)?;
@@ -396,6 +395,7 @@ pub fn tick_due(
             let Some((data,resume,hold))=tick_projection(state,ask,&status,archived,permitted,now,director.as_deref()) else{continue};
             let continuation_changed=data!=ask.bounded_continuation;
             state.update_ask(&id,now,|ask|{ask.bounded_continuation=data;ask.resume=resume;ask.hold=hold;});
+            super::super::stop_settlement::close_cancelled_continuation(state, &id, now);
             if continuation_changed {changed_and_notice(state,&id,director.as_deref(),now);}
         }
     })?;
@@ -504,6 +504,7 @@ pub fn changed_and_notice(
             ask.bounded_continuation.enqueue_limit_notice()
         })
         .flatten();
+    super::super::stop_settlement::close_cancelled_continuation(state, ask_id, now);
     let Some(ask) = state.asks.get(ask_id).cloned() else {
         return;
     };

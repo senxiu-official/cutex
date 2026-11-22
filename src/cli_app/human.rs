@@ -249,21 +249,18 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
         } => {
             use cutex::launch::local_deployment::LocalDeployment;
             let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
-            let prior = LocalDeployment::selected()?;
-            let deployment = LocalDeployment {
-                bundle_manifest: bundle_manifest.canonicalize()?,
-                native_home: match source_home {
-                    Some(home) => home,
-                    // The default shared home of a fresh cutex home does not exist yet.
-                    None => cutex::management::v2::codex_config::ensure_host_codex_home()?,
-                }
-                .canonicalize()?,
-                job_mcp: match job_descriptor {
-                    Some(path) => Some(serde_json::from_slice(&std::fs::read(path)?)?),
-                    None => prior.and_then(|p| p.job_mcp),
-                },
+            let prior = LocalDeployment::selected().context("install-runtime: read selected runtime deployment")?;
+            let native_home = match source_home {
+                Some(home) => home,
+                // The default shared home of a fresh cutex home does not exist yet.
+                None => cutex::management::v2::codex_config::ensure_host_codex_home()
+                    .context("install-runtime: create default native home")?,
             };
-            deployment.install()?;
+            let deployment = LocalDeployment::from_install_paths(
+                &bundle_manifest, &native_home, job_descriptor.as_deref(), prior.and_then(|p| p.job_mcp),
+            )?;
+            deployment.install().with_context(|| format!("install-runtime: install bundle {} for native home {}",
+                deployment.bundle_manifest.display(), deployment.native_home.display()))?;
             println!("{}", serde_json::to_string_pretty(&LocalDeployment::selected()?)?);
         }
         HumanCommand::ManageNativeRuntime { check } => {

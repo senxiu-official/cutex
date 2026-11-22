@@ -159,6 +159,10 @@ pub struct CutexAppServerRuntimeBinding {
     /// evidence and projects as `unknown`; it is never inferred later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile_source: Option<LaunchProfileSource>,
+    /// Linux stock publication selected a transient scope for this occurrence.
+    /// Legacy and explicit fallback launches have no scope receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linux_scope: bool,
     #[serde(default)]
     pub auth_token_path: Option<String>,
     pub diagnostic_journal_path: String,

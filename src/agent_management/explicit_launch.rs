@@ -79,17 +79,67 @@ mod digest_memo {
         len: u64,
         modified: Option<SystemTime>,
         created: Option<SystemTime>,
+        #[cfg(unix)]
+        identity: (u64, u64),
+        #[cfg(unix)]
+        changed: (i64, i64),
+        #[cfg(windows)]
+        identity: crate::platform::private_fs::FileIdentity,
     }
 
-    static MEMO: Mutex<Option<HashMap<PathBuf, (Stamp, Instant, Sha256)>>> = Mutex::new(None);
+    const MAX_DIGEST_MEMO_ENTRIES: usize = 256;
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    enum MemoKey {
+        Path(PathBuf),
+        #[cfg(unix)]
+        Identity(u64, u64),
+    }
+    fn memo_key(path: &Path, stamp: &Stamp) -> MemoKey {
+        #[cfg(unix)]
+        { let _ = path; MemoKey::Identity(stamp.identity.0, stamp.identity.1) }
+        #[cfg(not(unix))]
+        { let _ = stamp; MemoKey::Path(path.to_path_buf()) }
+    }
+    type Memo = HashMap<MemoKey, (Stamp, Instant, Sha256)>;
+
+    static MEMO: Mutex<Option<Memo>> = Mutex::new(None);
 
     fn stamp(path: &Path) -> Option<Stamp> {
-        let metadata = std::fs::metadata(path).ok()?;
-        (metadata.is_file() && metadata.len() >= DIGEST_MEMO_MIN_BYTES).then(|| Stamp {
+        // Identity and timestamps come from one short-lived handle. If identity
+        // cannot be established, callers hash without reusing any cached digest.
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() < DIGEST_MEMO_MIN_BYTES { return None; }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        let identity = crate::platform::private_fs::identity(&file).ok()?;
+        #[cfg(not(any(unix, windows)))]
+        return None;
+        #[cfg(any(unix, windows))]
+        Some(Stamp {
             len: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(windows)]
+            identity,
         })
+    }
+
+    fn remember(memo: &mut Memo, path: PathBuf, stamp: Stamp, digest: Sha256) {
+        let path = memo_key(&path, &stamp);
+        memo.retain(|_, (_, at, _)| at.elapsed() < DIGEST_MEMO_TTL);
+        if !memo.contains_key(&path) && memo.len() >= MAX_DIGEST_MEMO_ENTRIES {
+            if let Some(oldest) = memo.iter().min_by_key(|(_, (_, at, _))| *at)
+                .map(|(path, _)| path.clone()) {
+                memo.remove(&oldest);
+            }
+        }
+        memo.insert(path, (stamp, Instant::now(), digest));
     }
 
     pub(super) fn file_sha256_memoized(
@@ -100,7 +150,7 @@ mod digest_memo {
             return compute(path);
         };
         if let Ok(memo) = MEMO.lock() {
-            if let Some((stamp, at, digest)) = memo.as_ref().and_then(|memo| memo.get(path)) {
+            if let Some((stamp, at, digest)) = memo.as_ref().and_then(|memo| memo.get(&memo_key(path, &before))) {
                 if *stamp == before && at.elapsed() < DIGEST_MEMO_TTL {
                     return Ok(digest.clone());
                 }
@@ -110,8 +160,7 @@ mod digest_memo {
         // Only remember a digest whose file did not change while it was read.
         if stamp(path).as_ref() == Some(&before) {
             if let Ok(mut memo) = MEMO.lock() {
-                memo.get_or_insert_with(HashMap::new)
-                    .insert(path.to_path_buf(), (before, Instant::now(), digest.clone()));
+                remember(memo.get_or_insert_with(HashMap::new), path.to_path_buf(), before, digest.clone());
             }
         }
         Ok(digest)
@@ -121,6 +170,100 @@ mod digest_memo {
     mod tests {
         use super::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[cfg(unix)]
+        #[test]
+        fn aliases_of_one_file_share_one_digest_and_metadata_still_invalidates() {
+            let dir = std::env::temp_dir().join(format!("cutex-digest-alias-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let first = dir.join("first");
+            let second = dir.join("second");
+            std::fs::write(&first, vec![7u8; DIGEST_MEMO_MIN_BYTES as usize]).unwrap();
+            std::fs::hard_link(&first, &second).unwrap();
+            let calls = AtomicUsize::new(0);
+            let compute = |path: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                super::super::file_sha256_uncached(path)
+            };
+            let digest = file_sha256_memoized(&first, compute).unwrap();
+            assert_eq!(file_sha256_memoized(&second, compute).unwrap(), digest);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            std::fs::write(&second, vec![8u8; DIGEST_MEMO_MIN_BYTES as usize + 1]).unwrap();
+            assert_ne!(file_sha256_memoized(&first, compute).unwrap(), digest);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn replacement_with_matching_timestamps_requires_new_file_identity() {
+            let dir = std::env::temp_dir().join(format!("cutex-digest-identity-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("large.bin");
+            std::fs::write(&path, vec![7u8; DIGEST_MEMO_MIN_BYTES as usize]).unwrap();
+            let old_digest = file_sha256_memoized(&path, super::super::file_sha256_uncached).unwrap();
+            let mut old_stamp = stamp(&path).unwrap();
+            // Keep the old inode/file ID alive so the OS cannot recycle it.
+            std::fs::rename(&path, dir.join("old.bin")).unwrap();
+            std::fs::write(&path, vec![8u8; DIGEST_MEMO_MIN_BYTES as usize]).unwrap();
+            let new_stamp = stamp(&path).unwrap();
+            assert!(old_stamp.identity != new_stamp.identity);
+            // Simulate identical timestamps: identity must still invalidate.
+            old_stamp.modified = new_stamp.modified;
+            old_stamp.created = new_stamp.created;
+            #[cfg(unix)]
+            { old_stamp.changed = new_stamp.changed; }
+            MEMO.lock().unwrap().as_mut().unwrap().insert(memo_key(&path, &old_stamp), (old_stamp, Instant::now(), old_digest.clone()));
+            let calls = AtomicUsize::new(0);
+            let digest = file_sha256_memoized(&path, |path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                super::super::file_sha256_uncached(path)
+            }).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_ne!(digest, old_digest);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn replacement_during_hash_is_not_remembered() {
+            let dir = std::env::temp_dir().join(format!("cutex-digest-race-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("large.bin");
+            std::fs::write(&path, vec![7u8; DIGEST_MEMO_MIN_BYTES as usize]).unwrap();
+            let first = file_sha256_memoized(&path, |path| {
+                let digest = super::super::file_sha256_uncached(path)?;
+                std::fs::rename(path, dir.join("old.bin"))?;
+                std::fs::write(path, vec![8u8; DIGEST_MEMO_MIN_BYTES as usize])?;
+                Ok(digest)
+            }).unwrap();
+            assert!(!MEMO.lock().unwrap().as_ref().is_some_and(|memo| memo.contains_key(&memo_key(&path, &stamp(&path).unwrap()))));
+            assert_ne!(file_sha256_memoized(&path, super::super::file_sha256_uncached).unwrap(), first);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn digest_memo_is_bounded_and_evicts_oldest_or_expired() {
+            let dir = std::env::temp_dir().join(format!("cutex-digest-bound-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("large.bin");
+            std::fs::write(&path, vec![7u8; DIGEST_MEMO_MIN_BYTES as usize]).unwrap();
+            let stamp = stamp(&path).unwrap();
+            let digest = super::super::file_sha256_uncached(&path).unwrap();
+            let mut memo = Memo::new();
+            let now = Instant::now();
+            for i in 0..MAX_DIGEST_MEMO_ENTRIES {
+                memo.insert(MemoKey::Path(PathBuf::from(format!("file-{i}"))), (stamp.clone(), now, digest.clone()));
+            }
+            memo.get_mut(&MemoKey::Path("file-0".into())).unwrap().1 = now - std::time::Duration::from_secs(1);
+            remember(&mut memo, path.clone(), stamp.clone(), digest.clone());
+            assert_eq!(memo.len(), MAX_DIGEST_MEMO_ENTRIES);
+            assert!(!memo.contains_key(&MemoKey::Path("file-0".into())));
+            assert!(memo.contains_key(&memo_key(&path, &stamp)));
+            memo.get_mut(&MemoKey::Path("file-1".into())).unwrap().1 = now - DIGEST_MEMO_TTL;
+            remember(&mut memo, path.clone(), stamp, digest);
+            assert_eq!(memo.len(), MAX_DIGEST_MEMO_ENTRIES - 1);
+            assert!(!memo.contains_key(&MemoKey::Path("file-1".into())));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
 
         #[test]
         fn large_files_reuse_digest_until_metadata_changes_small_files_never() {

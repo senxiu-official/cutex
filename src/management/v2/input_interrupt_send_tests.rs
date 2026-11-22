@@ -1,4 +1,23 @@
 use super::*;
+
+#[test]
+fn ordered_batch_and_submit_selection_are_strict_and_exported() {
+    let batch=json!({"inputIds":["a","b"],"expectedRevs":{"a":1,"b":2},"expectedTurnId":"T","expectedRuntimeGeneration":7});
+    assert_eq!(InterruptSendMany::parse(&batch,false).unwrap().input_ids,["a","b"]);
+    super::super::contract_validation::validate_cutex_request(&json!({"requestId":"batch","method":METHOD,"params":batch})).unwrap();
+    for patch in [json!({"inputIds":["a","a"]}),json!({"expectedRevs":{"a":1}}),json!({"expectedRevs":{"a":0,"b":2}}),
+        json!({"expectedRevs":{"a":1,"b":2,"c":3}}),json!({"unknown":true})] {
+        let mut bad=batch.clone();for (key,value) in patch.as_object().unwrap() {bad[key]=value.clone();}
+        assert!(InterruptSendMany::parse(&bad,false).is_err(),"{bad}");
+    }
+    let submit=json!({"clientUserMessageId":"draft","origin":{"kind":"other","clientId":"desktop"},"strategy":"interrupt",
+        "input":[{"type":"text","text":"draft"}],"interruptSend":batch});
+    let parsed=super::super::user_input::parse_user_input_submit_params(&submit).unwrap();
+    assert!(parsed.interrupt_send.is_some());
+    super::super::contract_validation::validate_cutex_request(&json!({"requestId":"draft","method":"cutex/userInput/submit","params":submit})).unwrap();
+    let mut wrong=submit.clone();wrong["strategy"]=json!("auto");assert!(super::super::user_input::parse_user_input_submit_params(&wrong).is_err());
+    wrong=submit.clone();wrong["clientUserMessageId"]=json!("a");assert!(super::super::user_input::parse_user_input_submit_params(&wrong).is_err());
+}
 use super::super::input_ledger::{
     Action, Evidence, Expect, InputIntent, InputKind, InputLedger, InputSender, InputState, LedgerError, NewInput,
     Next, SenderKind, Stage, Strategy, Surface, Timing, DATABASE_FILE,

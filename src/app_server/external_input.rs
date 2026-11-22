@@ -858,6 +858,17 @@ impl ExternalInputClient {
     /// or refuse with a typed `busy` reason (nothing queued). The turn id is
     /// returned synchronously; the receipt follows via status.
     pub fn submit_exclusive(&self, envelope: &Envelope) -> anyhow::Result<ExclusiveSubmit> {
+        self.submit_exclusive_with(envelope, false)
+    }
+    pub fn supports_stop_answer(&self) -> bool {
+        self.initialize_response().get("externalInputStopAnswer").and_then(serde_json::Value::as_u64)
+            .is_some_and(|v| v >= 1)
+    }
+    pub fn submit_stop_answer(&self, envelope: &Envelope) -> anyhow::Result<ExclusiveSubmit> {
+        ensure!(self.supports_stop_answer(), "stop_answer_unavailable");
+        self.submit_exclusive_with(envelope, true)
+    }
+    fn submit_exclusive_with(&self, envelope: &Envelope, stop_answer: bool) -> anyhow::Result<ExclusiveSubmit> {
         ensure!(self.supports_exclusive_turn(), "native exclusive admission (N1) unavailable");
         envelope.validate()?;
         exclusive_envelope_allowed(envelope, self.supports_structured_view())?;
@@ -869,6 +880,7 @@ impl ExternalInputClient {
         );
         let mut params = serde_json::to_value(envelope)?;
         params["admission"] = serde_json::Value::from(EXCLUSIVE_TURN_ADMISSION);
+        if stop_answer { params["admission"] = serde_json::Value::from("stop_answer"); }
         let mut raw = match self.request("thread/externalInput/submit", params) {
             Ok(raw) => raw,
             Err(error) => match busy_refusal_reason(&error) {
@@ -883,6 +895,9 @@ impl ExternalInputClient {
         let response: Response = serde_json::from_value(raw)?;
         response.validate(&self.binding, &[envelope.key()])?;
         let status = response.statuses.into_iter().next().context("exclusive submit without status")?;
+        if turn_id.is_none() && status.processing.state == ProcessingState::Held {
+            return Ok(ExclusiveSubmit::Replayed(status));
+        }
         let turn_id = turn_id.or_else(|| status.receipt.as_ref().map(|receipt| receipt.turn_id.clone()));
         Ok(match turn_id {
             Some(turn_id) => ExclusiveSubmit::Started { turn_id, status },

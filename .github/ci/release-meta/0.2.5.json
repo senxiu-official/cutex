@@ -1,0 +1,38 @@
+{
+  "_comment": "Public release metadata. Historical migration boundaries remain explicit.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "durable-state-sqlite",
+      "class": "one-way",
+      "since": "0.2.1",
+      "notes": {
+        "en": "Moves durable session, communication and usage state to SQLite-backed stores. Retain an offline backup; automatic rollback across this migration is unavailable.",
+        "zh-CN": "会话、通信及用量的持久状态迁入 SQLite。请保留离线备份；无法跨过本次迁移自动回退。"
+      }
+    },
+    {
+      "id": "background-service-records",
+      "class": "one-way",
+      "since": "0.2.3",
+      "notes": {
+        "en": "Adds persisted worker service records that older cutex versions cannot read. Keep a backup and do not downgrade a store containing worker services to an older release.",
+        "zh-CN": "新增旧版 cutex 无法读取的 worker 服务持久记录。请保留备份，不要把包含后台应用记录的数据退回旧版。"
+      }
+    },
+    {
+      "id": "job-follow-up-disposition",
+      "class": "one-way",
+      "since": "0.2.5",
+      "notes": {
+        "en": "Job Service 0.1.3 can persist unconfirmed jobs when follow-up is ended. Job Service 0.1.2 cannot read that state. Retain an offline backup and do not downgrade the Job Service or restore older binaries over a store containing those records.",
+        "zh-CN": "Job Service 0.1.3 在结束后续处理时可持久保存 unconfirmed 作业。Job Service 0.1.2 无法读取该状态。请保留离线备份；包含这些记录后，不要降级 Job Service 或用旧二进制覆盖该存储。"
+      }
+    }
+  ],
+  "notes": {
+    "en": "Ordered owner input across interruption and recovery; bounded note admission; improved Linux runtime supervision; Native 0.169.0-r65 and Claude claude-r55. Before manually returning to 0.2.4, use 0.2.5 to stop all stock Native and Claude runtime scopes and verify that they are empty or collected. Hold the return if any scope cannot be drained. Includes Job Service 0.1.3. Ending job follow-up creates state unreadable by 0.1.2; keep a backup and do not downgrade that component.",
+    "zh-CN": "改进中断与恢复过程中的主人输入顺序、有界便条接收和 Linux 运行时监管，提供 Native 0.169.0-r65 与 Claude claude-r55。 手动退回 0.2.4 前，须先用 0.2.5 停止全部 stock Native 和 Claude 运行时 scope，并确认已经清空或回收；任何 scope 无法排空时暂缓回退。 提供 Job Service 0.1.3。结束作业后续处理会产生 0.1.2 无法读取的状态；请保留备份，不要降级该组件。"
+  }
+}

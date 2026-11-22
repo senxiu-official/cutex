@@ -94,6 +94,15 @@ pub fn results_view(
     target_of: &dyn Fn(&str) -> (String, Option<String>),
     answer_preview: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
+    results_view_with_stop_answer(items,target_of,answer_preview,None)
+}
+
+pub fn results_view_with_stop_answer(
+    items: &[ReturnItem],
+    target_of: &dyn Fn(&str) -> (String, Option<String>),
+    answer_preview: &dyn Fn(&str) -> Option<String>,
+    stop_since: Option<&str>,
+) -> Value {
     let mut rows = Vec::new();
     for item in items {
         let row = match item {
@@ -118,10 +127,11 @@ pub fn results_view(
                 json!({"kind": "question", "askId": ask_id, "title": title,
                     "target": {"id": id, "name": name}, "questionId": question_id, "preview": first})
             }
-            ReturnItem::State { ask_id, title, state, .. } => {
+            // r290 P7
+            ReturnItem::State { ask_id, title, state, failure, .. } => {
                 let (id, name) = target_of(ask_id);
                 json!({"kind": "state", "askId": ask_id, "title": title,
-                    "target": {"id": id, "name": name}, "state": state})
+                    "target": {"id": id, "name": name}, "state": state, "handlerFailure":failure})
             }
         };
         rows.push(row);
@@ -130,6 +140,7 @@ pub fn results_view(
     let mut omitted = 0usize;
     loop {
         let mut data = json!({"items": rows});
+        if let Some(since)=stop_since { data["stopAnswerSince"]=json!(since); }
         if omitted > 0 {
             data["omitted"] = json!(omitted);
         }
@@ -181,7 +192,7 @@ mod tests {
                 review: true, flags: vec![], error: None },
             ReturnItem::Question { ask_id: "ask-1".into(), title: "T".into(), target: "Helper".into(),
                 question_id: "q-1".into(), questions: json!([{"question": "Which file?"}]) },
-            ReturnItem::State { ask_id: "ask-2".into(), title: "U".into(), target: "Helper".into(), state: "busy".into() },
+            ReturnItem::State { ask_id: "ask-2".into(), title: "U".into(), target: "Helper".into(), state: "busy".into(), failure: None },
         ];
         let view = results_view(&items, &|_| ("cutex.t".into(), Some("Helper".into())), &|_| Some("done".into()));
         let rows = view["data"]["items"].as_array().unwrap();
@@ -193,7 +204,7 @@ mod tests {
         assert!(view["data"].get("omitted").is_none());
         // Too many items: the tail is omitted and counted.
         let many: Vec<ReturnItem> = (0..200)
-            .map(|n| ReturnItem::State { ask_id: format!("ask-{n}"), title: "x".repeat(100), target: "H".into(), state: "held".into() })
+            .map(|n| ReturnItem::State { ask_id: format!("ask-{n}"), title: "x".repeat(100), target: "H".into(), state: "held".into(), failure: None })
             .collect();
         let view = results_view(&many, &|_| ("cutex.t".into(), None), &|_| None);
         assert!(view["data"]["omitted"].as_u64().unwrap() > 0);
@@ -243,7 +254,7 @@ mod tests {
                 state.update_ask(&ask_id, now, |ask| {
                     let attempt = ask.current_attempt_mut().unwrap();
                     for n in 0..7 {
-                        attempt.progress.push(ProgressNote { text: format!("p{n}"), at: "t".into() });
+                        attempt.progress.push(ProgressNote { text: format!("p{n}"), at: "t".into(), steps:None });
                     }
                 });
             })

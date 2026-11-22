@@ -47,6 +47,7 @@ const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 /// paths, drive prefixes, `..`, `.git` components and anything whose
 /// canonical form (symlinks/junctions resolved) lies outside the root.
 pub fn resolve_rel(root: &ResolvedRoot, raw: &str) -> WorkspaceResult<(PathBuf, String)> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     crate::artifacts::paths::validate_resolved_local_path(&root.canonical).map_err(|_|WorkspaceError::new(403,"path_forbidden","unsafe workspace root"))?;
     let components = normalize_rel(raw)?;
     let mut joined = root.canonical.clone();
@@ -132,6 +133,7 @@ pub fn dir_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     let _credentials = super::host_files::credential_request();
     let raw = params.get("path").map(String::as_str).unwrap_or("");
     let (dir, rel) = resolve_rel(root, raw)?;
@@ -245,6 +247,7 @@ pub fn file_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     let raw = params
         .get("path")
         .filter(|path| !path.is_empty())
@@ -521,6 +524,7 @@ pub fn search_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     let _credentials = super::host_files::credential_request();
     let query: String = params
         .get("q")
@@ -693,6 +697,7 @@ fn watch_hub() -> &'static Mutex<HashMap<PathBuf, Arc<RootWatch>>> {
 /// with the first subscriber and stops once every receiver is dropped and
 /// `prune_watch` runs.
 pub fn subscribe_watch(root: &Path) -> WorkspaceResult<mpsc::Receiver<WatchBatch>> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     crate::artifacts::paths::validate_resolved_local_path(root).map_err(|_|WorkspaceError::new(403,"path_forbidden","unsafe watch root"))?;
     let (sender, receiver) = mpsc::sync_channel(64);
     let mut hub = watch_hub()
@@ -815,7 +820,9 @@ fn debounce_loop(
         if batch.paths.is_empty() && !batch.git_changed && !batch.overflow {
             continue;
         }
-        super::workspace_git::invalidate_status(&root);
+        if status_changed(&root, &batch) {
+            super::workspace_git::invalidate_status(&root);
+        }
         if !batch.paths.is_empty() || batch.overflow {
             invalidate_file_list(&root);
         }
@@ -829,6 +836,15 @@ fn debounce_loop(
             });
         };
     }
+}
+
+/// Ignore rules affect status invalidation, not the file watch stream. Git's
+/// own check-ignore also keeps tracked files relevant even when a rule matches.
+fn status_changed(root: &Path, batch: &WatchBatch) -> bool {
+    if batch.git_changed || batch.overflow { return true; }
+    let names = batch.paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let ignored = super::workspace_git::check_ignored(root, &names);
+    names.iter().any(|name| !ignored.contains(*name))
 }
 
 /// Convert raw absolute event paths into a root-relative batch; `.git`
@@ -1433,6 +1449,32 @@ mod tests {
         assert_eq!(batch.paths, vec!["a.txt", "d/e"]);
         assert!(batch.git_changed);
         assert!(!batch.overflow);
+    }
+
+    #[test]
+    fn git_status_invalidation_uses_git_ignore_and_preserves_tracked_and_git_changes() {
+        let (dir, root) = temp_root("status-ignore");
+        let git = |args: &[&str]| assert!(super::super::workspace_git::run_git(&dir, args, None).unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n!keep.log\n").unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/tracked.txt"), "tracked").unwrap();
+        git(&["add", "-f", "target/tracked.txt"]);
+        // r290 integration: this verifies real Git ignore semantics, separately
+        // from workspace_git's production-deadline conservative-fallback tests.
+        let changed = |name: &str| super::super::workspace_git::with_test_ignore_budget(
+            Duration::from_secs(30),
+            || status_changed(&root.canonical, &batch_from_paths(&root.canonical, &[root.canonical.join(name)])),
+        );
+        assert!(!changed("target/ignored.txt"));
+        assert!(!changed("output.log"));
+        assert!(changed("keep.log"));
+        assert!(changed("target/tracked.txt"));
+        assert!(changed(".git/index"));
+        assert!(changed(".git/HEAD"));
+        assert!(changed(".git/refs/heads/main"));
+        assert!(status_changed(&root.canonical, &WatchBatch { paths: vec![], git_changed: false, overflow: true }));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

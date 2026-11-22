@@ -124,11 +124,13 @@ fn context() -> ManagementRequestContext {
         handle_user_input: |_| unreachable!(),
         flush_user_input_queue: |_, _, _| unreachable!(),
         steer_user_input_queue: |_, _, _| unreachable!(),
-        interrupt_active_turn: |_, _| unreachable!(),
-        load_bootstrap_state: |_, _| {
+        interrupt_active_turn: |_, _, _| unreachable!(),
+        load_bootstrap_state: |_, _, _| {
             Ok(json!({"userInputQueue":[], "pendingServerRequests":[], "agentBusMessages":[]}))
         },
         load_latest_plan: |_| Value::Null,
+        // r290 P6
+        load_board_plan: |_| Value::Null,
         load_latest_token_usage: |_| Value::Null,
         revert_session_history: |id, turn, _| {
             let before: usize = turn.strip_prefix("turn-").unwrap().parse().unwrap();

@@ -424,11 +424,51 @@ pub fn active_jobs(paths: &Paths) -> anyhow::Result<Vec<String>> {
         .into_iter()
         .flatten()
         .filter(|(_, job)| job.get("external").is_none_or(Value::is_null))
-        .filter(|(_, job)| job["state"].as_str().is_some_and(|s| ACTIVE_STATES.contains(&s)))
+        .filter(|(_, job)| {
+            job["state"].as_str().is_some_and(|s| ACTIVE_STATES.contains(&s))
+                || job["launchPending"] == true || recorded_job_process_alive(job)
+        })
         .map(|(id, _)| id.clone())
         .collect();
     ids.sort();
     Ok(ids)
+}
+
+fn recorded_job_process_alive(job: &Value) -> bool {
+    let Some(pid) = job.get("processId").and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok()).filter(|pid| *pid != 0) else {
+        return false;
+    };
+    let Some(birth) = job.get("processStartTicks").and_then(Value::as_u64) else {
+        return false;
+    };
+    local_job_process_birth(pid) == Some(birth)
+}
+
+/// A read-only identity probe. Linux uses /proc start ticks; Windows uses
+/// creation FILETIME ticks. PID reuse and zombie processes do not block a restart.
+fn local_job_process_birth(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = stat.rfind(')')?;
+        let fields: Vec<_> = stat.get(close + 2..)?.split_whitespace().collect();
+        if matches!(fields.first().copied(), Some("Z" | "X" | "x")) { return None; }
+        return fields.get(19)?.parse().ok();
+    }
+    #[cfg(windows)]
+    {
+        if !crate::platform::process::process_is_running(pid) { return None; }
+        let started = crate::platform::process::process_started_at(pid).ok()?;
+        return u64::try_from(started.timestamp()).ok()?.checked_mul(10_000_000)?
+            .checked_add(u64::from(started.timestamp_subsec_nanos() / 100))?
+            .checked_add(116_444_736_000_000_000);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn busy_error(count: usize, what: &str) -> anyhow::Error {
@@ -950,3 +990,32 @@ impl Handler for JobService {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "job_service_tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod process_presence_tests {
+    use super::*;
+
+    struct PrivateRoot(PathBuf);
+    impl Drop for PrivateRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn unconfirmed_process_blocks_restart_only_for_the_recorded_identity() {
+        let root = PrivateRoot(std::env::temp_dir().join(format!("job-presence-{}", uuid::Uuid::new_v4().simple())));
+        std::fs::create_dir(&root.0).unwrap();
+        let paths = Paths::under(&root.0);
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let pid = std::process::id();
+        let birth = local_job_process_birth(pid).unwrap();
+        std::fs::write(&paths.state, serde_json::to_vec(&json!({"jobs":{
+            "alive":{"state":"unconfirmed","processId":pid,"processStartTicks":birth},
+            "reused":{"state":"unconfirmed","processId":pid,"processStartTicks":birth+1},
+            "external":{"state":"unconfirmed","processId":pid,"processStartTicks":birth,"external":{"source":"nci"}},
+            "missing":{"state":"unconfirmed"},
+            "pending":{"state":"unconfirmed","launchPending":true},
+            "future":{"state":"future_state","processId":pid,"processStartTicks":birth}
+        }})).unwrap()).unwrap();
+        assert_eq!(active_jobs(&paths).unwrap(), vec!["alive".to_string(), "future".to_string(), "pending".to_string()]);
+    }
+}

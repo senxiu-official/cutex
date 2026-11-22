@@ -55,12 +55,21 @@ sqlite_domain!(
     "durable owner disposal authority; independent of the rebuildable input ledger; standalone user_version=1, retained without expiry"
 );
 sqlite_domain!(
+    SUBMITTED_INPUT_INDEX,
+    "submitted-input-index",
+    "runtime/management-v2/submitted-input-index.sqlite3",
+    "rebuildable advisory submitted-input fingerprints and atomic journal byte checkpoint; included in kit SQLite snapshots; journal remains authoritative"
+);
+sqlite_domain!(
     REQUEST_IDEMPOTENCY,
     "request-idempotency",
     "runtime/management-v2/request-idempotency.sqlite3",
     "request idempotency receipts"
 );
 sqlite_domain!(PAN, "pan", "pan/pan.sqlite", "Pan download tasks and audit entries commit together");
+sqlite_domain!(PROFILE_QUOTA_NOTES, "profile-quota-notes", "runtime/profile-quota-notes/quota-notes-v1.sqlite3", "passive quota note outbox and per-window dedupe"); // r290 P12.
+// r290 P5: schedule cursor, occurrence audit and owner receipts are atomic.
+sqlite_domain!(SCHEDULES, "schedules", "runtime/schedules/schedules-v1.sqlite3", "owner recurring schedules, occurrence audit and idempotent writes");
 sqlite_domain!(NAME_TARGET_PINS, "name-target-pins", "runtime/name-target-pins.sqlite3", "immutable action recipient bindings");
 sqlite_domain!(
     INTEGRATION_DEDUPE,
@@ -165,15 +174,18 @@ pub static EXTERNAL: TxDomain = TxDomain {
 };
 
 pub static DOMAINS: &[&TxDomain] = &[
+    &SCHEDULES, // r290 P5 schedules.
     &OWNER_NOTIFY,
     &APPROVALS,
     &MANAGEMENT_STATE,
     &SESSIONS,
     &INPUT_LEDGER,
     &INPUT_DISPOSITIONS,
+    &SUBMITTED_INPUT_INDEX,
     &REQUEST_IDEMPOTENCY,
     &NAME_TARGET_PINS,
     &PAN,
+    &PROFILE_QUOTA_NOTES, // r290 P12.
     &INTEGRATION_DEDUPE,
     &PENDING_STOPS,
     &PROJECT_EVENTS,

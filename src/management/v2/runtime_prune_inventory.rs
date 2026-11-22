@@ -1,7 +1,13 @@
 //! Read-only discovery and reference authority for owner-triggered runtime pruning.
+#[path = "runtime_prune_budget.rs"]
+pub(super) mod budget;
+#[path = "runtime_prune_path_index.rs"]
+mod path_index;
+#[path = "runtime_prune_timing.rs"]
+pub(super) mod timing;
 use crate::session::model::CutexSessionStore;
 use crate::upgrade::layout::Layout;
-use anyhow::{Context, ensure};
+use anyhow::{ensure, Context};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -17,8 +23,12 @@ pub struct Version {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub bytes: u64,
+    /// Directory sizes are advisory and are not recursively walked by the plan.
+    pub bytes_estimated: bool,
     pub can_prune: bool,
     pub blocked_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_process_inspection: Option<super::runtime_prune_processes::UnresolvedClaude>,
     #[serde(skip)]
     pub targets: Vec<PathBuf>,
 }
@@ -41,15 +51,27 @@ pub(super) fn executable_sha() -> anyhow::Result<String> {
 }
 
 pub fn read_json(path: &Path) -> anyhow::Result<Value> {
-    let bytes = std::fs::read(path)?;
+    use std::io::Read;
+    budget::check()?;
+    if let Some(value) = budget::json(path) {
+        return Ok(value);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() <= 8 * 1024 * 1024,
         "runtime reference metadata too large"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    let value: Value = serde_json::from_slice(&bytes)?;
+    budget::save_json(path.to_path_buf(), value.clone(), bytes.len());
+    budget::check()?;
+    Ok(value)
 }
 
 pub fn optional_json(path: &Path) -> anyhow::Result<Option<Value>> {
+    budget::check()?;
     match std::fs::metadata(path) {
         Ok(_) => read_json(path).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -60,15 +82,25 @@ pub fn optional_json(path: &Path) -> anyhow::Result<Option<Value>> {
 /// Compare existing paths by canonical identity, absent references lexically. Windows aliases
 /// and case are normalized without accepting parent traversal in deletion targets.
 pub fn normalized(path: &Path) -> PathBuf {
+    if budget::check().is_err() {
+        return path.to_path_buf();
+    }
+    if let Some(value) = budget::path(path) {
+        return value;
+    }
+    let key = path.to_path_buf();
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     {
-        PathBuf::from(
+        let value = PathBuf::from(
             crate::agent_management::strip_verbatim_prefix(&path.to_string_lossy()).to_lowercase(),
-        )
+        );
+        budget::save_path(key, value.clone());
+        value
     }
     #[cfg(not(windows))]
     {
+        budget::save_path(key, path.clone());
         path
     }
 }
@@ -198,12 +230,13 @@ fn contracts(value: &Value, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn session_references(
-    store: &CutexSessionStore,
+    store: &crate::session::store::RuntimeReferenceSnapshot,
     pins: &mut Vec<PathBuf>,
     data: &mut Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     // All durable rows, including hidden, paused, offline and restorable retired rows.
-    for record in store.sessions.values() {
+    for record in store.values() {
+        budget::check()?;
         if let Some(contract) = &record.explicit_launch {
             bundle(&contract.bundle_manifest, pins)?;
             data.push(contract.native_home.clone());
@@ -340,11 +373,13 @@ fn rollback(home: &Path, layout: Option<&Layout>, out: &mut Vec<PathBuf>) -> any
 }
 
 fn direct_children(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    budget::check()?;
     if !root.exists() {
         return Ok(Vec::new());
     }
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(root)? {
+        budget::check()?;
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             paths.push(entry.path());
@@ -356,8 +391,19 @@ fn direct_children(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// A version root must be an ordinary owned object. Contained links are removable directory
 /// entries, not permission to inspect/delete their destinations (bundled Python uses symlinks).
 pub fn target_bytes(path: &Path) -> anyhow::Result<u64> {
+    let metadata = checked_root(path)?;
+    let _ = metadata;
+    tree_bytes(path)
+}
+
+pub(super) fn checked_root(path: &Path) -> anyhow::Result<std::fs::Metadata> {
+    budget::check()?;
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(!metadata.file_type().is_symlink(), "linked runtime root");
+    ensure!(
+        metadata.is_file() || metadata.is_dir(),
+        "special runtime artifact"
+    );
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -366,11 +412,12 @@ pub fn target_bytes(path: &Path) -> anyhow::Result<u64> {
             "reparse runtime root"
         );
     }
-    tree_bytes(path)
+    Ok(metadata)
 }
 
 /// Logical bytes of entries removed. Never follow a contained link/junction out of the version.
 pub fn tree_bytes(path: &Path) -> anyhow::Result<u64> {
+    budget::check()?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(metadata.len());
@@ -413,8 +460,10 @@ fn candidate(
         release,
         version,
         bytes: 0,
+        bytes_estimated: false,
         can_prune: false,
         blocked_reasons: Vec::new(),
+        claude_process_inspection: None,
         targets,
     }
 }
@@ -433,12 +482,33 @@ pub(super) fn inspect_with_processes(
     store: &CutexSessionStore,
     known_processes: Option<anyhow::Result<Vec<PathBuf>>>,
 ) -> anyhow::Result<Inventory> {
+    inspect_reference_snapshot(
+        home,
+        layout,
+        &crate::session::store::runtime_references_from_store(store),
+        known_processes,
+    )
+}
+
+pub(super) fn inspect_reference_snapshot(
+    home: &Path,
+    layout: Option<&Layout>,
+    store: &crate::session::store::RuntimeReferenceSnapshot,
+    known_processes: Option<anyhow::Result<Vec<PathBuf>>>,
+) -> anyhow::Result<Inventory> {
+    let discovery_stage = timing::stage("candidate_discovery");
+    let _scope = budget::Scope::enter(
+        std::time::Duration::from_secs(10),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    budget::check()?;
     let registry =
         crate::launch::version_registry::load(&home.join("native-version-registry-v1.json"))?;
     let mut versions = Vec::new();
     let mut groups = BTreeMap::<String, BTreeSet<PathBuf>>::new();
     if let Some(registry) = registry {
         for (path, record) in registry.runtime_paths {
+            budget::check()?;
             if Path::new(&path).is_file() {
                 groups
                     .entry(record.version)
@@ -448,6 +518,7 @@ pub(super) fn inspect_with_processes(
         }
     }
     for (version, paths) in groups {
+        budget::check()?;
         let mut unique = BTreeMap::new();
         for path in paths {
             unique.entry(normalized(&path)).or_insert(path);
@@ -528,6 +599,8 @@ pub(super) fn inspect_with_processes(
             }
         }
     }
+    drop(discovery_stage);
+    let authority_stage = timing::stage("authority_references");
     let mut chosen = Vec::new();
     let mut pins = Vec::new();
     let mut recovery = Vec::new();
@@ -537,13 +610,60 @@ pub(super) fn inspect_with_processes(
     let selected_complete = selected(home, layout, &mut chosen, &mut data).is_ok();
     let pins_complete = session_references(store, &mut pins, &mut data).is_ok();
     let rollback_complete = rollback(home, layout, &mut recovery).is_ok();
+    drop(authority_stage);
     let all_targets = versions
         .iter()
         .flat_map(|v| v.targets.iter().cloned())
         .collect::<Vec<_>>();
-    let processes = known_processes
-        .unwrap_or_else(|| super::runtime_prune_processes::running_paths(&all_targets));
+    let inspection = match known_processes {
+        Some(paths) => paths.map(super::runtime_prune_processes::ProcessInspection::from_paths),
+        None => super::runtime_prune_processes::inspect_processes(&all_targets),
+    };
+    let (processes, unresolved_claude) = match inspection {
+        Ok(inspection) => (Ok(inspection.paths), inspection.unresolved_claude),
+        Err(error) => (Err(error), Default::default()),
+    };
+    let index_stage = timing::stage("path_index");
+    timing::count("versions", versions.len());
+    timing::count("targets", all_targets.len());
+    timing::count("selectedReferences", chosen.len());
+    timing::count("pinReferences", pins.len());
+    timing::count("rollbackReferences", recovery.len());
+    timing::count("dataReferences", data.len());
+    let index = |paths: Vec<PathBuf>| path_index::Index::new(paths.iter().map(|p| normalized(p)));
+    let chosen = index(chosen);
+    let pins = index(pins);
+    let recovery = index(recovery);
+    let data = index(data);
+    let unresolved = processes.as_ref().is_ok_and(|paths| {
+        paths
+            .iter()
+            .any(|p| p == Path::new(super::runtime_prune_processes::UNKNOWN_CLAUDE))
+    });
+    let processes = processes.map(index);
+    let mut roots = vec![normalized(&home.join("native"))];
+    let layout_roots = layout.map(|l| {
+        (
+            normalized(&l.runtimes_dir()),
+            normalized(&crate::components::components_dir(l)),
+        )
+    });
+    if let Some(l) = layout {
+        roots.extend(
+            [
+                l.releases_dir(),
+                l.runtimes_dir(),
+                l.natives_dir(),
+                crate::components::components_dir(l),
+            ]
+            .iter()
+            .map(|p| normalized(p)),
+        );
+    }
+    drop(index_stage);
+    let _eligibility_stage = timing::stage("eligibility");
     for version in &mut versions {
+        budget::check()?;
         version.id = candidate(
             &version.kind,
             version.release.clone(),
@@ -565,35 +685,24 @@ pub(super) fn inspect_with_processes(
             reasons.insert("rollback_protection_unavailable");
         }
         for target in &version.targets {
-            let native_root = home.join("native");
-            let managed = normalized(target).starts_with(normalized(&native_root))
-                || layout.is_some_and(|l| {
-                    [
-                        l.releases_dir(),
-                        l.runtimes_dir(),
-                        l.natives_dir(),
-                        crate::components::components_dir(l),
-                    ]
-                    .iter()
-                    .any(|root| normalized(target).starts_with(normalized(root)))
-                });
+            let canonical = normalized(target);
+            let managed = roots.iter().any(|root| canonical.starts_with(root));
             if !managed {
                 reasons.insert("unmanaged");
             }
             if version.kind == "native"
-                && layout.is_some_and(|l| {
-                    let relative = normalized(target)
-                        .strip_prefix(normalized(&l.runtimes_dir()))
-                        .ok()
-                        .map(Path::to_path_buf);
-                    normalized(target)
-                        .starts_with(normalized(&crate::components::components_dir(l)))
-                        || relative.is_some_and(|r| {
-                            r.components().next().is_some_and(|c| {
-                                c.as_os_str().to_string_lossy().starts_with("claude-r")
-                            })
-                        })
-                })
+                && layout_roots
+                    .as_ref()
+                    .is_some_and(|(runtime_root, component_root)| {
+                        canonical.starts_with(component_root)
+                            || canonical
+                                .strip_prefix(runtime_root)
+                                .ok()
+                                .and_then(|p| p.components().next())
+                                .is_some_and(|c| {
+                                    c.as_os_str().to_string_lossy().starts_with("claude-r")
+                                })
+                    })
             {
                 reasons.insert("unmanaged");
             }
@@ -611,38 +720,21 @@ pub(super) fn inspect_with_processes(
                     reasons.insert("unmanaged");
                 }
             }
-            if chosen
-                .iter()
-                .any(|p| overlaps(target, p) || overlaps(p, target))
-            {
+            if chosen.either(&canonical) {
                 reasons.insert("selected");
             }
-            if pins
-                .iter()
-                .any(|p| overlaps(target, p) || overlaps(p, target))
-            {
+            if pins.either(&canonical) || data.descendant(&canonical) {
                 reasons.insert("pinned");
             }
-            if data.iter().any(|p| overlaps(target, p)) {
-                reasons.insert("pinned");
-            }
-            if recovery
-                .iter()
-                .any(|p| overlaps(target, p) || overlaps(p, target))
-            {
+            if recovery.either(&canonical) {
                 reasons.insert("rollback");
             }
             match &processes {
-                Ok(paths)
-                    if version.kind == "claude"
-                        && paths.iter().any(|p| {
-                            p == Path::new(super::runtime_prune_processes::UNKNOWN_CLAUDE)
-                        }) =>
-                {
+                Ok(_) if version.kind == "claude" && unresolved => {
                     reasons.insert("inspection_failed");
                     reasons.insert("claude_process_unresolved");
                 }
-                Ok(paths) if paths.iter().any(|p| overlaps(target, p)) => {
+                Ok(paths) if paths.descendant(&canonical) => {
                     reasons.insert("running");
                 }
                 Err(_) => {
@@ -651,8 +743,14 @@ pub(super) fn inspect_with_processes(
                 }
                 _ => {}
             }
-            match target_bytes(target) {
-                Ok(bytes) => version.bytes = version.bytes.saturating_add(bytes),
+            match checked_root(target) {
+                Ok(metadata) => {
+                    if metadata.is_file() {
+                        version.bytes = version.bytes.saturating_add(metadata.len());
+                    } else {
+                        version.bytes_estimated = true;
+                    }
+                }
                 Err(_) => {
                     reasons.insert("inspection_failed");
                     reasons.insert("runtime_size_inspection_failed");
@@ -660,8 +758,16 @@ pub(super) fn inspect_with_processes(
             }
         }
         version.blocked_reasons = reasons.into_iter().map(str::to_owned).collect();
+        if version
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason == "claude_process_unresolved")
+        {
+            version.claude_process_inspection = Some(unresolved_claude.clone());
+        }
         version.can_prune = version.blocked_reasons.is_empty();
     }
     versions.sort_by(|a, b| (&a.kind, &a.release, &a.id).cmp(&(&b.kind, &b.release, &b.id)));
+    budget::check()?;
     Ok(Inventory { versions })
 }

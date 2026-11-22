@@ -346,7 +346,28 @@ pub(crate) fn write_response_parts(stream: &mut TcpStream, parts: &[&[u8]], budg
     write_response_parts_clock(stream, parts, budget, Instant::now)
 }
 
-fn write_response_parts_clock(stream: &mut TcpStream, parts: &[&[u8]], budget: Duration, mut now: impl FnMut() -> Instant) -> std::io::Result<()> {
+/// Streaming responses can enforce a policy across every write/retry rather
+/// than resetting a whole-transfer budget for each buffer.
+pub(crate) fn write_response_parts_checked(
+    stream: &mut TcpStream,
+    parts: &[&[u8]],
+    budget: Duration,
+    progress: impl FnMut(usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    write_response_parts_checked_clock(stream, parts, budget, Instant::now, progress)
+}
+
+fn write_response_parts_clock(stream: &mut TcpStream, parts: &[&[u8]], budget: Duration, now: impl FnMut() -> Instant) -> std::io::Result<()> {
+    write_response_parts_checked_clock(stream, parts, budget, now, |_| Ok(()))
+}
+
+fn write_response_parts_checked_clock(
+    stream: &mut TcpStream,
+    parts: &[&[u8]],
+    budget: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut progress: impl FnMut(usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let previous = stream.write_timeout()?;
     let stall = previous.map_or(budget, |timeout| timeout.min(budget));
     let mut last_progress = now();
@@ -357,6 +378,7 @@ fn write_response_parts_clock(stream: &mut TcpStream, parts: &[&[u8]], budget: D
         for part in parts {
             let mut remaining = *part;
             while !remaining.is_empty() {
+                progress(0)?;
                 if now().duration_since(last_progress) >= stall {
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP response write deadline expired"));
                 }
@@ -365,6 +387,7 @@ fn write_response_parts_clock(stream: &mut TcpStream, parts: &[&[u8]], budget: D
                     Ok(written) => {
                         remaining = &remaining[written..];
                         last_progress = now();
+                        progress(written)?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));

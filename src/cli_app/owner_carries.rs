@@ -39,6 +39,14 @@ fn returned_details(details: &Value) -> Value {
     details
 }
 
+fn returned_input_details(record: &il::InputRecord) -> Value {
+    let mut details = returned_details(&record.details);
+    if record.intent.timing == il::Timing::Passive {
+        details.as_object_mut().expect("returned details").remove("ownerHold");
+    }
+    details
+}
+
 fn accepted_next(owner: &str, turn: &str, starts_turn: bool, mut details: Value) -> Next {
     details["carriedByOwner"] = json!(owner);
     if starts_turn { details[il::READ_SIGNAL] = json!("turnStart"); }
@@ -50,7 +58,7 @@ fn owns_reservation(record: &il::InputRecord, owner: &str) -> bool {
         && record.details.get("carriedByOwner").and_then(Value::as_str) == Some(owner)
 }
 
-fn canonical_policy(
+pub(crate) fn canonical_policy(
     session: &str,
     record: &cutex::session::model::CutexSessionRecord,
     generation: u64,
@@ -141,7 +149,7 @@ impl OwnerCarries {
             return;
         };
         if matches!(record.state, InputState::Sending | InputState::Accepted | InputState::Uncertain | InputState::Waiting) {
-            il::record(session, input, Expect::rev(record.rev), Next::waiting("returned").details(returned_details(&record.details)));
+            il::record(session, input, Expect::rev(record.rev), Next::waiting("returned").details(returned_input_details(&record)));
         }
     }
 
@@ -208,6 +216,19 @@ impl OwnerCarries {
                 runtime_generation: generation,
                 canonical_byte_limit: canonical_policy(session, &record, generation)?,
             };
+            if let Some(ids) = cutex::management::v2::agent_bus_wake::selected_note_ids(il::default_ledger()?, session, owner)? {
+                let bus = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+                let mut bytes = 0usize;
+                bundle.envelopes = bus.reserve_note_carries(session, owner, thread, generation, &ids, |message, meta| {
+                    let envelope = cutex::app_server::bus_bridge::owner_carry_envelope(message, &binding, meta, None)?;
+                    bytes = bytes.saturating_add(serde_json::to_vec(&envelope)?.len());
+                    anyhow::ensure!(bytes <= 1024 * 1024, "selected notes exceed owner transport budget");
+                    Ok(envelope)
+                })?;
+                bundle.ids = bundle.envelopes.iter().map(|e| e.message.id.clone()).collect();
+                if !bundle.ids.is_empty() { bundle.record_reservation()?; }
+                return Ok(());
+            }
             let store = AskStore::open_default()?;
             if let Some(results) = cutex::asks::owner_carries::reserve_owner_results(
                 &store,
@@ -330,6 +351,12 @@ impl OwnerCarries {
         }
     }
 
+    pub(crate) fn passive_budget(&self) -> cutex::app_server::pre_turn_notes::Budget {
+        let bytes=self.envelopes.iter().map(|e|serde_json::to_vec(e).map(|v|v.len()).unwrap_or(usize::MAX))
+            .fold(0usize,usize::saturating_add);
+        cutex::app_server::pre_turn_notes::Budget::after_carried(self.ids.len(),bytes)
+    }
+
     pub(crate) fn accepted(&self, turn: Option<&str>, starts_turn: bool) {
         let Some(turn) = turn else {
             self.unknown();
@@ -425,7 +452,9 @@ impl OwnerCarries {
                     // Both authoritative sources released this safely unsent
                     // reservation. Their projection may have run while the
                     // record was still Sending; restore hold actions here too.
-                    details["ownerHold"] = json!(false);
+                    if record.intent.timing == il::Timing::Passive {
+                        details.as_object_mut().expect("returned details").remove("ownerHold");
+                    } else { details["ownerHold"] = json!(false); }
                     Next::waiting("returned")
                 };
                 next.details = Some(details);

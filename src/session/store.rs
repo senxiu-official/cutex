@@ -30,6 +30,8 @@ pub use rows::with_locked_session_rows;
 pub use rows::SessionRowConflict;
 pub use rows::SessionRows;
 pub(crate) use sqlite::indexed::pending_quick_chat_promotions_at;
+pub(crate) use sqlite::indexed::archive_receipt_at;
+pub(crate) use sqlite::indexed::{runtime_references_at, runtime_references_from_store, RuntimeReferenceSnapshot};
 // Every receipt map, for row-level writers (not all have one yet).
 #[allow(unused_imports)]
 pub(crate) use rows::{
@@ -204,6 +206,13 @@ pub(crate) fn load_cutex_session_store_shared_at(path: &Path) -> anyhow::Result<
 /// revision); an unchanged store costs one small query. `read` runs on a
 /// shared snapshot outside every lock, so nested reads and writes from
 /// inside `read` are fine.
+/// The default store's shared snapshot, brought up to date like
+/// [`with_cutex_session_store`]. Do not keep it: a held snapshot makes the
+/// next commit copy the whole store; compare `store_revision` instead.
+pub fn shared_cutex_session_store() -> anyhow::Result<std::sync::Arc<CutexSessionStore>> {
+    sqlite::shared(&cutex_sessions_path()?)
+}
+
 pub fn with_cutex_session_store<T>(read: impl FnOnce(&CutexSessionStore) -> T,
 ) -> anyhow::Result<T> {
     let path = cutex_sessions_path()?;

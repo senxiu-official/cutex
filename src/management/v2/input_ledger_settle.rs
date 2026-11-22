@@ -426,41 +426,100 @@ pub fn session_delivery(facts: &DeliveryFacts, now: DateTime<Utc>) -> Value {
     })
 }
 
+// Surface-less results wait for an explicit tool read, not automatic progress.
+fn hidden_result(record: &InputRecord) -> bool {
+    record.surface == Surface::None && matches!(record.kind,
+        InputKind::DelegationResult | InputKind::DelegationQuestion | InputKind::DelegationStatus)
+}
+
 /// §2.2 `stalled{noProgress}`: a `waiting` record that should move (its
 /// reason is not one of [`STALL_EXEMPT`]) while its session is `idle`, and
 /// did not change for `stall_after`, is marked; the mark goes when the
 /// session is no longer idle (a state change clears it anyway). Not a
 /// [`il::stranded_resend`]: no turn can move it, its mark and actions stay.
 /// `since` is when the wait began. Returns the transition to write, or `None`.
+pub fn note_waiting_next(record: &InputRecord, view: &RuntimeView) -> Option<Next> {
+    if record.state.is_settled() { return None; }
+    let mut details = record.details.clone();
+    let diagnostic = details.get_mut("deliveryDiagnostics")?;
+    let source_wait = diagnostic.get("sourceWaitingFor").or_else(||diagnostic.get("waitingFor")).cloned()?;
+    let source = source_wait.as_str().unwrap_or("nativeInbox");
+    let binding = &diagnostic["binding"];
+    let conflict = binding["runtimeGeneration"].as_u64().zip(view.generation).is_some_and(|(a,b)|a!=b)
+        || binding["threadId"].as_str().zip(view.thread_id.as_deref()).is_some_and(|(a,b)|a!=b);
+    let waiting = if matches!(source,"ownerResume"|"staleReview"|"earlierInput"|"nativeRelease") { source }
+        else if conflict { "bindingReconciliation" }
+        else if !view.connected { "runtimeConnection" }
+        else if diagnostic["stage"]=="inbox" && il::shown_to_agent(record) { "contextReceipt" }
+        else if diagnostic["stage"] == "inbox" || source=="nextBoundaryBudget" { if view.active_turn.is_none() {"nextTurn"} else {"nextInputBoundary"} }
+        else { source };
+    let waiting = waiting.to_owned();
+    diagnostic["sourceWaitingFor"] = source_wait;
+    diagnostic["waitingFor"] = json!(waiting);
+    if details == record.details { return None; }
+    let mut next = Next::to(record.state).details(details);
+    next.reason = record.reason.clone(); next.stage = record.stage;
+    Some(next)
+}
+
+fn normal_next_turn(record:&InputRecord, idle:bool) -> bool {
+    idle && record.intent.timing==il::Timing::Passive
+        && !il::shown_to_agent(record)
+        && record.details["deliveryDiagnostics"]["waitingFor"]=="nextTurn"
+        && record.details["deliveryDiagnostics"]["lastError"].is_null()
+        && record.details.get("projectionFailure").is_none()
+}
+
 pub fn stall_next(record: &InputRecord, idle: bool, now: DateTime<Utc>, stall_after: Duration) -> Option<Next> {
-    if record.state != InputState::Waiting {
+    if normal_next_turn(record,idle) {
+        return record.stalled.as_ref().filter(|s|s.reason=="noProgress").map(|_| {
+            let mut next=Next::to(record.state).stalled(None);next.reason=record.reason.clone();next.stage=record.stage;next
+        });
+    }
+    // A repeatedly failed Bus projection owns its diagnostic until its
+    // source retries successfully, including passive notes and busy turns.
+    let projection = record.details.get("projectionFailure");
+    if projection.and_then(|p| p["attempts"].as_u64()).is_some_and(|n| n >= 2) { return None; }
+    let diagnostic = record.details.get("deliveryDiagnostics");
+    let note = diagnostic.is_some() && record.intent.timing == il::Timing::Passive;
+    if record.state != InputState::Waiting && !(note && matches!(record.state, InputState::Sending | InputState::Accepted)) {
         return None;
     }
     let reason = record.reason.as_deref().unwrap_or("afterTurn");
     let marked = record.stalled.as_ref().is_some_and(|stalled| stalled.reason == "noProgress");
-    let eligible = idle && !STALL_EXEMPT.contains(&reason);
+    let eligible = !hidden_result(record) && (note || projection.is_some() || idle && !STALL_EXEMPT.contains(&reason));
     if marked && !eligible && !il::stranded_resend(record) {
         return Some(Next::waiting(reason).stalled(None));
     }
     if !eligible || record.stalled.is_some() {
         return None;
     }
-    let quiet = parse_time(&record.updated_at)
+    let since = diagnostic.and_then(|d| d["since"].as_str()).or_else(|| projection.and_then(|p| p["since"].as_str())).unwrap_or(&record.updated_at);
+    let quiet = parse_time(since)
         .is_some_and(|at| now - at >= chrono::Duration::from_std(stall_after).unwrap_or_default());
-    quiet.then(|| Next::waiting(reason).stalled(Some(Stalled { reason: "noProgress".into(), since: record.since.clone() })))
+    quiet.then(|| {
+        let mut next = Next::to(record.state).stalled(Some(Stalled { reason: "noProgress".into(), since: since.into() }));
+        next.reason = record.reason.clone(); next.stage = record.stage;
+        next
+    })
 }
 
 /// When [`stall_next`] would next mark one of these records (`None`: none
 /// is eligible).
 pub fn next_stall_check(records: &[InputRecord], idle: bool, stall_after: Duration) -> Option<DateTime<Utc>> {
-    if !idle {
-        return None;
-    }
     records
         .iter()
-        .filter(|record| record.state == InputState::Waiting && record.stalled.is_none())
-        .filter(|record| !STALL_EXEMPT.contains(&record.reason.as_deref().unwrap_or("afterTurn")))
-        .filter_map(|record| parse_time(&record.updated_at))
+        .filter(|record| (record.state == InputState::Waiting || record.details.get("deliveryDiagnostics").is_some()
+            && record.intent.timing == il::Timing::Passive && matches!(record.state, InputState::Sending | InputState::Accepted)) && record.stalled.is_none())
+        .filter(|record| !hidden_result(record))
+        .filter(|record| !normal_next_turn(record,idle))
+        .filter(|record| {
+            if let Some(p) = record.details.get("projectionFailure") { return p["attempts"].as_u64().unwrap_or(0) < 2; }
+            if record.details.get("deliveryDiagnostics").is_some() && record.intent.timing == il::Timing::Passive { return true; }
+            idle && !STALL_EXEMPT.contains(&record.reason.as_deref().unwrap_or("afterTurn"))
+        })
+        .filter_map(|record| parse_time(record.details.get("deliveryDiagnostics").and_then(|d| d["since"].as_str())
+            .or_else(||record.details.get("projectionFailure").and_then(|p| p["since"].as_str())).unwrap_or(&record.updated_at)))
         .map(|at| after(at, stall_after))
         .min()
 }
@@ -678,7 +737,7 @@ pub fn disconnected(ledger: &InputLedger, session: &str, now: DateTime<Utc>) -> 
     let mut changed = 0;
     for record in unsettled(ledger, session) {
         if !matches!(record.state, InputState::Sending | InputState::Accepted)
-            || record.stalled.as_ref().is_some_and(|s| s.reason == "runtimeDisconnected")
+            || record.stalled.is_some()
         {
             continue;
         }
@@ -693,9 +752,14 @@ pub fn disconnected(ledger: &InputLedger, session: &str, now: DateTime<Utc>) -> 
 /// prove; deadlines restart now.
 pub fn reconnected(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, generation_changed: bool, now: DateTime<Utc>) -> usize {
     let view = runtime.view(session);
+    if !view.connected { return 0; }
     let mut changed = 0;
     for record in unsettled(ledger, session) {
         if !matches!(record.state, InputState::Sending | InputState::Accepted) {
+            continue;
+        }
+        let stranded = generation_changed && record.stalled.as_ref().is_some_and(|stall| stall.reason == "noProgress");
+        if record.stalled.as_ref().is_some_and(|stall| stall.reason != "runtimeDisconnected") && !stranded {
             continue;
         }
         let was_stalled = record.stalled.as_ref().is_some_and(|s| s.reason == "runtimeDisconnected");
@@ -704,7 +768,7 @@ pub fn reconnected(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, g
             InputState::Sending if was_stalled => {
                 Some(Next::sending().stalled(None).deadline(Some(after(now, ledger.deadlines().sending))))
             }
-            InputState::Accepted if is_delegation(record.kind) => was_stalled.then(|| Next::accepted().stalled(None)),
+            InputState::Accepted if is_delegation(record.kind) && !stranded => was_stalled.then(|| Next::accepted().stalled(None)),
             InputState::Accepted if generation_changed => {
                 let (result, item, carrying_turn) = check_full(runtime, &record, None);
                 bind_receipt_turn(bind_checked(settle_next(record.kind, Occasion::GenerationChanged, &result), item), carrying_turn)
@@ -1015,12 +1079,50 @@ impl Runtime for LiveRuntime {
 
 struct Watch {
     generation: Option<u64>,
+    /// Explicitly offline runtimes await an event, without periodic polling.
+    poll: bool,
+}
+
+fn observe_connection(
+    ledger: &InputLedger,
+    runtime: &dyn Runtime,
+    session: &str,
+    view: &RuntimeView,
+    watched: &mut BTreeMap<String, Watch>,
+    now: DateTime<Utc>,
+) {
+    if view.connected {
+        if let Some(watch) = watched.remove(session) {
+            let changed = watch.generation.is_none() || watch.generation != view.generation;
+            reconnected(ledger, runtime, session, changed, now);
+        }
+    } else if view.present && !view.stopped {
+        if let Some(watch) = watched.get_mut(session) {
+            watch.poll = true;
+        } else {
+            disconnected(ledger, session, now);
+            watched.insert(session.to_string(), Watch { generation: view.generation, poll: true });
+        }
+    } else if let Some(watch) = watched.get_mut(session) {
+        // Preserve the disconnected generation until an online event arrives.
+        // Dropping it here loses reconnect settlement for an offline/online pair.
+        watch.poll = false;
+    }
+    // A dormant entry has no reconnect work once every input has settled.
+    // Keep the watch on a read failure: an unavailable store is not empty.
+    if watched.get(session).is_some_and(|watch| !watch.poll)
+        && ledger.list(session, il::ListQuery { since_revision: None, include_settled_secs: 0 })
+            .is_ok_and(|list| list.records.iter().all(|record| record.state.is_settled()))
+    {
+        watched.remove(session);
+    }
+
 }
 
 struct Engine {
     runtime: LiveRuntime,
     subscription: Option<super::repository::EventSubscription>,
-    /// Sessions seen disconnected (polled until they come back).
+    /// Sessions awaiting reconnect; explicit offline entries sleep until an event.
     watched: BTreeMap<String, Watch>,
     /// Sessions with a published delivery (refreshed every drift pass).
     known: BTreeSet<String>,
@@ -1165,7 +1267,7 @@ impl Engine {
         }
         if self.last_watch.elapsed() >= Duration::from_secs(1) {
             self.last_watch = Instant::now();
-            dirty.extend(self.watched.keys().cloned());
+            dirty.extend(self.watched.iter().filter(|(_, watch)| watch.poll).map(|(session, _)| session.clone()));
             dirty.extend(self.reconnect_checks.iter().cloned());
             dirty.extend(self.starting.keys().cloned());
             let due: Vec<String> =
@@ -1265,6 +1367,7 @@ impl Engine {
                         disconnected(ledger, session, now);
                         self.watched.insert(session.to_string(), Watch {
                             generation: cutex.params.get("runtimeGeneration").and_then(Value::as_u64),
+                            poll: true,
                         });
                     }
                     dirty.insert(session.to_string());
@@ -1291,19 +1394,9 @@ impl Engine {
         let Ok(ledger) = il::default_ledger() else { return };
         let now = Utc::now();
         let view = self.runtime.view(session);
-        if view.present && !view.connected && !view.stopped && !self.watched.contains_key(session) {
-            disconnected(ledger, session, now);
-            self.watched.insert(session.to_string(), Watch { generation: view.generation });
-        } else if view.connected {
-            if let Some(watch) = self.watched.remove(session) {
-                let changed = watch.generation.is_some() && watch.generation != view.generation;
-                reconnected(ledger, &self.runtime, session, changed, now);
-            }
-            if self.reconnect_checks.remove(session) {
-                reconnected(ledger, &self.runtime, session, false, now);
-            }
-        } else if !view.present || view.stopped {
-            self.watched.remove(session);
+        observe_connection(ledger, &self.runtime, session, &view, &mut self.watched, now);
+        if view.connected && self.reconnect_checks.remove(session) {
+            reconnected(ledger, &self.runtime, session, false, now);
         }
         let starting = match self.starting.get(session) {
             Some(_) if view.connected => {
@@ -1321,7 +1414,7 @@ impl Engine {
         facts.starting = starting;
         let delivery = session_delivery(&facts, now);
         super::input_ledger_wake::refresh(ledger, session, &delivery);
-        self.stall(ledger, session, delivery["state"] == "idle", now);
+        self.stall(ledger, session, &view, delivery["state"] == "idle", now);
         self.stuck_owner(ledger, session, &view, facts.lease.as_ref(), now);
         match ledger.delivery_changed(session, &delivery) {
             Ok(change) => {
@@ -1336,10 +1429,12 @@ impl Engine {
 
     /// §2.2 `stalled{noProgress}` for the session's waiting records, and
     /// when to look again (no polling: one timer per session).
-    fn stall(&mut self, ledger: &InputLedger, session: &str, idle: bool, now: DateTime<Utc>) {
+    fn stall(&mut self, ledger: &InputLedger, session: &str, view: &RuntimeView, idle: bool, now: DateTime<Utc>) {
         let stall_after = ledger.deadlines().stall_after;
         let records = unsettled(ledger, session);
         for record in &records {
+            let refreshed = note_waiting_next(record, view).and_then(|next|apply(ledger,record,next)).map(|t| t.record);
+            let record = refreshed.as_ref().unwrap_or(record);
             if let Some(next) = stall_next(record, idle, now, stall_after) {
                 apply(ledger, record, next);
             }
@@ -1569,6 +1664,8 @@ fn thread_idle(ledger: &InputLedger, session: &str) -> bool {
 /// be ([`super::input_ledger_bus::target_of`]). Only a different STATE the
 /// §2.3 edges allow is corrected (waiting reasons written by other paths —
 /// hostBusy, agentOffline, ownerRetry … — are not the store's to judge).
+/// Source-owned stale-release proof is also refreshed at the same waiting
+/// reason, so an older row gains no action until the source proves it.
 /// No native calls.
 pub fn bus_drift(
     record: &InputRecord,
@@ -1585,6 +1682,22 @@ pub fn bus_drift(
         return None;
     }
     let target = target_of(facts);
+    if let Some(source) = &facts.delivery_diagnostics {
+        let mut current = record.details.get("deliveryDiagnostics").cloned();
+        if let Some(diagnostic) = current.as_mut() {
+            if let Some(waiting) = diagnostic.as_object_mut().and_then(|o|o.remove("sourceWaitingFor")) {
+                diagnostic["waitingFor"] = waiting;
+            }
+        }
+        if current.as_ref() != Some(source) { return Some(target); }
+    }
+    if record.state == InputState::Waiting && record.reason.as_deref() == Some("staleHeld") {
+        if let super::input_ledger_bus::Target::Waiting { reason:"staleHeld", details:Some(details) } = &target {
+            if record.details.get("staleReleaseAllowed") != details.get("staleReleaseAllowed") {
+                return Some(target);
+            }
+        }
+    }
     let state = target.state();
     (state != record.state && !plan(Some(record.state), &target, facts.timing).is_empty()).then_some(target)
 }
@@ -1610,9 +1723,9 @@ fn bus_drift_one(_ledger: &InputLedger, record: &InputRecord, now: DateTime<Utc>
         return;
     }
     let Some(target) = bus_drift(record, view.as_ref(), now) else { return };
-    let Some((_, _, input)) = view else { return };
+    let Some((_, facts, input)) = view else { return };
     let before = record.state;
-    if let Some(after) = super::input_ledger_bus::drive(&record.cutex_session_id, &record.input_id, &input, &target) {
+    if let Some(after) = super::input_ledger_bus::drive_with_diagnostics(&record.cutex_session_id, &record.input_id, &input, &target, facts.delivery_diagnostics.as_ref()) {
         if after.state != before {
             eprintln!("{DRIFT_LOG}: {}/{}: {} -> {} (agent-bus store)", record.cutex_session_id, record.input_id, before, after.state);
         }
@@ -1864,10 +1977,63 @@ pub fn remember_owner_submit(session: &str, client_user_message_id: &str, params
     }
     if let Err(error) = il::default_ledger()
         .map_err(LedgerError::Storage)
-        .and_then(|ledger| ledger.put_payload(session, client_user_message_id, params))
+        .and_then(|ledger| {
+            // A repeat submit must not overwrite the content of a later
+            // queue merge or of the input actually sent to native.
+            ledger.put_initial_payload(session, client_user_message_id, params)
+        })
     {
         eprintln!("cutex input ledger (settle): retry payload {session}/{client_user_message_id}: {error}");
     }
+}
+
+/// Logical owner input before adapter image encoding. Keep every part and
+/// retain routing metadata so a resend can reconstruct the same input.
+pub fn owner_submit_payload(params: &super::user_input::UserInputSubmitParams) -> Value {
+    let mut payload = json!({
+        "clientUserMessageId": params.client_user_message_id,
+        "origin": params.origin, "strategy": params.strategy,
+        "input": params.input, "expectedTurnId": params.expected_turn_id,
+    });
+    if let Some(join) = &params.join_delegation { payload["joinDelegation"] = json!(join); }
+    if let Some(batch) = &params.interrupt_send { payload["interruptSend"] = json!(batch); }
+    payload
+}
+
+pub fn remember_merged_owner_input(
+    ledger: &InputLedger, session: &str, item: &super::user_input::UserInputQueueItem,
+) -> Result<(), LedgerError> {
+    let mut payload = ledger.payload(session, &item.client_user_message_id)?.unwrap_or_else(||
+        owner_submit_payload(&super::user_input::UserInputSubmitParams {
+                interrupt_send: None,
+            client_user_message_id: item.client_user_message_id.clone(), origin: item.origin.clone(),
+            strategy: super::user_input::UserInputStrategy::Auto, input: item.input.clone(),
+            expected_turn_id: None, join_delegation: None,
+        }));
+    payload["input"] = json!(item.input);
+    payload["origin"] = json!(item.origin);
+    ledger.put_payload(session, &item.client_user_message_id, &payload)
+}
+
+/// Refuse a stale resend copy before interrupting a turn or reopening retry.
+/// Look up the latest submitted fingerprint by session/id. Missing historical
+/// evidence is compatible with an older input; a known mismatch never sends.
+pub fn verify_owner_resend_payload(
+    events: &super::repository::EventRepository, session: &str, id: &str, payload: &Value,
+) -> Result<(), UserInputExecutionError> {
+    let unavailable = |message: String| retry_error("event_persistence_unavailable", message,
+        json!({"inputId":id,"nothingSent":true}));
+    let latest = events.latest_submitted_input_sha256(session, id)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let saved = super::native_requests::canonical_request_sha256(&payload["input"])
+        .map_err(|error| unavailable(error.to_string()))?;
+    if payload["clientUserMessageId"].as_str() != Some(id) || !payload["input"].is_array()
+        || latest.as_ref().is_some_and(|hash| hash != &saved) {
+        return Err(retry_error("retry_payload_mismatch",
+            "The saved input differs from the last submitted input. Nothing was sent. Your original input is unchanged; restore the complete saved copy before retrying.".into(),
+            json!({"inputId":id,"nothingSent":true})));
+    }
+    Ok(())
 }
 
 fn retry_error(code: &str, message: String, details: Value) -> UserInputExecutionError {
@@ -1908,7 +2074,9 @@ pub fn parse_retry(session: &str, params: &Value) -> Result<(String, u64), UserI
 /// r274.2 §9.4: also an owner record a lost runtime left stuck
 /// (`il::owner_stuck`), never resent by cutex itself.
 pub fn retryable(record: &InputRecord) -> bool {
-    matches!(record.state, InputState::Failed | InputState::Uncertain) || il::owner_stuck(record)
+    if il::owner_batch_retry_blocked(record) { return false; }
+    matches!(record.state, InputState::Failed | InputState::Uncertain) || il::owner_stuck(record) || il::owner_batch_blocked(record)
+        || (record.kind==InputKind::DelegationResult && record.state==InputState::Waiting && record.reason.as_deref()==Some("nativeHeld"))
 }
 
 /// Where a retry of `record` is sent again, checked BEFORE the ledger moves
@@ -2074,8 +2242,23 @@ fn retry_on(
     expected_rev: u64,
     resubmit: &mut dyn FnMut(&Value) -> Result<Value, UserInputExecutionError>,
 ) -> Result<Value, UserInputExecutionError> {
+    let events = super::repository::management_v2_repository()
+        .map_err(|error| retry_error("event_persistence_unavailable", error.to_string(), json!({"nothingSent":true})))?;
+    retry_on_with_events(ledger, events, session, id, expected_rev, resubmit)
+}
+
+fn retry_on_with_events(
+    ledger: &InputLedger, events: &super::repository::EventRepository, session: &str,
+    id: &str, expected_rev: u64,
+    resubmit: &mut dyn FnMut(&Value) -> Result<Value, UserInputExecutionError>,
+) -> Result<Value, UserInputExecutionError> {
     let id = id.to_string();
     let before = ledger.get(session, std::slice::from_ref(&id)).map_err(il::ledger_error)?.records.pop();
+    if before.as_ref().is_some_and(|record|record.kind == InputKind::Owner) {
+        if let Some(payload) = ledger.payload(session, &id).map_err(il::ledger_error)? {
+            verify_owner_resend_payload(events, session, &id, &payload)?;
+        }
+    }
     let transition = retry_transition_checked(ledger, session, &id, expected_rev, &|record| redelivery_precheck(session, record))?;
     let redelivery = match transition.record.kind {
         InputKind::Owner => {
@@ -2086,7 +2269,11 @@ fn retry_on(
                     if forget_owner_acceptance(session, &id) {
                         resend_alone(ledger, session, &transition.record);
                     }
-                    resubmit(&payload)
+                    let mut submit = payload;
+                    if let Some(object) = submit.as_object_mut() {
+                        object.remove(super::agent_bus_wake::READ_NOTES_FIELD);
+                    }
+                    resubmit(&submit)
                 }
                 Ok(None) => Err(retry_error("retry_payload_unavailable", "the original submit is no longer kept".into(), json!({}))),
                 Err(error) => Err(il::ledger_error(error)),
@@ -2202,6 +2389,8 @@ fn refused_resend_returns(ledger: &InputLedger, session: &str, id: &str, before:
         let mut failed = Next::failed(reason.unwrap_or("notDelivered"));
         failed.error = before.error.clone();
         failed
+    } else if il::owner_batch_blocked(before) {
+        Next::waiting("nativeHeld").deadline(before.deadline.as_deref().and_then(parse_time))
     } else if il::owner_stuck(before) {
         Next::uncertain(il::stuck_uncertain_reason(before))
     } else {
@@ -2212,6 +2401,11 @@ fn refused_resend_returns(ledger: &InputLedger, session: &str, id: &str, before:
     }
     let mut details=back.details.take().unwrap_or_else(||json!({}));
     if !details.is_object(){details=json!({});}
+    if il::owner_batch_blocked(before) {
+        // The refused retry sent nothing; the same unsent proof now belongs
+        // to the current attempt, so the existing recovery action remains.
+        details["interruptBatch"]["attempt"] = json!(current.attempt);
+    }
     details["retryRefused"]=json!(true);
     back=back.details(details);
     match ledger.transition(session, id, Expect::rev(current.rev), back) {

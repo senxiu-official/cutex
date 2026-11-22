@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 
 use super::model::*;
 use super::store::{AskError, AskState, AskStore};
+mod job_follow_up;
+pub use job_follow_up::{job_follow_up_ended,job_follow_up_ended_default,poll_follow_up_ended};
 use super::{now_rfc3339, parse_time, truncate_chars};
 
 /// The Job Service MCP server name in agent configs.
@@ -124,7 +126,7 @@ pub fn observe_item(state: &mut AskState, ask_id: &str, attempt: u32, item: &Val
 /// A job's terminal outcome as completion v2 reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobOutcome {
-    /// `exited`, `failed`, `cancelled`, `interrupted`, `launchUnknown`.
+    /// Physical completion states, or administrative `unconfirmed`.
     pub status: String,
     pub exit_code: Option<i64>,
 }
@@ -227,6 +229,20 @@ pub fn wake(state: &mut AskState, ask_id: &str, now: DateTime<Utc>) -> Option<Re
     if !ask.is_waiting() {
         return None;
     }
+    if ask.awaiting.as_ref().is_some_and(|wait|wait.jobs.iter().filter_map(|id|ask.job(id))
+        .any(|job|job.terminal.as_ref().is_some_and(|terminal|terminal.status=="unconfirmed"))) {
+        state.update_ask(ask_id,now,|ask|{
+            if let Some(attempt)=ask.current_attempt_mut() {
+                attempt.last_error=Some("job_follow_up_ended: bound job result is unconfirmed".into());
+            }
+        });
+        // Owner tracking ended, not physical execution. No ResumeRecord or
+        // synthetic completion/ANSWER may be created from this fact.
+        if let Err(error)=super::tools::close_in_state(state,None,ask_id,"followUpEnded",false,now) {
+            eprintln!("asks: could not settle job follow-up: {error}");
+        }
+        return None;
+    }
     let reason = due(ask, now)?;
     state.update_ask(ask_id, now, |ask| to_resume(ask, reason, None, None, now));
     Some(reason)
@@ -274,7 +290,7 @@ pub fn check_len(field: &str, text: &str, max: usize) -> Result<(), AskError> {
     .with(json!({"field": field, "chars": chars, "limit": max})))
 }
 
-/// Manual resume of a waiting delegation (`delegation_resume`,
+/// Manual resume of a delegation waiting for jobs (`delegation_resume`,
 /// `cutex/ask/resume`). `requester` is the calling agent (`None`: the owner).
 pub fn resume_now(state: &mut AskState, ask_id: &str, requester: Option<&str>, note: Option<&str>, now: DateTime<Utc>) -> Result<Value, AskError> {
     let ask = state.asks.get(ask_id).ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
@@ -288,7 +304,8 @@ pub fn resume_now(state: &mut AskState, ask_id: &str, requester: Option<&str>, n
     if ask.resume_pending() || (ask.resume.is_some() && ask.execution == ExecutionState::Running) {
         return Ok(json!({"ok": true, "ask_id": ask_id, "resuming": true, "detail": "It is already resuming."}));
     }
-    if !ask.is_waiting() {
+    // r290 P7: an explicit resume is also valid after a failed handler turn.
+    if !ask.is_waiting() && !(matches!(ask.execution, ExecutionState::Failed | ExecutionState::Interrupted) && ask.current_attempt().is_some_and(|r|r.handler_failure.is_some())) {
         return Err(AskError::new(
             "ask_not_waiting",
             "it is not waiting for jobs (only a delegation whose handler yielded with delegation_await can be resumed)",
@@ -296,7 +313,11 @@ pub fn resume_now(state: &mut AskState, ask_id: &str, requester: Option<&str>, n
     }
     let by = if requester.is_some() { ResumeBy::Requester } else { ResumeBy::Owner };
     let note = note_of(note)?;
-    state.update_ask(ask_id, now, |ask| to_resume(ask, ResumeReason::Resumed, Some(by), note, now));
+    state.update_ask(ask_id, now, |ask| {
+        // r290 P7: resume_pending requires the scheduler's Running state.
+        ask.execution = ExecutionState::Running;
+        to_resume(ask, ResumeReason::Resumed, Some(by), note, now);
+    });
     Ok(json!({"ok": true, "ask_id": ask_id, "resuming": true,
         "detail": "The handler continues this delegation in a new turn as soon as it can take one; its result then arrives as usual."}))
 }
@@ -311,9 +332,13 @@ pub fn reopen(state: &mut AskState, ask_id: &str, requester: Option<&str>, note:
         ask.require_controller(requester, "ask_not_found", "no such delegation of yours")?;
     }
     let note = note_of(note)?.ok_or_else(|| AskError::new("invalid_arguments", "note: say what is missing or what to change"))?;
-    let answered = matches!(ask.execution, ExecutionState::Answered | ExecutionState::Failed);
+    // r290 P7: a proven runtime exit also permits an explicit continuation.
+    let answered = matches!(ask.execution, ExecutionState::Answered | ExecutionState::Failed)
+        || (ask.execution == ExecutionState::Interrupted && ask.current_attempt().is_some_and(|r|r.handler_failure.is_some()));
     let reopenable = answered
-        && (ask.review == Some(ReviewState::AwaitingAcceptance) || (ask.closed == Some(CloseOutcome::Completed) && ask.review.is_none()));
+        && (ask.review == Some(ReviewState::AwaitingAcceptance) || (ask.closed == Some(CloseOutcome::Completed) && ask.review.is_none())
+            // r290 P7
+            || (ask.is_open() && ask.current_attempt().is_some_and(|r|r.handler_failure.is_some())));
     if !reopenable {
         return Err(AskError::new(
             "ask_not_reopenable",
@@ -443,7 +468,7 @@ pub fn register(state: &mut AskState, caller: &str, request: &AwaitRequest, now:
         });
         if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
             record.activity.line = Some(truncate_chars(&note, 300));
-            record.progress.push(ProgressNote { text: truncate_chars(&note, 300), at: now_rfc3339(now) });
+            record.progress.push(ProgressNote { text: truncate_chars(&note, 300), at: now_rfc3339(now), steps:None });
             let excess = record.progress.len().saturating_sub(PROGRESS_KEEP);
             record.progress.drain(..excess);
         }
@@ -562,7 +587,7 @@ fn queried(result: &Value) -> Option<(u64, String)> {
     Some((record.get("revision")?.as_u64()?, record.get("state")?.as_str()?.to_string()))
 }
 
-const TERMINAL_JOB_STATES: &[&str] = &["exited", "failed", "cancelled", "interrupted", "launch_unknown", "launchUnknown"];
+const TERMINAL_JOB_STATES: &[&str] = &["exited", "failed", "cancelled", "interrupted", "launch_unknown", "launchUnknown", "unconfirmed"];
 
 /// Run a queued cancel through the handler's runtime: `query` for the
 /// revision, then `cancel` (the Job adapter signs as the handler, the job's
@@ -579,6 +604,7 @@ pub fn run_cancel(
     let Some(ask) = state.asks.get(ask_id) else {
         return Ok(true);
     };
+    if ask.follow_up_ended { return Ok(true); }
     let pending: Vec<JobBinding> = ask
         .jobs
         .iter()
@@ -591,8 +617,10 @@ pub fn run_cancel(
     let status = runtime.target_status(session);
     let mut results: Vec<(String, JobCancelState, Option<String>)> = Vec::new();
     for job in &pending {
-        if job.terminal.is_some() {
-            results.push((job.job_id.clone(), JobCancelState::NotRunning, Some("already finished".into())));
+        if let Some(terminal)=&job.terminal {
+            let unconfirmed=terminal.status=="unconfirmed";
+            results.push((job.job_id.clone(),if unconfirmed {JobCancelState::Failed}else{JobCancelState::NotRunning},
+                Some(if unconfirmed {"job follow-up ended; execution result unconfirmed"}else{"already finished"}.into())));
             continue;
         }
         let requested = job.cancel.as_ref().and_then(|cancel| parse_time(&cancel.requested_at));
@@ -608,6 +636,7 @@ pub fn run_cancel(
             Err(error) => (JobCancelState::Failed, Some(truncate_chars(&format!("query: {error:#}"), 300))),
             Ok(result) => match queried(&result) {
                 None => (JobCancelState::Failed, Some(truncate_chars(&format!("unexpected query result: {result}"), 300))),
+                Some((_, state)) if state=="unconfirmed" => (JobCancelState::Failed, Some("job follow-up ended; execution result unconfirmed".into())),
                 Some((_, state)) if TERMINAL_JOB_STATES.contains(&state.as_str()) => (JobCancelState::NotRunning, Some(format!("job is {state}"))),
                 Some((revision, _)) => {
                     match runtime.call_mcp_tool(session, JOB_SERVER, "cancel", &json!({"jobId": job.job_id, "expectedRevision": revision})) {
@@ -769,6 +798,57 @@ mod tests {
     }
 
     #[test]
+    fn administrative_job_follow_up_settles_wait_without_success_or_turn() {
+        let now=Utc::now();let mut state=AskState::default();
+        let id=running(&mut state,"follow-up-ended",now);
+        observe_item(&mut state,&id,1,&submit_item("job-follow-up"),now);
+        register(&mut state,TARGET,&request("wait for job"),now).unwrap();
+        yielded(&mut state,&id,now);
+        crate::asks::agent_pause::pause(&mut state,TARGET,"owner",None,now);
+        assert_eq!(job_follow_up_ended(&mut state,"job-follow-up",7,now),1);
+        let ask=&state.asks[&id];
+        assert!(!ask.is_open());assert!(ask.follow_up_ended);assert!(ask.resume.is_none());
+        assert!(ask.answer_id.is_none());assert!(!ask.job("job-follow-up").unwrap().terminal.as_ref().unwrap().ok);
+        assert!(crate::asks::agent_pause::is_paused(&state,TARGET));
+        assert_eq!(job_follow_up_ended(&mut state,"job-follow-up",7,now),0);
+        note_job_completion(&mut state,TARGET,"job-follow-up","late-success",&exited(0),now);
+        assert!(!state.asks[&id].job("job-follow-up").unwrap().terminal.as_ref().unwrap().ok);
+        assert!(state.asks[&id].resume.is_none());
+    }
+
+    #[test]
+    fn administrative_job_poll_is_bounded_throttled_and_does_not_start_turns() {
+        use crate::asks::scheduler::tests::FakeRuntime;
+        let (store,dir)=crate::asks::store::tests::temp_store("job-follow-up-poll");
+        let runtime=FakeRuntime::idle(&[]);let now=Utc::now();
+        store.with_state(|state|{
+            for n in 0..5 {
+                let job=format!("job-poll-{n}");let id=running(state,&format!("poll-{n}"),now);
+                observe_item(state,&id,1,&submit_item(&job),now);
+                register(state,TARGET,&request("waiting"),now).unwrap();yielded(state,&id,now);
+                runtime.job_snapshots.borrow_mut().insert(job.clone(),json!({"jobId":job,"state":"running","revision":1,
+                    "request":{"subscriberCutexSessionId":TARGET}}));
+            }
+        }).unwrap();
+        poll_follow_up_ended(&runtime,&store,now).unwrap();assert_eq!(runtime.mcp_calls.borrow().len(),4);
+        poll_follow_up_ended(&runtime,&store,now).unwrap();assert_eq!(runtime.mcp_calls.borrow().len(),5);
+        poll_follow_up_ended(&runtime,&store,now).unwrap();assert_eq!(runtime.mcp_calls.borrow().len(),5);
+        assert!(runtime.submitted.borrow().is_empty());
+        assert!(store.snapshot().unwrap().asks.values().all(|a|a.is_open()));
+        let id=store.with_state(|state|{
+            let id=running(state,"poll-ended",now);
+            observe_item(state,&id,1,&submit_item("job-poll-ended"),now);
+            register(state,TARGET,&request("waiting"),now).unwrap();yielded(state,&id,now);id
+        }).unwrap();
+        runtime.job_snapshots.borrow_mut().insert("job-poll-ended".into(),json!({"jobId":"job-poll-ended","state":"unconfirmed",
+            "terminalReason":"followUpEnded","revision":9,"request":{"subscriberCutexSessionId":TARGET}}));
+        poll_follow_up_ended(&runtime,&store,now).unwrap();
+        assert!(store.snapshot().unwrap().asks[&id].follow_up_ended);
+        assert!(runtime.submitted.borrow().is_empty());
+        let _=std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn wake_policy_failure_all_any_each_and_timeout() {
         let now = Utc::now();
         let setup = |until: AwaitUntil, resume: AwaitResume, timeout: Option<u64>| {
@@ -842,6 +922,61 @@ mod tests {
     }
 
     #[test]
+    fn requester_cannot_release_runtime_gate_for_the_target_queue() {
+        let now = Utc::now();
+        let mut state = AskState::default();
+        let ask_id = state.create_ask(new_ask("gate-resume", "existing brief"), now).unwrap().0.ask_id;
+        let other_id = state.create_ask(new_ask("other-gate-queue", "other work"), now).unwrap().0.ask_id;
+        super::super::control::runtime_gate_pause(&mut state, TARGET, 7, now);
+        let original = serde_json::to_value(&state.asks).unwrap();
+        assert_eq!(resume_now(&mut state, &ask_id, Some(TARGET), None, now).unwrap_err().code, "ask_not_found");
+        // Per-delegation resume must not release a target-wide gate.
+        for requester in [Some(REQUESTER), None] {
+            for note in [None, Some("new work")] {
+                assert_eq!(resume_now(&mut state, &ask_id, requester, note, now).unwrap_err().code, "ask_not_waiting");
+                assert!(super::super::control::runtime_gate_closed(&state, TARGET));
+                assert!(state.commands.is_empty());
+                assert_eq!(serde_json::to_value(&state.asks).unwrap(), original);
+                assert!(state.asks[&other_id].hold.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn requester_resume_preserves_explicit_owner_and_agent_holds() {
+        let now = Utc::now();
+        for stop in [false, true] {
+            let mut state = AskState::default();
+            let ask_id = state.create_ask(new_ask(if stop { "owner-stop" } else { "owner-pause" }, "work"), now).unwrap().0.ask_id;
+            super::super::agent_pause::pause(&mut state, TARGET, "owner", None, now);
+            super::super::control::runtime_gate_pause(&mut state, TARGET, 7, now);
+            if stop { super::super::control::owner_stop(&mut state, TARGET, now); }
+            else { super::super::control::owner_pause(&mut state, TARGET, now); }
+            let original = super::super::control::pause_json(state.pauses.get(TARGET));
+            assert_eq!(resume_now(&mut state, &ask_id, Some(REQUESTER), None, now).unwrap_err().code, "ask_not_waiting");
+            assert_eq!(super::super::control::pause_json(state.pauses.get(TARGET)), original);
+            assert!(super::super::agent_pause::is_paused(&state, TARGET));
+            assert!(state.presence[TARGET].paused);
+            assert!(state.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn requester_gate_resume_never_reopens_failed_delegation() {
+        let now = Utc::now();
+        let mut state = AskState::default();
+        let ask_id = state.create_ask(new_ask("failed-gate-resume", "work"), now).unwrap().0.ask_id;
+        super::super::control::runtime_gate_pause(&mut state, TARGET, 7, now);
+        state.update_ask(&ask_id, now, |ask| {
+            ask.execution = ExecutionState::Failed;
+            ask.closed = Some(CloseOutcome::Completed);
+        });
+        assert_eq!(resume_now(&mut state, &ask_id, Some(REQUESTER), None, now).unwrap_err().code, "ask_closed");
+        assert!(super::super::control::runtime_gate_closed(&state, TARGET));
+        assert!(state.commands.is_empty());
+    }
+
+    #[test]
     fn manual_resume_and_reopen() {
         let now = Utc::now();
         let mut state = AskState::default();
@@ -886,6 +1021,30 @@ mod tests {
             ask.closed = Some(CloseOutcome::Accepted);
         });
         assert_eq!(reopen(&mut state, &ask_id, None, Some("x"), now).unwrap_err().code, "ask_not_reopenable");
+    }
+
+    #[test]
+    fn administrative_job_terminal_never_claims_cancel_success_or_redrives_closed_follow_up() {
+        use crate::asks::scheduler::tests::FakeRuntime;
+        let (store,dir)=crate::asks::store::tests::temp_store("job-follow-up-cancel");let now=Utc::now();
+        let runtime=FakeRuntime::idle(&[TARGET]);
+        let id=store.with_state(|state|{
+            let id=running(state,"job-cancel-follow-up",now);
+            observe_item(state,&id,1,&submit_item("job-cancel-ended"),now);
+            state.update_ask(&id,now,|ask|mark_cancel(ask,ResumeBy::Owner,now));
+            // Still-running handler: administrative evidence alone does not
+            // interrupt it or synthesize a successful job cancellation.
+            job_follow_up_ended(state,"job-cancel-ended",3,now);id
+        }).unwrap();
+        assert!(run_cancel(&runtime,&store,&id,TARGET,&["job-cancel-ended".into()],now).unwrap());
+        let state=store.snapshot().unwrap();
+        assert_eq!(state.asks[&id].job("job-cancel-ended").unwrap().cancel.as_ref().unwrap().state,JobCancelState::Failed);
+        assert!(runtime.mcp_calls.borrow().is_empty());
+        store.with_state(|s|super::super::tools::close_in_state(s,None,&id,"followUpEnded",false,now)).unwrap().unwrap();
+        let probes=runtime.target_probes.borrow().len();
+        assert!(run_cancel(&runtime,&store,&id,TARGET,&["job-cancel-ended".into()],now).unwrap());
+        assert_eq!(runtime.target_probes.borrow().len(),probes);
+        let _=std::fs::remove_dir_all(dir);
     }
 
     #[test]

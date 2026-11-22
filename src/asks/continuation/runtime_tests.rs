@@ -3,6 +3,26 @@ use crate::asks::scheduler::tests::{world, FakeRuntime, FakeWorld};
 use crate::asks::store::tests::{new_ask, temp_store, TARGET};
 use crate::asks::{awaits, observe, scheduler};
 
+// r290 P7: declared continuation used to absorb a failed turn as Running.
+#[test]
+fn handler_failure_cancels_automatic_continuation_and_notifies_controller() {
+    let f = Fixture::new("handler-failure-continuation");
+    f.declare(1);
+    f.finish(1, f.now, "failed");
+    let state = f.store.snapshot().unwrap();
+    let ask = &state.asks[&f.ask];
+    assert!(ask.is_open());
+    assert_eq!(ask.execution, ExecutionState::Failed);
+    assert_eq!(ask.bounded_continuation.current.as_ref().unwrap().state, Phase::Cancelled);
+    assert_eq!(state.deliveries.values().filter(|d|d.ref_id.starts_with(crate::asks::handler_failure::PREFIX)).count(),1);
+    drop(state);
+    f.tick(61);
+    assert_eq!(f.runtime.submitted.borrow().len(),1);
+}
+// r290 P14
+#[path = "p14_tests.rs"]
+mod p14;
+
 #[test]
 #[ignore = "EVA-sized continuation no-change scale probe"]
 fn waste_scale_a06_continuation_not_due() {
@@ -532,7 +552,48 @@ fn real_store_limit_outbox_is_once_and_reset_never_erases_stage_or_starts_a_runt
         .sessions
         .contains(&crate::management::v2::services::HOST_EVENT_SESSION_ID.into()));
     assert_eq!(snapshot.asks[&f.ask].execution, ExecutionState::Running);
+    assert!(snapshot.asks[&f.ask].is_open(), "Limited retains the explicit reset entry");
     assert!(snapshot.answers.is_empty());
+}
+
+#[test]
+fn yielded_stop_cancels_waiting_and_ready_plans_and_keeps_outer_closed() {
+    for ready in [false,true] {
+        let f=Fixture::new("yielded-stop-continuation");f.declare(1);f.finish(1,f.now,"completed");
+        if ready { tick_due(&f.world,&f.runtime,&f.store,f.now+Duration::seconds(60)).unwrap(); }
+        let result=crate::asks::tools::close_ask(&f.store,None,&f.ask,"stop",f.now+Duration::seconds(60)).unwrap();
+        assert_eq!(result["stopping"],false);
+        f.tick(61);f.tick(120);
+        let state=f.store.snapshot().unwrap();let ask=&state.asks[&f.ask];
+        assert!(!ask.is_open());assert!(ask.resume.is_none());assert!(!ask.attempts[0].stop_requested);
+        assert_eq!(ask.bounded_continuation.current.as_ref().unwrap().state,Phase::Cancelled);
+        assert_eq!(f.runtime.submitted.borrow().len(),1);assert!(state.answers.is_empty());
+    }
+}
+
+#[test]
+fn cancelled_plan_settles_outer_in_the_same_scheduler_transaction_but_limit_resets() {
+    let f=Fixture::new("continuation-cancel-outer");f.declare(1);f.finish(1,f.now,"completed");
+    f.store.with_state(|s| {
+        s.asks.get_mut(&f.ask).unwrap().bounded_continuation.cancel("ancestorStopped");
+        crate::asks::stop_settlement::close_cancelled_continuation(s,&f.ask,f.now);
+        assert!(!s.asks[&f.ask].is_open());
+    }).unwrap();
+    f.tick(61);assert_eq!(f.runtime.submitted.borrow().len(),1);
+
+    let limited=Fixture::new("continuation-limit-reset");limited.declare(1);limited.finish(1,limited.now,"completed");
+    let at=limited.now+Duration::seconds(MAX_ELAPSED_SECONDS);
+    tick_due(&limited.world,&limited.runtime,&limited.store,at).unwrap();
+    let state=limited.store.snapshot().unwrap();let a=&state.asks[&limited.ask];assert!(a.is_open());
+    let revision=a.bounded_continuation.current.as_ref().unwrap().revision;
+    let actor=Actor::Owner;
+    let request=ResetRequest{action_id:"owner-reset".into(),expected_revision:revision};
+    limited.store.with_state(|s|resume_limited(s,&limited.ask,Authority{actor:&actor,current_director:None},&request,
+        Guards{online:true,permission_valid:true,occurrence_valid:true,..Default::default()},at)).unwrap().unwrap();
+    limited.store.with_state(|s|resume_limited(s,&limited.ask,Authority{actor:&actor,current_director:None},&request,
+        Guards{online:true,permission_valid:true,occurrence_valid:true,..Default::default()},at)).unwrap().unwrap();
+    assert!(limited.store.snapshot().unwrap().asks[&limited.ask].is_open());
+    assert_eq!(limited.runtime.submitted.borrow().len(),1,"reset grants a later wake, never immediate IO");
 }
 
 #[test]

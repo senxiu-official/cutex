@@ -234,6 +234,16 @@ use StoreClass::{AppendLog, Blob, Cache, MutableState, SmallConfig};
 const SMALL: usize = 256 * 1024;
 
 pub static MANIFEST: &[StoreSpec] = &[
+    // r290 P12: standalone SQLite user_version=2, migrates v1 outbox metadata.
+    base("profile-quota-notes", &["src/profile_quota_agents/alerts.rs"],
+        Sqlite { file: "runtime/profile-quota-notes/quota-notes-v1.sqlite3", tables: &["quota_notes", "quota_note_windows"] }, MutableState, &domain::PROFILE_QUOTA_NOTES)
+        .key("id", &[K::Host, K::Recipient]).indexes(&["quota_notes_pending", "quota_notes_cycle", "quota_notes_expiry", "quota_note_windows_cycle"]),
+    // r290 P5 schedules: standalone versioned SQLite, keyed and bounded.
+    base("schedules", &["src/schedules/store.rs"],
+        Sqlite { file: "runtime/schedules/schedules-v1.sqlite3", tables: &["schedules", "schedule_runs", "schedule_actions"] },
+        MutableState, &domain::SCHEDULES)
+        .key("schedule_id / occurrence_id / action_id", &[K::Host, K::Session])
+        .indexes(&["schedules_due", "schedules_active", "schedules_target", "schedule_runs_history", "schedule_runs_due", "schedule_one_open_run"]), // standalone user_version=1
     // --- management-state.sqlite3 (hot_store) ---------------------------------
     base("asks", &["src/asks/store.rs", "src/asks/store_diagnostics.rs", "src/asks/receipt_uncertainty/read_context/observer.rs"],
         HotStore { logical: "asks" }, MutableState, &domain::MANAGEMENT_STATE)
@@ -314,6 +324,16 @@ pub static MANIFEST: &[StoreSpec] = &[
         .key("session,input_id", &[K::Host, K::Session])
         .indexes(&["PRIMARY KEY(session,input_id)", "owner_dispositions_pending(next_check_ms,requested_at) WHERE applied_at IS NULL"])
         .grows(0, 0, "permanent owner decisions; no row TTL or automatic pruning; standalone schema user_version=1"),
+    // Repository child module: owns only an advisory fingerprint index. It is
+    // reconstructible from the retained journal if absent. Kit/data-copy roots
+    // include management-v2 and consistently snapshot this DB, not its sidecars.
+    // Standalone schema (schema_version=0), additive R0; no previous exporter.
+    base("submitted-input-index", &["src/management/v2/submitted_input_lookup.rs"],
+        Sqlite { file: "runtime/management-v2/submitted-input-index.sqlite3", tables: &["submitted_inputs", "submitted_checkpoint"] },
+        Cache, &domain::SUBMITTED_INPUT_INDEX)
+        .key("session,input_id", &[K::Host, K::Session])
+        .indexes(&["PRIMARY KEY(session,input_id)", "submitted_checkpoint(singleton)"])
+        .grows(0, 0, "one advisory fingerprint per submitted input and one journal checkpoint; rebuildable from retained journal; contains no input content"),
     base("request-idempotency", &["src/management/v2/request_idempotency.rs"],
         Sqlite { file: "runtime/management-v2/request-idempotency.sqlite3", tables: &["requests"] },
         MutableState, &domain::REQUEST_IDEMPOTENCY)
@@ -359,7 +379,7 @@ pub static MANIFEST: &[StoreSpec] = &[
         MutableState, &domain::WORKFLOWS)
         .key("run_id", &[K::Project]).grows(0, 0, "workflow runs and logs"),
     base("artifacts", &["src/artifacts/store.rs"],
-        Sqlite { file: "runtime/artifacts/artifacts-v1.sqlite3", tables: &["artifacts", "artifact_versions", "actions", "capture_files", "turn_windows", "meta"] },
+        Sqlite { file: "runtime/artifacts/artifacts-v1.sqlite3", tables: &["artifacts", "artifact_versions", "artifact_source_stamps", "actions", "capture_files", "turn_windows", "meta"] },
         AppendLog, &domain::ARTIFACTS)
         .key("artifact_id,version", &[K::Project]).grows(0, 0, "artifact versions"),
     base("documents", &["src/documents/mod.rs", "src/documents/sweep.rs"],
@@ -589,6 +609,9 @@ pub static MANIFEST: &[StoreSpec] = &[
         Json { path: "config.json, accounts.json, state.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("claude-accounts", &["src/runtime/claude_accounts.rs"],
         Json { path: "runtime/claude/accounts.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
+    base("claude-process-launch", &["src/runtime/claude/process_receipt.rs"],
+        JsonDir { path: "runtime/claude/sessions/<session>/process-launch-receipt.json" },
+        SmallConfig, &domain::OWN_FILE).key("cutex_session_id", &[K::Host, K::Session]).config(64 * 1024),
     base("runtime-intent", &["src/session/runtime_intent.rs"],
         Json { path: "runtime/runtime-intent/online.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("prompt-cache-key", &["src/launch/prompt_cache_key.rs"],
@@ -615,7 +638,7 @@ pub static MANIFEST: &[StoreSpec] = &[
     base("codex-thread-history", &["src/launch/native_history.rs"],
         External { owner: "cute-codex", path: "codex-home/thread_history_1.sqlite" }, StoreClass::External, &domain::EXTERNAL)
         .external().slice("native-history (conditional)"),
-    base("claude-adapter-state", &["src/runtime/claude/structure.rs", "src/runtime/claude/fork_history.rs", "src/runtime/claude_pin.rs"],
+    base("claude-adapter-state", &["src/runtime/claude/structure.rs", "src/runtime/claude/fork_history.rs", "src/runtime/claude_pin.rs", "src/cli_app/asks_claude/owner_note_evidence.rs"],
         External { owner: "claude runtime component", path: "runtime/claude/<session>/state.sqlite3" }, StoreClass::External, &domain::EXTERNAL)
         .external().slice("S2").rollback(Rollback::R2, None),
     base("dsh-timeline", &["src/runtime/dsh.rs", "src/runtime/dsh/product.rs"],
@@ -715,6 +738,24 @@ pub fn validate(repo_root: Option<&std::path::Path>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submitted_input_index_is_registered_as_a_rebuildable_repository_cache() {
+        let entry=spec("submitted-input-index");
+        assert_eq!(entry.owner,&["src/management/v2/submitted_input_lookup.rs"]);
+        assert!(matches!(entry.canonical,Canonical::Sqlite{file:"runtime/management-v2/submitted-input-index.sqlite3",tables}
+            if tables==["submitted_inputs","submitted_checkpoint"]));
+        assert_eq!(entry.class,StoreClass::Cache);
+        assert_eq!(entry.domain.path,"runtime/management-v2/submitted-input-index.sqlite3");
+        assert_eq!(domain::domain(entry.domain.id).unwrap().path,entry.domain.path);
+        assert_eq!(entry.access,Access::Keyed);assert_eq!(entry.key,"session,input_id");
+        assert_eq!(entry.rollback,Rollback::R0);assert!(entry.previous_exporter.is_none());
+        assert_eq!(entry.schema_version,0,"standalone schema, not StoreDb-managed");
+        assert!(entry.growth.with.contains("rebuildable"));
+        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|root|entry.domain.path.starts_with(&format!("{root}/"))));
+        assert!(include_str!("../management/v2/repository.rs").contains("mod submitted_input_lookup;"),
+            "SQLite stays in the EventRepository child module, not a caller allowlist");
+    }
 
     #[test]
     fn owner_dispositions_are_registered_as_permanent_source_authority() {

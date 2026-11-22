@@ -6,6 +6,7 @@ use serde_json::Value;
 pub const FEATURE: &str = "agent-bus-message-settlement-v1";
 pub const STALE_ACK_FEATURE: &str = "agent-bus-stale-ack-settlement-v1";
 pub const STALE_ACK_MIN_WAIT_SECS: u64 = 300;
+pub const END_FOLLOW_UP_PATH: &str = "/v2/agent-bus/stuck-messages/end-follow-up";
 pub const CLOSE_PATH: &str = "/v2/agent-bus/stuck-messages/close";
 pub const EVIDENCE_TTL_SECS: i64 = 180;
 pub const EVENT_METHOD: &str = "cutex/agentBus/messageSettlementUpdated";
@@ -171,7 +172,11 @@ pub struct SettlementView {
     pub state: String,
     pub can_close: bool,
     pub evidence_token: String,
-    pub evidence: EvidenceView,
+    pub evidence: Option<EvidenceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
     pub closure: Option<Closure>,
 }
 
@@ -180,7 +185,9 @@ pub struct SettlementView {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SettlementRecord {
     pub evidence_token: String,
-    pub evidence: Evidence,
+    pub evidence: Option<Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_request: Option<EndFollowUpRequest>,
     pub closure: Option<Closure>,
     #[serde(default)]
     pub request: Option<CloseRequest>,
@@ -194,6 +201,11 @@ pub struct SettlementRecord {
 }
 
 impl SettlementRecord {
+    pub fn evidence(&self) -> anyhow::Result<&Evidence> {
+        self.evidence
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("settlement has no native evidence"))
+    }
     pub fn view(&self, eligible: bool, now: DateTime<Utc>) -> SettlementView {
         SettlementView {
             state: if self.closure.is_some() {
@@ -202,19 +214,51 @@ impl SettlementRecord {
                 "outcome_unknown"
             }
             .into(),
-            can_close: self.closure.is_none() && eligible && self.evidence.fresh(now),
+            can_close: self.closure.is_none()
+                && eligible
+                && self.evidence.as_ref().is_some_and(|e| e.fresh(now)),
             evidence_token: self.evidence_token.clone(),
-            evidence: EvidenceView {
-                runtime: self.evidence.runtime.clone(),
-                runtime_generation: self.evidence.runtime_generation,
-                thread_id: self.evidence.thread_id.clone(),
-                actual_turn_id: self.evidence.actual_turn_id.clone(),
-                terminal_status: self.evidence.terminal_status.clone(),
-                observed_at: self.evidence.observed_at,
-                stale_ack: self.evidence.stale_ack.clone(),
-            },
+            evidence: self.evidence.as_ref().map(|e| EvidenceView {
+                runtime: e.runtime.clone(),
+                runtime_generation: e.runtime_generation,
+                thread_id: e.thread_id.clone(),
+                actual_turn_id: e.actual_turn_id.clone(),
+                terminal_status: e.terminal_status.clone(),
+                observed_at: e.observed_at,
+                stale_ack: e.stale_ack.clone(),
+            }),
+            outcome: self.owner_request.as_ref().map(|_| "unconfirmed".into()),
+            by: self.owner_request.as_ref().map(|_| "owner".into()),
             closure: self.closure.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EndFollowUpRequest {
+    pub message_id: String,
+    pub action_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_semantic_sha256: Option<String>,
+}
+impl EndFollowUpRequest {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.message_id.trim().is_empty()
+            || self.message_id.len() > 512
+            || self.action_id.trim().is_empty()
+            || self.action_id.len() > 128
+            || self.reason.trim().is_empty()
+            || self.reason.len() > 1024
+            || self
+                .expected_semantic_sha256
+                .as_ref()
+                .is_some_and(|sha| sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(Refusal::new(400,"invalid_request","messageId, actionId and reason are required and bounded; expectedSemanticSha256 is an optional digest"));
+        }
+        Ok(())
     }
 }
 
@@ -273,6 +317,8 @@ impl Refusal {
 pub enum Observation {
     Terminal(Evidence),
     Ineligible,
+    /// Persisted recipient identity is retired or absent; never inferred from connectivity.
+    RuntimeGone,
 }
 
 pub type Collector =

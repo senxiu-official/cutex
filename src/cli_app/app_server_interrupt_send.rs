@@ -38,6 +38,10 @@ use cutex::management::v2::user_input::{
 
 use super::*;
 
+#[path = "app_server_interrupt_many.rs"]
+mod many;
+pub(crate) use many::{interrupt_send_many_v2, submit_many_v2, resume_held_v2};
+
 /// What the live runtime says about the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LiveTurn {
@@ -76,6 +80,17 @@ pub(super) enum Reservation {
 
 /// The runtime and the stores (live, or a test fake).
 pub(super) trait Ops {
+    fn interrupt_batch(&self, session:&str, thread:&str, turn:&str, _generation:u64)->Result<(),InterruptFailure> {
+        self.interrupt(session,thread,turn)
+    }
+    fn turn_has_batch(&self, session:&str, thread:&str, turn:&str, client_ids:&[String], _generation:u64)->Vec<TurnCheck> {
+        client_ids.iter().map(|id|self.turn_has(session,thread,turn,id)).collect()
+    }
+    fn batch_admission(&self, _session:&str, _ids:&[String])->Result<(),UserInputExecutionError> {Ok(())}
+    fn supports_owner_batch(&self, _session: &str, _generation: u64) -> bool { false }
+    fn send_batch(&self, _command: &UserInputSubmitCommand, _prefix: &[Value], _generation: u64) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+        Err(execution_error_message("route","interrupt_send_many_unsupported","runtime lacks atomic owner input batches",false,false))
+    }
     fn ledger(&self) -> anyhow::Result<&InputLedger>;
     fn repository(&self) -> &UserInputRepository;
     /// The session's §2.6 delivery now.
@@ -97,6 +112,7 @@ pub(super) trait Ops {
     fn publish(&self, transition: &il::Transition);
     fn publish_delivery(&self, session: &str, change: &il::DeliveryChange);
     fn append_event(&self, session: &str, correlation: EventCorrelation, method: &str, params: Value) -> anyhow::Result<()>;
+    fn verify_resend(&self, session: &str, id: &str, payload: &Value) -> Result<(), UserInputExecutionError>;
 }
 
 /// Where the owner input is kept, and what goes out.
@@ -124,6 +140,7 @@ fn submit_params(value: &Value) -> Option<UserInputSubmitParams> {
     if let Some(object) = value.as_object_mut() {
         object.remove("allowHeld");
         object.remove("startIfOffline");
+        object.remove(cutex::management::v2::agent_bus_wake::READ_NOTES_FIELD);
     }
     parse_user_input_submit_params(&value).ok()
 }
@@ -145,6 +162,7 @@ fn locate(ops: &dyn Ops, ledger: &InputLedger, session: &str, record: &InputReco
             let (_, items) = ops.repository().list(session).map_err(queue_persistence_error)?;
             let item = items.into_iter().find(|item| item.client_user_message_id == *id).ok_or_else(missing)?;
             let params = UserInputSubmitParams {
+                interrupt_send: None,
                 join_delegation: None,
                 client_user_message_id: id.clone(),
                 origin: item.origin.clone(),
@@ -194,8 +212,7 @@ pub(super) fn run(ops: &dyn Ops, session: &str, request: &InterruptSendRequest) 
         .filter(|live| live.active_turn.as_deref() == Some(turn.as_str()) && live.generation == request.expected_runtime_generation)
         .ok_or_else(|| isend::conflict(Some(&record), Some(&delivery)))?;
     let thread = live.thread_id.clone();
-    let input = locate(ops, ledger, session, &record)?;
-    let steered = matches!(input.source, Source::Steered);
+    let steered = record.state == InputState::Accepted;
 
     // 2. Already in context: no interrupt, nothing resent.
     if steered {
@@ -210,6 +227,14 @@ pub(super) fn run(ops: &dyn Ops, session: &str, request: &InterruptSendRequest) 
             ops.publish(&transition);
             return Ok(Outcome::AlreadyInContext);
         }
+    }
+
+    // Only an actual resend needs its payload. An already-read steer is
+    // settled above even if its saved copy is stale or no longer retained.
+    let input = locate(ops, ledger, session, &record)?;
+    if steered {
+        let payload = cutex::management::v2::input_ledger_settle::owner_submit_payload(&input.params);
+        ops.verify_resend(session, &id, &payload)?;
     }
 
     // 3. The first transition and the delivery change of the interrupt,
@@ -510,11 +535,67 @@ fn first_in_queue(repository: &UserInputRepository, session: &str, queue_id: &st
 // ---------------------------------------------------------------------------
 // Live
 
-struct Live {
-    repository: &'static UserInputRepository,
+struct Live<'a> {
+    repository: &'a UserInputRepository,
 }
 
-impl Ops for Live {
+impl Ops for Live<'_> {
+    fn interrupt_batch(&self, session:&str, thread:&str, turn:&str, generation:u64)->Result<(),InterruptFailure> {
+        // A resumed held group owns the worker fence only through admission.
+        // Never keep it across interrupt/history/native IO.
+        cutex::asks::pause_admission::release_worker_fence();
+        use cutex::app_server::client::AppServerClientError;
+        let handle=session_manager(session).handle_for_generation(session,generation)
+            .map_err(|e|InterruptFailure::Offline(format!("{e:#}")))?;
+        crate::cli_app::asks_runtime::revoke_internal_interrupt(session,thread)
+            .map_err(|e|InterruptFailure::Refused(format!("Stop provenance persistence failed: {e:#}")))?;
+        let result=timed_input(TimingPath::InputNative,TimingStage::Dispatch,||handle.request_raw_message(json!({
+            "id":format!("owner-batch-interrupt-{}",Uuid::new_v4()),"method":"turn/interrupt",
+            "params":{"threadId":thread,"turnId":turn}})));
+        match result {
+            Ok(response) if response.get("error").is_some()=>Err(InterruptFailure::Refused(response["error"].to_string())),
+            Ok(_)=>Ok(()),
+            Err(AppServerClientError::Rpc(e))=>Err(InterruptFailure::Refused(format!("{e:?}"))),
+            Err(e @ (AppServerClientError::Connect(_)|AppServerClientError::Disconnected(_)|AppServerClientError::Shutdown))=>Err(InterruptFailure::Offline(e.to_string())),
+            Err(e)=>Err(InterruptFailure::Timeout(e.to_string()))
+        }
+    }
+    fn turn_has_batch(&self, session:&str, thread:&str, turn:&str, client_ids:&[String], generation:u64)->Vec<TurnCheck> {
+        let Ok(handle)=session_manager(session).handle_for_generation(session,generation) else {return vec![TurnCheck::Unavailable;client_ids.len()];};
+        many::check_turn_history(client_ids,|cursor| {
+            let mut params=json!({"threadId":thread,"turnId":turn,"limit":200,"sortDirection":"asc"});
+            if let Some(cursor)=cursor {params["cursor"]=json!(cursor);}
+            handle.request_raw_message(json!({"id":format!("owner-batch-history-{}",Uuid::new_v4()),
+                "method":"thread/items/list","params":params})).ok()?.get("result").cloned()
+        })
+    }
+    fn batch_admission(&self, session:&str, ids:&[String])->Result<(),UserInputExecutionError> {
+        cutex::management::v2::input_disposal::check(session,ids.iter().map(String::as_str))
+            .map_err(|e|execution_error("route","input_disposed",e,false,false))?;
+        match cutex::asks::pause_admission::gate(&self.repository.ask_store(),session).map_err(queue_persistence_error)? {
+            cutex::asks::pause_admission::Gate::Open=>Ok(()),
+            _=>Err(execution_error_message("route","admission_busy","owner batch admission is paused or busy; nothing interrupted",true,false))
+        }
+    }
+    fn supports_owner_batch(&self, session: &str, generation: u64) -> bool {
+        session_manager(session).owner_input_batch_supported(session,generation)
+    }
+
+    fn send_batch(&self, command: &UserInputSubmitCommand, prefix: &[Value], generation: u64) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+        cutex::asks::pause_admission::release_worker_fence();
+        cutex::management::v2::input_disposal::check(&command.cutex_session_id,
+            prefix.iter().filter_map(|v|v["clientUserMessageId"].as_str()).chain(std::iter::once(command.params.client_user_message_id.as_str())))
+            .map_err(|e|execution_error("route","input_disposed",e,false,false))?;
+        remember_native_owner_input(command)?;
+        send_user_input_native_request_bound(command,"turn/start",json!({"threadId":command.thread_id,
+            "clientUserMessageId":command.params.client_user_message_id,"input":command.params.input,
+            "ownerInputs":prefix}),UserInputDisposition::Started,Some(generation))
+    }
+    fn verify_resend(&self, session: &str, id: &str, payload: &Value) -> Result<(), UserInputExecutionError> {
+        let events = cutex::management::v2::repository::management_v2_repository()
+            .map_err(|error| execution_error("route", "event_persistence_unavailable", error, true, false))?;
+        cutex::management::v2::input_ledger_settle::verify_owner_resend_payload(events, session, id, payload)
+    }
     fn ledger(&self) -> anyhow::Result<&InputLedger> {
         il::default_ledger()
     }
@@ -558,6 +639,8 @@ impl Ops for Live {
 
     fn interrupt(&self, session: &str, thread: &str, turn: &str) -> Result<(), InterruptFailure> {
         use cutex::app_server::client::AppServerClientError;
+        crate::cli_app::asks_runtime::revoke_internal_interrupt(session,thread)
+            .map_err(|error|InterruptFailure::Refused(format!("Stop provenance persistence failed: {error:#}")))?;
         let commands = session_manager(session).commands(session)
             .map_err(|error| InterruptFailure::Offline(format!("{error:#}")))?;
         let result = timed_input(TimingPath::InputNative, TimingStage::Dispatch, || commands.turn_interrupt(&TurnInterruptParams {
@@ -610,6 +693,7 @@ impl Ops for Live {
     fn send_start(&self, command: &UserInputSubmitCommand) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
         // Never native IO under the fence (the reservation only tried it).
         cutex::asks::pause_admission::release_worker_fence();
+        remember_native_owner_input(command)?;
         let result = send_user_input_native_request(
             command,
             "turn/start",

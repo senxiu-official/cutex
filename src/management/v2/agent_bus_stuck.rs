@@ -34,7 +34,7 @@ pub const LIST_PATH: &str = "/v2/agent-bus/stuck-messages";
 pub const CONTENT_PATH: &str = "/v2/agent-bus/stuck-messages/content";
 pub const DISCARD_PATH: &str = "/v2/agent-bus/stuck-messages/discard";
 pub use super::agent_bus_settlement::EVIDENCE_PATH;
-pub use super::agent_bus_settlement_model::CLOSE_PATH;
+pub use super::agent_bus_settlement_model::{CLOSE_PATH, END_FOLLOW_UP_PATH};
 pub const DEFAULT_MIN_AGE_SECS: u64 = 3600;
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 1000;
@@ -42,7 +42,7 @@ const MAX_LIMIT: usize = 1000;
 pub fn is_path(path: &str) -> bool {
     matches!(
         path.split('?').next(),
-        Some(LIST_PATH) | Some(CONTENT_PATH) | Some(DISCARD_PATH) | Some(CLOSE_PATH) | Some(EVIDENCE_PATH)
+        Some(LIST_PATH) | Some(CONTENT_PATH) | Some(DISCARD_PATH) | Some(CLOSE_PATH) | Some(EVIDENCE_PATH) | Some(END_FOLLOW_UP_PATH)
     )
 }
 
@@ -133,6 +133,7 @@ pub(super) fn list_view_with_receipt_loader(
         ));
     }
     for (message_id, placed) in &placements {
+        if repository.live_discarded(message_id)? {continue;}
         if seen.contains(*message_id) {
             continue;
         }
@@ -375,6 +376,9 @@ pub fn discard(
         Err(OwnerDiscardError::NotFound) => {
             // In-memory only: allowed when it really is queued (and, for
             // protected messages, explicitly allowed).
+            if repository.live_discarded(&request.message_id)? {
+                (Some(json!({"state":"discarded","liveOnly":true,"changed":false})),false)
+            } else {
             let queued = match live.queued() {
                 Ok(queued) => queued,
                 Err(error) => {
@@ -392,7 +396,15 @@ pub fn discard(
             if protected && !request.allow_protected {
                 return Ok(Err(refusal_of(&OwnerDiscardError::ProtectedControl)));
             }
-            (None, false)
+            let changed=match repository.discard_live_occurrence(&request.message_id,request.expected_semantic_sha256.as_deref(),&request.reason,now) {
+                Ok(changed)=>changed,
+                Err(error) if error.is::<super::agent_bus_state::LiveDiscardCapacity>() => {
+                    return Ok(Err(DiscardRefusal::new(409,"live_discard_capacity",error.to_string())));
+                }
+                Err(error)=>return Err(error),
+            };
+            (Some(json!({"state":"discarded","liveOnly":true,"changed":changed})),changed)
+            }
         }
         Err(error) => return Ok(Err(refusal_of(&error))),
     };
@@ -477,6 +489,7 @@ pub(super) fn read_session_names(logical: &std::path::Path) -> anyhow::Result<st
 /// HTTP entry (root already checked by the caller).
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if path == END_FOLLOW_UP_PATH {return super::agent_bus_settlement::handle_end_follow_up(stream,request);}
     if path == EVIDENCE_PATH {
         return super::agent_bus_settlement::handle_evidence(stream, request);
     }

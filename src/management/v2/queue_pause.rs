@@ -91,6 +91,7 @@ pub(super) fn dispatch(
     cutex_session_id: &str,
     session: &Value,
     request: &ValidatedCutexRequest,
+    owner_authorized: bool,
 ) -> Result<Value, UserInputExecutionError> {
     if !request
         .params
@@ -108,11 +109,11 @@ pub(super) fn dispatch(
             // session's delegation_wait calls and leaves the native
             // external-input gate closed until the hold is released.
             crate::asks::waits::cancel_waits_default(cutex_session_id);
-            crate::asks::control::owner_stop_default(cutex_session_id);
+            crate::asks::control::owner_stop_default(cutex_session_id,owner_authorized).map_err(persistence_user_input_error)?;
             dispatch_stop(
                 event_repository,
                 queue,
-                |id, thread| interrupt(id, thread),
+                |id, thread| interrupt(id, thread, owner_authorized),
                 cutex_session_id,
                 session,
                 request,

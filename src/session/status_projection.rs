@@ -240,6 +240,7 @@ mod tests {
             launched_profile: Some("orchid".to_string()),
             launched_profile_id: None,
             launch_profile_source: None,
+            linux_scope: false,
             auth_token_path: None,
             diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
             schema_version: "test".to_string(),

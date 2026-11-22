@@ -40,16 +40,105 @@ pub struct SessionDeleteRequest {
     pub only_if_empty: bool,
 }
 
-pub(super) fn parse_params(params: &Value) -> Result<Option<u64>, UserInputExecutionError> {
+#[cfg(test)]
+fn parse_params(params: &Value) -> Result<Option<u64>, UserInputExecutionError> {
+    parse_delete_params(params).map(|(expected, _)| expected)
+}
+
+/// r290 P10 (B7): `{expectedRevision?, stopFirst?}`. `stopFirst: true` is the
+/// owner's confirmed "停止并删除": a running turn is stopped (the
+/// `cutex/turn/stop` path) before the delete instead of refusing it.
+pub(super) fn parse_delete_params(params: &Value) -> Result<(Option<u64>, bool), UserInputExecutionError> {
     let object = params
         .as_object()
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
-    if let Some(key) = object.keys().find(|key| key.as_str() != "expectedRevision") {
+    if let Some(key) = object.keys().find(|key| !matches!(key.as_str(), "expectedRevision" | "stopFirst")) {
         return Err(invalid_user_input_error(&format!("unknown parameter {key}")));
     }
-    match object.get("expectedRevision") {
-        None | Some(Value::Null) => Ok(None),
-        Some(_) => super::server::required_safe_integer_param(object, "expectedRevision").map(Some),
+    let stop_first = match object.get("stopFirst") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(invalid_user_input_error("stopFirst must be a boolean")),
+    };
+    let expected = match object.get("expectedRevision") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(super::server::required_safe_integer_param(object, "expectedRevision")?),
+    };
+    Ok((expected, stop_first))
+}
+
+/// r290 P10 (B7): how long a `stopFirst` delete waits, after the stop
+/// returned, for the session to become deletable (turn end settled, launch
+/// claim gone). Never deletes while the session is still busy.
+const STOP_FIRST_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+const STOP_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A refusal the stop can clear (nothing was changed by the attempt).
+fn busy_refusal(error: &UserInputExecutionError) -> bool {
+    !error.outcome_unknown
+        && (error.code == "session_busy" || error.code == crate::asks::pause_admission::ADMISSION_BUSY_CODE)
+}
+
+fn stop_timeout(stage: &str, message: String, last: Option<&UserInputExecutionError>) -> UserInputExecutionError {
+    UserInputExecutionError {
+        stage: stage.into(),
+        code: "session_stop_timeout".into(),
+        message,
+        retryable: true,
+        details: json!({
+            "stopFirst": true,
+            "deleted": false,
+            "lastRefusal": last.map(|error| json!({ "code": error.code, "details": error.details })),
+        }),
+        outcome_unknown: false,
+    }
+}
+
+/// r290 P10 (B7): delete; with `stop_first`, a busy refusal runs `stop` (the
+/// owner's `cutex/turn/stop`: queue pause + stop hold, interrupt, wait) and
+/// retries the delete until it is no longer busy or `settle` passed. The
+/// delete handler re-checks busy under the session lane every time, so a
+/// session with a running writer is never deleted.
+fn delete_stopping_first(
+    delete: &dyn Fn(&SessionDeleteRequest) -> Result<Value, UserInputExecutionError>,
+    stop: &dyn Fn() -> Result<Value, UserInputExecutionError>,
+    expected_revision: Option<u64>,
+    stop_first: bool,
+    settle: std::time::Duration,
+) -> Result<Value, UserInputExecutionError> {
+    let request = SessionDeleteRequest { expected_revision, only_if_empty: false };
+    let first = delete(&request);
+    let refusal = match first {
+        Err(error) if stop_first && busy_refusal(&error) => error,
+        other => return other,
+    };
+    match stop() {
+        Ok(_) => {}
+        Err(error) if error.code == "interrupt_timeout" => {
+            return Err(stop_timeout("interrupt", format!("the running turn did not stop in time; nothing was deleted: {}", error.message), Some(&refusal)));
+        }
+        Err(error) => return Err(error),
+    }
+    // Keep the owner's revision fence across the stop and every retry. A
+    // concurrent edit must be reviewed before a new destructive request.
+    let request = SessionDeleteRequest { expected_revision, only_if_empty: false };
+    let deadline = std::time::Instant::now() + settle;
+    let mut last = refusal;
+    loop {
+        match delete(&request) {
+            Ok(mut result) => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("stoppedFirst".into(), Value::Bool(true));
+                }
+                return Ok(result);
+            }
+            Err(error) if busy_refusal(&error) => last = error,
+            Err(error) => return Err(error),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(stop_timeout("route", "the session was stopped but is still busy; nothing was deleted, retry shortly".into(), Some(&last)));
+        }
+        std::thread::sleep(STOP_FIRST_POLL.min(settle));
     }
 }
 
@@ -74,9 +163,12 @@ pub(super) fn dispatch(
     cutex_session_id: &str,
     session: &Value,
     request: &ValidatedCutexRequest,
+    // r290 P10 (B7): the owner's `cutex/turn/stop` for this session, run only
+    // for `stopFirst: true` when the delete was refused as busy.
+    stop: &dyn Fn() -> Result<Value, UserInputExecutionError>,
 ) -> Result<Value, UserInputExecutionError> {
     require_owner(owner)?;
-    let expected_revision = parse_params(&request.params)?;
+    let (expected_revision, stop_first) = parse_delete_params(&request.params)?;
     super::archive::require_archive_revision(
         session,
         request.params.as_object().expect("validated object"),
@@ -84,12 +176,12 @@ pub(super) fn dispatch(
     // The delete moves the session's state directory: stop its offline
     // history reader first and keep it stopped (Windows: open handles / cwd).
     let fence = super::history::fence_offline_reader(cutex_session_id);
-    let result = delete(
-        cutex_session_id,
-        &SessionDeleteRequest {
-            expected_revision,
-            only_if_empty: false,
-        },
+    let result = delete_stopping_first(
+        &|request: &SessionDeleteRequest| delete(cutex_session_id, request),
+        stop,
+        expected_revision,
+        stop_first,
+        STOP_FIRST_SETTLE,
     );
     super::history::invalidate_session(cutex_session_id);
     drop(fence);
@@ -223,6 +315,7 @@ mod tests {
     use std::sync::Mutex;
 
     static CALLS: Mutex<Vec<(String, SessionDeleteRequest)>> = Mutex::new(Vec::new());
+    type R = Result<Value, UserInputExecutionError>;
 
     fn receipt(id: &str) -> Value {
         json!({
@@ -243,6 +336,116 @@ mod tests {
 
     fn refusing_handler(_: &str, _: &SessionDeleteRequest) -> Result<Value, UserInputExecutionError> {
         panic!("handler must not run")
+    }
+
+    fn no_stop() -> Result<Value, UserInputExecutionError> {
+        panic!("stop must not run")
+    }
+
+    fn refusal(code: &str, details: Value) -> UserInputExecutionError {
+        UserInputExecutionError {
+            stage: "route".into(),
+            code: code.into(),
+            message: String::new(),
+            retryable: true,
+            details,
+            outcome_unknown: false,
+        }
+    }
+
+    // r290 P10 (B7) ------------------------------------------------------
+
+    #[test]
+    fn stop_first_param_is_an_optional_boolean() {
+        assert_eq!(parse_delete_params(&json!({})).unwrap(), (None, false));
+        assert_eq!(parse_delete_params(&json!({ "stopFirst": true, "expectedRevision": 3 })).unwrap(), (Some(3), true));
+        assert_eq!(parse_delete_params(&json!({ "stopFirst": null })).unwrap(), (None, false));
+        assert!(parse_delete_params(&json!({ "stopFirst": "yes" })).is_err());
+        assert!(parse_delete_params(&json!({ "interrupt": true })).is_err());
+    }
+
+    #[test]
+    fn busy_delete_without_stop_first_is_refused_and_never_stops() {
+        let busy = |_: &SessionDeleteRequest| -> R { Err(refusal("session_busy", json!({ "activeTurnId": "t", "canStopFirst": true }))) };
+        let error = delete_stopping_first(&busy, &no_stop, Some(4), false, std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.code, "session_busy");
+        assert_eq!(error.details["canStopFirst"], true);
+    }
+
+    #[test]
+    fn stop_first_stops_then_deletes_once_idle() {
+        use std::cell::{Cell, RefCell};
+        let stopped = Cell::new(false);
+        let seen = RefCell::new(Vec::new());
+        let delete = |request: &SessionDeleteRequest| -> R {
+            seen.borrow_mut().push(request.clone());
+            // Busy until the stop ran, then one more busy poll (turn end settling).
+            if !stopped.get() || seen.borrow().len() == 2 {
+                return Err(refusal("session_busy", json!({ "activeTurnId": "t" })));
+            }
+            Ok(receipt("cutex.s1"))
+        };
+        let stop = || -> R { stopped.set(true); Ok(json!({ "interruptedTurnId": "t" })) };
+        let result = delete_stopping_first(&delete, &stop, Some(4), true, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["stoppedFirst"], true);
+        assert!(stopped.get());
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].expected_revision, Some(4), "the first attempt keeps the caller's revision");
+        assert!(seen[1..].iter().all(|r| r.expected_revision == Some(4) && !r.only_if_empty));
+    }
+
+    #[test]
+    fn stop_first_on_an_idle_session_just_deletes() {
+        let ok = |_: &SessionDeleteRequest| -> R { Ok(receipt("cutex.s1")) };
+        let result = delete_stopping_first(&ok, &no_stop, None, true, std::time::Duration::ZERO).unwrap();
+        assert!(result.get("stoppedFirst").is_none());
+    }
+
+    #[test]
+    fn stop_first_times_out_with_a_clear_code_and_never_deletes_a_busy_session() {
+        let busy = |_: &SessionDeleteRequest| -> R { Err(refusal("session_busy", json!({ "activeTurnId": "t" }))) };
+        let stop = || -> R { Ok(json!({})) };
+        let error = delete_stopping_first(&busy, &stop, None, true, std::time::Duration::from_millis(10)).unwrap_err();
+        assert_eq!(error.code, "session_stop_timeout");
+        assert_eq!(error.details["deleted"], false);
+        assert_eq!(error.details["lastRefusal"]["code"], "session_busy");
+        let slow = || -> R { Err(refusal("interrupt_timeout", json!({}))) };
+        let error = delete_stopping_first(&busy, &slow, None, true, std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.code, "session_stop_timeout");
+    }
+
+    #[test]
+    fn stop_first_keeps_other_refusals() {
+        let referenced = |_: &SessionDeleteRequest| -> R { Err(refusal("session_referenced", json!({}))) };
+        let error = delete_stopping_first(&referenced, &no_stop, None, true, std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.code, "session_referenced");
+    }
+
+    #[test]
+    fn stop_first_keeps_the_revision_fence_if_the_session_changes() {
+        let stopped = std::cell::Cell::new(false);
+        let delete = |request: &SessionDeleteRequest| -> R {
+            if !stopped.get() {
+                return Err(refusal("session_busy", json!({})));
+            }
+            assert_eq!(request.expected_revision, Some(4));
+            Err(refusal("revision_conflict", json!({"currentRevision": 5})))
+        };
+        let stop = || -> R { stopped.set(true); Ok(json!({})) };
+        let error = delete_stopping_first(&delete, &stop, Some(4), true, std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.code, "revision_conflict");
+    }
+
+    #[test]
+    fn stop_first_requires_the_owner() {
+        let (root, repository) = repository();
+        let session = json!({ "revision": 7 });
+        let denied = dispatch(&repository, refusing_handler, None, "cutex.s1", &session,
+            &request(METHOD, json!({ "stopFirst": true })), &no_stop).unwrap_err();
+        assert_eq!(denied.code, "cutex_method_denied");
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn request(method: &str, params: Value) -> ValidatedCutexRequest {
@@ -280,14 +483,14 @@ mod tests {
         let (root, repository) = repository();
         let session = json!({ "revision": 7, "native": { "threadId": "t-1" } });
         let denied = dispatch(&repository, refusing_handler, None, "cutex.s1", &session,
-            &request(METHOD, json!({}))).unwrap_err();
+            &request(METHOD, json!({})), &no_stop).unwrap_err();
         assert_eq!(denied.code, "cutex_method_denied");
         let owner = HumanManagementPrincipal::authenticated();
         let conflict = dispatch(&repository, refusing_handler, Some(&owner), "cutex.s1", &session,
-            &request(METHOD, json!({ "expectedRevision": 6 }))).unwrap_err();
+            &request(METHOD, json!({ "expectedRevision": 6 })), &no_stop).unwrap_err();
         assert_eq!(conflict.code, "revision_conflict");
         let result = dispatch(&repository, ok_handler, Some(&owner), "cutex.s1", &session,
-            &request(METHOD, json!({ "expectedRevision": 7 }))).unwrap();
+            &request(METHOD, json!({ "expectedRevision": 7 })), &no_stop).unwrap();
         assert_eq!(result["deleted"], true);
         let calls = CALLS.lock().unwrap().clone();
         assert!(calls.iter().any(|(id, call)| id == "cutex.s1"
@@ -320,7 +523,7 @@ mod tests {
         assert!(!reader_probe::holders(&dir).is_empty());
         let owner = HumanManagementPrincipal::authenticated();
         let session = json!({ "revision": 7, "native": { "threadId": "t-1" } });
-        dispatch(&repository, handler, Some(&owner), &id, &session, &request(METHOD, json!({}))).unwrap();
+        dispatch(&repository, handler, Some(&owner), &id, &session, &request(METHOD, json!({})), &no_stop).unwrap();
         assert_eq!(reader_probe::spawns(&id), 1);
         super::super::history::evict_offline_reader(&id);
         let _ = std::fs::remove_dir_all(dir);
@@ -335,7 +538,7 @@ mod tests {
         let (root, repository) = repository();
         let owner = HumanManagementPrincipal::authenticated();
         let error = dispatch(&repository, other, Some(&owner), "cutex.s1", &json!({ "revision": 1 }),
-            &request(METHOD, json!({}))).unwrap_err();
+            &request(METHOD, json!({})), &no_stop).unwrap_err();
         assert_eq!(error.code, "event_persistence_unavailable");
         assert!(repository.page(super::super::repository::ReplayQuery::default()).unwrap().events.is_empty());
         std::fs::remove_dir_all(root).ok();

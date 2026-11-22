@@ -39,6 +39,57 @@ fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap()
 }
 
+#[test]
+fn blocked_unsent_owner_batch_retries_manually_without_inventing_uncertainty() {
+    let f=Fixture::new();
+    f.go("blocked",Next::received().create(owner_input()));
+    f.go("blocked",Next::sending());
+    let details=json!({"interruptBatch":{"attempt":1,"blocked":true,"deferred":false,
+        "notSubmittedReason":"hook_blocked","identity":{"request":{"inputIds":["blocked"]}}}});
+    let blocked=f.go("blocked",Next::waiting("nativeHeld").details(details.clone())).record;
+    assert_eq!(blocked.actions,vec![il::Action::Retry,il::Action::Dismiss]);
+    assert!(retryable(&blocked));
+    for field in ["blocked","deferred","attempt","notSubmittedReason"] {
+        let mut other=blocked.clone();other.details["interruptBatch"].as_object_mut().unwrap().remove(field);
+        assert!(!il::owner_batch_blocked(&other));
+        assert!(!retryable(&other));
+        assert_eq!(il::record_actions(&other,None),vec![il::Action::Dismiss]);
+    }
+    let retried=retry_transition(&f.ledger,"s1","blocked",blocked.rev).unwrap().record;
+    assert_eq!(retried.state,InputState::Waiting);
+    assert_eq!(retried.reason.as_deref(),Some("ownerRetry"));
+    assert_eq!(retried.attempt,2);
+    assert!(!il::owner_batch_blocked(&retried));
+    assert_eq!(retried.details["interruptBatch"]["attempt"],1,"old batch audit is retained, not auto-replayed");
+}
+
+#[test]
+fn refused_blocked_owner_retry_restores_unsent_waiting_and_keeps_manual_recovery() {
+    let f = Fixture::new();
+    f.go("blocked", Next::received().create(owner_input()));
+    f.go("blocked", Next::sending());
+    let details = json!({"interruptBatch":{"attempt":1,"blocked":true,"deferred":false,
+        "notSubmittedReason":"hook_blocked","nativeError":{"data":{"ownerInputBatchNotSubmitted":"hook_blocked"}},
+        "identity":{"request":{"inputIds":["blocked"]}}}});
+    let mut before = f.go("blocked", Next::waiting("nativeHeld").details(details.clone())).record;
+    f.ledger.put_payload("s1", "blocked", &json!({"clientUserMessageId":"blocked","strategy":"auto","input":[]})).unwrap();
+    for expected_attempt in [2, 3] {
+        let (result, _) = il::capture_events(|| retry_on(&f.ledger, "s1", "blocked", before.rev, &mut |_| Err(refused_resend())));
+        let result = result.unwrap();
+        let after = f.get("blocked");
+        assert_eq!(after.state, InputState::Waiting);
+        assert_eq!(after.reason.as_deref(), Some("nativeHeld"));
+        assert_eq!(after.attempt, expected_attempt);
+        assert_eq!(after.details["interruptBatch"]["attempt"], expected_attempt);
+        assert_eq!(after.details["interruptBatch"]["identity"], details["interruptBatch"]["identity"]);
+        assert_eq!(after.details["interruptBatch"]["nativeError"], details["interruptBatch"]["nativeError"]);
+        assert!(il::owner_batch_blocked(&after));
+        assert_eq!(after.actions, vec![il::Action::Retry, il::Action::Dismiss]);
+        assert_eq!(result["redelivery"]["error"]["details"]["nothingSent"], true);
+        before = after;
+    }
+}
+
 fn sender(kind: SenderKind) -> InputSender {
     InputSender { kind, id: "sender".into(), name: "Sender".into(), host: None, cutex_session_id: None }
 }
@@ -580,6 +631,28 @@ fn stalled_no_progress_marks_an_idle_waiting_record_and_clears_when_busy() {
 }
 
 #[test]
+fn withdrawn_delegation_waits_have_no_progress_stall_or_timer() {
+    let f = Fixture::new();
+    let stall = Duration::from_secs(30);
+    let late = t0() + chrono::Duration::hours(1);
+    for kind in [InputKind::DelegationResult, InputKind::DelegationQuestion, InputKind::DelegationStatus] {
+        let id = kind.as_str();
+        let mut input = note_input();
+        input.kind = kind;
+        let visible = f.go(id, Next::waiting("returned").create(input)).record;
+        assert!(stall_next(&visible, true, late, stall).is_some());
+        let hidden = f.go(id, Next::waiting("returned").surface(il::Surface::None)).record;
+        assert!(stall_next(&hidden, true, late, stall).is_none(), "{kind:?}");
+        assert_eq!(next_stall_check(std::slice::from_ref(&hidden), true, stall), None);
+        let marked = f.go(id, Next::waiting("returned").stalled(Some(Stalled {
+            reason: "noProgress".into(), since: rfc3339(t0()),
+        }))).record;
+        let clear = stall_next(&marked, true, late, stall).expect("clear a prior noProgress mark");
+        assert!(f.go(id, clear).record.stalled.is_none());
+    }
+}
+
+#[test]
 fn delivery_reports_starting_while_a_start_is_pending() {
     let now = t0();
     let state = |facts: DeliveryFacts| session_delivery(&facts, now)["state"].as_str().unwrap().to_string();
@@ -595,6 +668,8 @@ fn bus_drift_corrects_only_a_state_the_store_proves() {
     use crate::management::v2::input_ledger_bus::{BusFacts, Target};
     let f = Fixture::new();
     let facts = |state: &str, inbox: bool| BusFacts {
+        stale_release_allowed: false, projection_failure: None,
+        delivery_diagnostics: None,
         state: state.into(), timing: Timing::AfterTurn, frozen: false, a2: false, inbox, a4: false,
         external_receipt: false, observed: None, turn: Some("t1".into()), settlement_closed: false, error_code: None, item: None,
     };
@@ -607,6 +682,10 @@ fn bus_drift_corrects_only_a_state_the_store_proves() {
     assert_eq!(bus_drift(&waiting, view(facts("inbox_accepted", true)).as_ref(), late), Some(Target::Accepted { turn: None }));
     // Same state, another reason: the store does not judge waiting reasons.
     assert_eq!(bus_drift(&waiting, view(facts("pending", false)).as_ref(), late), None);
+    let legacy_stale = f.go("legacy-stale", Next::waiting("staleHeld").create(note_input())).record;
+    let safe_stale = BusFacts { stale_release_allowed:true, ..facts("stale_held", false) };
+    assert_eq!(bus_drift(&legacy_stale, view(safe_stale).as_ref(), late),
+        Some(Target::Waiting {reason:"staleHeld",details:Some(json!({"staleReleaseAllowed":true}))}));
     // Another recipient, or no message: nothing.
     assert_eq!(bus_drift(&waiting, Some(("s2".to_string(), facts("delivered", false), note_input())).as_ref(), late), None);
     assert_eq!(bus_drift(&waiting, None, late), None);
@@ -671,6 +750,58 @@ fn retry_payloads_are_kept_and_compacted() {
     let later = t0() + chrono::Duration::days(8);
     assert_eq!(f.ledger.compact_payloads(later, PAYLOAD_RETENTION, 10).unwrap(), 1);
     assert!(f.ledger.payload("s1", "m1").unwrap().is_none());
+}
+
+#[test]
+fn merged_owner_retry_preserves_both_texts_and_three_images_and_refuses_stale_copy() {
+    use crate::management::v2::{model::{PendingEvent,EventCorrelation,EventSource,CutexMessage},
+        repository::EventRepository,user_input::{UserInputRepository,UserInputSubmitParams,UserInputStrategy,
+            UserInputOrigin,UserInputOriginKind}};
+    let f=Fixture::new();
+    let events=EventRepository::open(f.root.join("events"),"test").unwrap();
+    let queue=UserInputRepository::open(f.root.join("queue")).unwrap();
+    let a=UserInputSubmitParams {interrupt_send:None,client_user_message_id:"A".into(),
+        origin:UserInputOrigin {kind:UserInputOriginKind::Other,client_id:"desktop".into()},
+        strategy:UserInputStrategy::Queue,input:vec![json!({"type":"text","text":"A"})],
+        expected_turn_id:None,join_delegation:None};
+    let mut b=a.clone();b.client_user_message_id="B".into();
+    b.input=vec![json!({"type":"text","text":"B"}),
+        json!({"type":"localImage","path":"D:/fixtures/one.png"}),
+        json!({"type":"localImage","path":"D:/fixtures/two.png"}),
+        json!({"type":"localImage","path":"D:/fixtures/three.png"})];
+    let expected:Vec<_>=a.input.iter().chain(b.input.iter()).cloned().collect();
+    queue.enqueue("s1","thread","a",&a).unwrap();queue.enqueue("s1","thread","b",&b).unwrap();
+    let refs:Vec<_>=queue.list("s1").unwrap().1.into_iter().map(|item|(item.queue_id,item.revision)).collect();
+    let (merged,_)=queue.merge("s1",&refs,None).unwrap().unwrap();
+    let stale=owner_submit_payload(&a);
+    f.ledger.put_initial_payload("s1","A",&stale).unwrap();
+    remember_merged_owner_input(&f.ledger,"s1",&merged).unwrap();
+    f.ledger.put_initial_payload("s1","A",&stale).unwrap();
+    let complete=f.ledger.payload("s1","A").unwrap().unwrap();
+    assert_eq!(complete["input"],json!(expected));
+    let submitted=|input:Value|events.append(PendingEvent {cutex_session_id:"s1".into(),host_id:"test".into(),
+        source:EventSource::Cutex,schema:None,correlation:EventCorrelation::default(),native:None,
+        cutex:Some(CutexMessage {method:"cutex/userInput/submitted".into(),
+            params:json!({"managementRequestId":"merged-test","clientUserMessageId":"A","origin":a.origin,
+                "input":input,"disposition":"steered","nativeRequestId":"fake-steer","nativeMethod":"turn/steer",
+                "turnId":"t1","appServerAccepted":true,"submittedAt":Utc::now().to_rfc3339()})})}).unwrap();
+    submitted(json!(a.input));submitted(json!(expected));
+    f.go("A",Next::received().create(owner_input()));f.go("A",Next::sending());
+    let before=f.go("A",Next::uncertain("outcomeUnknown")).record;
+    f.ledger.put_payload("s1","A",&stale).unwrap();
+    let rejected=retry_on_with_events(&f.ledger,&events,"s1","A",before.rev,
+        &mut |_|panic!("stale subset reached native")).unwrap_err();
+    assert_eq!(rejected.code,"retry_payload_mismatch");
+    assert_eq!(rejected.details["nothingSent"],true);assert_eq!(f.get("A"),before);
+    assert!(f.get("A").actions.contains(&il::Action::Dismiss));
+    assert!(rejected.message.contains("Nothing was sent") && rejected.message.contains("original input is unchanged"));
+    f.ledger.put_payload("s1","A",&complete).unwrap();
+    let mut native_inputs=Vec::new();
+    let (result,_)=il::capture_events(||retry_on_with_events(&f.ledger,&events,"s1","A",before.rev,&mut |payload|{
+        native_inputs.push(payload["input"].clone());Ok(json!({"started":true}))
+    }));
+    assert_eq!(result.unwrap()["redelivery"]["ok"],true);
+    assert_eq!(native_inputs,vec![json!(expected)]);
 }
 
 #[test]
@@ -958,13 +1089,12 @@ fn refused_resend() -> UserInputExecutionError {
 #[test]
 fn a_refused_owner_resend_returns_to_retry_and_dismiss_and_says_nothing_was_sent() {
     let f = Fixture::new();
-    let payload = json!({"clientUserMessageId": "m", "strategy": "auto", "input": []});
     let settled: [(&str, Next); 2] = [("uncertain", Next::uncertain("outcomeUnknown")), ("failed", Next::failed("notDelivered"))];
     for (id, last) in settled {
         f.go(id, Next::received().create(owner_input()));
         f.go(id, Next::sending());
         let before = f.go(id, last).record;
-        f.ledger.put_payload("s1", id, &payload).unwrap();
+        f.ledger.put_payload("s1", id, &json!({"clientUserMessageId":id,"strategy":"auto","input":[]})).unwrap();
         let mut sent = 0;
         let (result, _) = il::capture_events(|| retry_on(&f.ledger, "s1", id, before.rev, &mut |_| {
             sent += 1;
@@ -1196,4 +1326,173 @@ fn rebuild_owner_source_preserves_placement_and_never_invents_explicit_queue() {
     assert_eq!(unknown.state,InputState::Uncertain);
     assert_eq!(unknown.reason.as_deref(),Some("outcomeUnknown"));
     assert!(unknown.actions.contains(&il::Action::Dismiss));
+}
+
+fn reconnect_time(time: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&format!("2026-11-16T{time}Z")).unwrap().with_timezone(&Utc)
+}
+
+#[test]
+fn accepted_note_offline_online_owner_turn_timeline_clears_disconnect_before_receipt() {
+    let f = Fixture::new();
+    f.ledger.set_clock(reconnect_time("02:58:32"));
+    accepted_note(&f, "cb2c5363", None);
+    let accepted = f.get("cb2c5363");
+    let mut watched = BTreeMap::new();
+    f.ledger.set_clock(reconnect_time("03:23:43"));
+    il::capture_events(|| disconnected(&f.ledger, "s1", reconnect_time("03:23:43")));
+    watched.insert("s1".into(), Watch { generation: Some(3), poll: true });
+    let offline = FakeRuntime { view: RuntimeView { stopped: true, ..RuntimeView::default() }, ..FakeRuntime::default() };
+    observe_connection(&f.ledger, &offline, "s1", &offline.view, &mut watched, reconnect_time("03:23:43"));
+    assert!(!watched["s1"].poll, "offline runtimes wait for an event, not a polling loop");
+    assert_eq!(watched["s1"].generation, Some(3));
+    assert_eq!(f.get("cb2c5363").stalled.unwrap().reason, "runtimeDisconnected");
+
+    f.ledger.set_clock(reconnect_time("03:23:45"));
+    let online = FakeRuntime::connected(None).answer("claude/input/status", Ok(json!({"state":"queued"})));
+    let (_, events) = il::capture_events(|| observe_connection(&f.ledger, &online, "s1", &online.view, &mut watched, reconnect_time("03:23:45")));
+    let resumed = f.get("cb2c5363");
+    assert_eq!(resumed.state, InputState::Accepted);
+    assert!(resumed.stalled.is_none());
+    assert!(watched.is_empty());
+    assert_eq!(resumed.rev, accepted.rev + 2);
+    assert_eq!(events.len(), 1, "clear is published even without a state change");
+    assert!(events[0].2["record"]["stalled"].is_null());
+
+    f.ledger.set_clock(reconnect_time("03:24:01"));
+    let bound = f.go("cb2c5363", Next::accepted().turn("owner-turn")
+        .timeline_item("cb2c5363").details(json!({il::READ_SIGNAL:"nativeItem"}))).record;
+    assert_eq!(bound.state, InputState::Accepted);
+    assert_eq!(bound.turn_id.as_deref(), Some("owner-turn"));
+    assert!(bound.stalled.is_none());
+    f.ledger.set_clock(reconnect_time("03:24:15"));
+    assert_eq!(f.go("cb2c5363", Next::in_context(Evidence::ContextPersisted)).record.state, InputState::InContext);
+}
+
+#[test]
+fn offline_reconnect_resumes_all_accepted_notes_once_without_polling_stopped_runtime() {
+    let f = Fixture::new();
+    for id in ["first", "second", "third"] { accepted_note(&f, id, None); }
+    il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+    let mut watched = BTreeMap::from([("s1".into(), Watch { generation: Some(3), poll: true })]);
+    let offline = FakeRuntime { view: RuntimeView { present: true, stopped: true, generation: Some(3), ..RuntimeView::default() }, ..FakeRuntime::default() };
+    for _ in 0..3 { observe_connection(&f.ledger, &offline, "s1", &offline.view, &mut watched, t0()); }
+    assert!(!watched["s1"].poll);
+    assert!(offline.calls.borrow().is_empty());
+    let online = FakeRuntime::connected(None).answer("claude/input/status", Ok(json!({"state":"queued"})));
+    il::capture_events(|| observe_connection(&f.ledger, &online, "s1", &online.view, &mut watched, t0()));
+    let revisions: Vec<_> = ["first", "second", "third"].map(|id| {
+        let row = f.get(id); assert!(row.stalled.is_none()); assert_eq!(row.state, InputState::Accepted); row.rev
+    }).to_vec();
+    observe_connection(&f.ledger, &online, "s1", &online.view, &mut watched, t0());
+    assert_eq!(online.calls.borrow().len(), 3);
+    for (i, id) in ["first", "second", "third"].iter().enumerate() { assert_eq!(f.get(id).rev, revisions[i]); }
+}
+
+#[test]
+fn offline_watch_keeps_old_generation_and_reconnect_does_not_invent_delivery() {
+    let f = Fixture::new();
+    accepted_note(&f, "old", None);
+    il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+    let mut watched = BTreeMap::from([("s1".into(), Watch { generation: Some(3), poll: true })]);
+    let offline = FakeRuntime::default();
+    observe_connection(&f.ledger, &offline, "s1", &offline.view, &mut watched, t0());
+    let mut online = FakeRuntime::connected(None).answer("claude/input/status", Ok(json!({"state":"queued"})));
+    online.view.generation = Some(4);
+    il::capture_events(|| observe_connection(&f.ledger, &online, "s1", &online.view, &mut watched, t0()));
+    let row = f.get("old");
+    assert_eq!(row.state, InputState::Uncertain);
+    assert_eq!(row.reason.as_deref(), Some("runtimeLost"));
+    assert!(row.stalled.is_none());
+    assert!(watched.is_empty());
+}
+
+#[test]
+fn disconnect_same_generation_reconnect_and_turn_binding_preserve_other_stalls() {
+    for id in ["noProgress", "paused"] {
+        let f = Fixture::new();
+        accepted_note(&f, id, None);
+        let stall = Stalled { reason: id.into(), since: rfc3339(t0()) };
+        f.go(id, Next::accepted().stalled(Some(stall.clone())));
+        il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+        let runtime = FakeRuntime::connected(None);
+        il::capture_events(|| reconnected(&f.ledger, &runtime, "s1", false, t0()));
+        if id == "paused" { il::capture_events(|| reconnected(&f.ledger, &runtime, "s1", true, t0())); }
+        let bound = f.go(id, Next::accepted().turn("active-turn")).record;
+        assert_eq!(bound.stalled.as_ref(), Some(&stall));
+        assert!(runtime.calls.borrow().is_empty());
+    }
+}
+
+#[test]
+fn disconnected_runtime_cannot_clear_stalls_until_it_is_connected() {
+    let f = Fixture::new(); accepted_note(&f, "pending", None);
+    il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+    let old = f.get("pending");
+    assert_eq!(reconnected(&f.ledger, &FakeRuntime::default(), "s1", false, t0()), 0);
+    assert_eq!(f.get("pending").rev, old.rev);
+    assert_eq!(f.get("pending").stalled, old.stalled);
+}
+
+#[test]
+fn dormant_watch_is_removed_when_no_unsettled_records_remain() {
+    let f = Fixture::new(); accepted_note(&f, "last", None);
+    il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+    let mut watched = BTreeMap::from([("s1".into(), Watch { generation: Some(3), poll: true })]);
+    let offline = FakeRuntime { view: RuntimeView { stopped: true, ..RuntimeView::default() }, ..FakeRuntime::default() };
+    observe_connection(&f.ledger, &offline, "s1", &offline.view, &mut watched, t0());
+    assert!(!watched["s1"].poll, "retain a dormant generation while work remains");
+    f.go("last", Next::in_context(Evidence::ContextPersisted));
+    observe_connection(&f.ledger, &offline, "s1", &offline.view, &mut watched, t0());
+    assert!(watched.is_empty(), "settled/archived offline sessions need no reconnect entry");
+    watched.insert("deleted-session".into(), Watch { generation: Some(3), poll: false });
+    observe_connection(&f.ledger, &offline, "deleted-session", &offline.view, &mut watched, t0());
+    assert!(watched.is_empty(), "a deleted session with no records is also released");
+    assert!(offline.calls.borrow().is_empty());
+}
+
+#[test]
+fn reconnect_with_unknown_previous_generation_uses_generation_changed_settlement() {
+    let f = Fixture::new(); accepted_note(&f, "unknown-generation", None);
+    il::capture_events(|| disconnected(&f.ledger, "s1", t0()));
+    let mut watched = BTreeMap::from([("s1".into(), Watch { generation: None, poll: false })]);
+    let online = FakeRuntime::connected(None).answer("claude/input/status", Ok(json!({"state":"queued"})));
+    il::capture_events(|| observe_connection(&f.ledger, &online, "s1", &online.view, &mut watched, t0()));
+    let record = f.get("unknown-generation");
+    assert_eq!(record.state, InputState::Uncertain, "unknown prior generation cannot prove same-generation continuity");
+    assert_eq!(record.reason.as_deref(), Some("runtimeLost"));
+    assert!(record.stalled.is_none());
+    assert!(watched.is_empty());
+    assert_eq!(online.calls.borrow().len(), 1);
+}
+
+#[test]
+fn changed_generation_checks_no_progress_accepted_and_loses_sending_but_keeps_paused() {
+    for persisted in [false, true] {
+        let f = Fixture::new();
+        accepted_owner(&f, "accepted", "old-turn");
+        f.go("accepted", Next::accepted().stalled(Some(Stalled { reason:"noProgress".into(), since:rfc3339(t0()) })));
+        f.go("sending", Next::received().create(owner_input()));
+        f.go("sending", Next::sending().stalled(Some(Stalled { reason:"noProgress".into(), since:rfc3339(t0()) })));
+        accepted_note(&f, "paused", None);
+        let paused = f.go("paused", Next::accepted().stalled(Some(Stalled { reason:"paused".into(), since:rfc3339(t0()) }))).record;
+        let answer = if persisted { Ok(json!({"data":[{"item":{"type":"userMessage","clientId":"accepted","id":"proven-item"}}]})) } else { Err("lost runtime receipt".into()) };
+        let mut runtime = FakeRuntime::connected(None).answer("thread/items/list", answer);
+        runtime.view.generation = Some(4);
+        assert_eq!(il::capture_events(|| reconnected(&f.ledger, &runtime, "s1", true, t0())).0, 2);
+        let accepted = f.get("accepted");
+        if persisted {
+            assert_eq!(accepted.state, InputState::InContext);
+            assert_eq!(accepted.timeline_item_id.as_deref(), Some("proven-item"));
+        } else {
+            assert_eq!(accepted.state, InputState::Uncertain);
+            assert_eq!(accepted.reason.as_deref(), Some("runtimeLost"));
+        }
+        assert!(accepted.stalled.is_none());
+        assert_eq!(f.get("sending").state, InputState::Uncertain);
+        assert_eq!(f.get("sending").reason.as_deref(), Some("runtimeLost"));
+        assert!(f.get("sending").stalled.is_none());
+        assert_eq!(f.get("paused"), paused, "paused remains entirely untouched");
+        assert_eq!(runtime.calls.borrow().len(), 1, "one check for Accepted, none for Sending or paused");
+    }
 }

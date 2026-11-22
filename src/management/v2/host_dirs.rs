@@ -91,6 +91,7 @@ fn is_hidden(name: &str, _meta: Option<&std::fs::Metadata>) -> bool {
 }
 
 pub fn list_dirs(raw: Option<&str>, home: Option<&Path>, max_entries: usize) -> Result<Value, DirError> {
+    let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8)
     if let Some(path) = raw.map(Path::new) {
         crate::artifacts::paths::validate_local_path(path).map_err(|_|DirError::new(403,"Forbidden","path_forbidden","unsafe directory path"))?;
     }

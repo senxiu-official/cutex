@@ -9,6 +9,74 @@ const STORE: &str = "session-store";
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ROWS: usize = 1024;
 
+/// Cleanup authority only: no transcripts, usage, identity metadata or receipts.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct RuntimeReferences {
+    pub explicit_launch: Option<crate::agent_management::ExplicitLaunchContract>,
+    pub claude_session: Option<ClaudeReferences>,
+    pub dsh_session: Option<crate::runtime::dsh::DshSession>,
+    pub cwd: String,
+    pub profile_binding: Option<crate::profiles::runtime_variants::ProfileLaunchBinding>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct ClaudeReferences {
+    pub deployment: crate::runtime::claude::ClaudeDeployment,
+    pub state_dir: PathBuf,
+}
+pub(crate) type RuntimeReferenceSnapshot = std::collections::BTreeMap<String, RuntimeReferences>;
+
+pub(crate) fn runtime_references_from_store(store: &CutexSessionStore) -> RuntimeReferenceSnapshot {
+    store.sessions.iter().map(|(key, row)| (key.clone(), RuntimeReferences {
+        explicit_launch: row.explicit_launch.clone(),
+        claude_session: row.claude_session.as_ref().map(|row| ClaudeReferences {
+            deployment: row.deployment.clone(), state_dir: row.state_dir.clone(),
+        }),
+        dsh_session: row.dsh_session.clone(), cwd: row.cwd.clone(),
+        profile_binding: row.profile_binding.clone(),
+    })).collect()
+}
+
+/// One consistent read transaction, fetching bounded key pages and projecting
+/// only fields consumed by runtime cleanup. Includes hidden/retired/orphan rows.
+pub(crate) fn runtime_references_at(path: &Path) -> anyhow::Result<RuntimeReferenceSnapshot> {
+    let Some(db) = ensure_ready(path, false, false)? else { return Ok(Default::default()); };
+    with_connection(&db, |connection| {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut result = RuntimeReferenceSnapshot::new();
+        let mut after: Option<String> = None;
+        {
+            let mut statement = tx.prepare_cached(
+                "SELECT key, json_object(
+                    'explicit_launch',json_extract(record_json,'$.explicit_launch'),
+                    'claude_session',CASE WHEN json_type(record_json,'$.claude_session')='object'
+                        THEN json_object('deployment',json_extract(record_json,'$.claude_session.deployment'),
+                            'state_dir',json_extract(record_json,'$.claude_session.state_dir')) ELSE NULL END,
+                    'dsh_session',json_extract(record_json,'$.dsh_session'),
+                    'cwd',json_extract(record_json,'$.cwd'),
+                    'profile_binding',json_extract(record_json,'$.profile_binding'))
+                 FROM sessions WHERE key >= coalesce(?1,'') AND (?1 IS NULL OR key != ?1)
+                 ORDER BY key LIMIT 256"
+            )?;
+            loop {
+                let mut rows = statement.query(params![after])?;
+                let mut count = 0;
+                while let Some(row) = rows.next()? {
+                    let key: String = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    let refs = serde_json::from_str(&json)
+                        .with_context(|| format!("invalid runtime references for session {key}"))?;
+                    after = Some(key.clone());
+                    result.insert(key, refs);
+                    count += 1;
+                }
+                if count < 256 { break; }
+            }
+        }
+        tx.commit()?;
+        Ok(result)
+    })
+}
+
 #[path = "indexed_repository.rs"]
 mod repository;
 pub use repository::{SessionFilter, SessionRepository};
@@ -478,6 +546,27 @@ pub(crate) fn mutate_at<T>(
         Ok(next)
     })?;
     Ok((result, revision))
+}
+
+/// r290 P10 (A1): one owner retirement receipt, without loading sessions or
+/// unrelated receipt maps. The primary key is (map, key).
+pub(crate) fn archive_receipt_at(path: &Path, key: &str) -> anyhow::Result<Option<crate::agent_management::AgentArchiveReceipt>> {
+    let Some(db) = ensure_ready(path, false, false)? else { return Ok(None) };
+    with_connection(&db, |connection| {
+        let json: Option<String> = connection.query_row(
+            "SELECT json FROM receipts WHERE map='agent_archive' AND key=?1",
+            [key], |row| row.get(0),
+        ).optional()?;
+        note(STORE, OpCounts {
+            sql_statements: 1,
+            rows_visited: u64::from(json.is_some()),
+            rows_materialized: u64::from(json.is_some()),
+            bytes_read: json.as_ref().map_or(0, |s| s.len() as u64),
+            bytes_decoded: json.as_ref().map_or(0, |s| s.len() as u64),
+            ..Default::default()
+        });
+        json.map(|value| serde_json::from_str(&value).context("decode retirement receipt")).transpose()
+    })
 }
 
 pub(crate) fn put_receipt_at<M: ReceiptMap>(

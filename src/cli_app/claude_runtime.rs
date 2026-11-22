@@ -260,6 +260,13 @@ fn complete_claude_event(
     // queue decides whether it may flush (as for Codex runtimes).
     super::asks_runtime::on_runtime_event(&context.cutex_session_id, context.runtime_generation, event);
     if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
+        if retained_queue_guard(&notification.method, notification.params.as_ref(), &context.thread_id) {
+            // Authenticate against the current durable occurrence, not provider prose.
+            if cutex::session::store::shared_session_row(&context.cutex_session_id)?.is_some_and(|row|
+                row.runtime_generation == context.runtime_generation) {
+                cutex::asks::control::runtime_gate_retained_default(&context.cutex_session_id, context.runtime_generation);
+            }
+        }
         // The adapter starts turns only with an open input gate: a
         // runtimeGate pause (asks / ask results refused) ends.
         if notification.method == "turn/started" && notification.params.as_ref().and_then(|p| p.get("threadId")).and_then(serde_json::Value::as_str) == Some(context.thread_id.as_str()) {
@@ -499,6 +506,25 @@ fn observe_inner(id: &str) -> anyhow::Result<()> {
         observed_connection::forget(id);
         manager().disconnect(id)?;
         manager().connect_adapter(observation)?;
+        // r290 P9: no observer proof, registration or queued input is admitted
+        // until the new adapter's tool gate is closed. A failure detaches only
+        // this unpublished connection; durable pauses and inputs are retained.
+        if let Err(error) = super::tool_gate::prepare_before_publish(
+            id, record.app_server_thread_id().unwrap(), record.runtime_generation,
+            &manager().handle(id)?, true,
+        ) {
+            manager().disconnect(id)?;
+            return Err(error);
+        }
+        // r290 P9: a stop or replacement during control IO cannot publish the
+        // old observer proof, even when its gate request was acknowledged.
+        let current = cutex::session::store::shared_session_row(id)?;
+        if !current.as_deref().is_some_and(|fresh| fresh.runtime_generation == record.runtime_generation
+            && fresh.claude_session == record.claude_session
+            && cutex::agent_bus::claude_occurrence::Occurrence::from_record(fresh) == expected) {
+            manager().disconnect(id)?;
+            anyhow::bail!("Claude occurrence changed during initial tool gate");
+        }
         observed_connection::remember(id, proof);
         drop(guard);
         note_status_probe(id, &record, None);
@@ -734,7 +760,7 @@ fn observe_settlement_message_with(
     let mut failed = false;
     let evidence = match collect(&snapshot, deadline) {
         Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Terminal(evidence)) => Some(evidence),
-        Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Ineligible) => None,
+        Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Ineligible | cutex::management::v2::agent_bus_settlement_model::Observation::RuntimeGone) => None,
         Err(error) => {
             eprintln!("Claude settlement observation for {id}/{message_id}: {error:#}");
             failed = true;
@@ -768,6 +794,26 @@ fn reconciliation_due(
     attempts.insert(id.to_string(), (generation, now));
     true
 }
+
+// Keep notice-only failures outside Claude's source-delivery error path.
+fn runtime_gate_notice_best_effort(work: impl FnOnce() -> anyhow::Result<()>) {
+    cutex::agent_bus::runtime_gate_notice::best_effort(|| {
+        #[cfg(test)]
+        if NOTICE_FAILURE.with(|fail| fail.get()) {
+            NOTICE_FAILURE_HITS.with(|hits| hits.set(hits.get() + 1));
+            anyhow::bail!("injected Claude notice storage failure");
+        }
+        work()
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static NOTICE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NOTICE_FAILURE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+use cutex::app_server::pre_turn_notes::ProjectionOrderFence;
 
 fn deliver_messages(
     id: &str,
@@ -823,6 +869,11 @@ fn deliver_messages_with(
     } else {
         Default::default()
     };
+    runtime_gate_notice_best_effort(|| {
+        cutex::agent_bus::runtime_gate_notice::report_existing_holds(repository, &polled, id)
+    });
+    let mut projection_error = None;
+    let mut projection_order = ProjectionOrderFence::default();
     for message in polled {
         // Service controls need their own typed target/seat checks and receipts.
         // A cross-host tell is an ordinary passive note with a peer control record.
@@ -840,10 +891,19 @@ fn deliver_messages_with(
             bus.ack(runtime, &[message.id])?;
             continue;
         }
+        if let Some(blocker) = projection_order.blocker(&message) {
+            if let Err(error) = repository.record_projection_blocked(id, &message.id, &blocker) {
+                eprintln!("Claude projection blocker diagnostic for {id}/{}: {error:#}", message.id);
+            }
+            continue;
+        }
         // Only the native ingress takes it (no legacy local-inbox receipt).
         if management && !native { continue; }
         let meta = repository.message_meta(&message.id)?;
-        let unfrozen = repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.external_input.is_none());
+        let snapshot = repository.snapshot_by_message_id(&message.id)?;
+        let unfrozen = snapshot.as_ref().is_some_and(|snapshot| snapshot.external_input.is_none());
+        let had_projection_failure = snapshot.as_ref().and_then(|s| s.error.as_ref())
+            .is_some_and(|e| e["code"] == "external_projection_failed" || e["code"] == "external_projection_blocked");
         // A job notice a delegation awaits, or batched behind the newest one,
         // rides along passive; the rest of a still-arriving batch waits.
         let job_passive = job && (cutex::app_server::bus_bridge::job_notice_awaited(&message, id)
@@ -886,8 +946,21 @@ fn deliver_messages_with(
                 eprintln!("warning: Claude alarm {} terminated: {error:#}", message.id);
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // This message has not crossed native IO. A bad projection
+                // must not starve later notes in the same Bus snapshot.
+                // Keep its original identity pending and report the failure
+                // after this pass; do not turn a transient build error into
+                // a terminal quarantine or a second native attempt.
+                projection_order.failed(&message);
+                if let Err(diagnostic) = repository.record_projection_failure(id, &message.id, Some(&format!("{error:#}"))) {
+                    eprintln!("Claude projection diagnostic for {id}/{}: {diagnostic:#}", message.id);
+                }
+                projection_error.get_or_insert(error);
+                continue;
+            }
         };
+        if had_projection_failure { repository.record_projection_failure(id, &message.id, None)?; }
         if native&&!job&&unfrozen {
             // A malformed/unsupported projection is a message failure, not a
             // broken adapter connection. Validate before any native request or
@@ -971,6 +1044,9 @@ fn deliver_messages_with(
         if !already_accepted && cutex::asks::pause_admission::is_held(
             &cutex::asks::store::AskStore::open_default()?, id,
         )? { continue; }
+        if busy_turn.is_none() && !already_accepted && triggers_turn {
+            super::turn_notes::synchronize_in_lane(id, thread, Some(record.runtime_generation)).attach_to_input(id,&message.id);
+        }
         let prepared_turn = (busy_turn.is_none() && !already_accepted && triggers_turn)
             .then(|| cutex::management::v2::admission::prepare_turn(id, "delivery", None));
         let mut receipt = if let Some(existing) = existing {
@@ -1008,6 +1084,16 @@ fn deliver_messages_with(
             repository.input_ledger_sending(id, &message.id);
             cutex::management::v2::input_disposal::check_envelope(id,&envelope)?;
             let submitted = super::claude_ingress::submit(&handle, &envelope, record.runtime_generation);
+            if let Err(error) = &submitted {
+                if let Err(diagnostic) = repository.record_note_attempt(id, &message.id, Some(&format!("{error:#}")), "nativeReconciliation") {
+                    eprintln!("Claude note admission diagnostic: {diagnostic:#}");
+                }
+            }
+            if submitted.as_ref().err().is_some_and(runtime_gate_refusal) {
+                runtime_gate_notice_best_effort(|| {
+                    cutex::agent_bus::runtime_gate_notice::record_hold(repository, &message, id, Some(record.runtime_generation))
+                });
+            }
             // 054 RC8 (S12): the local inbox receipt says nothing about a
             // native hold / retry / conflict. With the ledger on, read the
             // native status once and keep it; a withheld input gets no
@@ -1025,7 +1111,18 @@ fn deliver_messages_with(
             // changed the projection): its first acceptance stands.
             Err(cutex::app_server::client::AppServerClientError::Rpc(error)) if error.code == -32010 => handle
                 .request("claude/input/status", serde_json::json!({"threadId": thread, "messageId": message.id}))?,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                let error: anyhow::Error = error.into();
+                if let Err(diagnostic) = repository.record_note_attempt(id, &message.id, Some(&format!("{error:#}")), "nativeReconciliation") {
+                    eprintln!("Claude note admission diagnostic: {diagnostic:#}");
+                }
+                if runtime_gate_refusal(&error) {
+                    runtime_gate_notice_best_effort(|| {
+                        cutex::agent_bus::runtime_gate_notice::record_hold(repository, &message, id, Some(record.runtime_generation))
+                    });
+                }
+                return Err(error);
+            }
         }};
         ensure!(receipt["threadId"] == thread, "Claude inbox returned wrong thread");
         busy_delivery::decorate(&message.id, &mut receipt);
@@ -1037,7 +1134,7 @@ fn deliver_messages_with(
         }
         bus.ack(runtime, &[message.id])?;
     }
-    Ok(())
+    match projection_error { Some(error) => Err(error), None => Ok(()) }
 }
 
 /// Whether the Claude observer submits a polled bus message (the rest stay
@@ -1052,6 +1149,45 @@ fn submits(message: &cutex::agent_bus::model::AgentBusMessage, jobs: bool) -> bo
             || cutex::agent_bus::claude_task::is_claude_task(message)
             || cutex::agent_bus::rename_notice::is_notice(message) || management || job)
         && message.kind == cutex::agent_bus::model::AgentBusEnvelopeKind::Message
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_gate_refusal_requires_specific_gate_evidence() {
+    use cutex::app_server::{client::AppServerClientError, protocol::RpcError};
+    let error = |code, message: &str, data| anyhow::Error::new(AppServerClientError::Rpc(RpcError { code, message: message.into(), data }));
+    assert!(!runtime_gate_refusal(&error(-32011, "stale runtimeId", None)));
+    assert!(!runtime_gate_refusal(&error(-32009, "history mutation refused", None)));
+    assert!(!runtime_gate_refusal(&error(-32009, "queue paused without a terminal failed/interrupted turn; inspect the runtime", None)));
+    assert!(runtime_gate_refusal(&error(-32009, "queue paused; resume the agent before adding input", None)));
+    assert!(runtime_gate_refusal(&error(-32009, "interruption gate is closed; resume before retry", None)));
+    assert!(runtime_gate_refusal(&error(-32009, "busy", Some(serde_json::json!({"externalInputError":"busy","reason":"gate_closed"})))));
+}
+
+fn retained_queue_guard(method: &str, params: Option<&serde_json::Value>, thread: &str) -> bool {
+    method == "claude/queue/holdChanged" && params.is_some_and(|params|
+        params["threadId"].as_str() == Some(thread) && params["held"] == true
+        && params["reason"] == "silentTransportGuard"
+        && params["turnId"].as_str().is_some_and(|turn| !turn.is_empty()))
+}
+
+#[test]
+fn retained_queue_guard_requires_the_exact_root_protocol_signal() {
+    let valid = serde_json::json!({"threadId":"root","turnId":"t","held":true,"reason":"silentTransportGuard"});
+    assert!(retained_queue_guard("claude/queue/holdChanged", Some(&valid), "root"));
+    assert!(!retained_queue_guard("error", Some(&valid), "root"));
+    assert!(!retained_queue_guard("claude/queue/holdChanged", Some(&valid), "other"));
+    let mut invalid = valid.clone(); invalid["held"] = false.into();
+    assert!(!retained_queue_guard("claude/queue/holdChanged", Some(&invalid), "root"));
+    invalid["held"] = true.into(); invalid["reason"] = "provider text".into();
+    assert!(!retained_queue_guard("claude/queue/holdChanged", Some(&invalid), "root"));
+}
+
+fn runtime_gate_refusal(error: &anyhow::Error) -> bool {
+    cutex::app_server::external_input::busy_refusal_reason(error).as_deref() == Some("gate_closed")
+        || error.chain().any(|cause| matches!(cause.downcast_ref::<cutex::app_server::client::AppServerClientError>(),
+            Some(cutex::app_server::client::AppServerClientError::Rpc(rpc)) if rpc.code == -32009 && matches!(rpc.message.as_str(),
+                "queue paused; resume the agent before adding input" | "interruption gate is closed; resume before retry")))
 }
 
 /// The native runtime holds the input, asks for a retry, or refuses it
@@ -2061,17 +2197,94 @@ mod tests {
 
     #[test]
     fn invalid_native_projection_is_quarantined_before_later_message_processing() {
+        projection_delivery_with_notice_fault(false, false);
+    }
+
+    #[test]
+    fn notice_failure_does_not_block_claude_driver_from_processing_later_healthy_source() {
+        projection_delivery_with_notice_fault(true, false);
+    }
+
+    #[test]
+    fn projection_builder_failure_does_not_starve_later_claude_notes() {
+        projection_delivery_with_notice_fault(false, true);
+    }
+
+    #[test]
+    fn projection_builder_failure_preserves_ask_order_across_senders() {
+        projection_delivery_order_case(false, true, true);
+    }
+
+    #[test]
+    fn projection_order_fence_propagates_intersecting_lanes_and_separates_peers() {
+        use serde_json::json;
+        let make = |sender: &str, ask: &str| serde_json::from_value::<cutex::agent_bus::model::AgentBusMessage>(json!({
+            "id":format!("{sender}-{ask}"),"kind":"message","from":sender,"to":"runtime",
+            "fromCutexSessionId":sender,"toCutexSessionId":"receiver","content":"fixture",
+            "controlPayload":{"askId":ask},"deliveryMode":"passive","triggerTurn":false,
+            "createdAtEpochSecs":1,"senderKind":"agent"
+        })).unwrap();
+        let mut fence = ProjectionOrderFence::default();
+        fence.failed(&make("a", "q1"));
+        for (sender, ask) in [("b", "q1"), ("b", "q2"), ("c", "q2")] {
+            assert!(fence.blocked(&make(sender, ask)));
+        }
+        assert!(!fence.blocked(&make("d", "q3")));
+        assert!(!ProjectionOrderFence::default().blocked(&make("a", "q1")), "a new pass retries the original source");
+        let peer = |sender: &str| {
+            let mut m = make(sender, "peer-ask");
+            m.from_cutex_session_id = None;
+            m.from = cutex::agent_bus::peer_tell::SOURCE_ID.into();
+            m.control_type = Some(cutex::agent_bus::peer_tell::CONTROL_TYPE.into());
+            m.control_payload = Some(json!({"peerId":"private-peer","host":"private-host","senderId":sender,"senderName":sender,"tellId":sender}));
+            m
+        };
+        let mut fence = ProjectionOrderFence::default();
+        fence.failed(&peer("one"));
+        assert!(!fence.blocked(&peer("two")), "different peer senders retain independent lanes");
+        assert!(fence.blocked(&peer("one")));
+    }
+
+    fn projection_delivery_with_notice_fault(fail_notice: bool, fail_build: bool) {
+        projection_delivery_order_case(fail_notice, fail_build, false);
+    }
+
+    fn projection_delivery_order_case(fail_notice: bool, fail_build: bool, same_ask: bool) {
         use serde_json::json;
         use cutex::management::v2::agent_bus_state::{agent_bus_message_repository,AgentBusQueuedMessage};
         use cutex::session::{model::CutexSessionRecord,store};
+        // These are durable-source fixtures, as are the isolated alarm and
+        // management cases below. Earlier suites may leave real source rows
+        // and configuration in their marked home; neither is this case's input.
+        const CHILD: &str = "CUTEX_CLAUDE_PROJECTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test = match (fail_notice, fail_build, same_ask) {
+                (true, false, false) => "notice_failure_does_not_block_claude_driver_from_processing_later_healthy_source",
+                (false, false, false) => "invalid_native_projection_is_quarantined_before_later_message_processing",
+                (false, true, false) => "projection_builder_failure_does_not_starve_later_claude_notes",
+                (false, true, true) => "projection_builder_failure_preserves_ask_order_across_senders",
+                _ => panic!("unknown projection fixture"),
+            };
+            let root = std::env::temp_dir().join(format!("claude-projection-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(".cutex-test-private-home"), b"projection test").unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("cli_app::claude_runtime::tests::{test}"), "--nocapture"])
+                .env("HOME", &root).env("CUTEX_TEST_PRIVATE_HOME", &root).env(CHILD, "1")
+                .env_remove("CUTEX_HOME").status().unwrap();
+            assert!(result.success() && root.join("projection-test-done").is_file(), "isolated projection fixture: {}", root.display());
+            return;
+        }
         let owner=format!("cutex.{}",uuid::Uuid::new_v4());
         let mut record=CutexSessionRecord::new(owner.clone(),Some("projection-thread".into()),"private".into(),"/private".into(),None).unwrap();
         record.current_runtime_agent_id=Some("projection-runtime".into());record.runtime_generation=1;
         let path=store::cutex_sessions_path().unwrap();
         store::with_locked_session_rows(&path,|rows|{rows.insert_session(&owner,record);rows.commit()?;Ok(())}).unwrap();
-        let messages:Vec<cutex::agent_bus::model::AgentBusMessage>=(0..2).map(|n|serde_json::from_value(json!({
+        let messages:Vec<cutex::agent_bus::model::AgentBusMessage>=(0..if fail_build {3} else {2}).map(|n|serde_json::from_value(json!({
             "id":format!("projection-{n}-{}",uuid::Uuid::new_v4()),"kind":"message","from":"sender","to":"projection-runtime",
-            "fromCutexSessionId":"cutex.sender","toCutexSessionId":owner,"content":"unchanged canonical content",
+            "fromCutexSessionId":if n == 2 {"cutex.other"} else if same_ask && n == 1 {"cutex.ask-peer"} else {"cutex.sender"},
+            "controlPayload":if same_ask && n < 2 {json!({"askId":"ask-projection-order"})} else {serde_json::Value::Null},
+            "toCutexSessionId":owner,"content":"unchanged canonical content",
             "deliveryMode":"passive","triggerTurn":false,"createdAtEpochSecs":1,"senderKind":"agent"
         })).unwrap()).collect();
         let repository=agent_bus_message_repository().unwrap();
@@ -2090,6 +2303,7 @@ mod tests {
             let deadline=Instant::now()+Duration::from_secs(5);
             while Instant::now()<deadline {
                 let Ok((mut stream,_))=listener.accept() else {std::thread::sleep(Duration::from_millis(10));continue};
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let request=cutex::http::server::read_simple_http_request(&mut stream).unwrap();
                 let reply=if request.method=="GET" {json!({"messages":wire})} else {
@@ -2098,32 +2312,42 @@ mod tests {
                     json!({"ok":true,"acked":1})
                 };
                 cutex::http::server::write_json_response(&mut stream,200,"OK",&reply).unwrap();
-                if !acked.lock().unwrap().is_empty() {break}
+                if fail_build || !acked.lock().unwrap().is_empty() {break}
             }
         });
         let bus=cutex::agent_bus::client::AgentBusHttpClient::new(format!("http://127.0.0.1:{port}"),None);
         let projected=std::cell::RefCell::new(Vec::new());
+        struct ResetNoticeFault(bool);
+        impl Drop for ResetNoticeFault { fn drop(&mut self) { NOTICE_FAILURE.with(|fail| fail.set(self.0)); } }
+        let reset = ResetNoticeFault(NOTICE_FAILURE.with(|fail| fail.replace(fail_notice)));
+        let hits_before = NOTICE_FAILURE_HITS.with(|hits| hits.get());
         let error=deliver_messages_with(&owner,&bus,&mut HashMap::new(),|_|Some(json!({
             "externalInputVersion":1,"externalInputVersions":[1,2],"externalInputDeliveries":["after_turn","passive"],
             "input":{"views":true,"deliveryModes":["passive"]}
         })),|sessions,thread,id,message,meta,v2| {
             projected.borrow_mut().push(message.id.clone());
+            if fail_build && message.id == messages[0].id { anyhow::bail!("fixture projection builder failure before native IO"); }
             if message.id==messages[0].id {return Ok(json!({"threadId":thread,"messageId":message.id,
                 "source":{"kind":"service","id":"Future Service"},"eventType":"unrecognized_future_projection",
                 "text":"never sent","metadata":{"deliveryMode":"passive"}}))}
             claude_message_params(sessions,thread,id,message,meta,v2)
         }).unwrap_err();
+        drop(reset);
+        if fail_notice { assert!(NOTICE_FAILURE_HITS.with(|hits| hits.get()) > hits_before, "notice fault was exercised"); }
         server.join().unwrap();
-        assert_eq!(*projected.borrow(),messages.iter().map(|message|message.id.clone()).collect::<Vec<_>>());
+        assert_eq!(*projected.borrow(),messages.iter().enumerate().filter(|(n,_)| !fail_build || *n != 1)
+            .map(|(_,message)|message.id.clone()).collect::<Vec<_>>(), "delivery error before the expected later fence: {error:#}");
         assert!(error.to_string().contains("runtime generation changed: expected 1, actual none"),
             "the later valid input reached its native generation fence: {error:#}");
-        assert_eq!(*acknowledgments.lock().unwrap(),vec![messages[0].id.clone()]);
+        assert_eq!(*acknowledgments.lock().unwrap(),if fail_build {vec![]} else {vec![messages[0].id.clone()]});
         let invalid=repository.snapshot_by_message_id(&messages[0].id).unwrap().unwrap();
-        assert_eq!(invalid.state,"quarantined");assert_eq!(invalid.error.unwrap()["code"],"external_projection_invalid");
+        if fail_build { assert_eq!(invalid.state,"pending"); }
+        else { assert_eq!(invalid.state,"quarantined");assert_eq!(invalid.error.unwrap()["code"],"external_projection_invalid"); }
         assert_eq!(repository.snapshot_by_message_id(&messages[1].id).unwrap().unwrap().state,"pending");
         for message in &messages {
             assert_eq!(serde_json::to_value(repository.canonical_message(&message.id).unwrap()).unwrap(),serde_json::to_value(message).unwrap());
         }
+        std::fs::write(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("projection-test-done"), b"done").unwrap();
     }
 
     #[test]

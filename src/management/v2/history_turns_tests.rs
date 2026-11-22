@@ -345,7 +345,9 @@ fn runtimes_without_turns_list_keep_the_legacy_read() {
 
 #[test]
 fn a_live_newest_turn_is_cached_once_it_has_settled() {
-    TEST_SETTLE.with(|settle| settle.set(std::time::Duration::from_millis(50)));
+    // Control eligibility explicitly: a shaped page can itself take longer
+    // than a short settling interval on a loaded host.
+    TEST_SETTLE.with(|settle| settle.set(std::time::Duration::MAX));
     let setup = Setup::new(true);
     let native = native(4);
     let query = page(3, None);
@@ -354,28 +356,28 @@ fn a_live_newest_turn_is_cached_once_it_has_settled() {
     // First seen final: not cached yet.
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 0, 3));
     assert_eq!(cached_turns(&setup.id), 2);
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    TEST_SETTLE.with(|settle| settle.set(std::time::Duration::ZERO));
     // Settled: read once more and kept; then nothing is read in full.
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 2, 1));
     assert_eq!(setup.shaped(&native, &query, false), (expected, 3, 0));
     lists(&native);
     // Its metadata changes (it was only listed interrupted): read again and
     // settling starts over.
+    TEST_SETTLE.with(|settle| settle.set(std::time::Duration::MAX));
     native.borrow_mut().turns[3]["status"] = json!("interrupted");
     let expected = setup.old(&native, &query, false);
     lists(&native);
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 2, 1));
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 2, 1));
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    TEST_SETTLE.with(|settle| settle.set(std::time::Duration::ZERO));
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 2, 1));
     assert_eq!(setup.shaped(&native, &query, false), (expected, 3, 0));
-    // A running newest turn never settles.
+    // A running newest turn never settles, even with a zero interval.
     native.borrow_mut().turns.push(turn(4, "inProgress"));
     let expected = setup.old(&native, &query, false);
-    std::thread::sleep(std::time::Duration::from_millis(80));
     assert_eq!(setup.shaped(&native, &query, false), (expected.clone(), 2, 1));
-    std::thread::sleep(std::time::Duration::from_millis(80));
     assert_eq!(setup.shaped(&native, &query, false), (expected, 2, 1));
+    TEST_SETTLE.with(|settle| settle.set(SETTLE));
 }
 
 #[test]

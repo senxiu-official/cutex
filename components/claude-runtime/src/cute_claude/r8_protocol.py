@@ -1,5 +1,6 @@
 """Additional native v2 routes; SDK-only state stays behind the runtime owner."""
 from .errors import RpcError, require, text
+from .runtime_tasks import stop_outcome
 from .session_ops import SessionOperations
 
 
@@ -86,13 +87,22 @@ class R8Protocol:
             tid = text(params.get('threadId'), 'threadId', limit=256)
             server.store.thread(tid)
             owner = getattr(engine.driver, 'owners', {}).get(tid)
+            if method == 'claude/tasks/stop':
+                task_id = text(params.get('taskId'), 'taskId', limit=256)
+                if not owner or owner.task.done():
+                    return stop_outcome(tid, task_id, 'refused', 'runtimeOffline'), None
+                try:
+                    result = await engine.runtime_control(tid, 'task_stop', task_id=task_id,
+                                                          expected_connection_id=owner.connection_id)
+                except Exception:
+                    # The owner may disappear after admitting the command. Never
+                    # claim a refusal or replay a potentially written request.
+                    result = stop_outcome(tid, task_id, 'unknown', 'stopUnconfirmed')
+                return result, None
             tasks = (await engine.runtime_control(tid, 'task_list')) if owner and not owner.task.done() else {
                 'tasks': [], 'source': 'observedSdkLifecycle', 'completeInventory': False}
             if method == 'claude/tasks/list':
                 return tasks, None
-            if method == 'claude/tasks/stop':
-                await engine.runtime_control(tid, 'task_stop', task_id=text(params.get('taskId'), 'taskId', limit=256))
-                return {'stopRequested': True, 'terminalConfirmed': False}, None
             shells = [t for t in tasks['tasks'] if t.get('taskType') in {'local_bash', 'local_shell', 'bash'}
                       and t['status'] in {'running', 'pending'}]
             if method.endswith('/list'):
@@ -105,7 +115,10 @@ class R8Protocol:
             requested = text(params.get('processId'), 'processId', limit=256) if method.endswith('/terminate') else None
             selected = [t for t in shells if requested is None or t['taskId'] == requested]
             for task in selected:
-                await engine.runtime_control(tid, 'task_stop', task_id=task['taskId'])
+                receipt = await engine.runtime_control(tid, 'task_stop', task_id=task['taskId'],
+                                                       expected_connection_id=owner.connection_id)
+                if receipt['outcome'] != 'accepted':
+                    raise RpcError(-32009, 'Background task stop was not acknowledged', receipt)
             return ({'terminated': bool(selected)} if requested is not None else {}), None
         return None
 

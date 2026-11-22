@@ -21,6 +21,21 @@ pub struct ExportedSchema {
 }
 
 pub const SCHEMAS: &[ExportedSchema] = &[
+    // r290 P6
+    ExportedSchema {name:"board",title:"Host project board",routes:&["GET /v2/board", "If-None-Match / ETag"],text:include_str!("schema/export/board.json")},
+    // r290 P13
+    ExportedSchema {
+        name: "model-context-settings", title: "Unified Profile model and context settings",
+        routes: &["GET|PATCH /v2/profiles/{p}", "GET /v2/profiles/{p}/models", "PATCH /v2/profiles/{p}/models/{id}"],
+        text: include_str!("schema/export/model-context-settings.json"),
+    },
+    // r290 P5 schedules.
+    ExportedSchema { name:"schedules", title:"Owner recurring schedules", routes:&["GET|POST /v2/schedules", "GET|PUT|DELETE /v2/schedules/{id}", "GET /v2/schedules/{id}/runs"], text:include_str!("schema/export/schedules.json") },
+    ExportedSchema {
+        name:"owner-dispositions",title:"Owner record dispositions",
+        routes:&["POST /v2/asks/{askId}/close", "POST /v2/owner-notifications/{notificationId}/ack", "POST /v2/owner-notifications/{notificationId}/dismiss", "POST /v2/owner-notifications/{notificationId}/delete", "POST /v2/owner-notifications/{notificationId}/safety-dismiss", "POST /v2/agent-bus/stuck-messages/end-follow-up"],
+        text:include_str!("schema/export/owner-dispositions.json"),
+    },
     ExportedSchema {
         name: "baidu-pan", title: "Host Baidu Pan connection and downloads",
         routes: &["GET|PUT|DELETE /v2/pan/connection", "POST /v2/pan/auth", "GET /v2/pan/auth/{id}", "POST /v2/pan/auth/code", "GET /v2/pan/files", "GET /v2/pan/search", "GET /v2/pan/meta", "GET|POST /v2/pan/downloads", "GET /v2/pan/downloads/{id}", "POST /v2/pan/downloads/{id}/{action}", "GET /v2/pan/events", "POST /api/pan/v1"],
@@ -141,6 +156,7 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         routes: &[
             "GET /v2/sessions/{id}/bootstrap",
             "GET /v2/sessions/{id}/history",
+            "GET /v2/sessions/{id}/bus-messages",
         ],
         text: include_str!("schema/export/bootstrap.json"),
     },
@@ -329,6 +345,9 @@ pub const SCHEMAS: &[ExportedSchema] = &[
             "DELETE /v2/users/token-persons/{tokenId}/previous",
             "GET /v2/users/me/devices",
             "DELETE /v2/users/me/devices/{tokenId}",
+            "PUT|DELETE /v2/users/{id}/projects/{projectId}",
+            "POST /v2/users/{id}/tokens",
+            "DELETE /v2/users/{id}/tokens/{tokenId}",
             "GET|PUT /v2/users/me/home",
             "GET|PUT|DELETE /v2/users/me/home/cover",
             "GET /v2/users/me/layout",
@@ -445,6 +464,45 @@ pub fn assert_valid(name: &str, definition: &str, value: &Value) {
 mod tests {
     use super::*;
 
+    // r290 P13
+    #[test]
+    fn context_schema_matches_runtime_resources_and_percent_writes() {
+        use crate::profiles::{catalog_api,settings_api};
+        let (_home,account,bundle,_native)=crate::profiles::model_variants::store_tests::fixture();
+        for supported in [false,true] {
+            crate::profiles::model_variants::store_tests::set_context_support(&bundle,supported);
+            let models=catalog_api::models_resource(&account).unwrap();
+            assert_valid("model-context-settings","modelsResource",&models);
+            assert_valid("model-context-settings","profileFields",&settings_api::profile_item(&account,&Default::default(),true));
+        }
+        for kind in [crate::profiles::model::CliKind::Dsh,crate::profiles::model::CliKind::Kimi] {
+            let mut other=account.clone();other.cli_kind=kind;
+            let models=catalog_api::models_resource(&other).unwrap();
+            assert_valid("model-context-settings","modelsResource",&models);
+            assert_eq!(models["modelContextSettingsSupport"]["supported"],false);
+        }
+        assert_valid("model-context-settings","profileWrite",&json!({"modelAutoCompactPercent":75}));
+        assert_valid("model-context-settings","profileWrite",&json!({"claudeCompaction":{"percent":75}}));
+        assert_valid("model-context-settings","modelWrite",&json!({"autoCompactPercent":null}));
+        assert_valid("model-context-settings","modelWrite",&json!({"restorePreservedContextWindow":true}));
+        assert_valid("model-context-settings","modelWrite",&json!({"restorePreservedAutoCompaction":true}));
+        assert_valid("model-context-settings","source",&json!("preserved"));
+
+        assert!(!validator("model-context-settings","profileWrite").unwrap().is_valid(&json!({"modelAutoCompactPercent":75,"modelAutoCompactTokenLimit":100000})));
+        assert!(!validator("model-context-settings","modelWrite").unwrap().is_valid(&json!({"autoCompactPercent":101})));
+    }
+
+    #[test]
+    fn owner_dispositions_export_strict_requests_and_unconfirmed_results() {
+        assert_valid("owner-dispositions","askClose",&json!({"outcome":"followUpEnded","actionId":"a"}));
+        assert_valid("owner-dispositions","messageEndFollowUp",&json!({"messageId":"m","actionId":"a","reason":"stop tracking"}));
+        assert_valid("owner-dispositions","notificationAction",&json!({}));
+        assert!(!validator("owner-dispositions","askClose").unwrap().is_valid(&json!({"outcome":"completed","actionId":"a"})));
+        assert!(!validator("owner-dispositions","messageEndFollowUp").unwrap().is_valid(&json!({"messageId":"m","actionId":"a","reason":"r","evidence":{}})));
+        let exported=index();
+        assert!(exported.to_string().contains("POST /v2/asks/{askId}/close"));
+    }
+
     #[test]
     fn background_work_schema_hashes_and_ephemeral_status_contract() {
         assert_valid("sessions", "newAgentMemoryInjection", &json!({"memoryInjection":false}));
@@ -493,6 +551,8 @@ mod tests {
         for value in [
             Value::Null,
             json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]}),
+            json!({"kind":"portrait","portraitThemes":["kit-20261029/mountain-city-myriad-layers", "kit-20261029/university-universalis"]}),
+            json!({"kind":"portrait","portraitThemes":[format!("{}/{}", "a".repeat(20), "b".repeat(32))]}),
             json!({"kind":"emoji","emojiThemes":null}),
             json!({"kind":"emoji","emojiThemes":["sea","cats"]}),
             json!({"kind":"letter"}),
@@ -501,6 +561,8 @@ mod tests {
         }
         for invalid in [
             json!({"kind":"portrait","portraitThemes":["../theme"]}),
+            json!({"kind":"portrait","portraitThemes":[format!("pack/{}", "a".repeat(33))]}),
+            json!({"kind":"portrait","portraitThemes":[format!("{}/theme", "a".repeat(21))]}),
             json!({"kind":"portrait","portraitThemes":[]}),
             json!({"kind":"emoji"}), json!({"kind":"emoji","emojiThemes":["unknown"]}),
             json!({"kind":"letter","portraitThemes":["pack/theme"]}),
@@ -680,7 +742,7 @@ mod tests {
     fn real_resources_match_their_schemas() {
         let asks=SCHEMAS.iter().find(|s|s.name=="asks").unwrap();
         assert!(!asks.text.contains('\r'));
-        { use sha2::{Digest,Sha256}; assert_eq!(format!("{:x}",Sha256::digest(asks.text.as_bytes())),"b8fd54a16fabc69b5939fe4606f9f6c79ebab166465581f46e6f9e4e91d19e6b"); }
+        { use sha2::{Digest,Sha256}; assert_eq!(format!("{:x}",Sha256::digest(asks.text.as_bytes())),"80974457891b038e30d22b007de0a4862e404d2781e95811bd9baa2feae2ce84"); }
         use crate::management::v2::model::{
             EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
         };

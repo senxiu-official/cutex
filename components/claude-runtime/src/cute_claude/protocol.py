@@ -242,7 +242,7 @@ class Server:
                     # Owner `turn/steer`: read after the running turn's next main-agent tool
                     # call (PostToolUse), else the next turn (docs/BUSY_DELIVERY.md).
                     "sameTurnSteering": subscription, "steerDelivery": "next-tool-call-or-next-turn" if subscription else None,
-                    "admissions": [asks.ADMISSION], "askEvents": list(asks.EVENT_TYPES),
+                    "admissions": [asks.ADMISSION, "stop_answer"], "externalInputStopAnswer": 1, "askEvents": list(asks.EVENT_TYPES),
                     # cutex agent messaging v2 (0.4.0): `view` param, passive notes,
                     # `external_event` timeline items keyed by message id.
                     "views": True, "deliveryModes": ["after-turn", "passive"] + (["soon"] if subscription else []),
@@ -473,7 +473,11 @@ class Server:
             self.store.thread(tid)
             if method == TOOL_GATE_SET:
                 require(isinstance(params.get('held'), bool), 'held must be a boolean')
-                return await self.engine.tool_gate.set(tid, params['held']), None
+                result = await self.engine.tool_gate.set(tid, params['held'])
+                synced = self.engine.__dict__.setdefault('_probe_gate_synced', set())
+                synced.discard(tid) if params['held'] else synced.add(tid)
+                restore = getattr(self.engine, 'restore_retained_probe', None)
+                return result, (lambda: restore(tid)) if restore and not params['held'] else None
             return self.engine.tool_gate.snapshot(tid), None
         if method in {'claude/approvals/get', 'claude/approvals/set'}:
             require(self.settings.backend == 'subscription', 'Claude subscription backend required')
@@ -575,6 +579,9 @@ class Server:
             async def after_resume():
                 await self._replay_recovered(peer, tid)
                 await self._emit_settings(tid)
+                restore = getattr(self.engine, 'restore_retained_probe', None)
+                if restore:
+                    await restore(tid)
             return self._thread_response(tid), after_resume
         if method in {"thread/turns/list", "thread/items/list"}:
             tid = text(params.get("threadId"), "threadId", limit=256)
@@ -594,6 +601,23 @@ class Server:
             status = "unsubscribed" if tid in peer.subscriptions else "notSubscribed"
             peer.subscriptions.discard(tid)
             return {"status": status}, None
+        if method == "claude/subagent/verify":
+            require(self.settings.backend == 'subscription', 'native child proof requires subscription backend', -32601)
+            require(set(params) == {'threadId', 'childId'}, 'unsupported native child proof fields')
+            tid = text(params.get('threadId'), 'threadId', limit=256)
+            child = text(params.get('childId'), 'childId', limit=256)
+            self.store.thread(tid)
+            owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
+            bridge = getattr(owner, 'bridge', None)
+            task = getattr(owner, 'task', None)
+            live = (owner is not None and bridge is not None and task is not None and not task.done()
+                    and getattr(owner, 'accepting', False) and not self.engine.closing
+                    and tid not in getattr(self.engine, 'offline_threads', set()))
+            foreground = (live and bridge.accepting and bridge.binding is not None
+                          and bridge.children.get(child) == bridge.binding)
+            background = live and child in bridge.background
+            return {'verified':bool(foreground or background), 'parentThreadId':tid, 'childId':child,
+                    'nativeSessionId':getattr(bridge, 'sid', None)}, None
         if method in {"claude/runtime/start", "claude/runtime/status", "claude/runtime/close"}:
             require(self.settings.backend == "subscription", "runtime control requires subscription backend", -32601)
             require(set(params) <= {"threadId"}, "unsupported runtime control fields")
@@ -606,7 +630,8 @@ class Server:
             else:
                 result = self.engine.runtime_status(tid)
             peer.subscriptions.add(tid)
-            return result, None
+            restore = getattr(self.engine, 'restore_retained_probe', None)
+            return result, (lambda: restore(tid)) if method.endswith('/start') and restore else None
         if method == "thread/loaded/list":
             return {"data": sorted(set().union(*(p.subscriptions for p in self.peers)))}, None
         if method == "thread/list":
@@ -693,22 +718,27 @@ class Server:
             owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
             require(owner is None or not owner.task.done(),
                     "Claude runtime has exited. Restart this Agent runtime in Cutex, then submit your new instruction; the failed input will not be replayed.", -32009)
+            from .owner_batch import parse_owner_prefix
+            owner_prefix = parse_owner_prefix(self, tid, params)
             carries = self.external_inputs.owner_carries(tid, params['ownerCarries']) if 'ownerCarries' in params else []
             carrier_id = None
-            if carries:
+            if carries or owner_prefix is not None:
                 carrier_id = owner_carrier_key('owner-', params.get('clientUserMessageId'))
             previous = self.store.db.execute('SELECT * FROM inputs WHERE thread_id=? AND message_id=?', (tid, carrier_id)).fetchone() if carrier_id else None
             if not previous and self.store.user_turn_busy(tid):
                 # `data.reason` lets cutex keep the input in its own queue
                 # (e.g. an Agent Bus message was queued just before it).
                 raise RpcError(-32009, "thread busy; use claude/input/submit for a separate queued turn",
-                               {"reason": "threadBusy", "runtime": "claude"})
+                               {"reason": "threadBusy", "runtime": "claude", **(
+                                   {'ownerInputBatchNotSubmitted': 'not_idle'} if owner_prefix is not None else {})})
             value, attachments, display = parse_turn_input(params.get("input"), images=self.settings.backend == "subscription",
                 skills=self.skills, cwd=self.store.thread(tid)['cwd'])
             require(not params.get("toolOutput"), "arbitrary tool-output injection is unsupported")
             if self.settings.backend == "subscription" and params.get("model"):
                 await self.engine.set_model(tid, params["model"], live=await self._live_settings())
-                require(not self.store.user_turn_busy(tid), "thread became busy while changing model", -32009)
+                if self.store.user_turn_busy(tid):
+                    raise RpcError(-32009, "thread became busy while changing model", {
+                        'ownerInputBatchNotSubmitted': 'not_idle'} if owner_prefix is not None else None)
             if params.get('collaborationMode'):
                 await self.approvals.set_plan(tid, params['collaborationMode']['mode'] == 'plan')
             payload = {"source": {"kind": "user", "id": "local-controller"}, "eventType": "user.message", "text": value, "metadata": {}}
@@ -723,12 +753,22 @@ class Server:
                 payload["clientId"] = client_id[:256]
             if carries:
                 payload['metadata']['ownerCarries'] = carries
+            if owner_prefix is not None:
+                payload['metadata']['ownerInputs'] = owner_prefix
             with self.store.transaction():
+                if owner_prefix is not None and previous is None:
+                    for original in [*owner_prefix, payload]:
+                        read = self.store.db.execute("""SELECT 1 FROM items i JOIN turns t ON t.id=i.turn_id
+                            WHERE t.thread_id=? AND json_extract(i.payload,'$.type')='userMessage'
+                            AND json_extract(i.payload,'$.clientId')=? LIMIT 1""", (tid, original['clientId'])).fetchone()
+                        require(read is None, 'owner input identity already appears in history', -32010)
                 receipt = self.store.enqueue(tid, carrier_id or identifier(), payload, self.settings.max_pending, resume_interrupted=True)
                 self.external_inputs.reserve_owner_carries(tid, receipt['messageId'], carries)
                 if not receipt['duplicate']:
                     record = self.store.claim(tid, receipt['messageId'])
-                    require(record is not None, 'owner claim refused', -32009)
+                    if record is None:
+                        raise RpcError(-32009, 'owner claim refused', {
+                            'ownerInputBatchNotSubmitted': 'pending_trigger_turn'} if owner_prefix is not None else None)
             peer.subscriptions.add(tid)
             return {"turn": self.store.turn(receipt["turnId"], include_items=False)}, lambda: self.engine.wake(tid)
         if method == "turn/steer":
@@ -773,7 +813,7 @@ class Server:
         if method == "claude/input/submit":
             require(not (set(params) - {"threadId", "messageId", "source", "eventType", "text", "metadata", "expectedRuntimeId", "admission", "view"}), "unsupported input fields")
             admission = params.get("admission")
-            require(admission in (None, asks.ADMISSION, 'next_step'), "unsupported admission")
+            require(admission in (None, asks.ADMISSION, 'next_step', 'stop_answer'), "unsupported admission")
             tid = text(params.get("threadId"), "threadId", limit=256)
             if params.get("expectedRuntimeId"):
                 require(params["expectedRuntimeId"] == self.runtime_id, "stale runtimeId", -32011)
@@ -818,20 +858,36 @@ class Server:
                 receipt = self.store.enqueue_note(tid, mid, payload, self.settings.max_pending)
                 peer.subscriptions.add(tid)
                 return receipt, None
-            if admission == asks.ADMISSION and not self.store.input_known(tid, mid):
+            stop_answer = admission == 'stop_answer'
+            if stop_answer:
+                require(source == {'kind': 'service', 'id': 'cutex-asks'} and payload['eventType'] == 'ANSWER'
+                        and mid.startswith('cutex-ask-event-') and metadata.get('asks')
+                        and metadata.get('attempt') is None and not soon
+                        and isinstance((view or {}).get('data', {}).get('stopAnswerSince'), str),
+                        'stop-answer admission requires a daemon delegation ANSWER')
+            if admission in (asks.ADMISSION, 'stop_answer') and not self.store.input_known(tid, mid):
                 # Exclusive: start its own turn now or queue nothing. A known
                 # message id falls through to enqueue (receipt replay, or the
                 # conflict error) and never queues a second turn.
-                reason = asks.busy_reason(self, tid)
+                reason = asks.busy_reason(self, tid, stop_answer=stop_answer)
                 if reason:
                     raise asks.refuse_busy(reason)
             with self.store.transaction():
-                receipt = self.store.enqueue(tid, mid, payload, self.settings.max_pending)
+                receipt = self.store.enqueue(tid, mid, payload, self.settings.max_pending, stop_answer=stop_answer)
+                if stop_answer and receipt['state'] == 'queued':
+                    # An exclusive result receipt means a real persisted turn,
+                    # not merely a queued permit whose post-reply wake can vanish.
+                    duplicate = receipt['duplicate']
+                    record = self.store.claim(tid, mid)
+                    require(record is not None and record['message_id'] == mid, 'stop-answer admission changed', -32009)
+                    receipt = self.store.input_status(tid, mid)
+                    receipt['duplicate'] = duplicate
                 if soon:
                     self.busy_delivery.register(tid, mid, receipt)
             receipt = self.busy_delivery.receipt(receipt)
             peer.subscriptions.add(tid)
-            return receipt, (None if receipt["duplicate"] else lambda: self.engine.wake(tid))
+            wake = not receipt['duplicate'] or (stop_answer and receipt['state'] == 'processing')
+            return receipt, (lambda: self.engine.wake(tid)) if wake else None
         if method == "claude/input/status":
             return self.busy_delivery.receipt(self.store.input_status(text(params.get("threadId"), "threadId", limit=256), text(params.get("messageId"), "messageId", limit=256))), None
         if method == "claude/queue/resume":
@@ -839,7 +895,7 @@ class Server:
             t = self.store.thread(tid)
             require(params.get("acknowledgeUncertainEffects") is True, "explicit acknowledgeUncertainEffects=true is required")
             require(not t["archived"], "thread is archived", -32009)
-            self.store.db.execute("UPDATE threads SET halted=0 WHERE id=?", (tid,))
+            self.store.resume_queue(tid)
             # Uncertain/interrupted inputs are NEVER requeued; only untouched queued inputs run.
             return {"threadId": tid, "resumed": True}, lambda: self.engine.wake(tid)
         if method == "claude/events/read":

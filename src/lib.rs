@@ -40,11 +40,14 @@ pub mod owner_notify;
 pub mod owner_pins;
 pub mod platform;
 pub mod profiles;
+pub mod profile_quota_agents; // r290 P12.
 /// One-time r219 on-load migration: archives Task Service / Release rotation /
 /// seat stores under `archive/r219-removed/`.
 pub mod r219_migration;
 pub mod role_revision;
 pub mod runtime;
+// r290 P5 owner-created recurring schedules.
+pub mod schedules;
 pub mod services;
 pub mod session;
 pub mod short_ids;

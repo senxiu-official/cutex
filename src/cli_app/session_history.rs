@@ -245,6 +245,12 @@ pub(crate) fn latest_plan_for_management(cutex_session_id: &str) -> Value {
     derive_from_native_rollout(cutex_session_id, cutex::launch::native_plan::latest_plan)
 }
 
+// r290 P6: bounded current-plan read for host board aggregation; no native RPC.
+pub(crate) fn latest_plan_for_board(cutex_session_id:&str)->Value {
+    if let Some(plan)=claude_latest(cutex_session_id,cutex::management::v2::claude_plan::latest){return plan;}
+    derive_from_native_rollout(cutex_session_id,cutex::launch::native_plan::latest_plan_for_board)
+}
+
 /// `ManagementRequestContext::load_latest_token_usage`:
 /// `cutexState.latestTokenUsage` from the session's current native rollout
 /// (`cutex::launch::native_token_usage`); `null` in the same cases as
@@ -268,7 +274,7 @@ fn claude_latest(
     cutex_session_id: &str,
     latest: fn(&str, &str) -> anyhow::Result<Option<Value>>,
 ) -> Option<Value> {
-    let store = cutex::session::store::load_cutex_session_store().ok()?;
+    let store = cutex::session::store::load_cutex_session_store_shared().ok()?;
     claude_latest_in(
         &store,
         cutex_session_id,
@@ -309,7 +315,8 @@ fn derive_from_native_rollout(
     derive_value: fn(&Path, &str) -> anyhow::Result<Option<Value>>,
 ) -> Value {
     let derive = || -> anyhow::Result<Option<Value>> {
-        let store = cutex::session::store::load_cutex_session_store()?;
+        // r290 P6: shared snapshots avoid per-member deep copies.
+        let store = cutex::session::store::load_cutex_session_store_shared()?;
         let Some(key) = cutex::session::service::cutex_session_key_for_user_id_including_retired(
             &store,
             cutex_session_id,
@@ -401,6 +408,7 @@ fn claude_history_reader(
 }
 
 pub(super) struct Editor {
+    cutex_session_id: Option<String>,
     connection: Connection,
     thread: String,
     home: PathBuf,
@@ -424,6 +432,7 @@ impl Editor {
             Connection::Isolated(isolated_endpoint(record, &home)?)
         };
         Ok(Self {
+            cutex_session_id: record.map(|r|r.cutex_session_id.clone()),
             connection,
             thread,
             home,
@@ -433,8 +442,9 @@ impl Editor {
     /// native `thread/revert` reloads the loaded thread in place, so the
     /// runtime process, its subscriptions and the thread identity survive.
     pub(crate) fn managed(id: &str, handle: AppServerHandle) -> anyhow::Result<Self> {
-        let (_, thread, home) = resolve(id)?;
+        let (record, thread, home) = resolve(id)?;
         Ok(Self {
+            cutex_session_id: record.map(|r|r.cutex_session_id),
             connection: Connection::Managed(handle),
             thread,
             home,
@@ -550,6 +560,7 @@ impl Editor {
             )?;
         }
         if let Some(active) = current.turns.iter().find(|t| t.active) {
+            if let Some(session)=&self.cutex_session_id {super::asks_runtime::revoke_internal_interrupt(session,&self.thread)?;}
             self.connection.request(
                 "turn/interrupt",
                 json!({"threadId":self.thread,"turnId":active.id}),
@@ -1424,6 +1435,7 @@ mod tests {
             Editor::open(data["thread"].as_str().unwrap()).unwrap()
         } else {
             Editor {
+                cutex_session_id: None,
                 connection: Connection::Live(AppServerClient::connect(options).unwrap()),
                 thread: data["thread"].as_str().unwrap().into(),
                 home: fixture.join(".cutex/codex-home"),

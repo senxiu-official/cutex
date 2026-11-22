@@ -584,12 +584,7 @@ pub fn probe_dir(dir: &Path) -> Value {
     }
     let selected = selected_raw().unwrap_or(Value::Null);
     let cli_status = match read_cli_status(dir) {
-        Value::Null => json!({
-            "selected": "system",
-            "override": false,
-            "bundled": null,
-            "system": {"path": selected["claude_cli"], "version": null},
-        }),
+        Value::Null => fallback_cli_status(dir, &selected),
         status => status,
     };
     let detail = json!({
@@ -876,10 +871,71 @@ fn bundled_claude_cli(dir: &Path) -> anyhow::Result<Option<(PathBuf, String)>> {
 }
 
 fn read_cli_status(dir: &Path) -> Value {
-    std::fs::read(prepared_dir(dir).join(CLAUDE_CLI_STATUS_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or(Value::Null)
+    read_cli_metadata(&prepared_dir(dir).join(CLAUDE_CLI_STATUS_FILE))
+}
+
+/// Status reconstruction is deliberately file-only. Kits can prepare the SDK
+/// without running `select`, so the absence of its status receipt says nothing
+/// about whether the selected CLI came from the system.
+fn read_cli_metadata(path: &Path) -> Value {
+    const LIMIT: u64 = 64 * 1024;
+    let read = || -> Option<Value> {
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > LIMIT {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > LIMIT {
+            return None;
+        }
+        serde_json::from_slice(&bytes).ok()
+    };
+    read().unwrap_or(Value::Null)
+}
+
+fn fallback_cli_status(dir: &Path, selected: &Value) -> Value {
+    let receipt = read_cli_metadata(&prepared_dir(dir).join(PREPARE_RECEIPT));
+    let metadata = read_cli_metadata(&dir.join(BUNDLED_CLAUDE_CLI_METADATA));
+    let path = selected["claude_cli"].as_str().map(Path::new);
+    let recorded = receipt["bundledClaudeCli"].as_str().map(Path::new);
+    let within = |path: &Path, root: &Path| {
+        // Keep lexical containment too: a packaged symlink is still bundled.
+        let lexical = !path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+            && path.starts_with(root);
+        lexical || path.canonicalize().ok().zip(root.canonicalize().ok())
+            .is_some_and(|(path, root)| path.starts_with(root))
+    };
+    let is_bundled = path.is_some_and(|path| {
+        within(path, &prepared_dir(dir))
+            || within(path, &dir.join("src/claude_agent_sdk/_bundled"))
+            || recorded.is_some_and(|recorded| same_path(path, recorded))
+    });
+    // `sdk` is the Python package version, never the CLI version. An archive
+    // may explicitly supply cliVersion; current archives omit it (unknown).
+    let packaged_version = if metadata["schema"] == "cutex/claude-cli-runtime/v1"
+        && metadata["bundled"] == true
+    {
+        metadata["cliVersion"].as_str().map(str::trim).filter(|version| {
+            !version.is_empty() && version.len() <= 200 && !version.chars().any(char::is_control)
+        })
+    } else {
+        None
+    };
+    let bundled = if is_bundled || recorded.is_some() || metadata["bundled"] == true {
+        json!({"path": if is_bundled { path } else { recorded }, "version": packaged_version})
+    } else {
+        Value::Null
+    };
+    json!({
+        "selected": if is_bundled { "bundled" } else { "system" },
+        "override": false,
+        "bundled": bundled,
+        "bundledError": null,
+        "system": if is_bundled { Value::Null } else { json!({"path": path, "version": null}) },
+        "systemError": null,
+    })
 }
 
 /// Public `GET /v2/components` projection (cutex-desktop

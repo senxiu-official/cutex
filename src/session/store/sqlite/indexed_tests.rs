@@ -227,6 +227,28 @@ fn quick_chat_promote_discovery_does_not_decode_sessions_or_completed_receipts()
         [r#"{"result":{"complete":true}}"#]).unwrap();
     assert!(pending_quick_chat_promotions_at(&f.path).unwrap().is_empty());
 }
+
+#[test]
+fn runtime_reference_projection_pages_all_lifecycles_without_decoding_metadata_or_receipts() {
+    let f = fixture_shape(600, 2);
+    let expected = runtime_references_from_store(&load_cutex_session_store_from_path(&f.path).unwrap());
+    let copies = crate::session::store::whole_store_copies_on_this_thread();
+    assert_eq!(runtime_references_at(&f.path).unwrap(), expected);
+    assert_eq!(crate::session::store::whole_store_copies_on_this_thread(), copies);
+    let connection = open_connection(&database_path(&f.path), false).unwrap();
+    // Invalid unrelated metadata and receipt bodies must never reach a full decoder.
+    connection.execute("UPDATE sessions SET record_json=json_set(record_json,'$.note',json('{}')) WHERE key='cutex.active-0000'", []).unwrap();
+    connection.execute("UPDATE receipts SET json='{}' WHERE key='receipt'", []).unwrap();
+    assert_eq!(runtime_references_at(&f.path).unwrap(), expected);
+    connection.execute("UPDATE sessions SET record_json=json_set(record_json,'$.cwd','/changed') WHERE key='cutex.retired-000001'", []).unwrap();
+    let changed = runtime_references_at(&f.path).unwrap();
+    assert_eq!(changed.len(), 602);
+    assert_ne!(changed, expected);
+    assert_eq!(changed["cutex.retired-000001"].cwd, "/changed");
+    // Broken authority itself fails closed.
+    connection.execute("UPDATE sessions SET record_json=json_set(record_json,'$.explicit_launch',json('{}')) WHERE key='cutex.active-0000'", []).unwrap();
+    assert!(runtime_references_at(&f.path).is_err());
+}
 fn fixture(history: usize) -> Fixture {
     fixture_shape(166, history)
 }

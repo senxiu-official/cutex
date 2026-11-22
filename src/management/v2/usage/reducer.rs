@@ -53,6 +53,7 @@ pub(super) enum UsageEvent {
         model_context_window: Option<u64>,
         compaction_count: Option<u64>,
         model_requests: Option<u64>,
+        background_total: Option<TokenUsageBreakdown>,
     },
     Settings {
         thread_id: String,
@@ -183,6 +184,12 @@ pub(super) fn parse_usage_event(envelope: &EventEnvelope) -> anyhow::Result<Opti
                 compaction_count: optional_u64(token_usage, "compactionCount", "tokenUsage")?,
                 // The Claude adapter reports a turn's SDK steps at its end.
                 model_requests: optional_u64(token_usage, "modelRequests", "tokenUsage")?.filter(|n| *n > 0),
+                // The Claude adapter's running total of its background subagents (claude-r35).
+                background_total: token_usage
+                    .get("backgroundTotal")
+                    .filter(|value| !value.is_null())
+                    .map(|value| parse_breakdown(value, "tokenUsage.backgroundTotal"))
+                    .transpose()?,
             }))
         }
         "thread/settings/updated" => {
@@ -300,6 +307,7 @@ pub(super) fn reduce_usage_event(
             model_context_window,
             compaction_count,
             model_requests,
+            background_total,
         } => reduce_token(
             state,
             envelope,
@@ -311,6 +319,7 @@ pub(super) fn reduce_usage_event(
             model_context_window,
             compaction_count,
             model_requests,
+            background_total,
         ),
         UsageEvent::Settings { thread_id, patch } => {
             reduce_settings(state, envelope, profile, thread_id, patch)
@@ -338,8 +347,12 @@ fn reduce_token(
     model_context_window: Option<u64>,
     compaction_count: Option<u64>,
     model_requests: Option<u64>,
+    background_total: Option<TokenUsageBreakdown>,
 ) -> anyhow::Result<UsageMutation> {
     total.validate()?;
+    if let Some(background) = &background_total {
+        background.validate()?;
+    }
     if let Some(last) = &last {
         last.validate()?;
     }
@@ -365,6 +378,8 @@ fn reduce_token(
         counter.profile = profile.name.clone();
         counter.profile_id = profile.id.clone();
         counter.position = Some(position.clone());
+        // r290 P8: background usage is a subset of its parent ledger delta.
+        let previous_background = std::mem::replace(&mut counter.previous_background_total, background_total.clone());
         let previous = match counter.previous_total.clone() {
             Some(previous) => previous,
             None => {
@@ -386,6 +401,7 @@ fn reduce_token(
                 TokenUsageBreakdown::default()
             }
         };
+        let fresh = counter.previous_total.is_none();
         if total == previous {
             return Ok(UsageMutation {
                 changed: true,
@@ -417,6 +433,15 @@ fn reduce_token(
             Some(last) => (last, UsageTokenSource::NativeLast),
             None => (cumulative_delta, UsageTokenSource::CumulativeDelta),
         };
+        // Background share of a cumulative delta: the same delta of the
+        // background total, never more than the row itself. Unknown (None)
+        // when the previous update did not report one (older adapter).
+        let background_tokens = match (&background_total, previous_background.or(fresh.then(TokenUsageBreakdown::default))) {
+            (Some(now), Some(before)) if token_source == UsageTokenSource::CumulativeDelta && !now.has_regression_from(&before) => {
+                Some(now.checked_difference(&before)?.capped_by(&tokens)).filter(|delta| !delta.detailed_is_zero())
+            }
+            _ => None,
+        };
         let mut attribution = counter.active_turn.as_ref()
             .filter(|turn| turn.turn_id == turn_id && turn.runtime_generation == position.runtime_generation)
             .map(|turn| &turn.attribution).unwrap_or(&counter.attribution).clone();
@@ -442,6 +467,7 @@ fn reduce_token(
             model_context_window,
             compaction_count,
             model_requests,
+            background_tokens,
             tokens,
             cumulative_total: total,
         }

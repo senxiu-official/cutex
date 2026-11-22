@@ -133,6 +133,26 @@ async def test_three_sequential_hook_claims_ack_independently_before_result(held
         assert live(ph, STAGE, client) == expected(tid, turn, client, ['registered', 'offered', 'contextPersisted'])
 
 
+async def test_failed_tool_context_requires_the_exact_failure_hook_receipt(held):
+    ph, tid, turn, bridge, path = held
+    call = 'failed-read'
+    await ph.call('turn/steer', steer(tid, client='failure', text='after failed read', expectedTurnId=turn))
+    data = {'session_id': bridge.sid, 'hook_event_name': 'PostToolUseFailure', 'tool_name': 'Read',
+            'tool_input': {'file_path': str(ph.settings.workspace / 'absent.txt')}, 'error': 'not found'}
+    await bridge.pre_tool(data, call, {})
+    hook = ph.sdk.clients[0].options.hooks['PostToolUseFailure'][0].hooks[0]
+    notes = (await hook(data, call, {}))['hookSpecificOutput']['additionalContext']
+    await publications(ph)
+    # Identical text attached by another hook event is not proof of this offer.
+    write(path, *proof(bridge.sid, call, notes))
+    await unconfirmed(held, 'failure')
+    parent, attachment = proof(bridge.sid, call, notes)
+    attachment['attachment']['hookEvent'] = 'PostToolUseFailure'
+    attachment['attachment']['hookName'] = 'PostToolUseFailure:Read'
+    write(path, parent, attachment)
+    await confirmed(held, 'failure')
+
+
 async def test_later_queued_input_cannot_use_an_earlier_attachment(held):
     ph, tid, turn, bridge, path = held
     call, notes = await offer(held, 'early')

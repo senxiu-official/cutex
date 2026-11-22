@@ -1,8 +1,9 @@
 {
   "version": 1,
-  "release": "claude-r48",
+  "release": "claude-r55",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
+    "nativeSubagentScope": 1,
     "systemAppendFile": true,
     "turnStart": true,
     "launchModelUpdate": true,
@@ -71,6 +72,7 @@
     "livePermissionMode": true,
     "liveModelEffort": true,
     "compactionModels": true,
+    "modelContextSettingsV1": true,
     "permissionRules": true,
     "apiAccounts": true,
     "safetyGrants": true,

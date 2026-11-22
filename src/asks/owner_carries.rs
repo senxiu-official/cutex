@@ -386,6 +386,33 @@ mod tests {
     }
 
     #[test]
+    fn owner_steer_captures_a_just_arrived_answer_without_waiting_for_busy_deadline() {
+        let (store, dir) = temp_store("owner-carry-just-ready-answer");
+        let now = Utc::now();
+        let id = store.with_state(|state| {
+            let (ask, _) = state.create_ask(new_ask("just-ready-answer", "Ready answer"), now).unwrap();
+            state.update_ask(&ask.ask_id, now, |ask| ask.execution = ExecutionState::Answered);
+            state.answers.insert("just-ready".into(), AnswerRecord {answer_id:"just-ready".into(),
+                ask_id:ask.ask_id.clone(),attempt:1,revision:1,status:AnswerStatus::Completed,
+                artifact_id:None,bytes:0,metadata:Default::default(),created_at:now_rfc3339(now),preview:Some("ready".into())});
+            state.leases.insert(REQUESTER.into(), AdmissionLease {cutex_session_id:REQUESTER.into(),
+                holder:LeaseHolder::Owner,native_message_id:"running-owner".into(),runtime_generation:1,
+                turn_id:Some("running-owner-turn".into()),since:now_rfc3339(now)});
+            super::super::delivery::record_answer_delivery(state, &ask, "just-ready", now).unwrap()
+        }).unwrap();
+        let before = store.snapshot().unwrap();
+        assert_eq!(before.deliveries[&id].state, DeliveryState::Pending);
+        assert!(crate::management::v2::admission::ask_next_step(&before, REQUESTER).iter().any(|row| row.id == id && row.eligible));
+        let bundle = reserve(&store, "new-owner-steer", now).expect("no busy wait is required by owner capture");
+        assert_eq!(bundle.input_ids, [id.clone()]);
+        assert_eq!(bundle.submission.event_type, super::super::render::ANSWER_EVENT);
+        assert!(reserve(&store, "another-owner-steer", now).is_none(), "an existing reservation must not be stolen");
+        assert_eq!(store.snapshot().unwrap().deliveries[&id].owner_input_id.as_deref(), Some("new-owner-steer"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lost_generation_owner_carries_settle_both_results_without_replay() {
         use crate::management::v2::input_ledger::{InputLedger, InputState};
         for persisted in [true, false] {

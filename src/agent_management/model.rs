@@ -239,6 +239,21 @@ pub struct ManagedAgentSpec {
 }
 
 impl ManagedAgentSpec {
+    /// Claude exposes Codex-shaped policy fields for client compatibility.
+    /// Its permission mode and tool permissions have their own runtime state.
+    pub fn codex_policy_mismatch(&self, approval_policy: &str, sandbox_mode: &str) -> Option<&'static str> {
+        if self.runtime_backend == "claude_subscription" {
+            return None;
+        }
+        if approval_policy != self.approval_policy {
+            Some("approval_policy")
+        } else if sandbox_mode != self.sandbox_mode {
+            Some("sandbox_mode")
+        } else {
+            None
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AgentManagementError> {
         if self
             .profile

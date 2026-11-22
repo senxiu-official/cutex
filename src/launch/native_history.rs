@@ -1,7 +1,7 @@
 //! Resolve the current native rollout rather than an obsolete pre-revert file.
 use anyhow::{ensure, Context};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 pub fn metadata(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -15,6 +15,25 @@ pub fn metadata(path: &Path) -> anyhow::Result<serde_json::Value> {
         "native history metadata missing"
     );
     Ok(value["payload"].clone())
+}
+
+// r290 P6: narrow existing-state lookup, without the legacy directory scan.
+pub fn current_indexed(home:&Path,id:&str)->anyhow::Result<Option<PathBuf>> {
+    let db=home.join("state_5.sqlite");
+    if !db.is_file(){return Ok(None);}
+    let connection=Connection::open_with_flags(db,OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let path:Option<String>=connection.query_row("SELECT rollout_path FROM threads WHERE id=?1",[id],|row|row.get(0)).optional()?;
+    path.map(|path| {
+        let path=Path::new(&path).canonicalize()?;
+        ensure!(path.starts_with(home.join("sessions").canonicalize()?), "history outside active native sessions");
+        let mut first=Vec::new();
+        std::io::BufReader::new(std::fs::File::open(&path)?.take(64*1024)).read_until(b'\n',&mut first)?;
+        ensure!(first.last()==Some(&b'\n'), "board metadata exceeds 64KiB or is incomplete");
+        let meta:serde_json::Value=serde_json::from_slice(&first)?;
+        ensure!(meta["type"]=="session_meta" && meta["payload"]["id"]==id, "native history identity mismatch");
+        Ok(path)
+    }).transpose()
 }
 
 pub fn current(home: &Path, id: &str) -> anyhow::Result<PathBuf> {

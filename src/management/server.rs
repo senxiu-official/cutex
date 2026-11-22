@@ -40,10 +40,10 @@ pub type ManagementUserInputHandler =
     fn(UserInputSubmitCommand) -> Result<UserInputSubmitExecution, UserInputExecutionError>;
 /// (cutexSessionId, maxItems, ignorePause) -> items sent.
 pub type ManagementUserInputQueueFlusher = fn(&str, usize, bool) -> anyhow::Result<usize>;
-/// `cutex/turn/stop` backend: (cutexSessionId, threadId) -> interrupted turn id
+/// `cutex/turn/stop` backend: (cutexSessionId, threadId, ownerAuthorized) -> interrupted turn id
 /// (None: no turn was running). Interrupts and waits for the turn to stop.
 pub type ManagementTurnInterruptHandler =
-    fn(&str, &str) -> Result<Option<String>, UserInputExecutionError>;
+    fn(&str, &str, bool) -> Result<Option<String>, UserInputExecutionError>;
 /// `cutex/session/history/revert` backend: (cutexSessionId, beforeTurnId,
 /// rewindFiles) -> result.
 pub type ManagementHistoryRevertHandler =
@@ -69,7 +69,7 @@ pub type OfflineHistoryEndpointOpener = fn(
     Box<dyn crate::catalog::CatalogEndpoint>,
     std::path::PathBuf,
 )>;
-pub type ManagementBootstrapStateLoader = fn(&str, u64) -> anyhow::Result<serde_json::Value>;
+pub type ManagementBootstrapStateLoader = fn(&str, u64, Option<&crate::management::v2::agent_bus_state::history::Window>) -> anyhow::Result<serde_json::Value>;
 /// A cutex session's `cutexState.latestPlan` (`launch::native_plan`; Claude
 /// sessions: `management::v2::claude_plan`); `null` when it has none or it
 /// cannot be derived (other hosts).
@@ -188,6 +188,8 @@ pub struct ManagementRequestContext {
     pub interrupt_active_turn: ManagementTurnInterruptHandler,
     pub load_bootstrap_state: ManagementBootstrapStateLoader,
     pub load_latest_plan: ManagementLatestPlanLoader,
+    // r290 P6
+    pub load_board_plan: ManagementLatestPlanLoader,
     pub load_latest_token_usage: ManagementLatestTokenUsageLoader,
     pub revert_session_history: ManagementHistoryRevertHandler,
     pub delete_session: ManagementSessionDeleteHandler,
@@ -281,6 +283,7 @@ pub fn run_management_server_on(
     // Create the persisted instance id before the first client asks for it.
     let _ = crate::management::instance::instance_id();
     crate::management::v2::host_files::prime_secret_path_cache();
+    crate::management::v2::runtimes_api::start_inventory();
     // P1 users: run the one-time migration (every existing client / device
     // token → owner) before the first request, so its moment is well defined.
     if let Err(error) = crate::management::users::UserStore::open_default()
@@ -674,10 +677,10 @@ pub fn handle_parsed_management_request(
         }
         // owner-local-only: creating a pairing code hands out access; only
         // the host itself or SSH (a paired device's token on loopback: no).
-        if !crate::management::users::request_is_owner_local() {
-            let error = crate::management::users::owner_local_only("pairingCode");
+        // r290 P10 (B6): a full-scope owner device confirms first (428).
+        if let Err(error) = crate::management::users::owner_widening_gate("pairingCode", &request) {
             return crate::management::v2::server::write_v2_error(
-                stream, 403, "Forbidden", error.code, &error.message, false, error.details,
+                stream, error.status, crate::management::users::reason_phrase(error.status), error.code, &error.message, false, error.details,
             );
         }
         return crate::management::v2::pairing::handle_issue(stream, &request);

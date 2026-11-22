@@ -121,8 +121,14 @@ impl PackageSummary {
 /// `r\d+` at the start of `name` (`"r209-desktop-20261008"` → `"r209"`).
 fn release_prefix(name: &str) -> Option<String> {
     let rest = name.strip_prefix('r')?;
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    (digits > 0).then(|| format!("r{}", &rest[..digits]))
+    let mut length = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if length == 0 { return None; }
+    while rest.as_bytes().get(length) == Some(&b'.') {
+        let digits = rest[length + 1..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 { break; }
+        length += 1 + digits;
+    }
+    Some(format!("r{}", &rest[..length]))
 }
 
 /// The nearest ancestor directory of `path` whose name starts with `r\d+`.

@@ -59,7 +59,13 @@ fn cached_support(key: &ProbeKey) -> anyhow::Result<Option<bool>> {
 }
 
 fn supported(cli: &VerifiedFile, native_home: &Path, args: &[&str]) -> anyhow::Result<bool> {
-    let key = probe_key(cli, args).context("native executable is missing")?;
+    supported_feature(cli, native_home, args, "modelVariants")
+}
+
+// r290 P13: cache each feature independently; old runtime variants stay false.
+fn supported_feature(cli: &VerifiedFile, native_home: &Path, args: &[&str], feature: &str) -> anyhow::Result<bool> {
+    let mut key = probe_key(cli, args).context("native executable is missing")?;
+    if feature != "modelVariants" { key.args.push_str(&format!("#{feature}")); }
     if let Some(supported) = cached_support(&key)? {
         return Ok(supported);
     }
@@ -67,9 +73,18 @@ fn supported(cli: &VerifiedFile, native_home: &Path, args: &[&str]) -> anyhow::R
     // swapping the file fails closed.
     cli.validate()?;
     let supported = super::native_models::run_cli(cli, args, native_home,
-        std::time::Duration::from_secs(10)).map(|out| parse_support(&out)).unwrap_or(false);
+        std::time::Duration::from_secs(10)).map(|out| {
+            if feature == "modelVariants" { parse_support(&out) } else {
+                serde_json::from_slice::<Value>(&out).ok()
+                    .and_then(|v| v.get(feature).and_then(Value::as_bool)) == Some(true)
+            }
+        }).unwrap_or(false);
     // Remember it only if the file did not change while it was verified.
-    if probe_key(cli, args).as_ref() == Some(&key) {
+    let mut after = probe_key(cli, args);
+    if feature != "modelVariants" {
+        if let Some(after) = after.as_mut() { after.args.push_str(&format!("#{feature}")); }
+    }
+    if after.as_ref() == Some(&key) {
         remember_support(key, supported)?;
     }
     Ok(supported)
@@ -83,6 +98,22 @@ pub fn bundle_supported(bundle: &StockBundle, native_home: &Path) -> anyhow::Res
     } else {
         supported(&bundle.executable, native_home, &["debug", "models", "--capabilities"])
     }
+}
+
+// r290 P13: probe the selected/pinned server, never infer from version strings.
+pub fn bundle_context_supported(bundle: &StockBundle, native_home: &Path) -> anyhow::Result<bool> {
+    let args: &[&str] = if bundle.common_ingress() { &["--model-variants-capability"] }
+        else { &["debug", "models", "--capabilities"] };
+    supported_feature(&bundle.executable, native_home, args, "modelContextSettingsV2")
+}
+
+pub fn context_supported(account: &StoredAccount) -> bool {
+    account.cli_kind == CliKind::Codex && (|| -> anyhow::Result<bool> {
+        let deployment = crate::launch::local_deployment::LocalDeployment::selected()?
+            .context("no local runtime selected")?;
+        let bundle: StockBundle = serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
+        bundle_context_supported(&bundle, &deployment.native_home)
+    })().unwrap_or(false)
 }
 
 pub fn selected_supported() -> bool {
@@ -104,20 +135,44 @@ fn needs_support(route: &Route, rows: &[Value]) -> bool {
 
 /// Called with the actual launch bundle, not the currently selected deployment.
 pub fn validate_runtime(projection: &Projection, bundle: &StockBundle, native_home: &Path) -> anyhow::Result<()> {
-    let Some(catalog) = &projection.catalog else { return Ok(()); };
+    projection_for_runtime(projection, bundle, native_home).map(|_| ())
+}
+
+/// Adapt only the launch copy, never the Profile or its immutable catalog. A
+/// migrated Profile can still be used by an old pin when legacy resolution is
+/// equivalent. New settings that an old server would ignore remain blocked.
+pub fn projection_for_runtime(projection: &Projection, bundle: &StockBundle, native_home: &Path) -> anyhow::Result<Projection> {
+    let catalog = projection.catalog.as_ref().map(read_catalog).transpose()?;
+    let mut launch = projection.clone();
+    if (projection.settings.model_context_settings_v1 == Some(true)
+        || projection.settings.model_auto_compact_percent.is_some())
+        && !bundle_context_supported(bundle, native_home)?
+    {
+        legacy_context::validate(projection, catalog.as_ref())?;
+        // Explicit false also overrides a migrated marker in the native home.
+        launch.settings.model_context_settings_v1 = Some(false);
+    }
+    if let Some(catalog) = catalog {
+        let rows = catalog["models"].as_array().context("catalog models missing")?;
+        validate_bindings(rows)?;
+        if needs_support(&projection.route, rows) {
+            ensure!(bundle_supported(bundle, native_home)?,
+                "this model catalog requires a native runtime with modelVariants support; update the selected or pinned runtime");
+        }
+    }
+    Ok(launch)
+}
+
+fn read_catalog(catalog: &VerifiedFile) -> anyhow::Result<Value> {
     catalog.validate()?;
     let bytes = std::fs::read(&catalog.path)?;
     use sha2::Digest;
     ensure!(format!("{:x}", sha2::Sha256::digest(&bytes)) == catalog.sha256.as_str(), "catalog changed before runtime capability check");
-    let catalog: Value = serde_json::from_slice(&bytes)?;
-    let rows = catalog["models"].as_array().context("catalog models missing")?;
-    validate_bindings(rows)?;
-    if needs_support(&projection.route, rows) {
-        ensure!(bundle_supported(bundle, native_home)?,
-            "this model catalog requires a native runtime with modelVariants support; update the selected or pinned runtime");
-    }
-    Ok(())
+    Ok(serde_json::from_slice(&bytes)?)
 }
+
+#[path = "model_variants_legacy_context.rs"]
+mod legacy_context;
 
 pub fn validate_bindings(rows: &[Value]) -> anyhow::Result<()> {
     for row in rows {
@@ -209,7 +264,14 @@ pub(super) fn reset_catalog_row(account: &StoredAccount, state: &CatalogState, i
     let mut fresh = native_row.or(preset_row).or(custom_base).unwrap_or_else(|| catalog_api::template_row(base));
     let mut wrapper = json!({ "models": [fresh.take()] });
     super::model_discovery::apply_known_model_metadata_overlays_to_catalog(&mut wrapper);
-    let fresh = crate::profiles::model_variants::reset_row(&current, wrapper["models"][0].take());
+    let mut defaults=wrapper["models"][0].take();
+    // r290 P13: reset a derived row to the base recommendation, not its owner's settings.
+    if state.snapshot.model_context_settings_v1 {
+        if let Some(catalog)=defaults.get("context_settings").and_then(|v|v.get("catalog")).cloned() {
+            defaults=super::model_context::with_settings(&defaults,&catalog,&json!({}),&json!({}));
+        }
+    }
+    let fresh = crate::profiles::model_variants::reset_row(&current, defaults);
     let rows = catalog["models"].as_array_mut().context("catalog models missing")?;
     match rows.iter_mut().find(|row| row.get("slug").and_then(Value::as_str) == Some(id)) {
         Some(row) => *row = fresh,

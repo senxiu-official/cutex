@@ -1015,6 +1015,17 @@ mod switch_tests {
         crate::management::listeners::set_current_client_token(Some(token));
         let response = call(&f.store, "POST", json!({"enabled":true}), true);
         crate::management::listeners::set_current_client_token(None);
+        // r290 P10 (B6): turning public pairing on from an owner device needs
+        // its fresh confirm; a narrowed owner device stays refused.
+        assert_eq!(response.0, 428);
+        assert_eq!(response.1["error"]["code"], "owner_confirm_required");
+        assert_eq!(response.1["error"]["details"]["action"], "publicPairingOn");
+        let mut narrowed = VerifiedClientToken::test_token("mct-paired-owner-chat");
+        narrowed.issued_via = super::super::super::client_tokens::IssuedVia::Pairing;
+        narrowed.scope = super::super::super::client_tokens::DeviceScope::Chat;
+        crate::management::listeners::set_current_client_token(Some(narrowed));
+        let response = call(&f.store, "POST", json!({"enabled":false}), true);
+        crate::management::listeners::set_current_client_token(None);
         assert_eq!(response.0, 403);
         assert_eq!(response.1["error"]["code"], "owner_local_only");
         assert_eq!(status(&f.store)["enabled"], false);

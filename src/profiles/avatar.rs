@@ -65,9 +65,9 @@ fn nullable_emoji_themes<'de, D: serde::Deserializer<'de>>(
     Option::<Vec<String>>::deserialize(deserializer)
 }
 
-fn portrait_identifier(id: &str) -> bool {
+fn portrait_identifier(id: &str, max: usize) -> bool {
     !id.is_empty()
-        && id.len() <= 20
+        && id.len() <= max
         && (id.as_bytes()[0].is_ascii_lowercase() || id.as_bytes()[0].is_ascii_digit())
         && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
@@ -86,9 +86,9 @@ pub fn normalize_avatar_style(style: &AvatarStyle) -> Result<AvatarStyle, String
             let mut seen = std::collections::BTreeSet::new();
             for reference in portrait_themes {
                 let valid = reference.split_once('/').is_some_and(|(pack, theme)| {
-                    portrait_identifier(pack) && portrait_identifier(theme)
+                    portrait_identifier(pack, 20) && portrait_identifier(theme, 32)
                 });
-                if !valid { return Err("portraitThemes must use pack/theme identifiers (1-20 lowercase letters, digits or hyphens per segment; first character alphanumeric)".into()); }
+                if !valid { return Err("portraitThemes must use pack/theme identifiers (pack: 1-20, theme: 1-32 lowercase letters, digits or hyphens; first character alphanumeric)".into()); }
                 if !seen.insert(reference) { return Err("duplicate portraitThemes reference".into()); }
             }
             Ok(style.clone())
@@ -523,6 +523,23 @@ pub fn remove_default(profile_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_portrait_theme_ids_round_trip_with_path_safe_boundaries() {
+        let value = json!({"kind":"portrait","portraitThemes":[
+            "kit-20261029/mountain-city-myriad-layers",
+            "kit-20261029/university-universalis",
+            format!("{}/{}", "a".repeat(20), "b".repeat(32))
+        ]});
+        assert_eq!(serde_json::to_value(parse_avatar_style(&value).unwrap()).unwrap(), value);
+        for reference in [
+            format!("{}/theme", "a".repeat(21)), format!("pack/{}", "a".repeat(33)),
+            "pack/../theme".into(), "pack/theme/extra".into(), "pack/theme_name".into(),
+            "pack/Theme".into(), "pack/山城万象".into(), "pack/-theme".into(), "pack/theme\n".into(),
+        ] {
+            assert!(parse_avatar_style(&json!({"kind":"portrait","portraitThemes":[reference]})).is_err(), "{reference:?}");
+        }
+    }
 
     #[test]
     fn full_avatar_styles_are_strict_canonical_and_preserve_uninstalled_portraits() {

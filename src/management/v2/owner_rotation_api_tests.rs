@@ -29,9 +29,11 @@ fn context() -> crate::management::server::ManagementRequestContext {
         handle_user_input: |_| panic!("unused"),
         flush_user_input_queue: |_, _, _| panic!("unused"),
         steer_user_input_queue: |_, _, _| panic!("unused"),
-        interrupt_active_turn: |_, _| panic!("unused"),
-        load_bootstrap_state: |_, _| panic!("unused"),
+        interrupt_active_turn: |_, _, _| panic!("unused"),
+        load_bootstrap_state: |_, _, _| panic!("unused"),
         load_latest_plan: |_| panic!("unused"),
+        // r290 P6
+        load_board_plan: |_| serde_json::Value::Null,
         load_latest_token_usage: |_| panic!("unused"),
         revert_session_history: |_, _, _| panic!("unused"),
         delete_session: |_, _| panic!("unused"),

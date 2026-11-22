@@ -88,6 +88,9 @@ pub struct CodexProfileConfigSnapshot {
     pub image_history_trim: Option<ImageHistoryTrim>,
     pub model_catalog_json: Option<String>,
     pub model_context_window: Option<u64>,
+    // r290 P13
+    pub model_auto_compact_percent: Option<u64>,
+    pub model_context_settings_v1: bool,
     pub model_auto_compact_token_limit: Option<u64>,
     pub provider_name: Option<String>,
     pub provider_base_url: Option<String>,
@@ -117,6 +120,9 @@ pub struct CodexProfileConfigPatch {
     pub image_history_trim: ConfigValueUpdate<ImageHistoryTrim>,
     pub model_catalog_json: ConfigValueUpdate<String>,
     pub model_context_window: ConfigValueUpdate<u64>,
+    // r290 P13
+    pub model_auto_compact_percent: ConfigValueUpdate<u64>,
+    pub model_context_settings_v1: ConfigValueUpdate<bool>,
     pub model_auto_compact_token_limit: ConfigValueUpdate<u64>,
     pub provider_name: ConfigValueUpdate<String>,
     pub provider_base_url: ConfigValueUpdate<String>,
@@ -145,6 +151,8 @@ impl CodexProfileConfigPatch {
             && matches!(self.image_history_trim, ConfigValueUpdate::Unchanged)
             && matches!(self.model_catalog_json, ConfigValueUpdate::Unchanged)
             && matches!(self.model_context_window, ConfigValueUpdate::Unchanged)
+            && matches!(self.model_auto_compact_percent, ConfigValueUpdate::Unchanged)
+            && matches!(self.model_context_settings_v1, ConfigValueUpdate::Unchanged)
             && matches!(self.model_auto_compact_token_limit, ConfigValueUpdate::Unchanged)
             && matches!(self.provider_name, ConfigValueUpdate::Unchanged)
             && matches!(self.provider_base_url, ConfigValueUpdate::Unchanged)
@@ -193,6 +201,8 @@ pub fn inspect_codex_profile_config(
         },
         model_catalog_json: optional_string(&root, "model_catalog_json")?,
         model_context_window: optional_provider_u64(Some(&root), "model_context_window")?,
+        model_auto_compact_percent: optional_provider_u64(Some(&root), "model_auto_compact_percent")?,
+        model_context_settings_v1: optional_provider_bool(Some(&root), "model_context_settings_v1")?.unwrap_or(false),
         model_auto_compact_token_limit: optional_provider_u64(
             Some(&root),
             "model_auto_compact_token_limit",
@@ -306,6 +316,19 @@ pub fn apply_codex_profile_config_patch(
         "model_auto_compact_token_limit",
         &patch.model_auto_compact_token_limit,
     )?;
+    // r290 P13: compaction is one mode per scope, never two competing values.
+    anyhow::ensure!(!(matches!(patch.model_auto_compact_percent, ConfigValueUpdate::Set(_))
+        && matches!(patch.model_auto_compact_token_limit, ConfigValueUpdate::Set(_))),
+        "modelAutoCompactPercent and modelAutoCompactTokenLimit are mutually exclusive");
+    if let ConfigValueUpdate::Set(percent) = patch.model_auto_compact_percent {
+        anyhow::ensure!((1..=100).contains(&percent), "modelAutoCompactPercent must be 1..100");
+        root.remove("model_auto_compact_token_limit");
+    }
+    if matches!(patch.model_auto_compact_token_limit, ConfigValueUpdate::Set(_)) {
+        root.remove("model_auto_compact_percent");
+    }
+    apply_optional_u64(&mut root, "model_auto_compact_percent", &patch.model_auto_compact_percent)?;
+    apply_nested_bool(&mut root, &["model_context_settings_v1"], &patch.model_context_settings_v1)?;
     apply_model_provider_update(
         &mut root,
         previous_provider.as_deref(),
@@ -1160,4 +1183,29 @@ name = "Custom"
         // Like every provider option, it needs a custom provider.
         assert!(apply_codex_profile_config_patch(Some("model = \"m\"\n"), &patch(ConfigValueUpdate::Set(true))).is_err());
     }
+    // r290 P13
+    #[test]
+    fn context_percent_modes_and_launch_projection_survive_materialization() {
+        let percent=CodexProfileConfigPatch {model_auto_compact_percent:ConfigValueUpdate::Set(75),
+            model_context_settings_v1:ConfigValueUpdate::Set(true),..Default::default()};
+        let (on,_)=apply_codex_profile_config_patch(Some("cutex_provider_mode='selected_profile_v2'\nmodel_auto_compact_token_limit=150000\n"),&percent).unwrap();
+        let on=on.unwrap();
+        let extracted=crate::profiles::profile_config::extract_profile_config_toml(&on).unwrap().unwrap();
+        let snapshot=inspect_codex_profile_config(Some(&extracted)).unwrap();
+        assert_eq!(snapshot.model_auto_compact_percent,Some(75));
+        assert_eq!(snapshot.model_auto_compact_token_limit,None);
+        assert!(snapshot.model_context_settings_v1);
+        let projected=crate::launch::selected_profile::Config::parse(&on).unwrap();
+        assert_eq!(projected.model_auto_compact_percent,Some(75));
+        assert_eq!(projected.model_context_settings_v1,Some(true));
+        let (absolute,_)=apply_codex_profile_config_patch(Some(&on),&CodexProfileConfigPatch {
+            model_auto_compact_token_limit:ConfigValueUpdate::Set(125000),..Default::default()}).unwrap();
+        let snapshot=inspect_codex_profile_config(absolute.as_deref()).unwrap();
+        assert_eq!(snapshot.model_auto_compact_percent,None);
+        assert_eq!(snapshot.model_auto_compact_token_limit,Some(125000));
+        assert!(apply_codex_profile_config_patch(Some(&on),&CodexProfileConfigPatch {
+            model_auto_compact_percent:ConfigValueUpdate::Set(50),
+            model_auto_compact_token_limit:ConfigValueUpdate::Set(100000),..Default::default()}).is_err());
+    }
+
 }

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:owner-dispositions",
+  "title": "Owner dispositions",
+  "description": "Owner/root credential required. Operations use record identity without resolving an active target session. Message endFollowUp records uncertainty, never confirms execution or requeues work.",
+  "$defs": {
+    "askClose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "actionId"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "stop",
+            "abandoned",
+            "accepted",
+            "followUpEnded"
+          ]
+        },
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "notificationAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {}
+    },
+    "messageEndFollowUp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "actionId",
+        "reason"
+      ],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "expectedSemanticSha256": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        }
+      }
+    },
+    "ownerMessageSettlement": {
+      "type": "object",
+      "required": [
+        "state",
+        "canClose",
+        "evidence",
+        "evidenceToken",
+        "outcome",
+        "by",
+        "closure"
+      ],
+      "properties": {
+        "state": {
+          "const": "closed"
+        },
+        "canClose": {
+          "const": false
+        },
+        "evidence": {
+          "type": "null"
+        },
+        "evidenceToken": {
+          "const": ""
+        },
+        "outcome": {
+          "const": "unconfirmed"
+        },
+        "by": {
+          "const": "owner"
+        },
+        "closure": {
+          "type": "object",
+          "required": [
+            "actor",
+            "closedAt",
+            "reason",
+            "requestId"
+          ]
+        }
+      }
+    },
+    "askCloseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ask",
+        "receipt"
+      ],
+      "properties": {
+        "ask": {
+          "type": "object",
+          "properties": {
+            "followUpEnded": {
+              "type": "boolean"
+            },
+            "closed": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "receipt": {
+          "type": "object"
+        },
+        "stopping": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -526,7 +526,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "expectedRevision": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 }
+        "expectedRevision": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "stopFirst": { "type": ["boolean", "null"] }
       }
     },
     "sessionDeleteResult": {
@@ -540,7 +541,8 @@
         "nativeDelete": { "enum": ["thread/delete", "storageMove", "claudeState", "dshState", "none"] },
         "runtimeStopped": { "type": "boolean" },
         "backupPath": { "$ref": "#/$defs/nonEmptyString" },
-        "deletedAt": { "$ref": "#/$defs/timestamp" }
+        "deletedAt": { "$ref": "#/$defs/timestamp" },
+        "stoppedFirst": { "type": "boolean" }
       }
     },
     "sessionDeleted": {
@@ -749,6 +751,10 @@
         "submitError": { "type": "object" }
       }
     },
+    "agentBusWakeInput": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"inputIds": {"type":"array","maxItems":99,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":512}}}
+    },
     "agentBusWakeResult": {
       "type": "object",
       "required": ["pendingNotes", "started"],
@@ -862,6 +868,7 @@
         "expectedRuntimeGeneration": { "$ref": "#/$defs/safeInteger" },
         "reason": { "type": "string" },
         "openVisibleTerminal": { "type": "boolean" },
+        "expectedRuntimeUpdatedAt": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Optional maintenance precondition: exact session updatedAt captured after confirmed offline; a newer owner action refuses this restoration before launch." },
         "launchProfile": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
@@ -915,6 +922,7 @@
         "input": { "$ref": "#/$defs/userInputArray" },
         "expectedTurnId": { "type": ["string", "null"] },
         "joinDelegation": { "$ref": "#/$defs/ownerJoinDelegation" },
+        "interruptSend": { "$ref": "#/$defs/inputInterruptSendMany" },
         "startIfOffline": { "type": "boolean" },
         "allowHeld": { "type": "boolean" }
       }
@@ -1734,6 +1742,7 @@
         "submittedAt"
       ],
       "properties": {
+        "passiveNotes": { "$ref": "#/$defs/passiveNoteAdmissionReport" },
         "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "managementRequestId": { "$ref": "#/$defs/requestId" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
@@ -1813,6 +1822,27 @@
         "host": { "$ref": "#/$defs/nonEmptyString" },
         "peerId": { "$ref": "#/$defs/nonEmptyString" },
         "senderId": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "passiveNoteDeliveryDiagnostics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stage", "since", "sinceEvidence", "lastAttemptAt", "lastAttemptKind", "lastError", "waitingFor", "blockedByInputId", "binding", "nativeReason"],
+      "properties": {
+        "stage": { "enum": ["bus", "inbox", "context"] },
+        "since": { "type": ["string", "null"] },
+        "sinceEvidence": { "enum": ["durableQueue", "firstRecordedNativeEvidence"] },
+        "lastAttemptAt": { "type": ["string", "null"] },
+        "lastAttemptKind": { "type": ["string", "null"] },
+        "lastError": { "type": ["string", "null"] },
+        "waitingFor": { "type": "string" },
+        "sourceWaitingFor": { "type": "string" },
+        "blockedByInputId": { "type": ["string", "null"] },
+        "binding": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["threadId", "runtimeGeneration"],
+          "properties": { "threadId": { "type": "string" }, "runtimeGeneration": { "$ref": "#/$defs/safeInteger" } }
+        },
+        "nativeReason": { "type": ["string", "null"] }
       }
     },
     "agentBusQueued": {
@@ -1956,6 +1986,7 @@
         "wakeDowngraded": { "const": true },
         "senderTurnId": { "type": "string" },
         "nativeSubmissionId": { "type": ["string", "null"] },
+        "deliveryDiagnostics": { "$ref": "#/$defs/passiveNoteDeliveryDiagnostics" },
         "deliveredAt": { "$ref": "#/$defs/timestamp" },
         "turnId": { "type": ["string", "null"] },
         "deliveryMode": { "enum": ["after_turn", "soon", "passive", "interrupt"] },
@@ -1982,6 +2013,7 @@
         "wakeDowngraded": { "const": true },
         "senderTurnId": { "type": "string" },
         "error": { "$ref": "#/$defs/cutexError" },
+        "deliveryDiagnostics": { "$ref": "#/$defs/passiveNoteDeliveryDiagnostics" },
         "failedAt": { "$ref": "#/$defs/timestamp" },
         "deliveryMode": { "enum": ["after_turn", "soon", "passive", "interrupt"] }
       }
@@ -2545,6 +2577,21 @@
         "attachCommand": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
+    "passiveNoteAdmissionReport": {
+      "type": "object", "additionalProperties": false,
+      "required": ["admitted", "skipped", "errors", "budgetNotes", "budgetBytes"],
+      "properties": {
+        "budgetNotes": { "type": "integer", "minimum": 0, "maximum": 99 },
+        "budgetBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "admitted": { "type": "array", "items": { "type": "string" } },
+        "skipped": { "type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["inputId", "waitingFor", "error"],
+          "properties": { "inputId": { "type": "string" }, "waitingFor": { "type": "string" }, "error": { "type": ["string", "null"] } }
+        } },
+        "errors": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "userInputSubmitResult": {
       "type": "object",
       "additionalProperties": false,
@@ -2557,6 +2604,7 @@
         "queue"
       ],
       "properties": {
+        "passiveNotes": { "$ref": "#/$defs/passiveNoteAdmissionReport" },
         "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "disposition": { "enum": ["started", "steered", "queued", "deduplicated", "held"] },
@@ -2783,7 +2831,8 @@
         "params": { "type": "object" }
       },
       "allOf": [
-        { "if": { "properties": { "method": { "enum": ["cutex/session/get", "cutex/session/groups/get", "cutex/focus/get", "cutex/userInput/queue/list", "cutex/userInput/queue/yield", "cutex/userInput/queue/pause", "cutex/userInput/queue/resume", "cutex/turn/stop", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/empty" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/wake" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusWakeInput" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/session/get", "cutex/session/groups/get", "cutex/focus/get", "cutex/userInput/queue/list", "cutex/userInput/queue/yield", "cutex/userInput/queue/pause", "cutex/userInput/queue/resume", "cutex/turn/stop", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/empty" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/defaults/update" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionDefaultsUpdate" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profile/set" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionProfileSet" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profile/clear" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/expectedRevision" } } } },
@@ -2957,7 +3006,11 @@
     "queueMerge": {"description":"cutex/userInput/queue/merge (input-ledger-v1): merge 2..20 queued owner inputs into the first; input defaults to their inputs in order.","type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","minItems":2,"maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["queueId","expectedRevision"],"properties":{"queueId":{"$ref":"#/$defs/nonEmptyString"},"expectedRevision":{"$ref":"#/$defs/positiveSafeInteger"}}}},"input":{"$ref":"#/$defs/userInputArray"}}},
     "queueMergeResult": {"type":"object","additionalProperties":false,"required":["revision","affectedQueueIds","item","inputs"],"properties":{"revision":{"$ref":"#/$defs/safeInteger"},"affectedQueueIds":{"type":"array","uniqueItems":true,"items":{"$ref":"#/$defs/nonEmptyString"}},"item":{"$ref":"#/$defs/queueItem"},"inputs":{"type":"array","items":{"$ref":"#/$defs/inputRecord"}}}},
     "inputRetryResult": {"description":"cutex/input/retry result (054 §2.14): the record after failed / uncertain → waiting{ownerRetry}; redelivery is what the owning block did to send the same id again.","type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","record","redelivery"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"record":{"$ref":"#/$defs/inputRecord"},"redelivery":{"type":"object","additionalProperties":false,"required":["path","ok"],"properties":{"path":{"enum":["ownerResubmit","busRequeue","delegationRequeue"]},"ok":{"type":"boolean"},"error":{"type":["object","null"]},"result":{}}}}},
-    "inputInterruptSend": {"description":"cutex/input/interruptSend params (r274 interrupt-send contract, owner only): CAS on the record's rev, the running turn and the runtime generation the owner sees.","type":"object","additionalProperties":false,"required":["inputId","expectedRev","expectedTurnId","expectedRuntimeGeneration"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"},"expectedTurnId":{"$ref":"#/$defs/nonEmptyString"},"expectedRuntimeGeneration":{"$ref":"#/$defs/safeInteger"}}},
-    "inputInterruptSendResult": {"description":"cutex/input/interruptSend result: interrupted = the turn was interrupted and the input queued as the next turn's first input (the record follows sending{interruptSend} -> inContext); alreadyInContext = no interrupt, nothing resent; held = waiting for the host authority fence; agentOffline = waiting{agentOffline}, the agent is started.","type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","outcome","interruptedTurnId","record"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"outcome":{"enum":["interrupted","alreadyInContext","held","agentOffline"]},"interruptedTurnId":{"type":["string","null"]},"record":{"$ref":"#/$defs/inputRecord"}}}
+    "inputInterruptSendMany": {"type":"object","additionalProperties":false,"required":["inputIds","expectedRevs","expectedTurnId","expectedRuntimeGeneration"],"properties":{"inputIds":{"type":"array","maxItems":100,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},"expectedRevs":{"type":"object","additionalProperties":{"$ref":"#/$defs/positiveSafeInteger"}},"expectedTurnId":{"$ref":"#/$defs/nonEmptyString"},"expectedRuntimeGeneration":{"$ref":"#/$defs/safeInteger"}}},
+    "inputInterruptSendSingle": {"description":"Legacy owner interrupt: CAS on the record, running turn and runtime generation.","type":"object","additionalProperties":false,"required":["inputId","expectedRev","expectedTurnId","expectedRuntimeGeneration"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"},"expectedTurnId":{"$ref":"#/$defs/nonEmptyString"},"expectedRuntimeGeneration":{"$ref":"#/$defs/safeInteger"}}},
+    "inputInterruptSend": {"oneOf":[{"$ref":"#/$defs/inputInterruptSendSingle"},{"allOf":[{"$ref":"#/$defs/inputInterruptSendMany"},{"properties":{"inputIds":{"minItems":1}}}]}]},
+    "inputInterruptSendSingleResult": {"description":"cutex/input/interruptSend result: interrupted = the turn was interrupted and the input queued as the next turn's first input (the record follows sending{interruptSend} -> inContext); alreadyInContext = no interrupt, nothing resent; held = waiting for the host authority fence; agentOffline = waiting{agentOffline}, the agent is started.","type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","outcome","interruptedTurnId","record"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"outcome":{"enum":["interrupted","alreadyInContext","held","agentOffline"]},"interruptedTurnId":{"type":["string","null"]},"record":{"$ref":"#/$defs/inputRecord"}}},
+    "inputInterruptSendManyResult": {"type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","outcome","interruptedTurnId","inputIds","records","carrierInputId","alreadyInContext","submitted"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"outcome":{"enum":["interrupted","alreadyInContext","held","agentOffline"]},"interruptedTurnId":{"type":["string","null"]},"inputIds":{"type":"array","items":{"type":"string"}},"records":{"type":"array","items":{"$ref":"#/$defs/inputRecord"}},"carrierInputId":{"type":["string","null"]},"alreadyInContext":{"type":"array","items":{"type":"string"}},"submitted":{"type":"array","items":{"type":"string"}}}},
+    "inputInterruptSendResult": {"oneOf":[{"$ref":"#/$defs/inputInterruptSendSingleResult"},{"$ref":"#/$defs/inputInterruptSendManyResult"}]}
   }
 }

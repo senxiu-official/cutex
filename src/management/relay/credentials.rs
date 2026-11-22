@@ -125,6 +125,14 @@ fn current_leaf(store: &Store, token: &VerifiedClientToken) -> anyhow::Result<Ce
     let peer = current_peer()
         .filter(|p| p.device_id == token.token_id)
         .ok_or_else(forbidden)?;
+    // r290 P10 (B3): a grace connection's leaf has expired; it is checked
+    // live (unrevoked, device present, inside the grace window).
+    if super::grace_peer() {
+        return store
+            .grace_uncached(&peer.certificate_id)?
+            .filter(|r| r.device_id == token.token_id)
+            .ok_or_else(|| forbidden().into());
+    }
     store
         .active(&peer.certificate_id)?
         .filter(|r| r.device_id == token.token_id)
@@ -220,23 +228,30 @@ fn route(request: &crate::http::server::SimpleHttpRequest) -> anyhow::Result<ser
     let leaf = current_leaf(&store, &token)?;
     let expiry =
         chrono::DateTime::parse_from_rfc3339(&leaf.expires_at)?.with_timezone(&chrono::Utc);
+    // r290 P10 (B3): renewable from the half-life (final 15 days), warned in
+    // the final 7, renewable with the same key for 30 days after expiry.
+    let renew_after = expiry - chrono::Duration::days(super::RENEW_BEFORE_EXPIRY_DAYS);
     let warning = expiry - chrono::Duration::days(7);
+    let grace_until = expiry + chrono::Duration::days(super::RENEW_GRACE_DAYS);
     if request.method == "GET" && path == "/v2/relay-certificate" {
+        let now = chrono::Utc::now();
         return Ok(
-            json!({"certificateId":leaf.certificate_id,"deviceId":leaf.device_id,"expiresAt":leaf.expires_at,"serverTime":chrono::Utc::now().to_rfc3339(),"renewAfter":warning.to_rfc3339(),"warningAt":warning.to_rfc3339(),"renewalRequired":chrono::Utc::now()>=warning,"server":store.server_public()?}),
+            json!({"certificateId":leaf.certificate_id,"deviceId":leaf.device_id,"expiresAt":leaf.expires_at,"serverTime":now.to_rfc3339(),"renewAfter":renew_after.to_rfc3339(),"warningAt":warning.to_rfc3339(),"graceUntil":grace_until.to_rfc3339(),"expired":now>=expiry,"renewalRequired":now>=renew_after,"server":store.server_public()?}),
         );
     }
     if request.method == "POST" && path == "/v2/relay-certificate/renew" {
-        if chrono::Utc::now() < warning {
+        if chrono::Utc::now() < renew_after {
             bail!(ApiError(
                 409,
                 "Conflict",
                 "relay_renewal_too_early",
-                "renew during the final seven days"
+                "renew during the final fifteen days"
             ));
         }
         let body: serde_json::Value = serde_json::from_slice(&request.body)?;
         let csr = body["csrPem"].as_str().ok_or_else(invalid)?;
+        // r290 P10 (B3): store.renew re-checks the parent live and, for an
+        // expired one, requires the same key.
         return store.renew(&leaf.certificate_id, csr);
     }
     bail!(invalid())

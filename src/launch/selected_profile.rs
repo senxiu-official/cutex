@@ -96,6 +96,11 @@ pub struct Settings {
     #[serde(default)]
     pub projects: BTreeMap<String, Trust>,
     pub memories: Option<Memories>,
+    // r290 P13
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_auto_compact_percent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_settings_v1: Option<bool>,
     pub model_auto_compact_token_limit: Option<u64>,
     pub skills: Option<Skills>,
     pub tui: Option<Tui>,
@@ -307,6 +312,11 @@ pub struct Config {
     #[serde(default)]
     pub projects: BTreeMap<String, Trust>,
     pub memories: Option<Memories>,
+    // r290 P13
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_auto_compact_percent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_settings_v1: Option<bool>,
     pub model_auto_compact_token_limit: Option<u64>,
     pub model_catalog_json: Option<PathBuf>,
     pub skills: Option<Skills>,
@@ -347,6 +357,7 @@ const KNOWN_ROOT_KEYS: &[&str] = &[
     "model_supports_reasoning_summaries", "model_verbosity", "plan_mode_reasoning_effort", "review_model",
     "cutex_provider_mode", "model", "model_provider", "model_reasoning_effort", "cli_auth_credentials_store",
     "approvals_reviewer", "service_tier", "shell_environment_policy", "projects", "memories",
+    "model_auto_compact_percent", "model_context_settings_v1",
     "model_auto_compact_token_limit", "model_catalog_json", "skills", "tui", "notice", "plugins", "tools",
     "web_search", "tool_schema_compat", "generated_image_history_max_inline", "generated_image_history_keep",
     "model_providers", "mcp_servers",
@@ -553,6 +564,8 @@ impl Config {
             shell_environment_policy: self.shell_environment_policy,
             projects: self.projects,
             memories: self.memories,
+            model_auto_compact_percent: self.model_auto_compact_percent,
+            model_context_settings_v1: self.model_context_settings_v1,
             model_auto_compact_token_limit: self.model_auto_compact_token_limit,
             skills: self.skills,
             tui: self.tui,
@@ -602,6 +615,10 @@ impl Settings {
             self.service_tier.as_deref().is_none_or(|v| matches!(v, "default" | "fast" | "priority" | "flex")),
             "unsupported service tier"
         );
+        // r290 P13
+        ensure!(self.model_auto_compact_percent.is_none_or(|v| (1..=100).contains(&v)), "invalid compaction percentage");
+        ensure!(self.model_auto_compact_percent.is_none() || self.model_auto_compact_token_limit.is_none(), "compaction modes are mutually exclusive");
+        ensure!(self.model_auto_compact_percent.is_none() || self.model_context_settings_v1 == Some(true), "compaction percentage requires v1 settings");
         ensure!(
             self.model_auto_compact_token_limit.is_none_or(|v| v > 0),
             "invalid compaction limit"
@@ -822,6 +839,13 @@ pub fn validate_model(
                 .iter()
                 .filter(|m| m["slug"].as_str() == Some(model))
                 .collect();
+            // r290 P13: explicit owner opt-in admits only an unlisted raw model.
+            // Existing rows and unavailable named configurations retain strict validation.
+            if matched.is_empty() && crate::profiles::model_check::unlisted_allowed() {
+                ensure!(!v["reserved_model_ids"].as_array().is_some_and(|ids|ids.iter().any(|id|id.as_str()==Some(model))),"unavailable model configuration {model} cannot be used as an unlisted model");
+                ensure!(effort.is_none_or(supported_effort),"unsupported reasoning effort");
+                return Ok(());
+            }
             ensure!(
                 matched.len() == 1
                     && matched[0]["supported_reasoning_levels"]
@@ -1217,6 +1241,28 @@ impl Projection {
 
 #[cfg(test)]
 mod tests {
+    // r290 P13: owner opt-in affects unknown membership only, never row validation.
+    #[test]
+    fn context_unlisted_owner_opt_in_keeps_effort_and_reserved_bindings_strict() {
+        use serde_json::json;
+        let _home=crate::profiles::lifecycle::tests::TestHome::new();
+        let path=crate::config::paths::config_dir().unwrap().join("unlisted-catalog.json");
+        crate::config::atomic::write_private_pretty_json_atomic(&path,&json!({"models":[{"slug":"known","supported_reasoning_levels":[{"effort":"low"}]}],"reserved_model_ids":["Fast"]}),"fixture").unwrap();
+        let file=super::VerifiedFile {path:path.canonicalize().unwrap(),sha256:crate::agent_management::file_sha256(&path).unwrap()};
+        let _scope=crate::profiles::model_check::RequestScope::enter(false);
+        assert!(super::validate_model(&super::Route::ChatgptFile,"new-upstream",Some("high"),Some(&file)).is_err());
+        {
+            let _allow=crate::profiles::model_check::RequestScope::enter(true);
+            assert!(super::validate_model(&super::Route::ChatgptFile,"new-upstream",Some("high"),Some(&file)).is_ok());
+            assert!(super::validate_model(&super::Route::ApiKey,"new-upstream",None,Some(&file)).is_ok());
+            assert!(super::validate_model(&super::Route::ChatgptFile,"known",Some("high"),Some(&file)).is_err());
+            assert!(super::validate_model(&super::Route::ChatgptFile,"known",Some("low"),Some(&file)).is_ok());
+            assert!(super::validate_model(&super::Route::ChatgptFile,"Fast",None,Some(&file)).is_err());
+            assert!(super::validate_model(&super::Route::ChatgptFile,"new-upstream",Some("invented"),Some(&file)).is_err());
+        }
+        assert!(!crate::profiles::model_check::unlisted_allowed());
+    }
+
     use super::*;
     #[test]
     fn omitted_profile_model_inherits_home_but_explicit_values_win() {

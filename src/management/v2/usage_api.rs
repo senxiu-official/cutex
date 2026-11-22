@@ -3,6 +3,8 @@
 //! - `GET|PUT /v2/usage/prices` (`?library=<substring>` searches the cached library)
 //! - `POST /v2/usage/prices/refresh` (fetch the library / rates now)
 //! - `GET /v2/usage/quota-history?profile=&from=&to=`
+//! - `GET /v2/usage/quota-attribution?account=<id>|profile=<name>&window=5h|7d`
+//!   (`usage/quota_attribution.rs`, capability `quota-attribution`)
 //! - `GET|POST /v2/usage/sources`, `PATCH|DELETE /v2/usage/sources/{id}`
 //!   (`?purge=true`), `POST /v2/usage/sources/{id}/rescan`: extra usage
 //!   sources (`usage/external.rs`, capability `usage-external-sources`;
@@ -35,6 +37,8 @@ pub enum UsageRoute {
     Prices,
     PricesRefresh,
     QuotaHistory,
+    // r290 P8: available by default with the quota-attribution capability.
+    QuotaAttribution,
     Sources,
     Source(String),
     SourceRescan(String),
@@ -46,6 +50,7 @@ pub fn parse_path(path: &str) -> Option<UsageRoute> {
         "/v2/usage/prices" => Some(UsageRoute::Prices),
         "/v2/usage/prices/refresh" => Some(UsageRoute::PricesRefresh),
         "/v2/usage/quota-history" => Some(UsageRoute::QuotaHistory),
+        "/v2/usage/quota-attribution" => Some(UsageRoute::QuotaAttribution),
         "/v2/usage/sources" => Some(UsageRoute::Sources),
         _ => {
             let rest = path.strip_prefix("/v2/usage/sources/")?;
@@ -122,6 +127,45 @@ fn parse_params(full_path: &str, allowed: &[&str]) -> Result<Params, String> {
         }
     }
     Ok(params)
+}
+
+/// `?account=<claude account id>` or `?profile=<id or name>` (exactly one)
+/// and `window=5h|7d` (default 5h).
+// r290 P8: preserve the original strict v1 selector/window contract.
+fn attribution_params(
+    full_path: &str,
+) -> Result<(usage::quota_attribution::Selector, usage::quota_attribution::WindowKind), String> {
+    use usage::quota_attribution::{Selector, WindowKind};
+    let mut selector = None;
+    let mut kind = None;
+    let query = full_path.split_once('?').map_or("", |(_, query)| query);
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let value = value.trim();
+        match name.as_ref() {
+            "account" | "profile" => {
+                if selector.is_some() {
+                    return Err("give exactly one of account and profile".to_string());
+                }
+                if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+                    return Err(format!("{name} must be a non-empty id or name"));
+                }
+                selector = Some(if name == "account" {
+                    Selector::Account(value.to_string())
+                } else {
+                    Selector::Profile(value.to_string())
+                });
+            }
+            "window" => {
+                if kind.is_some() {
+                    return Err("query parameter window given twice".to_string());
+                }
+                kind = Some(WindowKind::parse(value).ok_or("window must be 5h or 7d")?);
+            }
+            other => return Err(format!("unsupported query parameter: {other}")),
+        }
+    }
+    let selector = selector.ok_or("account or profile is required")?;
+    Ok((selector, kind.unwrap_or(WindowKind::FiveHour)))
 }
 
 /// Resolve `[from, to]` with defaults (last 7 days ending `today`).
@@ -391,6 +435,28 @@ pub(super) fn handle(
                 Err(error) => unavailable(stream, error),
             }
         }
+        ("GET", UsageRoute::QuotaAttribution) => {
+            let (selector, kind) = match attribution_params(&request.path) {
+                Ok(params) => params,
+                Err(message) => return bad_request(stream, &message),
+            };
+            match usage::quota_attribution::live(&selector, kind) {
+                Ok(body) => write_json_response(stream, 200, "OK", &body),
+                Err(refusal) => super::server::write_v2_error(
+                    stream,
+                    refusal.status,
+                    match refusal.status {
+                        404 => "Not Found",
+                        409 => "Conflict",
+                        _ => "Service Unavailable",
+                    },
+                    refusal.code,
+                    &refusal.message,
+                    refusal.status == 503,
+                    json!({}),
+                ),
+            }
+        }
         (_, route @ (UsageRoute::Sources | UsageRoute::Source(_) | UsageRoute::SourceRescan(_))) => {
             handle_sources(stream, request, route)
         }
@@ -399,7 +465,7 @@ pub(super) fn handle(
             405,
             "Method Not Allowed",
             "method_not_allowed",
-            "use GET for /v2/usage and /v2/usage/quota-history, GET or PUT for /v2/usage/prices, POST for /v2/usage/prices/refresh",
+            "use GET for /v2/usage, /v2/usage/quota-history and /v2/usage/quota-attribution, GET or PUT for /v2/usage/prices, POST for /v2/usage/prices/refresh",
             false,
             json!({}),
         ),
@@ -758,6 +824,23 @@ fn snapshot_resource(snapshot: &usage::QuotaSnapshot) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // r290 P8: validate public selectors/defaults and reject ambiguous requests.
+    #[test]
+    fn quota_attribution_query_defaults_and_errors() {
+        use usage::quota_attribution::{Selector, WindowKind};
+        assert_eq!(parse_path("/v2/usage/quota-attribution"), Some(UsageRoute::QuotaAttribution));
+        assert_eq!(parse_path("/v2/usage/quota-attribution/"), None);
+        let (selector, window) = attribution_params("/v2/usage/quota-attribution?profile=Account%20A").unwrap();
+        assert!(matches!(selector, Selector::Profile(name) if name == "Account A"));
+        assert_eq!(window, WindowKind::FiveHour);
+        let (selector, window) = attribution_params("/v2/usage/quota-attribution?account=ca-test&window=7d").unwrap();
+        assert!(matches!(selector, Selector::Account(id) if id == "ca-test"));
+        assert_eq!(window, WindowKind::SevenDay);
+        for query in ["", "window=5h", "profile=", "account=%00", "profile=a&account=b", "profile=a&profile=b", "account=a&window=1d", "account=a&window=5h&window=7d", "account=a&enabled=true"] {
+            assert!(attribution_params(&format!("/v2/usage/quota-attribution?{query}")).is_err(), "{query}");
+        }
+    }
 
     fn d(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()

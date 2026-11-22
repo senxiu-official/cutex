@@ -19,6 +19,7 @@ from cute_claude.config import Settings
 from cute_claude.subscription import OfficialSdkDriver
 from cute_claude.subscription_auth import CONFLICTING_ENV
 from test_subscription import SubHarness
+from fake_sdk import materialize
 
 
 pytestmark = pytest.mark.skipif(not os.environ.get('CUTEX_TEST_CLAUDE_CLI'), reason='explicit private native CLI required')
@@ -37,7 +38,7 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
     workspace.mkdir()
     readable = workspace / 'fixture.txt'
     readable.write_text('read this fixture only', encoding='utf-8')
-    calls, queries, tool_calls = [], [], []
+    calls, queries, tool_calls, native_inputs = [], [], [], []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -86,7 +87,7 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
             if scenario == 'reset-success' and number == 1:
                 self.reset()
                 return
-            status = (500 if scenario in {'exhausted', 'cancel'} else
+            status = (500 if scenario == 'cancel' or scenario == 'exhausted' and number <= 4 else
                       int(scenario[:3]) if scenario[:3].isdigit() and (number == 1 or '-' not in scenario) else
                       429 if scenario == 'usage' else None)
             if status:
@@ -119,6 +120,13 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    if scenario == 'exhausted':
+        async def fast_backoff(event, delay):
+            # Exercise real SDK/CLI retries without spending production backoff.
+            await asyncio.sleep(0)
+        monkeypatch.setattr('cute_claude.queue_recovery.wait_backoff', fast_backoff)
+    if scenario == 'cancel':
+        monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 60)
     sdk = importlib.import_module('claude_agent_sdk')
     native_client = sdk.ClaudeSDKClient
 
@@ -139,9 +147,11 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
         client = native_client(options=options)
         original_query = client.query
 
-        async def query(*args, **kwargs):
+        async def query(prompt, *args, **kwargs):
             queries.append(True)
-            return await original_query(*args, **kwargs)
+            text, replay = await materialize(prompt)
+            native_inputs.append(text)
+            return await original_query(replay, *args, **kwargs)
 
         client.query = query
         return client
@@ -156,7 +166,7 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
         turn = await h.turn(tid, 'Use the fixture Read tool.' if scenario in {'tool-drop', 'tool-stream-drop'} else 'Reply briefly.')
         if scenario == 'cancel':
             async with asyncio.timeout(45):
-                while turn not in h.engine.retry_waiting:
+                while turn not in h.engine.retry_waiting and tid not in h.engine.queue_backoffs:
                     if not h.engine.workers:
                         pytest.fail(f'no backoff: {h.store.turn(turn)}')
                     await asyncio.sleep(0.01)
@@ -166,19 +176,26 @@ async def test_subscription_silent_retry_with_real_cli(tmp_path, monkeypatch, sc
             while h.engine.workers:
                 await asyncio.gather(*list(h.engine.workers.values()))
         result = h.store.turn(turn)
-        success = scenario.endswith('-success')
-        expected_queries = 2 if success else 3 if scenario == 'exhausted' else 1
+        success = scenario.endswith('-success') or scenario == 'exhausted'
+        expected_queries = 5 if scenario == 'exhausted' else 2 if success else 3 if scenario == 'tool-drop' else 1
         evidence = {'scenario': scenario, 'httpAttempts': len(calls), 'queries': len(queries),
                     'tools': tool_calls, 'status': result['status'], 'error': result.get('error')}
         print(json.dumps(evidence))
         assert len(queries) == expected_queries, evidence
         assert result['status'] == ('completed' if success else 'interrupted' if scenario == 'cancel' else 'failed'), evidence
+        if scenario == 'exhausted':
+            assert h.store.db.execute("SELECT COUNT(*) FROM inputs WHERE turn_id=?", (turn,)).fetchone()[0] == 1
+            assert h.store.db.execute("SELECT state FROM inputs WHERE turn_id=?", (turn,)).fetchone()[0] == 'completed'
+            assert sum('Reply briefly.' in payload for payload in native_inputs) == 1, native_inputs
+            assert not h.store.thread(tid)['halted']
+            assert not any(e.get('method') == 'claude/queue/holdChanged' and e['params']['held'] for e in h.out)
+            assert len([e for e in h.out if e.get('method') == 'turn/completed']) == 1
         # Pinned CLI 2.1.321 performs its own generic-400 recovery inside one
         # query even with MAX_RETRIES=0. The adapter must never add a query.
         if scenario == 'tool-stream-drop':
             assert len(calls) >= 2, evidence  # Native stream recovery remains inside the one query.
         else:
-            assert len(calls) == (2 if scenario == 'tool-drop' else 4 if scenario == '400' else expected_queries), evidence
+            assert len(calls) == (4 if scenario in {'tool-drop', '400'} else expected_queries), evidence
         if scenario == '400':
             assert result['error']['codexErrorInfo'] == 'badRequest', evidence
         assert tool_calls == (['Read'] if scenario in {'tool-drop', 'tool-stream-drop'} else []), evidence

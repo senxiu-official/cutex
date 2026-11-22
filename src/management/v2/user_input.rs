@@ -129,6 +129,7 @@ pub fn parse_owner_join(value: &Value) -> Result<OwnerJoinDelegation, String> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserInputSubmitParams {
+    pub interrupt_send: Option<super::input_interrupt_send::InterruptSendMany>,
     pub client_user_message_id: String,
     pub origin: UserInputOrigin,
     pub strategy: UserInputStrategy,
@@ -193,6 +194,7 @@ fn owner_block_reason(state: &crate::asks::store::AskState, session: &str, admis
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserInputSubmitExecution {
+    pub passive_notes: Option<crate::app_server::pre_turn_notes::Report>,
     pub disposition: UserInputDisposition,
     pub app_server_accepted: bool,
     pub native_request_id: Option<Value>,
@@ -444,6 +446,7 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
         "input",
         "expectedTurnId",
         "joinDelegation",
+        "interruptSend",
     ];
     if object.keys().any(|key| !allowed.contains(&key.as_str()))
         || !["clientUserMessageId", "origin", "strategy", "input"]
@@ -501,6 +504,18 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
         }
     };
     let join_delegation = object.get("joinDelegation").map(parse_owner_join).transpose()?;
+    let interrupt_send = object.get("interruptSend")
+        .map(|value| super::input_interrupt_send::InterruptSendMany::parse(value, true).map_err(|e|e.message))
+        .transpose()?;
+    if let Some(batch) = &interrupt_send {
+        if strategy != UserInputStrategy::Interrupt || join_delegation.is_some()
+            || batch.input_ids.len() >= super::input_ledger::MAX_BATCH_ITEMS
+            || client_user_message_id.len() > 256
+            || batch.input_ids.contains(&client_user_message_id)
+            || expected_turn_id.as_ref().is_some_and(|turn| turn != &batch.expected_turn_id) {
+            return Err("interruptSend requires strategy interrupt, at most 99 other inputs and the same expected turn".into());
+        }
+    }
     if join_delegation.is_some() && strategy != UserInputStrategy::Auto {
         return Err("joinDelegation requires strategy auto".into());
     }
@@ -508,6 +523,7 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
         if &join.expected_turn_id != expected { return Err("joinDelegation expectedTurnId differs".into()); }
     }
     Ok(UserInputSubmitParams {
+        interrupt_send,
         join_delegation,
         client_user_message_id,
         origin,
@@ -548,6 +564,7 @@ pub fn validate_user_input(value: &Value) -> Result<(), String> {
         "image" => required_string("url")?,
         "localImage" => {
             required_string("path")?;
+            let _shares = super::host_files::owner_share_scope(); // r290 P10 (B4/A8): owner images on \\wsl$ / configured shares
             crate::artifacts::paths::validate_local_path(std::path::Path::new(object["path"].as_str().unwrap())).map_err(|_|"unsafe local image path".to_string())?;
         }
         "skill" | "mention" => {

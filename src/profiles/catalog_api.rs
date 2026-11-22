@@ -109,17 +109,8 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
     let context_window = int(row, "context_window");
     let max_context_window = int(row, "max_context_window");
     let catalog_auto_compact = int(row, "auto_compact_token_limit");
-    let profile_window = snapshot.model_context_window.and_then(|v| i64::try_from(v).ok());
-    let profile_auto = snapshot.model_auto_compact_token_limit.and_then(|v| i64::try_from(v).ok());
-    let resolved_window = match profile_window {
-        Some(window) => Some(max_context_window.map_or(window, |max| window.min(max))),
-        None => context_window.or(max_context_window),
-    };
-    let configured_auto = profile_auto.or(catalog_auto_compact);
-    let effective_auto = match resolved_window {
-        Some(window) => Some(configured_auto.map_or(window * 9 / 10, |limit| limit.min(window * 9 / 10))),
-        None => configured_auto,
-    };
+    // r290 P13: use the same resolution as migration and Native v1.
+    let limits = super::model_context::resolve(row, snapshot);
     let efforts: Vec<Value> = row
         .get("supported_reasoning_levels")
         .and_then(Value::as_array)
@@ -132,6 +123,7 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
         "contextWindow": context_window,
         "maxContextWindow": max_context_window,
         "autoCompactTokenLimit": catalog_auto_compact,
+        "autoCompactPercent": int(row, "auto_compact_percent"), // r290 P13
         "effectiveContextWindowPercent": int(row, "effective_context_window_percent"),
         "inputModalities": row.get("input_modalities").cloned().unwrap_or(json!(["text", "image"])),
         "supportedReasoningEfforts": efforts,
@@ -139,12 +131,17 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
         "isDefault": snapshot.model.as_deref() == Some(id),
         "discovered": discovered.iter().any(|model| model == id),
         "effective": {
-            "contextWindow": resolved_window,
-            "contextWindowSource": if profile_window.is_some() { "profile" } else if resolved_window.is_some() { "catalog" } else { "unknown" },
-            "autoCompactTokenLimit": effective_auto,
-            "autoCompactTokenLimitSource": if profile_auto.is_some() { "profile" } else if catalog_auto_compact.is_some() { "catalog" } else if effective_auto.is_some() { "default90Percent" } else { "unknown" },
+            "contextWindow": limits.window,
+            "contextWindowSource": limits.window_source,
+            "autoCompactPercent": limits.percent,
+            "autoCompactPercentSource": limits.compact_source,
+            "autoCompactTokenLimit": limits.absolute,
+            "autoCompactTokenLimitSource": limits.compact_source,
         },
     });
+    // r290 P13: backend resolves default labels; desktop must not infer them.
+    view["contextSettings"]=row.get("context_settings").map(context_settings_json).unwrap_or_else(||context_settings_json(&json!({"catalog":super::model_context::settings_values(row),"owner":{},"preserved":{}})));
+    view["defaultValues"]=super::model_context::default_values(row,snapshot);
     // Preserve Claude reference provenance and compatibility evidence instead
     // of losing it while adapting native-shaped rows for Desktop.
     for field in ["kind", "family", "source", "description", "accountAvailability", "minCliVersion", "cliCompatibility", "effortSupportKnown"] {
@@ -153,12 +150,24 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
     view
 }
 
+fn context_settings_json(value: &Value) -> Value {
+    let mut result=json!({});
+    for name in ["catalog","owner","preserved"] {
+        result[name]=json!({"contextWindow":value[name]["context_window"],"autoCompactPercent":value[name]["auto_compact_percent"],"autoCompactTokenLimit":value[name]["auto_compact_token_limit"]});
+    }
+    result
+}
+
 pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
     if account.cli_kind == CliKind::Dsh {
         return Ok(super::dsh::models_resource(account));
     }
     if account.cli_kind == CliKind::Kimi {
         return Ok(super::kimi::models_resource(account));
+    }
+    // r290 P13: failed preparation leaves the marker false and legacy values intact.
+    if let Err(error) = overlay::ensure_context_migrated(account) {
+        eprintln!("cutex-model-context: migration of {} deferred: {error:#}", account.id);
     }
     let follows_upstream = overlay::uses_overlay(account);
     if follows_upstream {
@@ -188,7 +197,7 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         // apply the picker's visibility for display only.
         match crate::profiles::native_models::upstream_for_profile(account) {
             Ok(native) => {
-                let resolved = overlay::resolve(&native.rows, edits);
+                let resolved = if state.snapshot.model_context_settings_v1 {overlay::resolve_context(&native.rows, edits)}else{overlay::resolve(&native.rows,edits)};
                 unavailable = resolved.unavailable;
                 let rows = resolved
                     .rows
@@ -218,14 +227,36 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
             Err(reason) => (Vec::new(), None, Some(reason)),
         }
     };
+    let custom=if state.snapshot.model_context_settings_v1 && !follows_upstream {
+        super::model_context::custom_provenance(&json!({"models":rows}),load_edits(account).as_ref())["models"].as_array().cloned().unwrap_or_default()
+    }else{rows};
     let mut models: Vec<Value> =
-        rows.iter().map(|row| model_view(row, &state.snapshot, &discovered_ids)).collect();
+        custom.iter().map(|row| model_view(row, &state.snapshot, &discovered_ids)).collect();
     if account.cli_kind == CliKind::Claude {
+        // r290 P13: read the settings once for the complete table.
+        let defaults = super::claude_compaction::view(account).0;
+        let per_model = super::claude_compaction::models_view(account).0;
         for model in &mut models {
             model["isDefault"] = json!(model["id"].as_str() == selected_model.as_deref());
             model["defaultReasoningEffort"] = claude_default_effort(
                 model, account.options.claude.effort.map(|effort| effort.as_str()));
             claude_effective_limits(model);
+            // r290 P13: per-model compaction records override Profile defaults atomically.
+            let selected = model["id"].as_str().and_then(|id| per_model.as_ref().and_then(|m| m.get(id)));
+            let configured = selected.copied().or(defaults);
+            let reference=model["contextWindow"].clone();
+            model["defaultValues"]=claude_default_values(&reference,defaults,selected.is_some());
+            model["contextSettings"]=json!({"catalog":{"contextWindow":reference,"autoCompactPercent":null,"autoCompactTokenLimit":null},"owner":{"contextWindow":selected.and_then(|c|c.auto_compact_window),"autoCompactPercent":selected.map(|c|c.auto_compact_percent),"autoCompactTokenLimit":null},"preserved":{}});
+            let source = if selected.is_some() { "model" } else if defaults.is_some() { "profile" } else { "runtimeDefault" };
+            model["autoCompactPercent"] = json!(selected.map(|c| c.auto_compact_percent));
+            model["effective"]["autoCompactPercent"] = json!(configured.map(|c| c.auto_compact_percent));
+            model["effective"]["autoCompactPercentSource"] = json!(source);
+            model["effective"]["autoCompactTokenLimitSource"] = json!(if configured.is_some() { "unknown" } else { "runtimeDefault" });
+            model["effective"]["contextWindowIsReference"] = json!(true);
+            if let Some(window) = configured.and_then(|c| c.auto_compact_window) {
+                model["effective"]["contextWindow"] = json!(window);
+                model["effective"]["contextWindowSource"] = json!(source);
+            }
         }
     }
     // profile-model-display-names: this profile's own name for each entry
@@ -239,6 +270,15 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         model["entryDisplayName"] = json!(name);
     }
     let variants_supported = crate::profiles::model_variants::for_profile(account);
+    // r290 P13: resolve the selected runtime once for this response.
+    let context_support = super::model_context::support(account);
+    let context_supported = context_support["supported"].as_bool().unwrap_or(false);
+    let selected_defaults=models.iter().find(|row|row["id"].as_str()==selected_model.as_deref()).map(|row|row["defaultValues"]["profile"].clone()).or_else(||{
+        if account.cli_kind!=CliKind::Codex || selected_model.is_none(){return None;}
+        let mut profile=state.snapshot.clone();profile.model_auto_compact_percent=None;profile.model_auto_compact_token_limit=None;
+        let mut values=super::model_context::limits_json(&super::model_context::resolve_uncatalogued(&profile));
+        values["contextWindow"]=Value::Null;values["contextWindowSource"]=json!("unknown");Some(values)
+    });
     Ok(json!({
         // profile-catalog-overlay: official lists follow upstream; edits are
         // an overlay, entries whose (base) model left upstream are listed in
@@ -253,6 +293,9 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         "profile": { "id": account.id, "name": account.name },
         "catalogSupported": discovery_supported(account) || variants_supported,
         "modelVariantsSupported": variants_supported,
+        "modelContextSettingsSupport": context_support,
+        "modelContextSettingsV1Supported": context_supported, // r290 P13
+        "modelContextSettingsV1": state.snapshot.model_context_settings_v1,
         "discoverySupported": discovery_supported(account),
         "catalogPath": state.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "catalogPresent": state.catalog.is_some(),
@@ -264,6 +307,8 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         "autoCompactApplies": account.cli_kind != CliKind::Claude,
         "profileOverrides": {
             "modelContextWindow": state.snapshot.model_context_window,
+            "modelAutoCompactPercent": state.snapshot.model_auto_compact_percent,
+            "modelContextSettingsV1": state.snapshot.model_context_settings_v1,
             "modelAutoCompactTokenLimit": state.snapshot.model_auto_compact_token_limit,
         },
         "discovery": discovered.as_ref().map(|d| json!({
@@ -271,10 +316,33 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
             "fetchedAt": d.fetched_at,
             "models": d.models,
         })),
+        "profileDefaultValues": {
+            "selectedModel":selected_model,
+            "selected":selected_defaults,
+            "byModel":models.iter().filter_map(|row|row["id"].as_str().map(|id|(id.to_owned(),row["defaultValues"]["profile"].clone()))).collect::<Map<_,_>>(),
+        },
         "models": models,
         "unsupportedModelFields": UNSUPPORTED_MODEL_FIELDS,
-        "precedence": "profile modelContextWindow replaces catalog contextWindow (clamped to maxContextWindow); profile modelAutoCompactTokenLimit replaces catalog autoCompactTokenLimit; effective auto-compact = min(limit, 90% of resolved context window)",
+        "precedence": if state.snapshot.model_context_settings_v1 {
+            "preserved > owner model > profile > catalog/default; percentages use the resolved context window; auto-compaction capped at 90%"
+        } else { "legacy profile > catalog; auto-compaction capped at 90%" },
     }))
+}
+
+// r290 P13: clearing only a model window retains its percent-only atomic record.
+fn claude_default_values(reference: &Value, defaults: Option<super::claude_compaction::ClaudeCompaction>, has_model_record: bool) -> Value {
+    let source=if reference.is_null(){"unknown"}else{"reference"};
+    let profile=json!({"contextWindow":reference,"contextWindowSource":source,"autoCompactPercent":null,"autoCompactPercentSource":"runtimeDefault","autoCompactTokenLimit":null,"autoCompactTokenLimitSource":"runtimeDefault"});
+    let mut model=profile.clone();
+    if let Some(defaults)=defaults {
+        model["autoCompactPercent"]=json!(defaults.auto_compact_percent);
+        model["autoCompactPercentSource"]=json!("profile");
+        model["autoCompactTokenLimitSource"]=json!("unknown");
+        if !has_model_record {
+            if let Some(window)=defaults.auto_compact_window {model["contextWindow"]=json!(window);model["contextWindowSource"]=json!("profile");}
+        }
+    }
+    json!({"model":model,"profile":profile})
 }
 
 /// Claude rows: the context window is the adapter's reference value (the
@@ -330,6 +398,11 @@ pub(crate) fn validate_catalog(catalog: &Value) -> anyhow::Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for row in rows {
         let slug = row.get("slug").and_then(Value::as_str).context("catalog row without slug")?;
+        // r290 P13
+        if let Some(percent) = row.get("auto_compact_percent").filter(|v| !v.is_null()) {
+            ensure!(percent.as_u64().is_some_and(|v| (1..=100).contains(&v)), "catalog auto_compact_percent must be 1..100");
+            ensure!(row.get("auto_compact_token_limit").is_none_or(Value::is_null), "catalog compaction modes are mutually exclusive");
+        }
         ensure!(seen.insert(slug), "duplicate catalog model {slug}");
         for key in ["display_name", "supported_reasoning_levels", "shell_type", "visibility", "truncation_policy"] {
             ensure!(row.get(key).is_some(), "catalog model {slug} lacks {key}");
@@ -362,7 +435,7 @@ pub fn load_edits(account: &StoredAccount) -> Option<model_discovery::ModelEdits
     serde_json::from_slice(&std::fs::read(edits_path(account).ok()?).ok()?).ok()
 }
 
-fn save_edits(account: &StoredAccount, edits: &model_discovery::ModelEdits) -> anyhow::Result<()> {
+pub(crate) fn save_edits(account: &StoredAccount, edits: &model_discovery::ModelEdits) -> anyhow::Result<()> {
     write_private_pretty_json_atomic(&edits_path(account)?, edits, "model edits")
 }
 
@@ -443,10 +516,16 @@ pub(super) fn template_row(id: &str) -> Value {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ModelPatch {
+    // r290 P13: internal validation context, never accepted from the wire.
+    #[doc(hidden)]
+    pub validation_profile: Option<CodexProfileConfigSnapshot>,
+    pub restore_preserved_context_window: bool,
+    pub restore_preserved_auto_compaction: bool,
     pub request_model: ConfigValueUpdate<String>,
     pub display_name: ConfigValueUpdate<String>,
     pub context_window: ConfigValueUpdate<u64>,
     pub max_context_window: ConfigValueUpdate<u64>,
+    pub auto_compact_percent: ConfigValueUpdate<u64>, // r290 P13
     pub auto_compact_token_limit: ConfigValueUpdate<u64>,
     pub effective_context_window_percent: ConfigValueUpdate<u64>,
     pub input_modalities: ConfigValueUpdate<Vec<String>>,
@@ -472,6 +551,8 @@ fn set_or_clear<T: serde::Serialize>(row: &mut Map<String, Value>, key: &str, up
 
 /// Apply a per-model patch to a catalog row (pure; validated).
 pub fn apply_model_patch(row: &mut Value, patch: &ModelPatch) -> anyhow::Result<()> {
+    let context=patch.validation_profile.as_ref().filter(|profile|profile.model_context_settings_v1);
+    let before=context.map(|_|row.clone());
     let object = row.as_object_mut().context("catalog row must be an object")?;
     set_or_clear(object, "display_name", &patch.display_name, Value::Null);
     if matches!(patch.display_name, ConfigValueUpdate::Clear) {
@@ -480,6 +561,16 @@ pub fn apply_model_patch(row: &mut Value, patch: &ModelPatch) -> anyhow::Result<
     }
     set_or_clear(object, "context_window", &patch.context_window, Value::Null);
     set_or_clear(object, "max_context_window", &patch.max_context_window, Value::Null);
+    // r290 P13
+    ensure!(!(matches!(patch.auto_compact_percent, ConfigValueUpdate::Set(_))
+        && matches!(patch.auto_compact_token_limit, ConfigValueUpdate::Set(_))),
+        "autoCompactPercent and autoCompactTokenLimit are mutually exclusive");
+    if let ConfigValueUpdate::Set(percent) = patch.auto_compact_percent {
+        ensure!((1..=100).contains(&percent), "autoCompactPercent must be 1..100");
+        object.remove("auto_compact_token_limit");
+    }
+    if matches!(patch.auto_compact_token_limit, ConfigValueUpdate::Set(_)) { object.remove("auto_compact_percent"); }
+    set_or_clear(object, "auto_compact_percent", &patch.auto_compact_percent, Value::Null);
     set_or_clear(object, "auto_compact_token_limit", &patch.auto_compact_token_limit, Value::Null);
     set_or_clear(object, "effective_context_window_percent", &patch.effective_context_window_percent, Value::Null);
     set_or_clear(object, "input_modalities", &patch.input_modalities, Value::Null);
@@ -515,8 +606,17 @@ pub fn apply_model_patch(row: &mut Value, patch: &ModelPatch) -> anyhow::Result<
     if let (Some(window), Some(max)) = (window, max_window) {
         ensure!(window <= max, "contextWindow ({window}) cannot exceed maxContextWindow ({max})");
     }
-    if let (Some(auto), Some(window)) = (auto, window.or(max_window)) {
-        ensure!(auto < window, "autoCompactTokenLimit ({auto}) must be smaller than the context window ({window})");
+    // r290 P13: explicit absolute writes validate against the inherited window.
+    // Untouched catalog/legacy absolute values retain Native's normal 90% cap.
+    let validation_window=if let Some(profile)=context {
+        let mut candidate=Value::Object(object.clone());
+        super::model_context::edit_settings(&mut candidate,before.as_ref(),&pinned_keys(patch));
+        super::model_context::resolve(&candidate,profile).window
+    }else{window.or(max_window)};
+    if context.is_none() || matches!(patch.auto_compact_token_limit,ConfigValueUpdate::Set(_)) {
+        if let (Some(auto),Some(window))=(auto,validation_window) {
+            ensure!(auto<window,"autoCompactTokenLimit ({auto}) must be smaller than the context window ({window})");
+        }
     }
     let efforts: Vec<&str> = object
         .get("supported_reasoning_levels")
@@ -550,14 +650,17 @@ pub fn validate_model_id(id: &str) -> anyhow::Result<()> {
 
 /// The `ModelInfo` keys a patch sets or clears explicitly (an official
 /// overlay stores a changed one even while it equals upstream).
-fn pinned_keys(patch: &ModelPatch) -> Vec<&'static str> {
+pub(crate) fn pinned_keys(patch: &ModelPatch) -> Vec<&'static str> {
     let touched = |unchanged: bool, key: &'static str| (!unchanged).then_some(key);
     use ConfigValueUpdate::Unchanged;
     [
         touched(matches!(patch.display_name, Unchanged), "display_name"),
         touched(matches!(patch.context_window, Unchanged), "context_window"),
         touched(matches!(patch.max_context_window, Unchanged), "max_context_window"),
-        touched(matches!(patch.auto_compact_token_limit, Unchanged), "auto_compact_token_limit"),
+        touched(matches!(patch.auto_compact_percent, Unchanged)
+            && !matches!(patch.auto_compact_token_limit, ConfigValueUpdate::Set(_)), "auto_compact_percent"),
+        touched(matches!(patch.auto_compact_token_limit, Unchanged)
+            && !matches!(patch.auto_compact_percent, ConfigValueUpdate::Set(_)), "auto_compact_token_limit"),
         touched(matches!(patch.effective_context_window_percent, Unchanged), "effective_context_window_percent"),
         touched(matches!(patch.input_modalities, Unchanged), "input_modalities"),
         touched(matches!(patch.supported_reasoning_efforts, Unchanged), "supported_reasoning_levels"),
@@ -568,11 +671,46 @@ fn pinned_keys(patch: &ModelPatch) -> Vec<&'static str> {
     .collect()
 }
 
+pub(crate) fn clear_preserved(row: &mut Value, window: bool, auto: bool) {
+    if let Some(values)=row.get_mut("context_settings").and_then(|v|v.get_mut("preserved")).and_then(Value::as_object_mut) {
+        if window {values.remove("context_window");}
+        if auto {values.remove("auto_compact_percent");values.remove("auto_compact_token_limit");}
+    }
+}
+
 /// Create-or-update one model row. Returns whether the row was created.
 pub fn update_model(account: &StoredAccount, id: &str, patch: &ModelPatch) -> anyhow::Result<bool> {
     ensure!(catalog_supported(account), "this profile does not use a custom model catalog");
     validate_model_id(id)?;
+    // r290 P13: restore exposes the original owner setting, never deletes it.
+    ensure!(!patch.restore_preserved_context_window || matches!(patch.context_window,ConfigValueUpdate::Unchanged),"cannot restore and edit contextWindow together");
+    ensure!(!patch.restore_preserved_auto_compaction || (matches!(patch.auto_compact_percent,ConfigValueUpdate::Unchanged)&&matches!(patch.auto_compact_token_limit,ConfigValueUpdate::Unchanged)),"cannot restore and edit compaction together");
+    if patch.restore_preserved_context_window || patch.restore_preserved_auto_compaction {
+        ensure!(pinned_keys(patch).is_empty(),"restore must be a separate model settings action");
+        overlay::ensure_context_migrated(account)?;
+        if overlay::uses_overlay(account) {overlay::restore_preserved(account,id,patch.restore_preserved_context_window,patch.restore_preserved_auto_compaction)?;}
+        else {
+            let state=load(account)?;let mut catalog=state.catalog.context("model catalog unavailable")?;
+            let row=rows_mut(&mut catalog)?.iter_mut().find(|row|row["slug"]==id).context("model missing")?;
+            clear_preserved(row,patch.restore_preserved_context_window,patch.restore_preserved_auto_compaction);
+            select_catalog(account,&catalog)?;
+        }
+        return Ok(false);
+    }
+    // r290 P13: first custom catalog creation is an explicit edit, not an automatic migration.
+    if let Some(created) = overlay::bootstrap_context_catalog(account, id, patch)? { return Ok(created); }
+    // r290 P13
+    if !matches!(patch.auto_compact_percent, ConfigValueUpdate::Unchanged) {
+        ensure!(super::model_variants::context_supported(account), "selected native runtime does not support modelContextSettingsV2");
+        overlay::ensure_context_migrated(account)?;
+        ensure!(settings_api::codex_snapshot(account).model_context_settings_v1, "model context migration is incomplete");
+    } else if super::model_variants::context_supported(account) {
+        overlay::ensure_context_migrated(account)?;
+    }
     let state = load(account)?;
+    let mut contextual_patch=patch.clone();
+    if state.snapshot.model_context_settings_v1 {contextual_patch.validation_profile=Some(state.snapshot.clone());}
+    let patch=&contextual_patch;
     if matches!(patch.request_model, ConfigValueUpdate::Set(_)) {
         ensure!(crate::profiles::model_variants::for_profile(account), "the selected native runtime does not support model variants");
     }
@@ -602,9 +740,17 @@ pub fn update_model(account: &StoredAccount, id: &str, patch: &ModelPatch) -> an
         });
     }
     let mut catalog = crate::profiles::model_variants::catalog_for_edit(account, &state)?;
+    if state.snapshot.model_context_settings_v1 {catalog=super::model_context::custom_provenance(&catalog,load_edits(account).as_ref());}
     let before = catalog.clone();
     let rows = rows_mut(&mut catalog)?;
     let created = crate::profiles::model_variants::patch_row(rows, id, patch, !discovery_supported(account))?;
+    if state.snapshot.model_context_settings_v1 {
+        let old=before["models"].as_array().and_then(|rows|rows.iter().find(|row|row["slug"]==id).or_else(||{
+            if let ConfigValueUpdate::Set(target)=&patch.request_model {rows.iter().find(|row|row["slug"].as_str()==Some(target))}else{None}
+        }));
+        let row=catalog["models"].as_array_mut().and_then(|rows|rows.iter_mut().find(|row|row["slug"]==id)).context("model missing after edit")?;
+        super::model_context::edit_settings(row,old,&pinned_keys(patch));
+    }
     if catalog != before {
         select_catalog(account, &catalog)?;
         // A rediscovery never overwrites what the owner set (docs/design/028).
@@ -695,6 +841,34 @@ mod tests {
     }
 
     use super::*;
+
+    // r290 P13: Root100k/75%, model percent-only50%, catalog200k.
+    #[test]
+    fn context_claude_model_window_default_clears_only_its_window_field() {
+        use crate::profiles::claude_compaction::ClaudeCompaction;
+        let root=Some(ClaudeCompaction{auto_compact_window:Some(100000),auto_compact_percent:75});
+        let defaults=claude_default_values(&json!(200000),root,true);
+        assert_eq!(defaults["model"]["contextWindow"],200000);
+        assert_eq!(defaults["model"]["contextWindowSource"],"reference");
+        assert_eq!(defaults["model"]["autoCompactPercent"],75);
+        assert_eq!(defaults["model"]["autoCompactTokenLimit"],Value::Null);
+        assert_eq!(defaults["profile"]["contextWindow"],200000);
+        assert_eq!(claude_default_values(&json!(200000),root,false)["model"]["contextWindow"],100000);
+    }
+
+    // r290 P13
+    #[test]
+    fn context_model_percent_modes_clear_each_other() {
+        let mut row=template_row("custom"); row["context_window"]=json!(200000);
+        row["auto_compact_token_limit"]=json!(150000);
+        apply_model_patch(&mut row,&ModelPatch {auto_compact_percent:ConfigValueUpdate::Set(75),..Default::default()}).unwrap();
+        assert_eq!(row["auto_compact_percent"],75);
+        assert!(row.get("auto_compact_token_limit").is_none());
+        apply_model_patch(&mut row,&ModelPatch {auto_compact_token_limit:ConfigValueUpdate::Set(100000),..Default::default()}).unwrap();
+        assert!(row.get("auto_compact_percent").is_none());
+        assert_eq!(row["auto_compact_token_limit"],100000);
+        assert!(apply_model_patch(&mut row,&ModelPatch {auto_compact_percent:ConfigValueUpdate::Set(0),..Default::default()}).is_err());
+    }
 
     #[test]
     fn model_patch_maps_to_model_info_keys_and_validates() {

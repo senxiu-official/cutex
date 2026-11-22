@@ -52,6 +52,14 @@ pub fn latest_plan(home: &Path, thread_id: &str) -> anyhow::Result<Option<Value>
     latest_plan_in_rollout(home, &current, thread_id)
 }
 
+// r290 P6: independent cache/budget cannot poison the normal conversation plan cache.
+pub const BOARD_SCAN_BUDGET_BYTES:u64=128*1024;
+pub fn latest_plan_for_board(home:&Path,thread_id:&str)->anyhow::Result<Option<Value>> {
+    let Some(current)=super::native_history::current_indexed(home,thread_id)? else {return Ok(None);};
+    static BOARD_CACHE:rollout_scan::Cache<Option<Value>>=OnceLock::new();
+    rollout_scan::latest_current(&BOARD_CACHE,home,&current,thread_id,BOARD_SCAN_BUDGET_BYTES,|scanner:Scanner|scanner.finish(thread_id))
+}
+
 /// As [`latest_plan`] for an already resolved current rollout. Results are
 /// cached per rollout; after an append only the new lines are scanned
 /// (`rollout_scan`).
@@ -302,6 +310,28 @@ mod tests {
     fn scan(home: &Path, path: &Path) -> Option<Value> {
         let length = std::fs::metadata(path).unwrap().len();
         scan_chain(home, path, length, THREAD, SCAN_BUDGET_BYTES).unwrap()
+    }
+
+    #[test]
+    fn board_plan_budget_and_index_lookup_do_not_poison_conversation_cache() {
+        let home=home();let path=home.0.join("sessions/2026/board.jsonl");
+        let mut lines=vec![meta(Value::Null)];lines.extend(turn("board-turn","2026-11-17T00:00:00Z"));
+        lines.push(call("board-plan","2026-11-17T00:00:01Z",plan(None,&[("work","in_progress")])));
+        lines.push(output("board-plan","2026-11-17T00:00:02Z",PLAN_UPDATED_OUTPUT));write(&path,&lines);
+        // A missing native index never triggers a rollout-directory walk.
+        assert!(latest_plan_for_board(&home.0,THREAD).unwrap().is_none());
+        let db=rusqlite::Connection::open(home.0.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL)").unwrap();
+        db.execute("INSERT INTO threads VALUES(?1,?2)",rusqlite::params![THREAD,path.to_string_lossy()]).unwrap();drop(db);
+        assert_eq!(latest_plan_for_board(&home.0,THREAD).unwrap().unwrap()["turnId"],"board-turn");
+        lines.push(json!({"type":"response_item","payload":{"type":"message","text":"x".repeat(BOARD_SCAN_BUDGET_BYTES as usize*2)}}));write(&path,&lines);
+        assert!(latest_plan_for_board(&home.0,THREAD).ok().flatten().is_none());
+        assert_eq!(latest_plan_in_rollout(&home.0,&path,THREAD).unwrap().unwrap()["turnId"],"board-turn");
+        // A missing inherited prefix must never trigger a directory walk.
+        write(&path,&[meta(json!({"thread_id":"00000000-0000-4000-8000-000000000001","end_byte_offset":100}))]);
+        assert!(latest_plan_for_board(&home.0,THREAD).unwrap().is_none());
+        write(&path,&[json!({"type":"session_meta","payload":{"id":THREAD,"large":"x".repeat(64*1024)}})]);
+        assert!(latest_plan_for_board(&home.0,THREAD).is_err());
     }
 
     #[test]

@@ -458,7 +458,7 @@ pub fn waiting_reason(queued_reason: Option<&str>, queue_paused: bool) -> &'stat
 /// An unknown native outcome (`outcome_unknown`) is `uncertain{outcomeUnknown}`.
 pub fn error_step(error: &UserInputExecutionError) -> Option<Step> {
     match error.code.as_str() {
-        "idempotency_conflict" | "user_input_in_progress" | "invalid_request" => return None,
+        "idempotency_conflict" | "user_input_in_progress" | "invalid_request" | "owner_batch_not_submitted" => return None,
         _ => {}
     }
     if error.stage == "interrupt" || error.code == "interrupt_timeout" {
@@ -940,7 +940,7 @@ pub fn queue_removed(session: &str, client_user_message_id: &str) -> Option<Inpu
 /// transaction, one `stateRevision` for every changed record, so a client
 /// never sees an intermediate. Returns every affected record, survivor first
 /// (those the ledger knows).
-pub fn queue_merged(session: &str, survivor: &str, merged_away: &[String]) -> Vec<InputRecord> {
+pub fn queue_merged(session: &str, survivor: &str, merged_away: &[String], input: &[Value]) -> Vec<InputRecord> {
     if !ledger::enabled() {
         return Vec::new();
     }
@@ -948,7 +948,7 @@ pub fn queue_merged(session: &str, survivor: &str, merged_away: &[String]) -> Ve
     ids.extend(merged_away.iter().cloned());
     let read = || ledger::default_ledger().ok().and_then(|ledger| ledger.get(session, &ids).ok()).map(|result| result.records);
     let Some(before) = read() else { return Vec::new() };
-    let batch = merge_batch(&before, survivor, merged_away);
+    let batch = merge_batch(&before, survivor, merged_away, input);
     if batch.is_empty() {
         return before;
     }
@@ -961,16 +961,16 @@ pub fn queue_merged(session: &str, survivor: &str, merged_away: &[String]) -> Ve
 /// The transitions of one merge over the records the ledger has (pure):
 /// the survivor first, then each merged-away record still open. Records the
 /// ledger does not know (from before the switch) are left out.
-pub fn merge_batch(records: &[InputRecord], survivor: &str, merged_away: &[String]) -> Vec<(String, Expect, Next)> {
+pub fn merge_batch(records: &[InputRecord], survivor: &str, merged_away: &[String], input: &[Value]) -> Vec<(String, Expect, Next)> {
     let mut batch = Vec::new();
     let find = |id: &str| records.iter().find(|record| record.input_id == id);
     let absorbed: Vec<&String> = merged_away.iter().filter(|id| find(id).is_some_and(|record| record.state == InputState::Waiting)).collect();
-    if let Some(record) = find(survivor).filter(|record| record.state == InputState::Waiting && !absorbed.is_empty()) {
+    if let Some(record) = find(survivor).filter(|record| record.state == InputState::Waiting) {
         let mut merged: Vec<Value> = record.details.get("mergedFrom").and_then(Value::as_array).cloned().unwrap_or_default();
         merged.extend(absorbed.iter().map(|id| json!(id)));
         let mut details = if record.details.is_object() { record.details.clone() } else { json!({}) };
         details["mergedFrom"] = Value::Array(merged);
-        let mut next = Next::to(record.state).details(details);
+        let mut next = Next::to(record.state).details(details).preview(preview_text(input));
         if let Some(reason) = &record.reason {
             next = next.reason(reason);
         }

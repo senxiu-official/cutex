@@ -119,6 +119,8 @@ const MODEL_FIELDS: &[&str] = &[
     "displayName",
     "contextWindow",
     "maxContextWindow",
+    "restorePreservedContextWindow", "restorePreservedAutoCompaction",
+    "autoCompactPercent", // r290 P13
     "autoCompactTokenLimit",
     "effectiveContextWindowPercent",
     "inputModalities",
@@ -141,8 +143,19 @@ pub(super) fn parse_model_patch(body: &[u8]) -> Result<ModelPatch, String> {
             return Err(format!("unsupported field: {key}"));
         }
     }
+    // r290 P13
+    if body.get("autoCompactPercent").is_some_and(|v| !v.is_null())
+        && body.get("autoCompactTokenLimit").is_some_and(|v| !v.is_null()) {
+        return Err("percentage and absolute token limit are mutually exclusive".into());
+    }
+    for key in ["restorePreservedContextWindow","restorePreservedAutoCompaction"] {
+        if body.get(key).is_some_and(|v|!v.is_boolean()){return Err(format!("{key} must be a boolean"));}
+    }
     let tokens = 100_000_000;
     Ok(ModelPatch {
+        validation_profile:None,
+        restore_preserved_context_window:body.get("restorePreservedContextWindow").and_then(Value::as_bool).unwrap_or(false),
+        restore_preserved_auto_compaction:body.get("restorePreservedAutoCompaction").and_then(Value::as_bool).unwrap_or(false),
         request_model: tri_state(body, "requestModel", |v| {
             let id = visible_string(catalog_api::MAX_MODEL_ID_CHARS)(v)?;
             catalog_api::validate_model_id(&id).map_err(|e| e.to_string())?;
@@ -151,6 +164,7 @@ pub(super) fn parse_model_patch(body: &[u8]) -> Result<ModelPatch, String> {
         display_name: tri_state(body, "displayName", visible_string(200))?,
         context_window: tri_state(body, "contextWindow", count(tokens))?,
         max_context_window: tri_state(body, "maxContextWindow", count(tokens))?,
+        auto_compact_percent: tri_state(body, "autoCompactPercent", count(100))?,
         auto_compact_token_limit: tri_state(body, "autoCompactTokenLimit", count(tokens))?,
         effective_context_window_percent: tri_state(body, "effectiveContextWindowPercent", count(100))?,
         input_modalities: tri_state(body, "inputModalities", |v| {

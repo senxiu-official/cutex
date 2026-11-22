@@ -271,10 +271,17 @@ pub fn attempt_summary(attempt: &AttemptRecord) -> Value {
         "activity": attempt.activity,
         "interruptReason": attempt.interrupt_reason,
         "lastError": attempt.last_error,
+        // r290 P7
+        "handlerFailure": matches!(attempt.state, AttemptState::Failed | AttemptState::Interrupted).then_some(attempt.handler_failure.as_ref()).flatten(),
         "progress": attempt.progress,
+        // r290 P6
+        "steps": attempt.progress.iter().rev().find_map(|note|note.steps.as_ref()),
+        "lastProgressAt": attempt.progress.last().map(|note|&note.at),
         "continuation": attempt.continuation,
         "stageNote": attempt.stage_note,
         "stopRequested": attempt.stop_requested,
+        "stopDeadline": attempt.stop_deadline,
+        "stopUnconfirmed": attempt.stop_unconfirmed,
     })
 }
 
@@ -403,10 +410,46 @@ fn insert_review_refs(value: &mut Value, state: &AskState, ask: &AskRecord) {
             .unwrap_or("Project delegation routing review was denied")))
         .unwrap_or(Value::Null);
 }
+// r290 P14: one privacy-safe wait projection for owner, phone and agent lists.
+// No child IDs, declaration text, proofs or action receipts belong in a list.
+pub fn continuation_wait(ask: &AskRecord) -> Value {
+    use super::continuation::{Phase, WakeCondition};
+    if !ask.is_open() || ask.follow_up_ended
+        || !ask.current_attempt().is_some_and(|a| a.state == AttemptState::Yielded)
+    {
+        return Value::Null;
+    }
+    if let Some(record) = ask.bounded_continuation.current.as_ref().filter(|r|
+        matches!(r.state, Phase::Waiting | Phase::Ready | Phase::Resuming | Phase::Limited)) {
+        let state = match record.state {
+            Phase::Waiting => "waiting",
+            Phase::Ready | Phase::Resuming => "ready",
+            Phase::Limited => "limited",
+            _ => return Value::Null,
+        };
+        let kind = match record.declaration.wake {
+            Some(WakeCondition::Children { .. }) => "children",
+            _ => "after",
+        };
+        return json!({"state":state,"kind":kind,"since":record.declaration.yielded_at,
+            "nextWakeAt":if kind=="after" && state!="limited" {json!(record.next_wake_at)} else {Value::Null}});
+    }
+    if let Some(wait) = &ask.awaiting {
+        return json!({"state":if ask.resume.is_some(){"ready"}else{"waiting"},
+            "kind":"jobs","since":wait.since,"nextWakeAt":Value::Null});
+    }
+    if ask.resume.is_some() {
+        return json!({"state":"ready","kind":"jobs","since":ask.current_attempt().and_then(|a|a.ended_at.clone()),
+            "nextWakeAt":Value::Null});
+    }
+    Value::Null
+}
+
 pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
     let mut value = serde_json::to_value(ask).unwrap_or(Value::Null);
     if let Some(object) = value.as_object_mut() {
         object.insert("queuePosition".into(), json!(queue_position(state, ask)));
+        object.insert("continuationWait".into(), continuation_wait(ask)); // r290 P14
         object.insert("requester".into(), ask_requester(ask));
         object.remove("peerInbound");
         object.insert("lateAnswer".into(), json!(ask.remote.as_ref().and_then(|r|r.late_answer.as_ref())));
@@ -442,6 +485,7 @@ pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
 /// Compact list row (`GET /v2/asks`, `agent_list`).
 pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
     let mut value = json!({
+        "continuationWait": continuation_wait(ask), // r290 P14
         "askId": ask.ask_id,
         "hops": ask.hops,
         "lateAnswer": ask.remote.as_ref().and_then(|r|r.late_answer.as_ref()),
@@ -457,6 +501,7 @@ pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
         "holdSince": ask.hold_since,
         "review": ask.review,
         "closed": ask.closed,
+        "followUpEnded": ask.follow_up_ended,
         "queuePosition": queue_position(state, ask),
         "attempts": ask.attempts.len(),
         "answerId": ask.answer_id,
@@ -498,6 +543,7 @@ pub fn requester_view(state: &AskState, ask: &AskRecord) -> Value {
 pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, control: Option<Value>) -> Value {
     let attempt = ask.current_attempt();
     let mut value = json!({
+        "continuationWait": continuation_wait(ask), // r290 P14
         "ask_id": ask.ask_id,
         "action_id": ask.action_id,
         "target": ask.target_name.clone().unwrap_or_else(|| ask.target_cutex_session_id.clone()),
@@ -510,10 +556,13 @@ pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, con
         "review": ask.review,
         "attempt": attempt.map(|attempt| attempt.n),
         "activity": attempt.map(|attempt| &attempt.activity),
+        // r290 P7
+        "handlerFailure": attempt.filter(|r|matches!(r.state, AttemptState::Failed | AttemptState::Interrupted)).and_then(|attempt| attempt.handler_failure.as_ref()),
         "interrupt_reason": attempt.and_then(|attempt| attempt.interrupt_reason).or_else(||ask.remote.as_ref().and_then(|r|r.sync.interrupt_reason)),
         "remote": peer_remote(ask),
         "target_reverted": ask.target_reverted,
         "closed": ask.closed,
+        "followUpEnded": ask.follow_up_ended,
         "approval_id": ask.gate.as_ref().and_then(|gate| gate.approval_id.clone()),
         "waiting": ask.awaiting.as_ref().filter(|_| ask.is_waiting()).map(|wait| json!({
             "jobs": wait.jobs, "since": wait.since, "timeout_at": wait.timeout_at, "note": wait.note,

@@ -60,3 +60,6 @@ pub mod kimi;
 pub mod kimi_accounts;
 pub mod kimi_launch;
 pub mod interface_urls;
+
+// r290 P13
+pub mod model_context;

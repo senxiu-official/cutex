@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from cute_claude.queue_recovery import read
 from cute_claude.config import Settings
 from cute_claude.subscription import OfficialSdkDriver
 from cute_claude.subscription_auth import ApiAccount, CONFLICTING_ENV
@@ -28,7 +29,7 @@ from test_subscription import SubHarness
     (500, 'api_error', 'internalServerError', 4),
     (529, 'overloaded_error', 'serverOverloaded', 4),
 ])
-async def test_native_http_retry_count_and_terminal_error(tmp_path, monkeypatch, status, kind, info, attempts):
+async def test_native_http_retry_count_and_transport_outage_keeps_retrying(tmp_path, monkeypatch, status, kind, info, attempts):
     calls = []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -66,23 +67,63 @@ async def test_native_http_retry_count_and_terminal_error(tmp_path, monkeypatch,
     workspace.mkdir()
     driver = OfficialSdkDriver(Path(os.environ['CUTEX_TEST_CLAUDE_CLI']), private_home / 'claude', api_account=account)
     h = SubHarness(Settings(workspace, tmp_path / 'state', model='sonnet', mock=False, backend='subscription'), driver)
+    backoff_observed = asyncio.Event()
+
+    async def fixture_backoff(event, delay):
+        # Advance the first two adapter backoffs without production wall time;
+        # freeze the third so the retained queue can be inspected and cancelled.
+        if len(calls) >= attempts * 3:
+            backoff_observed.set()
+            await event.wait()
+        else:
+            await asyncio.sleep(0)
+
+    if status >= 500:
+        monkeypatch.setattr('cute_claude.queue_recovery.wait_backoff', fixture_backoff)
+        monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 60)
     try:
         await h.init()
         tid = await h.thread()
         turn = await h.turn(tid, 'Reply briefly to this local fixture.')
+        original = dict(h.store.db.execute("SELECT * FROM inputs WHERE turn_id=?", (turn,)).fetchone())
         async with asyncio.timeout(120):
-            while h.engine.workers:
-                await asyncio.gather(*list(h.engine.workers.values()))
+            if status >= 500:
+                while not backoff_observed.is_set():
+                    assert h.engine.workers, f'outage stopped retrying: {h.store.turn(turn)}'
+                    assert not h.store.thread(tid)['halted'], h.store.turn(turn)
+                    await asyncio.sleep(0.01)
+            else:
+                while h.engine.workers:
+                    await asyncio.gather(*list(h.engine.workers.values()))
         result = h.store.turn(turn)
+        diagnostic = result.get('claudeRetry', {}).get('error') or result['error']
+        if status >= 500:
+            assert result['error'] is None and result['claudeRetry']['willRetry']
         evidence = {'httpStatus': status, 'attempts': len(calls), 'paths': calls,
-                    'turnStatus': result['status'], 'error': result.get('error')}
+                    'turnStatus': result['status'], 'error': diagnostic}
         print(json.dumps(evidence))
-        assert result['status'] == 'failed', evidence
-        assert result['error']['codexErrorInfo'] == info, evidence
-        assert len(calls) == attempts, evidence
-        assert 'Official Claude' not in result['error']['message']
-        assert 'private fixture body' not in result['error']['message']
+        assert result['status'] == ('inProgress' if status >= 500 else 'failed'), evidence
+        if status >= 500:
+            assert h.store.db.execute("SELECT state FROM inputs WHERE turn_id=?", (turn,)).fetchone()[0] == 'queued'
+        assert diagnostic['codexErrorInfo'] == info, evidence
+        assert len(calls) == attempts * (3 if status >= 500 else 1), evidence
+        assert 'Official Claude' not in diagnostic['message']
+        assert 'private fixture body' not in diagnostic['message']
         assert 'synthetic-fixture-key' not in json.dumps(evidence)
+        if status >= 500:
+            retained = dict(h.store.db.execute("SELECT * FROM inputs WHERE turn_id=?", (turn,)).fetchone())
+            assert {k: v for k, v in retained.items() if k != 'state'} == {k: v for k, v in original.items() if k != 'state'}
+            assert h.store.db.execute("SELECT COUNT(*) FROM inputs WHERE turn_id=?", (turn,)).fetchone()[0] == 1
+            assert not h.store.thread(tid)['halted']
+            assert read(h.store, tid)['probeCount'] >= 3 and not read(h.store, tid)['held']
+            assert any(e.get('method') == 'error' and e['params'].get('willRetry') for e in h.out)
+            assert not any(e.get('method') == 'claude/queue/holdChanged' and e['params']['held'] for e in h.out)
+            assert not any(e.get('method') == 'turn/completed' for e in h.out)
+            async with asyncio.timeout(5):
+                await h.call('turn/interrupt', {'threadId': tid, 'turnId': turn})
+                await h.drain()
+            assert h.store.turn(turn)['status'] == 'interrupted'
+            assert len(calls) == attempts * 3, 'interrupt during backoff must not start another native query'
     finally:
         await h.close()
         server.shutdown()

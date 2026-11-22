@@ -22,8 +22,9 @@ from test_subscription import SubHarness
 pytestmark = pytest.mark.skipif(os.environ.get('CUTEX_BUSY_DELIVERY_NATIVE_SMOKE') != '1', reason='opt-in local SDK/CLI probe')
 
 
-@pytest.mark.parametrize('kind,tools', [('wake', True), ('wake', False), ('result', True), ('result', False)])
-async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, kind, tools):
+@pytest.mark.parametrize('kind,tools,tool_fails', [('wake', True, False), ('wake', False, False),
+    ('result', True, False), ('result', False, False), ('wake', True, True), ('result', True, True), ('note', True, True)])
+async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, kind, tools, tool_fails):
     for name in CONFLICTING_ENV:
         monkeypatch.delenv(name, raising=False)
     for name in ('HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'):
@@ -31,6 +32,8 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
         monkeypatch.setenv(name, str(isolated))
     work = tmp_path / 'workspace'; work.mkdir()
     readable = work / 'fixture.txt'; readable.write_text('local fixture')
+    if tool_fails:
+        readable = work / 'missing-fixture.txt'
     first, release = threading.Event(), threading.Event()
     requests = []
 
@@ -95,9 +98,9 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
         assert await asyncio.to_thread(first.wait, 45), 'CLI never reached the loopback provider'
         value = {'version': 1, 'ownerId': 'owner', 'threadId': tid, 'runtimeGeneration': 7,
                  'message': {'id': 'probe-wake', 'source': {'kind': 'agent', 'id': 'peer'},
-                             'type': 'agent_message', 'delivery': 'soon', 'text': 'BUSY_WAKE_MARKER_07'}}
+                             'type': 'agent_message', 'delivery': 'passive' if kind == 'note' else 'soon', 'text': 'BUSY_WAKE_MARKER_07'}}
         value['semanticSha256'] = semantic_digest(value)
-        if kind == 'wake':
+        if kind in {'wake', 'note'}:
             accepted = await h.call('thread/externalInput/submit', value)
             assert accepted['statuses'][0]['deliveryState'] == 'pending'
         else:
@@ -110,7 +113,7 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
         async with asyncio.timeout(60):
             while h.engine.workers:
                 await asyncio.gather(*list(h.engine.workers.values()))
-        if kind == 'wake':
+        if kind in {'wake', 'note'}:
             receipt = h.server.external_inputs._status(tid, 'probe-wake', value['semanticSha256'])
             assert receipt['deliveryState'] == 'context_persisted'
             consumed_turn = receipt['receipt']['turnId']
@@ -123,7 +126,7 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
         assert len(turns) == (1 if tools else 2)
         assert len(requests) == 2 and 'BUSY_WAKE_MARKER_07' in json.dumps(requests[1]['messages'])
         assert (consumed_turn == turn) == tools
-        print(json.dumps({'probe': 'real-sdk-cli-loopback', 'kind': kind, 'tools': tools, 'modelRequests': len(requests),
+        print(json.dumps({'probe': 'real-sdk-cli-loopback', 'kind': kind, 'tools': tools, 'toolFails': tool_fails, 'modelRequests': len(requests),
                           'turns': len(turns), 'contextPersisted': True, 'sameTurn': tools}))
     finally:
         release.set()
@@ -131,7 +134,8 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
-async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, monkeypatch):
+@pytest.mark.parametrize('owner_carry', [False, True])
+async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, monkeypatch, owner_carry):
     """A pending note is in an owner turn's first model request (owner's 唤醒,
     hachimi 2026-10-19), even without tool calls; Claude Code expands the owner's
     @path mention but not one in the note (an earlier text block)."""
@@ -186,14 +190,24 @@ async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, mo
         key, key_file)
     driver = OfficialSdkDriver(cli, tmp_path / 'native-config', api_account=account)
     h = SubHarness(Settings(work, tmp_path / 'adapter', model='claude-sonnet-4-6', backend='subscription', mock=False,
-                            thinking='disabled'), driver)
+                            thinking='disabled', external_owner_id='owner' if owner_carry else None,
+                            external_runtime_generation=7), driver)
     try:
         await h.init()
         tid = await h.thread()
-        await h.call('claude/input/submit', {'threadId': tid, 'messageId': 'probe-note', 'source': {'kind': 'agent', 'id': 'peer'},
-            'eventType': 'agent_message', 'text': 'NOTE_MARKER_83 see @secret.txt',
-            'metadata': {'sourceName': 'peer', 'deliveryMode': 'passive'}})
-        turn = await h.turn(tid, 'Read and handle the unread notes; also @owner.txt')
+        extra = {}
+        if owner_carry:
+            note = {'version':1,'ownerId':'owner','threadId':tid,'runtimeGeneration':7,
+                    'message':{'id':'probe-note','source':{'kind':'agent','id':'peer'},'type':'agent_message',
+                               'delivery':'passive','text':'NOTE_MARKER_83 see @secret.txt'}}
+            note['semanticSha256'] = semantic_digest(note)
+            extra = {'ownerCarries':[note], 'clientUserMessageId':'read-now-owner'}
+        else:
+            await h.call('claude/input/submit', {'threadId': tid, 'messageId': 'probe-note', 'source': {'kind': 'agent', 'id': 'peer'},
+                'eventType': 'agent_message', 'text': 'NOTE_MARKER_83 see @secret.txt',
+                'metadata': {'sourceName': 'peer', 'deliveryMode': 'passive'}})
+        turn = (await h.call('turn/start', {'threadId':tid, 'input':[{'type':'text',
+            'text':'Read and handle the unread notes; also @owner.txt'}], **extra}))['turn']['id']
         async with asyncio.timeout(60):
             while h.engine.workers:
                 await asyncio.gather(*list(h.engine.workers.values()))
@@ -205,8 +219,10 @@ async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, mo
         assert 'NOTE_FILE_CONTENT_47' not in first, "the note's @path mention does not"
         status = await h.call('claude/input/status', {'threadId': tid, 'messageId': 'probe-note'})
         assert status['state'] == 'injected'
+        if owner_carry:
+            assert h.server.external_inputs._status(tid, 'probe-note', note['semanticSha256'])['receipt']['turnId'] == turn
         print(json.dumps({'probe': 'real-sdk-cli-loopback', 'kind': 'owner-turn-notes', 'modelRequests': len(requests),
-                          'noteInFirstRequest': True, 'ownerMentionExpanded': True, 'noteMentionExpanded': False}))
+                          'noteInFirstRequest': True, 'ownerCarry':owner_carry, 'ownerMentionExpanded': True, 'noteMentionExpanded': False}))
     finally:
         await h.close()
         server.shutdown(); server.server_close(); thread.join(timeout=2)

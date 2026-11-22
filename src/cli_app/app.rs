@@ -17,6 +17,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     // `--version` / `--help` print and exit inside `parse`, before any
     // startup migration below.
     let cli = Cli::parse();
+    cutex::app_server::pre_turn_notes::install(super::turn_notes::synchronize_in_lane);
     instance_preflight(&cli)?;
     let migrate = !skips_startup_migrations(&cli);
     // 2026-10-15: decide once per home whether it predates the auto-mode

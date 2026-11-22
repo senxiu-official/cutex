@@ -57,6 +57,7 @@ fn sample(
         model_context_window: Some(400_000),
         compaction_count: None,
         model_requests: None,
+        background_tokens: None, // r290 P8: no background breakdown for this source.
         cumulative_total: tokens.clone(),
         tokens,
     }))

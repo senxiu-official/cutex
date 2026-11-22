@@ -31,3 +31,7 @@ pub mod wake_log;
 pub mod web_search;
 
 pub mod alarms;
+
+pub mod runtime_gate_notice;
+
+pub mod native_subagent;

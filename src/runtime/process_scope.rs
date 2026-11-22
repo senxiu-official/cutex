@@ -125,15 +125,79 @@ pub struct ManagedAgentScopeStopOutcome {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SystemdScopeSupport {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Available,
+    Available(SystemdUserManager),
     /// Windows: no systemd; a per-Agent Job object is the boundary.
     #[cfg_attr(not(windows), allow(dead_code))]
     WindowsJobObject,
     #[cfg_attr(windows, allow(dead_code))]
     Unavailable(ManagedAgentIsolationFallback),
+}
+
+/// The local user-manager address selected by the capability probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemdUserManager {
+    runtime_dir: String,
+}
+
+impl SystemdUserManager {
+    #[cfg(target_os = "linux")]
+    pub fn detect() -> Option<Self> {
+        let configured = std::env::var_os("XDG_RUNTIME_DIR");
+        let conventional = format!("/run/user/{}", unsafe { libc::geteuid() });
+        configured.into_iter()
+            .chain([conventional.into()])
+            .filter_map(|dir| dir.into_string().ok())
+            .find_map(Self::from_runtime_dir)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn from_runtime_dir(runtime_dir: String) -> Option<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let path = Path::new(&runtime_dir);
+        let uid = unsafe { libc::geteuid() };
+        if !path.is_absolute() {
+            return None;
+        }
+        let dir = path.symlink_metadata().ok()?;
+        if !dir.is_dir() || dir.uid() != uid || dir.mode() & 0o7777 != 0o700 {
+            return None;
+        }
+        let socket = path.join("systemd/private").symlink_metadata().ok()?;
+        (socket.file_type().is_socket() && socket.uid() == uid).then_some(Self { runtime_dir })
+    }
+
+    pub fn configure_scope_launch(
+        &self,
+        mut launch: LaunchCommand,
+        inherited_bus: Option<String>,
+    ) -> LaunchCommand {
+        const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
+        let explicit_bus = launch.envs.iter().rev().find(|(key, _)| key == BUS);
+        let bus = explicit_bus.map(|(_, value)| value.as_str()).or_else(|| {
+            if launch.env_removes.iter().any(|key| key == BUS) {
+                return None;
+            }
+            inherited_bus.as_deref()
+        });
+        if let Some(bus) = bus {
+            // systemd-run connects with the local manager address and restores
+            // the target's original session bus just before it execs the Agent.
+            launch.args.insert(0, format!("--setenv={BUS}={bus}"));
+        }
+        launch.env_unset(BUS)
+            .env_unset("XDG_RUNTIME_DIR")
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn configure_command(&self, command: &mut Command) {
+        command.env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -214,7 +278,7 @@ fn managed_agent_launch_plan_with_support(
     support: SystemdScopeSupport,
 ) -> ManagedAgentLaunchPlan {
     match support {
-        SystemdScopeSupport::Available => {
+        SystemdScopeSupport::Available(manager) => {
             let unit_name = managed_agent_scope_unit_name(cutex_session_id);
             let launch = launch
                 .env_unset(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR)
@@ -225,7 +289,10 @@ fn managed_agent_launch_plan_with_support(
                     format!("systemd_scope:{unit_name}"),
                 );
             ManagedAgentLaunchPlan {
-                launch: wrap_in_systemd_scope(launch, cutex_session_id, &unit_name),
+                launch: manager.configure_scope_launch(
+                    wrap_in_systemd_scope(launch, cutex_session_id, &unit_name),
+                    std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
+                ),
                 isolation: ManagedAgentProcessIsolation::SystemdScope { unit_name },
             }
         }
@@ -267,23 +334,137 @@ fn wrap_in_systemd_scope(
         envs,
         env_removes,
     } = launch;
-    let mut wrapped = LaunchCommand::new("systemd-run").args([
-        "--user".to_string(),
-        "--scope".to_string(),
-        "--quiet".to_string(),
-        "--collect".to_string(),
-        "--expand-environment=no".to_string(),
-        format!("--unit={unit_name}"),
-        format!("--slice={}", managed_agent_slice()),
-        "--property=KillMode=control-group".to_string(),
-        format!("--description=Cutex managed Agent {cutex_session_id}"),
-        "--".to_string(),
-        program,
-    ]);
+    let mut wrapped = LaunchCommand::new("systemd-run")
+        .args(systemd_scope_args(unit_name))
+        .arg(format!("--description=Cutex managed Agent {cutex_session_id}"))
+        .args(["--".to_string(), program]);
     wrapped.args.extend(args);
     wrapped.envs = envs;
     wrapped.env_removes = env_removes;
     wrapped
+}
+
+fn systemd_scope_args(unit_name: &str) -> Vec<String> {
+    vec![
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+        "--expand-environment=no".into(),
+        format!("--unit={unit_name}"),
+        format!("--slice={}", managed_agent_slice()),
+        "--property=KillMode=control-group".into(),
+    ]
+}
+
+/// A Linux scope for one stock publication or a Claude adapter state directory.
+/// The key is private runtime state, so independent homes and successive stock
+/// publications cannot reuse one another's stop target.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct LinuxRuntimeScope {
+    unit: String,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRuntimeScope {
+    pub fn new(session_id: &str, backend: &str, runtime_path: &Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let digest = Sha256::new()
+            .chain_update(backend.as_bytes())
+            .chain_update([0])
+            .chain_update(session_id.as_bytes())
+            .chain_update([0])
+            .chain_update(runtime_path.as_os_str().as_bytes())
+            .finalize();
+        let identity = digest[..12].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let label = sanitize_session_component(session_id, 32, "session");
+        Self { unit: format!("cutex-agent-{backend}-{label}-{identity}.scope") }
+    }
+
+    pub fn launcher(session_id: &str) -> Result<(PathBuf, SystemdUserManager), ManagedAgentIsolationFallback> {
+        let manager = match current_systemd_scope_support(true) {
+            SystemdScopeSupport::Available(manager) => manager,
+            SystemdScopeSupport::Unavailable(reason) => {
+                eprintln!("managed Agent process isolation fallback: cutex_session_id={session_id} mode=direct reason={reason}");
+                return Err(reason);
+            }
+            SystemdScopeSupport::WindowsJobObject => unreachable!("Linux does not select a Windows job"),
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path).map(|dir| dir.join("systemd-run")).find(|candidate| {
+                candidate.metadata().is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+        });
+        // Resolve now: the stock gate calls execve with a clean environment.
+        let Some(launcher) = launcher.and_then(|path| path.canonicalize().ok()) else {
+            let reason = ManagedAgentIsolationFallback::SystemdRunUnavailable;
+            eprintln!("managed Agent process isolation fallback: cutex_session_id={session_id} mode=direct reason={reason}");
+            return Err(reason);
+        };
+        Ok((launcher, manager))
+    }
+
+    pub fn arguments(&self) -> anyhow::Result<Vec<String>> {
+        let mut args = systemd_scope_args(&self.unit);
+        args.push("--property=OOMPolicy=kill".into());
+        for (key, property) in [
+            ("CUTEX_LINUX_SCOPE_MEMORY_HIGH_BYTES", "MemoryHigh"),
+            ("CUTEX_LINUX_SCOPE_MEMORY_MAX_BYTES", "MemoryMax"),
+            ("CUTEX_LINUX_SCOPE_TASKS_MAX", "TasksMax"),
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                let value = value.to_str()
+                    .with_context(|| format!("{key} must be a positive decimal integer"))?;
+                args.push(scope_limit_argument(key, property, value)?);
+            }
+        }
+        args.push("--".into());
+        Ok(args)
+    }
+
+    pub fn unit(&self) -> &str {
+        &self.unit
+    }
+
+    pub fn contains_pid(&self, pid: u32) -> anyhow::Result<bool> {
+        linux_pid_in_scope(pid, &self.unit)
+    }
+
+    pub fn is_empty(&self) -> anyhow::Result<bool> {
+        query_scope_state(&self.unit)
+            .map(|state| state.is_none_or(|state| !state.populated))
+            .map_err(|error| self.operator_error(error))
+    }
+
+    pub fn terminate(&self, force: bool) -> anyhow::Result<ManagedAgentScopeStopOutcome> {
+        terminate_systemd_scope(&self.unit, force).map_err(|error| self.operator_error(error))
+    }
+
+    fn operator_error(&self, error: anyhow::Error) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Unable to confirm the recorded Linux scope {}: {error:#}. If the systemd user manager or its socket is unavailable, restore it for the Cutex service account and retry before starting or downgrading this Agent.",
+            self.unit
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_limit_argument(key: &str, property: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.parse::<std::num::NonZeroU64>()
+        .with_context(|| format!("{key} must be a positive decimal integer"))?;
+    Ok(format!("--property={property}={value}"))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_pid_in_scope(pid: u32, unit: &str) -> anyhow::Result<bool> {
+    let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .with_context(|| format!("could not verify PID {pid} in scope {unit}"))?;
+    Ok(groups.lines().any(|line| {
+        line.strip_prefix("0::")
+            .is_some_and(|path| path.split('/').any(|part| part == unit))
+    }))
 }
 
 /// Return the populated cgroup for this Agent's active scope, if any.
@@ -294,7 +475,7 @@ fn wrap_in_systemd_scope(
 pub fn managed_agent_scope_control_group(cutex_session_id: &str) -> anyhow::Result<Option<String>> {
     match current_systemd_scope_support(false) {
         SystemdScopeSupport::Unavailable(_) | SystemdScopeSupport::WindowsJobObject => Ok(None),
-        SystemdScopeSupport::Available => Ok(query_scope_state(&managed_agent_scope_unit_name(
+        SystemdScopeSupport::Available(_) => Ok(query_scope_state(&managed_agent_scope_unit_name(
             cutex_session_id,
         ))?
         .filter(|state| state.populated)
@@ -308,7 +489,7 @@ pub fn managed_agent_scope_is_absent(cutex_session_id: &str) -> anyhow::Result<b
     #[cfg(target_os = "linux")]
     {
         match current_systemd_scope_support(false) {
-            SystemdScopeSupport::Available => Ok(query_scope_state(
+            SystemdScopeSupport::Available(_) => Ok(query_scope_state(
                 &managed_agent_scope_unit_name(cutex_session_id),
             )?
             .is_none_or(|state| !state.populated)),
@@ -353,7 +534,7 @@ pub fn terminate_managed_agent_scope(
     force: bool,
 ) -> anyhow::Result<ManagedAgentScopeStopOutcome> {
     let support = current_systemd_scope_support(false);
-    let SystemdScopeSupport::Available = support else {
+    let SystemdScopeSupport::Available(_) = support else {
         let SystemdScopeSupport::Unavailable(reason) = support else {
             unreachable!("Linux reports a systemd scope or a fallback")
         };
@@ -365,8 +546,15 @@ pub fn terminate_managed_agent_scope(
         });
     };
 
-    let unit_name = managed_agent_scope_unit_name(cutex_session_id);
-    let Some(state) = query_scope_state(&unit_name)? else {
+    terminate_systemd_scope(&managed_agent_scope_unit_name(cutex_session_id), force)
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_systemd_scope(
+    unit_name: &str,
+    force: bool,
+) -> anyhow::Result<ManagedAgentScopeStopOutcome> {
+    let Some(state) = query_scope_state(unit_name)? else {
         return Ok(ManagedAgentScopeStopOutcome {
             found: false,
             stopped: true,
@@ -375,7 +563,7 @@ pub fn terminate_managed_agent_scope(
         });
     };
     if !state.populated {
-        wait_for_scope_collection(&unit_name)?;
+        wait_for_scope_collection(unit_name)?;
         return Ok(ManagedAgentScopeStopOutcome {
             found: false,
             stopped: true,
@@ -384,9 +572,9 @@ pub fn terminate_managed_agent_scope(
         });
     }
 
-    signal_scope(&unit_name, "TERM", &state.cgroup_path)?;
+    signal_scope(unit_name, "TERM", &state.cgroup_path)?;
     if wait_for_scope_empty(&state.cgroup_path, SCOPE_STOP_WAIT)? {
-        wait_for_scope_collection(&unit_name)?;
+        wait_for_scope_collection(unit_name)?;
         return Ok(ManagedAgentScopeStopOutcome {
             found: true,
             stopped: true,
@@ -403,10 +591,10 @@ pub fn terminate_managed_agent_scope(
         });
     }
 
-    signal_scope(&unit_name, "KILL", &state.cgroup_path)?;
+    signal_scope(unit_name, "KILL", &state.cgroup_path)?;
     let stopped = wait_for_scope_empty(&state.cgroup_path, SCOPE_STOP_WAIT)?;
     if stopped {
-        wait_for_scope_collection(&unit_name)?;
+        wait_for_scope_collection(unit_name)?;
     }
     Ok(ManagedAgentScopeStopOutcome {
         found: true,
@@ -489,18 +677,18 @@ fn current_systemd_scope_support(require_launcher: bool) -> SystemdScopeSupport 
             ManagedAgentIsolationFallback::CgroupV2Unavailable,
         );
     }
-    if !systemd_user_manager_endpoint_exists() {
+    let Some(manager) = SystemdUserManager::detect() else {
         return SystemdScopeSupport::Unavailable(
             ManagedAgentIsolationFallback::SystemdUserManagerUnavailable,
         );
-    }
+    };
     if !command_exists_in_path("systemctl") {
         return SystemdScopeSupport::Unavailable(
             ManagedAgentIsolationFallback::SystemctlUnavailable,
         );
     }
     if !require_launcher {
-        return SystemdScopeSupport::Available;
+        return SystemdScopeSupport::Available(manager);
     }
     if !command_exists_in_path("systemd-run") {
         return SystemdScopeSupport::Unavailable(
@@ -512,7 +700,7 @@ fn current_systemd_scope_support(require_launcher: bool) -> SystemdScopeSupport 
             ManagedAgentIsolationFallback::SystemdRunMissingRequiredOptions,
         );
     }
-    SystemdScopeSupport::Available
+    SystemdScopeSupport::Available(manager)
 }
 
 #[cfg(windows)]
@@ -528,21 +716,6 @@ fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport {
     SystemdScopeSupport::Unavailable(ManagedAgentIsolationFallback::UnsupportedPlatform)
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_user_manager_endpoint_exists() -> bool {
-    let configured = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|runtime| runtime.join("systemd/private"));
-    let conventional = PathBuf::from(format!("/run/user/{}/systemd/private", unsafe {
-        libc::geteuid()
-    }));
-    configured
-        .into_iter()
-        .chain(std::iter::once(conventional))
-        .any(|endpoint| endpoint.exists())
 }
 
 #[cfg(target_os = "linux")]
@@ -563,6 +736,7 @@ fn systemd_run_has_required_options() -> bool {
         "--scope",
         "--collect",
         "--expand-environment",
+        "--setenv",
         "--slice",
         "--property",
     ]
@@ -571,8 +745,16 @@ fn systemd_run_has_required_options() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn scope_systemctl() -> anyhow::Result<Command> {
+    let manager = SystemdUserManager::detect().context("systemd user manager socket is missing")?;
+    let mut command = Command::new("systemctl");
+    manager.configure_command(&mut command);
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
 fn query_scope_state(unit_name: &str) -> anyhow::Result<Option<SystemdScopeState>> {
-    let output = Command::new("systemctl")
+    let output = scope_systemctl()?
         .args([
             "--user",
             "show",
@@ -668,7 +850,7 @@ fn cgroup_is_populated(cgroup_path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn signal_scope(unit_name: &str, signal: &str, cgroup_path: &Path) -> anyhow::Result<()> {
-    let output = Command::new("systemctl")
+    let output = scope_systemctl()?
         .args([
             "--user",
             "kill",
@@ -718,6 +900,18 @@ fn wait_for_scope_collection(unit_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_limits_emit_decimal_systemd_properties_and_reject_invalid_values() {
+        assert_eq!(scope_limit_argument("LIMIT", "MemoryHigh", "1048576").unwrap(),
+            "--property=MemoryHigh=1048576");
+        assert_eq!(scope_limit_argument("LIMIT", "TasksMax", "64").unwrap(),
+            "--property=TasksMax=64");
+        for invalid in ["", "0", "-1", "1M", "1\n--quiet", "18446744073709551616"] {
+            assert!(scope_limit_argument("LIMIT", "MemoryMax", invalid).is_err(), "{invalid}");
+        }
+    }
+
     #[test]
     fn instance_scopes_and_slices_are_qualified_by_the_instance_name() {
         let id = "cutex.018e0000-0000-7000-8000-0002a0001f93";
@@ -746,16 +940,39 @@ mod tests {
             .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_')));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_manager_requires_private_runtime_and_real_socket() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let dir = std::env::temp_dir().join(format!("sm-{}", uuid::Uuid::new_v4().simple()));
+        let manager = dir.join("systemd");
+        let socket = manager.join("private");
+        std::fs::create_dir_all(&manager).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_dir = dir.to_str().unwrap().to_owned();
+        std::fs::write(&socket, []).unwrap();
+        assert!(SystemdUserManager::from_runtime_dir(runtime_dir.clone()).is_none());
+        std::fs::remove_file(&socket).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(SystemdUserManager::from_runtime_dir(runtime_dir.clone()).is_some());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(SystemdUserManager::from_runtime_dir(runtime_dir).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn systemd_scope_plan_preserves_target_environment_and_exact_arguments() {
         let target = LaunchCommand::new("cute-codex")
             .args(["app-server", "literal-$HOME", "literal-$$"])
             .env("CUTEX_AGENT_ID", "runtime-agent")
-            .env_remove("STALE_VALUE");
+            .env_remove("STALE_VALUE")
+            .env("XDG_RUNTIME_DIR", "/wrong/runtime")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/wrong/bus");
         let plan = managed_agent_launch_plan_with_support(
             "cutex.scope-test",
             target,
-            SystemdScopeSupport::Available,
+            SystemdScopeSupport::Available(SystemdUserManager { runtime_dir: "/run/user/1000".into() }),
         );
         let ManagedAgentProcessIsolation::SystemdScope { unit_name } = &plan.isolation else {
             panic!("expected systemd scope");
@@ -779,6 +996,14 @@ mod tests {
             .windows(4)
             .any(|args| args == ["--", "cute-codex", "app-server", "literal-$HOME"]));
         assert!(plan.launch.args.iter().any(|arg| arg == "literal-$$"));
+        assert_eq!(
+            plan.launch.envs.iter().filter(|(key, _)| key == "XDG_RUNTIME_DIR")
+                .map(|(_, value)| value.as_str()).collect::<Vec<_>>(),
+            ["/run/user/1000"],
+        );
+        assert_eq!(plan.launch.args[0], "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/wrong/bus");
+        assert!(!plan.launch.envs.iter().any(|(key, _)| key == "DBUS_SESSION_BUS_ADDRESS"));
+        assert!(plan.launch.env_removes.iter().any(|key| key == "DBUS_SESSION_BUS_ADDRESS"));
         assert!(plan
             .launch
             .envs
@@ -829,7 +1054,9 @@ mod tests {
             .env("CUTEX_AGENT_ID", "runtime-agent")
             .env(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR, "inherited-unit")
             .env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, "stale")
-            .env_remove("STALE_VALUE");
+            .env_remove("STALE_VALUE")
+            .env("XDG_RUNTIME_DIR", "/wrong/runtime")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/wrong/bus");
         let plan = managed_agent_launch_plan_with_support(
             "cutex.job-test",
             target.clone(),

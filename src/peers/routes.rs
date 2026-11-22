@@ -40,6 +40,7 @@ fn respond(stream: &mut TcpStream, result: Result<Value>, status: u16) -> anyhow
                 404 => "Not Found",
                 409 => "Conflict",
                 413 => "Payload Too Large",
+                428 => "Precondition Required", // r290 P10 (B6)
                 429 => "Too Many Requests",
                 _ => "Service Unavailable",
             },
@@ -307,6 +308,10 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
 /// SSH-tunnelled desktop's CLI-issued owner token); a paired device's token
 /// on loopback gets 403 `owner_local_only`. Disabling, removing, labels,
 /// urls and policy stay as before (loopback).
+/// r290 P10 (B6): a full-scope owner device (any listener) gets 428
+/// `owner_confirm_required` instead and may repeat with `?ownerConfirm=`;
+/// disabling / removing is open to it on any listener
+/// (`owner_turn_off_action`).
 pub fn owner_local_action(method: &str, path: &str, data: &Value) -> Option<&'static str> {
     match (method, path) {
         ("POST", "/v2/peers/invites") | ("POST", "/v2/peers") => Some("peerPair"),
@@ -317,24 +322,79 @@ pub fn owner_local_action(method: &str, path: &str, data: &Value) -> Option<&'st
     }
 }
 
+/// r290 P10 (B6): peer actions that only turn off / remove
+/// (`users::OWNER_TURN_OFF_ACTIONS`): `DELETE /v2/peers/{id}` and `PATCH
+/// /v2/peers/{id}` with exactly `{enabled: false}`.
+pub fn owner_turn_off_action(method: &str, path: &str, data: &Value) -> Option<&'static str> {
+    path.strip_prefix("/v2/peers/").filter(|id| !id.is_empty() && !id.contains('/') && *id != "invites")?;
+    match method {
+        "DELETE" => Some("peerRemove"),
+        "PATCH" if data.as_object().is_some_and(|o| o.len() == 1 && o.get("enabled") == Some(&Value::Bool(false))) => {
+            Some("peerDisable")
+        }
+        _ => None,
+    }
+}
+
+/// r290 P10 (B6): the widening requests a remote owner device may make
+/// (after the confirm): pairing (POST), and `PATCH /v2/peers/{id}` with
+/// exactly `{enabled: true}` (labels / urls / policy stay loopback-only).
+fn remote_widening_shape(method: &str, data: &Value) -> bool {
+    method == "POST" || data.as_object().is_some_and(|o| o.len() == 1)
+}
+
 pub fn handle_v2(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let result = (|| {
-        if request.method != "GET" && !crate::management::listeners::current_request_is_loopback() {
-            return Err(Error::new("loopback_only", 403));
-        }
+        // r290 P10 (B6): a full-scope owner device may turn a peer off or
+        // remove it on any listener; widening (pair / enable) needs a fresh
+        // confirm (users::owner_widening_gate). Labels, urls and policy stay
+        // loopback-only.
         let store = Store::open()?;
         let data = body(request)?;
         let path = request.path.split('?').next().unwrap_or("");
-        if let Some(action) = owner_local_action(&request.method, path, &data) {
-            if !crate::management::users::request_is_owner_local() {
-                let mut error = Error::new("owner_local_only", 403);
-                error.details = crate::management::users::owner_local_only(action).details;
+        let turn_off = owner_turn_off_action(&request.method, path, &data);
+        let widening = owner_local_action(&request.method, path, &data);
+        if request.method != "GET" && !crate::management::listeners::current_request_is_loopback() {
+            let remote_ok = match (turn_off, widening) {
+                (Some(_), _) => crate::management::users::owner_may_turn_off(),
+                (None, Some(_)) => remote_widening_shape(&request.method, &data)
+                    && crate::management::users::request_is_full_owner_device(),
+                _ => false,
+            };
+            if !remote_ok {
+                return Err(Error::new("loopback_only", 403));
+            }
+        }
+        if let Some(action) = widening {
+            if let Err(refused) = crate::management::users::owner_widening_gate(action, request) {
+                let mut error = Error::new(refused.code, refused.status);
+                error.details = refused.details;
                 return Err(error);
             }
         }
         match (request.method.as_str(), path) {
             ("POST", "/v2/peers/invites") => super::pair::invite(&data),
-            ("POST", "/v2/peers") => super::pair::add(&store, &data),
+            // r290 P10 (c): `ownHost: true` applies the owner-to-owner preset
+            // once the pairing succeeded (owner-local, full scope, owner-bound).
+            ("POST", "/v2/peers") => {
+                let own_host = super::policy::own_host_requested(&data)?;
+                if own_host {
+                    if !super::policy::own_host_allowed() {
+                        let mut error = Error::new("owner_local_only", 403);
+                        error.details = crate::management::users::owner_local_only("peerOwnHost").details;
+                        return Err(error);
+                    }
+                    if super::pair::requested_owner_user(&data, "userId")? != super::store::OWNER_USER_ID {
+                        return Err(Error::new("invalid_request", 400));
+                    }
+                }
+                let paired = super::pair::add(&store, &data)?;
+                if !own_host {
+                    return Ok(paired);
+                }
+                own_host_result(&store, paired["peer"]["peerId"].as_str().unwrap_or_default())
+                    .or_else(|error| Ok(json!({"peer":paired["peer"],"ownHost":{"applied":false,"error":error.code}})))
+            }
             ("GET", "/v2/peers") => {
                 let state = store.snapshot()?;
                 let asks = crate::asks::store::AskStore::open_default()?;
@@ -375,6 +435,15 @@ pub fn handle_v2(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow:
                     }
                     ("GET", "agents") => {
                         refresh(&store, &peer).or_else(|_| Ok(cached(&store, &peer)))
+                    }
+                    // r290 P10 (c): the own-host preset for an existing peer.
+                    ("POST", "own-host") => {
+                        if !super::policy::own_host_allowed() {
+                            let mut error = Error::new("owner_local_only", 403);
+                            error.details = crate::management::users::owner_local_only("peerOwnHost").details;
+                            return Err(error);
+                        }
+                        own_host_result(&store, id)
                     }
                     ("DELETE", "") => {
                         let _ = super::client::call(
@@ -565,4 +634,17 @@ pub fn peer_view(store: &Store, peer: &Peer) -> Value {
             .unwrap_or_else(|| peer.view()))
     })();
     result.unwrap_or_else(|_| peer.view())
+}
+
+/// r290 P10 (c): apply the own-host preset (`policy::apply_own_host`) and
+/// answer `{peer, ownHost: {applied: true, verified}}`. `verified: false`
+/// means pairing did not show one of this host's owner keys on the peer: the
+/// preset is then only the owner's explicit choice on this host.
+fn own_host_result(store: &Store, id: &str) -> Result<Value> {
+    let peer = super::policy::apply_own_host(store, id)?;
+    let verified = super::policy::own_host_verified(id);
+    super::worker::maintain(store, &crate::asks::store::AskStore::open_default()?)?;
+    super::worker::wake();
+    changed(id, "updated");
+    Ok(json!({"peer":peer.view(),"ownHost":{"applied":true,"verified":verified}}))
 }

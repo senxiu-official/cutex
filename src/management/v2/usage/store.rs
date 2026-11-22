@@ -577,6 +577,10 @@ thread_local! {
     static USAGE_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static LOCKED_PARSE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+// r290 P8: expose the existing lock-parse counter to attribution regression tests.
+#[cfg(test)]
+pub(super) fn locked_parse_bytes() -> u64 { LOCKED_PARSE_BYTES.with(|value| value.get()) }
+
 #[cfg(test)]
 struct TestLockDepth;
 #[cfg(test)]

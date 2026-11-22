@@ -67,7 +67,17 @@ pub(crate) fn handle_with_store(
 ) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     match (request.method.as_str(), path == PATH, token_id_from_path(path)) {
-        ("GET", true, _) => match store.list() {
+        ("GET", true, _) => match store.list().and_then(|tokens| {
+            // r290 P10 (B3): each device's relay certificate (or null).
+            let certificates = crate::management::relay::device_certificate_views();
+            let mut values = Vec::with_capacity(tokens.len());
+            for token in tokens {
+                let mut value = serde_json::to_value(&token)?;
+                value["relayCertificate"] = certificates.get(&token.token_id).cloned().unwrap_or(serde_json::Value::Null);
+                values.push(value);
+            }
+            Ok(values)
+        }) {
             Ok(tokens) => write_json_response(
                 stream,
                 200,

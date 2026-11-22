@@ -1012,6 +1012,7 @@ const PATCH_FIELDS: &[&str] = &[
     "toolSchemaCompat",
     "imageHistoryTrim",
     "modelContextWindow",
+    "modelAutoCompactPercent", // r290 P13
     "modelAutoCompactTokenLimit",
     "providerName",
     "providerBaseUrl",
@@ -1069,13 +1070,17 @@ fn claude_compaction(value: &Value) -> Result<crate::profiles::claude_compaction
         return Err(format!("unknown field {unknown}"));
     }
     let number = |key: &str| object.get(key).and_then(Value::as_u64).ok_or(format!("{key} must be a whole number"));
-    let window = number("window")?;
+    // r290 P13: percent-only uses the model's window.
+    let window = match object.get("window") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(u32::try_from(number("window")?).map_err(|_| "window must be 100000..1000000".to_string())?),
+    };
     let percent = number("percent")?;
     let parsed = crate::profiles::claude_compaction::ClaudeCompaction {
-        auto_compact_window: u32::try_from(window).map_err(|_| "window must be 100000..1000000".to_string())?,
+        auto_compact_window: window,
         auto_compact_percent: u8::try_from(percent).map_err(|_| "percent must be 1..100".to_string())?,
     };
-    if !crate::profiles::claude_compaction::WINDOW_RANGE.contains(&parsed.auto_compact_window) {
+    if parsed.auto_compact_window.is_some_and(|window|!crate::profiles::claude_compaction::WINDOW_RANGE.contains(&window)) {
         return Err("window must be 100000..1000000".into());
     }
     if !crate::profiles::claude_compaction::PERCENT_RANGE.contains(&parsed.auto_compact_percent) {
@@ -1411,6 +1416,13 @@ pub(crate) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
                 one_of(MODEL_REASONING_SUMMARY_VALUES),
             )?,
             model_context_window: tri_state(body, "modelContextWindow", positive_count)?,
+            model_auto_compact_percent: tri_state(body, "modelAutoCompactPercent", |v| {
+                if body.get("modelAutoCompactTokenLimit").is_some_and(|v| !v.is_null()) {
+                    return Err("percentage and absolute token limit are mutually exclusive".into());
+                }
+                let n=positive_count(v)?;
+                if n>100 {return Err("must be 1..100".into());} Ok(n)
+            })?,
             model_auto_compact_token_limit: tri_state(body, "modelAutoCompactTokenLimit", positive_count)?,
             provider_name: tri_state(body, "providerName", visible_string(100))?,
             provider_base_url: tri_state(body, "providerBaseUrl", http_url)?,
@@ -2018,7 +2030,7 @@ mod tests {
         assert_eq!(parse_patch(br#"{"claudeCompactionModels":null}"#).unwrap().claude_compaction_models, ConfigValueUpdate::Clear);
         assert_eq!(
             parse_patch(br#"{"claudeCompactionModels":{"claude-sonnet-5-5":{"window":233000,"percent":100}}}"#).unwrap().claude_compaction_models,
-            ConfigValueUpdate::Set([("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: 233_000, auto_compact_percent: 100 })].into())
+            ConfigValueUpdate::Set([("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: Some(233_000), auto_compact_percent: 100 })].into())
         );
         assert_eq!(parse_patch(br#"{"claudeCompactionModels":{}}"#).unwrap().claude_compaction_models, ConfigValueUpdate::Set(Default::default()));
         for bad in [
@@ -2034,6 +2046,20 @@ mod tests {
         assert!(parse_patch(json!({"claudeCompactionModels": many}).to_string().as_bytes()).is_err());
     }
 
+    // r290 P13
+    #[test]
+    fn context_percent_patch_and_claude_model_window() {
+        assert_eq!(parse_patch(br#"{"modelAutoCompactPercent":75}"#).unwrap().codex_config.model_auto_compact_percent,ConfigValueUpdate::Set(75));
+        for bad in [r#"{"modelAutoCompactPercent":0}"#,r#"{"modelAutoCompactPercent":101}"#,
+            r#"{"modelAutoCompactPercent":50,"modelAutoCompactTokenLimit":100000}"#] {
+            assert!(parse_patch(bad.as_bytes()).is_err());
+        }
+        for body in [br#"{"claudeCompaction":{"percent":75}}"#.as_slice(),br#"{"claudeCompaction":{"window":null,"percent":75}}"#] {
+            assert_eq!(parse_patch(body).unwrap().claude_compaction,ConfigValueUpdate::Set(
+                crate::profiles::claude_compaction::ClaudeCompaction {auto_compact_window:None,auto_compact_percent:75}));
+        }
+    }
+
     #[test]
     fn claude_compaction_patch() {
         use crate::profiles::claude_compaction::ClaudeCompaction;
@@ -2041,7 +2067,7 @@ mod tests {
         assert_eq!(parse_patch(br#"{"claudeCompaction":null}"#).unwrap().claude_compaction, ConfigValueUpdate::Clear);
         assert_eq!(
             parse_patch(br#"{"claudeCompaction":{"window":533000,"percent":100}}"#).unwrap().claude_compaction,
-            ConfigValueUpdate::Set(ClaudeCompaction { auto_compact_window: 533_000, auto_compact_percent: 100 })
+            ConfigValueUpdate::Set(ClaudeCompaction { auto_compact_window: Some(533_000), auto_compact_percent: 100 })
         );
         for bad in [
             r#"{"claudeCompaction":{"window":99999,"percent":100}}"#,
@@ -2357,6 +2383,7 @@ mod tests {
         let before_sessions = serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap();
         for (requested, expected) in [
             (json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]}), json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]})),
+            (json!({"kind":"portrait","portraitThemes":["kit-20261029/mountain-city-myriad-layers", "kit-20261029/university-universalis"]}), json!({"kind":"portrait","portraitThemes":["kit-20261029/mountain-city-myriad-layers", "kit-20261029/university-universalis"]})),
             (json!({"kind":"emoji","emojiThemes":["cats","sea"]}), json!({"kind":"emoji","emojiThemes":["sea","cats"]})),
             (json!({"kind":"emoji","emojiThemes":null}), json!({"kind":"emoji","emojiThemes":null})),
             (json!({"kind":"letter"}), json!({"kind":"letter"})),

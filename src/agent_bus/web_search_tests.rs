@@ -313,6 +313,7 @@ fn search_usage_is_a_valid_ledger_row() {
         model_context_window: None,
         compaction_count: None,
         model_requests: None,
+        background_tokens: None, // r290 P8: no background breakdown for this source.
         cumulative_total: tokens.clone(),
         tokens,
     };

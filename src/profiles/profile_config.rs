@@ -20,6 +20,9 @@ pub const PROFILE_CONFIG_SCALAR_KEYS: &[&str] = &[
     "model_provider",
     "model_catalog_json",
     "model_context_window",
+    // r290 P13
+    "model_auto_compact_percent",
+    "model_context_settings_v1",
     "model_auto_compact_token_limit",
     "model_auto_compact_token_limit_scope",
     "model_reasoning_effort",

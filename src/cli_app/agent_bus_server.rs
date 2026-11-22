@@ -1886,6 +1886,7 @@ fn message_meta(
         facts,
         context_turn_id: None,
         delivered_at: None,
+        delivery_progress: None,
     }
 }
 
@@ -2054,8 +2055,11 @@ fn run_agent_bus_with_service_root(
     // 054 owner decision 9: ledger records for bus messages already open.
     cutex::management::v2::agent_bus_state::spawn_input_ledger_backfill();
     cutex::agent_bus::alarms::spawn()?;
+    // r290 P5 schedules reuse the fenced online adapter and durable alarm transport.
+    cutex::schedules::runtime::spawn(super::management_context::scheduled_online_management_v2_session)?;
     spawn_director_address_dispatch(Arc::clone(&state));
     super::agent_name_notices::spawn(Arc::clone(&state));
+    super::profile_quota_notes::spawn(Arc::clone(&state))?; // r290 P12.
     let active_requests = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {

@@ -399,6 +399,7 @@ fn resolve_bootstrap_launch_augmentation(
             if let Some(augmentation) = params.launch_augmentation.take() {
                 let config = if params.developer_instructions.is_none()
                     || augmentation.memory.is_some()
+                    || augmentation.native_subagent.is_some()
                 {
                     read_effective_native_config(handle, params.cwd.as_deref())
                 } else {
@@ -412,6 +413,7 @@ fn resolve_bootstrap_launch_augmentation(
                     config.as_ref(),
                 );
                 params.developer_instructions = resolved.developer_instructions;
+                apply_native_subagent_instructions(&mut params.config, resolved.native_subagent_instructions, config.as_ref());
                 if resolved.runtime_workspace_roots.is_some() {
                     params.runtime_workspace_roots = resolved.runtime_workspace_roots;
                 }
@@ -422,6 +424,7 @@ fn resolve_bootstrap_launch_augmentation(
             if let Some(augmentation) = params.launch_augmentation.take() {
                 let config = if params.developer_instructions.is_none()
                     || augmentation.memory.is_some()
+                    || augmentation.native_subagent.is_some()
                 {
                     read_effective_native_config(handle, params.cwd.as_deref())
                 } else {
@@ -435,6 +438,7 @@ fn resolve_bootstrap_launch_augmentation(
                     config.as_ref(),
                 );
                 params.developer_instructions = resolved.developer_instructions;
+                apply_native_subagent_instructions(&mut params.config, resolved.native_subagent_instructions, config.as_ref());
                 if resolved.runtime_workspace_roots.is_some() {
                     params.runtime_workspace_roots = resolved.runtime_workspace_roots;
                 }
@@ -442,6 +446,32 @@ fn resolve_bootstrap_launch_augmentation(
             ThreadBootstrap::Start(params)
         }
     }
+}
+
+fn apply_native_subagent_instructions(
+    config: &mut Option<std::collections::BTreeMap<String, Value>>,
+    instructions: Option<String>,
+    effective_config: Option<&Value>,
+) {
+    let Some(instructions) = instructions else { return; };
+    // Old native configFeatureToml accepts only boolean feature flags. Its
+    // pinned executable may stay old across a backend upgrade. Require the
+    // connected runtime's effective structured feature, never a kit/version
+    // label or an unverified requested override. Unknown keeps config intact.
+    let structured = effective_config
+        .and_then(|config| config.pointer("/features/multi_agent_v2"))
+        .and_then(Value::as_object)
+        .is_some_and(|feature| feature.get("enabled").is_some_and(Value::is_boolean));
+    if !structured { return; }
+    let config = config.get_or_insert_with(Default::default);
+    const KEY: &str = "features.multi_agent_v2.subagent_developer_instructions";
+    // The resolver already includes effective profile child requirements.
+    // Installing its complete structured text must not append them a second time.
+    config.insert(KEY.into(), Value::String(instructions));
+    // Byte-preserving full-history forks otherwise retain the parent's old
+    // developer identity before the child override. Re-render that prefix;
+    // the native runtime still keeps the conversation/task history.
+    config.insert("features.multi_agent_v2.preserve_fork_prefix".into(), Value::Bool(false));
 }
 
 struct AppServerRuntimeBootstrapResult {
@@ -667,6 +697,15 @@ impl AppServerRuntimeManager {
             && runtime.runtime_alive.load(Ordering::Acquire)
             && runtime.handle.disconnect_reason().is_none()
             && runtime.supports_owner_carries
+    }
+
+    pub fn owner_input_batch_supported(&self, session: &str, generation: u64) -> bool {
+        let Ok(runtimes) = self.runtimes.lock() else { return false };
+        let Some(runtime) = runtimes.get(session) else { return false };
+        let Ok(status) = runtime.status.lock() else { return false };
+        status.connected && status.runtime_generation == generation
+            && runtime.runtime_alive.load(Ordering::Acquire)
+            && runtime.handle.disconnect_reason().is_none() && runtime.supports_owner_input_batch
     }
 
     /// 057 §6: the runtime can give back a dropped steer's carried notes.
@@ -1258,6 +1297,7 @@ impl AppServerRuntimeManager {
         let runtime = ManagedRuntime {
             developer_instructions,
             supports_owner_carries: initialize_response.get("ownerInputCarries").and_then(Value::as_u64) == Some(1),
+            supports_owner_input_batch: initialize_response.get("ownerInputBatch").and_then(Value::as_u64) == Some(1),
             supports_owner_carry_return: initialize_response.get("ownerCarryReturn").and_then(Value::as_u64) == Some(1),
             supports_cutex_ingress,
             endpoint,
@@ -1291,6 +1331,7 @@ impl AppServerRuntimeManager {
 struct ManagedRuntime {
     developer_instructions: Option<String>,
     supports_owner_carries: bool,
+    supports_owner_input_batch: bool,
     supports_owner_carry_return: bool,
     supports_cutex_ingress: bool,
     endpoint: AppServerEndpoint,
@@ -1892,6 +1933,101 @@ mod reconnect_backlog_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_subagent_start_and_resume_read_connected_feature_even_with_explicit_parent_rules() {
+        fn read(socket: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Value {
+            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_ref()).unwrap()
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
+        let endpoint = AppServerEndpoint::LoopbackWebSocket {url:format!("ws://{}",listener.local_addr().unwrap()),bearer_token:None};
+        let server = std::thread::spawn(move || {
+            let (stream,_) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let init = read(&mut socket);
+            socket.send(tungstenite::Message::Text(json!({"id":init["id"],"result":{"userAgent":"fixture"}}).to_string().into())).unwrap();
+            assert_eq!(read(&mut socket)["method"],"initialized");
+            for supported in [false,true,false,true] {
+                let request = read(&mut socket);
+                assert_eq!(request["method"],"config/read");
+                let features = if supported {json!({"multi_agent_v2":{"enabled":true}})} else {json!({"multi_agent":true})};
+                socket.send(tungstenite::Message::Text(json!({"id":request["id"],"result":{"config":{"features":features}}}).to_string().into())).unwrap();
+            }
+            let _ = socket.read();
+        });
+        let client = AppServerClient::connect(AppServerClientOptions::new(endpoint)).unwrap();
+        for resume in [false,true] {
+            for supported in [false,true] {
+                let original = Some(std::collections::BTreeMap::from([("owner.key".into(),json!("kept"))]));
+                let augmentation = crate::memory::LaunchAugmentation {
+                    native_subagent:Some(crate::memory::NativeSubagentContext {parent_name:"parent".into(),project:None}),
+                    memory:None,harness:None,
+                };
+                let bootstrap = if resume {
+                    ThreadBootstrap::Resume(ThreadResumeParams {thread_id:"thread".into(),cwd:Some(std::env::temp_dir()),developer_instructions:Some("parent rules".into()),config:original.clone(),launch_augmentation:Some(augmentation),..Default::default()})
+                } else {
+                    ThreadBootstrap::Start(ThreadStartParams {cwd:Some(std::env::temp_dir()),developer_instructions:Some("parent rules".into()),config:original.clone(),launch_augmentation:Some(augmentation),..Default::default()})
+                };
+                let resolved = resolve_bootstrap_launch_augmentation(&client.handle(),bootstrap);
+                let config = match resolved {ThreadBootstrap::Start(p)=>p.config,ThreadBootstrap::Resume(p)=>p.config};
+                if supported {
+                    assert!(config.as_ref().unwrap().contains_key("features.multi_agent_v2.subagent_developer_instructions"));
+                } else {
+                    assert_eq!(serde_json::to_vec(&config).unwrap(),serde_json::to_vec(&original).unwrap());
+                }
+            }
+        }
+        client.handle().shutdown().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_subagent_unknown_or_legacy_features_preserve_config_bytes() {
+        use serde_json::json;
+        let features = [None, Some(json!({})), Some(json!({"features":{"multi_agent":true}})),
+            Some(json!({"features":{"multi_agent_v2":true}})),
+            Some(json!({"features":{"multi_agent_v2":{}}})),
+            Some(json!({"features":{"multi_agent_v2":{"enabled":"true"}}}))];
+        for effective in features {
+            for original in [None, Some(std::collections::BTreeMap::new()),
+                Some(std::collections::BTreeMap::from([
+                    ("features.multi_agent".to_string(), json!(true)),
+                    ("developer_instructions".to_string(), json!("owner configuration")),
+                ]))] {
+                let before = serde_json::to_vec(&original).unwrap();
+                let mut config = original;
+                super::apply_native_subagent_instructions(&mut config, Some("child frame".into()), effective.as_ref());
+                assert_eq!(serde_json::to_vec(&config).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn native_subagent_supported_feature_requires_instructions_and_preserves_other_keys() {
+        use serde_json::json;
+        let effective = json!({"features":{"multi_agent_v2":{"enabled":false}}});
+        let mut config = None;
+        super::apply_native_subagent_instructions(&mut config, None, Some(&effective));
+        assert!(config.is_none());
+        let mut config = Some(std::collections::BTreeMap::from([("owner.key".into(),json!("kept"))]));
+        super::apply_native_subagent_instructions(&mut config, Some("child frame".into()), Some(&effective));
+        let config = config.unwrap();
+        assert_eq!(config["owner.key"], json!("kept"));
+        assert_eq!(config["features.multi_agent_v2.subagent_developer_instructions"],json!("child frame"));
+        assert_eq!(config["features.multi_agent_v2.preserve_fork_prefix"],json!(false));
+    }
+
+    #[test]
+    fn native_subagent_profile_requirements_are_installed_once() {
+        const KEY:&str="features.multi_agent_v2.subagent_developer_instructions";
+        let mut config=Some(std::collections::BTreeMap::from([(KEY.into(),serde_json::json!("CHILD_PROFILE_RULE"))]));
+        super::apply_native_subagent_instructions(&mut config,Some("Child context\nCHILD_PROFILE_RULE\n".into()),Some(&serde_json::json!({"features":{"multi_agent_v2":{"enabled":true}}})));
+        let config=config.unwrap();
+        assert_eq!(config[KEY].as_str().unwrap().matches("CHILD_PROFILE_RULE").count(),1);
+        assert_eq!(config["features.multi_agent_v2.preserve_fork_prefix"],serde_json::json!(false));
+    }
+
+    #[test]
     fn event_media_shaping_never_truncates_internal_approval_or_answer_text() {
         use super::*;
         let context=AppServerRuntimeEventContext {
@@ -1997,6 +2133,7 @@ mod tests {
                 ManagedRuntime {
                     developer_instructions: None,
                     supports_owner_carries: false,
+                    supports_owner_input_batch: false,
                     supports_owner_carry_return: false,
                     supports_cutex_ingress: true,
                     endpoint: AppServerEndpoint::LoopbackWebSocket {
@@ -2664,6 +2801,7 @@ mod tests {
                 ThreadBootstrap::Start(ThreadStartParams {
                     cwd: Some(std::path::PathBuf::from("/work")),
                     launch_augmentation: Some(crate::memory::LaunchAugmentation {
+                        native_subagent: None,
                         harness: None,
                         memory: Some(crate::memory::LaunchMemoryContext {
                             index_snapshot: None,

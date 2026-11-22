@@ -699,6 +699,36 @@ mod tests {
     }
 
     #[test]
+    fn submitted_input_advisory_index_is_included_as_a_consistent_sqlite_snapshot() {
+        let home=temp("submitted-index-home");let dest=temp("submitted-index-backup");
+        let relative="runtime/management-v2/submitted-input-index.sqlite3";
+        std::fs::create_dir_all(home.join("runtime/management-v2")).unwrap();
+        let source=rusqlite::Connection::open(home.join(relative)).unwrap();
+        source.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE submitted_inputs(session TEXT NOT NULL,input_id TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(session,input_id));
+            CREATE TABLE submitted_checkpoint(singleton INTEGER PRIMARY KEY,stream TEXT,cursor TEXT,sequence INTEGER,byte_offset INTEGER);
+            INSERT INTO submitted_inputs VALUES('recipient','first','hash-1');
+            INSERT INTO submitted_checkpoint VALUES(1,'stream','cursor-1',1,100);").unwrap();
+        let reader=rusqlite::Connection::open(home.join(relative)).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        assert_eq!(reader.query_row("SELECT COUNT(*) FROM submitted_inputs",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        source.execute_batch("BEGIN IMMEDIATE;
+            INSERT INTO submitted_inputs VALUES('recipient','second','hash-2');
+            UPDATE submitted_checkpoint SET cursor='cursor-2',sequence=2,byte_offset=200 WHERE singleton=1;
+            COMMIT;").unwrap();
+        assert!(home.join(format!("{relative}-wal")).metadata().unwrap().len()>0);
+        let manifest=backup(&home,&dest).unwrap();
+        assert!(manifest.files.iter().any(|file|file.path==relative&&file.sqlite));
+        assert!(!manifest.files.iter().any(|file|file.path.ends_with("-wal")||file.path.ends_with("-shm")));
+        verify_manifest(&dest,&manifest).unwrap();
+        let copy=rusqlite::Connection::open(dest.join("home").join(relative)).unwrap();
+        assert_eq!(copy.query_row("SELECT COUNT(*) FROM submitted_inputs",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(copy.query_row("SELECT sequence FROM submitted_checkpoint WHERE singleton=1",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        drop(copy);drop(reader);drop(source);
+        std::fs::remove_dir_all(home).unwrap();std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
     fn new_state_snapshots_and_worker_rollback_refusal_preserve_all_data() {
         let home = temp("r282-state");
         let dest = temp("r282-backup");

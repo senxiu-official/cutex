@@ -145,7 +145,8 @@ pub fn settle_retired_target(store: &AskStore, session: &str, now: DateTime<Utc>
         for ask in state.asks.values().filter(|ask| (ask.remote.is_none() && ask.target_cutex_session_id == session) && ask.is_open()) {
             match ask.execution {
                 ExecutionState::Queued | ExecutionState::PendingReview => failed.push(ask.ask_id.clone()),
-                ExecutionState::Running if ask.is_waiting() || ask.resume_pending() => failed.push(ask.ask_id.clone()),
+                ExecutionState::Running if ask.is_waiting() || ask.resume_pending()
+                    || super::stop_settlement::terminal_without_lease(state, ask) => failed.push(ask.ask_id.clone()),
                 ExecutionState::Admitted | ExecutionState::Running => {
                     if let Some(attempt) = ask.current_attempt().filter(|attempt| !attempt.state.is_terminal()) {
                         running.push((ask.ask_id.clone(), attempt.n));
@@ -204,7 +205,8 @@ pub fn retry(state: &mut AskState, ask_id: &str, requester: Option<&str>, now: D
     if let Some(requester) = requester {
         ask.require_controller(requester, "ask_not_found", "no such ask of yours")?;
     }
-    if ask.execution != ExecutionState::Interrupted || !ask.is_open() {
+    // r290 P7
+    if !matches!(ask.execution, ExecutionState::Interrupted | ExecutionState::Failed) || !ask.is_open() {
         return Err(AskError::new("ask_not_retryable", "only an open, interrupted ask can be retried")
             .with(json!({"execution": ask.execution, "closed": ask.closed})));
     }

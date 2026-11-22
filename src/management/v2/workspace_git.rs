@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
@@ -20,6 +21,29 @@ use super::workspace::WorkspaceResult;
 
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 const UNTRACKED_COUNT_LIMIT: u64 = 1024 * 1024;
+const IGNORE_TIMEOUT: Duration = Duration::from_millis(500);
+
+// r290 integration: real-Git semantics fixtures retain a bounded test budget;
+// production and timeout-contract tests keep the 500 ms admission budget.
+#[cfg(test)]
+thread_local! {
+    static TEST_IGNORE_BUDGET: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn with_test_ignore_budget<T>(budget: Duration, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) { TEST_IGNORE_BUDGET.set(self.0); }
+    }
+    let _restore = Restore(TEST_IGNORE_BUDGET.replace(Some(budget)));
+    run()
+}
+fn ignore_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_IGNORE_BUDGET.get() { return budget; }
+    IGNORE_TIMEOUT
+}
+
 
 #[path = "git_status_capacity.rs"]
 mod status_capacity;
@@ -64,6 +88,72 @@ fn git_command(dir: &Path) -> Command {
     command
 }
 
+thread_local! {
+    static STATUS_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+struct GitDeadline(Option<Instant>);
+impl GitDeadline {
+    fn within(budget: Duration) -> Self {
+        let limit = Instant::now() + budget;
+        let previous = STATUS_DEADLINE.get();
+        STATUS_DEADLINE.set(Some(previous.map_or(limit, |old| old.min(limit))));
+        Self(previous)
+    }
+}
+impl Drop for GitDeadline { fn drop(&mut self) { STATUS_DEADLINE.set(self.0); } }
+
+// Drain both pipes while polling: waiting before reading can deadlock on a
+// large status response. Only this command's own child is killed on timeout.
+// Windows limit: cmd/git.exe launchers can leave a descendant holding pipes.
+// Use Git's direct mingw64/bin/git.exe for a strict bound; this runner does not
+// own a kill-on-close job for descendants (see docs/security/workspace-git.md).
+fn git_output(mut command: Command, input: Option<&[u8]>) -> std::io::Result<Output> {
+    let Some(deadline) = STATUS_DEADLINE.get() else {
+        if input.is_none() { return command.output(); }
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let bytes = input.unwrap_or_default().to_vec();
+        let writer = std::thread::spawn(move || { let _ = stdin.write_all(&bytes); });
+        let output = child.wait_with_output();
+        let _ = writer.join();
+        return output;
+    };
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "git scan timed out"));
+    }
+    if input.is_some() { command.stdin(Stdio::piped()); }
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
+    let err = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+    let writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let bytes = input.to_vec();
+        std::thread::spawn(move || { let _ = stdin.write_all(&bytes); })
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break match result {
+                    Err(error) => Err(error),
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "git scan timed out")),
+                };
+            }
+        }
+    };
+    if let Some(writer) = writer { let _ = writer.join(); }
+    let stdout = out.join().map_err(|_| std::io::Error::other("git stdout reader panicked"))??;
+    let stderr = err.join().map_err(|_| std::io::Error::other("git stderr reader panicked"))??;
+    Ok(Output { status: status?, stdout, stderr })
+}
+
 /// Run git in `dir`; `input` is written to stdin when present.
 pub(super) fn run_git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Output> {
     crate::artifacts::paths::validate_resolved_local_path(dir).map_err(|_|std::io::ErrorKind::PermissionDenied)?;
@@ -73,10 +163,12 @@ pub(super) fn run_git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> std::i
     // status/diff may otherwise run repository-defined clean/process filters.
     // Config inspection itself invokes no filters or hooks. Override every
     // driver, including drivers brought in through config includes.
-    let config = git_command(dir).args([
+    let mut inspect = git_command(dir);
+    inspect.args([
         "config", "--null", "--show-scope", "--name-only", "--get-regexp",
         r"^filter\..*\.(clean|smudge|process|required)$",
-    ]).output()?;
+    ]);
+    let config = git_output(inspect, None)?;
     if !config.status.success() && config.status.code() != Some(1) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
             "cannot inspect Git filter configuration"));
@@ -95,24 +187,18 @@ pub(super) fn run_git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> std::i
     }
     git_config(&mut command,&overrides);
     command.args(args);
-    if input.is_none() {
-        return command.output();
-    }
-    command.stdin(Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let input = input.unwrap_or_default().to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-    });
-    let output = child.wait_with_output();
-    let _ = writer.join();
-    output
+    git_output(command, input)
 }
 
 /// Names (entries of `dir`) that `.gitignore` rules ignore. Empty when `dir`
 /// is not inside a repository or git is unavailable.
 pub fn check_ignored(dir: &Path, names: &[&str]) -> HashSet<String> {
+    check_ignored_with(names, |input| run_git(dir, &["check-ignore", "-z", "--stdin"], Some(input)))
+}
+
+fn check_ignored_with(names: &[&str], run: impl FnOnce(&[u8]) -> std::io::Result<Output>) -> HashSet<String> {
+    // The watcher must recover conservatively if Git is slow or unavailable.
+    let _deadline = GitDeadline::within(ignore_budget());
     if names.is_empty() {
         return HashSet::new();
     }
@@ -121,7 +207,7 @@ pub fn check_ignored(dir: &Path, names: &[&str]) -> HashSet<String> {
         input.extend_from_slice(name.as_bytes());
         input.push(0);
     }
-    match run_git(dir, &["check-ignore", "-z", "--stdin"], Some(&input)) {
+    match run(&input) {
         Ok(output) if output.status.code() == Some(0) => split_nul(&output.stdout)
             .into_iter()
             .map(|path| path.trim_end_matches('/').to_string())
@@ -225,6 +311,7 @@ fn numstat(root: &Path, cached: bool) -> HashMap<String, (Option<u64>, Option<u6
 }
 
 fn count_lines(path: &Path) -> Option<u64> {
+    if STATUS_DEADLINE.get().is_some_and(|deadline| Instant::now() >= deadline) { return None; }
     super::host_files::refuse_root_credential_file(path).ok()?;
     let meta = path.metadata().ok()?;
     if !meta.is_file() || meta.len() > UNTRACKED_COUNT_LIMIT {
@@ -245,6 +332,18 @@ pub fn status_resource(root: &ResolvedRoot) -> WorkspaceResult<std::sync::Arc<Va
 }
 
 fn status_uncached(root: &ResolvedRoot) -> WorkspaceResult<Value> {
+    let _reset = GitDeadline::within(status_capacity::SCAN_TIMEOUT);
+    let deadline = STATUS_DEADLINE.get().expect("scan deadline");
+    let result = status_scan(root);
+    // Auxiliary reads may deliberately tolerate Git errors. The whole scan
+    // deadline still wins over a partial or misleading non-repository result.
+    if Instant::now() >= deadline {
+        return Err(status_capacity::busy());
+    }
+    result
+}
+
+fn status_scan(root: &ResolvedRoot) -> WorkspaceResult<Value> {
     let dir = &root.canonical;
     let Some(prefix) = repo_prefix(dir) else {
         return Ok(json!({
@@ -618,6 +717,61 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn git_status_ignore_probe_timeout_is_conservative_and_restores_deadline() {
+        const CHILD: &str = "CUTEX_GIT_IGNORE_TIMEOUT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(5));
+            return;
+        }
+        let previous = STATUS_DEADLINE.get();
+        let started = Instant::now();
+        let ignored = check_ignored_with(&["target/build.out"], |_| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["git_status_ignore_probe_timeout_is_conservative_and_restores_deadline", "--nocapture"])
+                .env(CHILD, "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(windows)] {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+            }
+            git_output(command, None)
+        });
+        assert!(ignored.is_empty(), "timeout must leave all changed paths relevant");
+        assert!(started.elapsed() >= IGNORE_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(STATUS_DEADLINE.get(), previous);
+        let _outer = GitDeadline::within(Duration::from_millis(50));
+        let outer = STATUS_DEADLINE.get();
+        let ignored = check_ignored_with(&["target/build.out"], |_| {
+            assert_eq!(STATUS_DEADLINE.get(), outer, "ignore probe must not extend an existing deadline");
+            Err(std::io::ErrorKind::TimedOut.into())
+        });
+        assert!(ignored.is_empty());
+        assert_eq!(STATUS_DEADLINE.get(), outer);
+    }
+
+    #[test]
+    fn git_status_process_deadline_reaps_its_own_child() {
+        const CHILD: &str = "CUTEX_GIT_TIMEOUT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(10));
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["git_status_process_deadline_reaps_its_own_child", "--nocapture"])
+            .env(CHILD, "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        }
+        let started = Instant::now();
+        let prior = STATUS_DEADLINE.replace(Some(started + Duration::from_millis(200)));
+        let result = git_output(command, None);
+        STATUS_DEADLINE.set(prior);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn status_never_verifies_a_repository_supplied_signature() {
         use std::os::unix::fs::PermissionsExt;
@@ -987,3 +1141,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "git_status_churn_scale_tests.rs"]
+mod churn_scale;

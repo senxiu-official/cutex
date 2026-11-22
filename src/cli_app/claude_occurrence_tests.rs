@@ -300,7 +300,9 @@ fn observer(root: &Path, role: &str) {
     }
 }
 fn command(root: &Path, role: &str, step: usize, text: &str) {
-    std::fs::write(root.join(format!("command-{role}-{step}")), text).unwrap();
+    let pending = root.join(format!("command-{role}-{step}.tmp"));
+    std::fs::write(&pending, text).unwrap();
+    std::fs::rename(pending, root.join(format!("command-{role}-{step}"))).unwrap();
     wait_for(|| root.join(format!("reply-{role}-{step}")).is_file());
 }
 #[test]

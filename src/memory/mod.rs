@@ -10,6 +10,8 @@
 pub mod harness;
 pub mod idle_note;
 pub mod instructions;
+pub mod native_subagent;
+pub use native_subagent::{NativeSubagentContext, compose_native_subagent_instructions};
 #[cfg(test)]
 #[path = "test_support_switch.rs"]
 pub(crate) mod switch_test_support;

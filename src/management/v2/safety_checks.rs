@@ -140,7 +140,12 @@ pub fn apply_notification(
             state.record_safety_block(agent_id, agent_name, block, settings, evaluator, project, now).1
         }
         UPDATED_NOTIFICATION => {
-            if state.safety_record(agent_id, &block.block_id).is_none() {
+            let Some(previous) = state.safety_record(agent_id, &block.block_id) else {
+                return false;
+            };
+            // A local owner dismissal is final for this block occurrence. A
+            // late observer snapshot must not resurrect the same open block.
+            if previous.safety_block.as_ref().is_some_and(|old| old.state == "dismissed") {
                 return false;
             }
             state.update_safety_block(agent_id, block, now).map(|(_, changed)| changed).unwrap_or(false)
@@ -302,6 +307,19 @@ pub enum RuntimeCallError {
 }
 
 fn runtime_call(cutex_session_id: &str, block: &SafetyBlock, method: &str, params: Value) -> Result<Value, RuntimeCallError> {
+    let lane = if method == RUNTIME_GRANT {
+        Some(super::session_coordination::session_lane(cutex_session_id)
+            .map_err(|error| RuntimeCallError::Failed(format!("{error:#}")))?)
+    } else { None };
+    // Recheck lifecycle after admission, and retain that occurrence's lane
+    // through the runtime decision. Never grant into a retired replacement.
+    let _reservation = lane.as_ref().map(|lane| grant_reservation(lane)).transpose()
+        .map_err(|error| RuntimeCallError::Failed(format!("{error:#}")))?;
+    if method == RUNTIME_GRANT {
+        let record = crate::session::store::shared_session_row(cutex_session_id)
+            .map_err(|error| RuntimeCallError::Failed(format!("{error:#}")))?;
+        grantable(record.as_deref())?;
+    }
     if block.runtime != "claude" {
         return Err(RuntimeCallError::Unsupported);
     }
@@ -312,6 +330,64 @@ fn runtime_call(cutex_session_id: &str, block: &SafetyBlock, method: &str, param
         E::Refused { code, message, data } => RuntimeCallError::Refused { code, message, data },
         E::Failed(error) => RuntimeCallError::Failed(format!("{error:#}")),
     })
+}
+
+fn grant_reservation(
+    lane: &super::session_coordination::OperationLane,
+) -> Result<super::session_coordination::OperationReservation<'_>, super::session_coordination::ReservationError> {
+    // The ordinary owner mutation route already owns this exact session lane.
+    // Nest its capability; try_lock deliberately does not support nesting.
+    if lane.held_by_current_thread() { lane.reserve() } else { lane.try_lock() }
+}
+
+fn grantable(record: Option<&crate::session::model::CutexSessionRecord>) -> Result<(), RuntimeCallError> {
+    if record.is_none_or(|record| record.is_retired()) {
+        return Err(RuntimeCallError::Refused {
+            code: "runtime_gone".into(),
+            message: "the agent was retired or deleted; a new grant cannot be delivered".into(),
+            data: json!({"code":"runtime_gone"}),
+        });
+    }
+    Ok(())
+}
+
+/// Owner-only notice disposal. It needs no session record or running adapter.
+/// The direct route provides its usual action receipt/idempotency envelope.
+pub fn dismiss_owner_notification(
+    owner: Option<HumanManagementPrincipal>,
+    notification_id: &str,
+) -> Result<Value, UserInputExecutionError> {
+    if owner.is_none() {
+        return Err(error("cutex_method_denied", "safety check decisions are the owner's", json!({})));
+    }
+    let store = OwnerNotifyStore::open_default().map_err(unavailable)?;
+    let result = dismiss_notification_with(&store, notification_id, Utc::now())?;
+    super::owner_notify::publish_pending_notices(&store);
+    Ok(result)
+}
+
+fn dismiss_notification_with(
+    store: &OwnerNotifyStore,
+    notification_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Value, UserInputExecutionError> {
+    store.edit_record(notification_id, |state| {
+        let record = state.notifications.get(notification_id).cloned()
+            .ok_or_else(|| error("safety_block_not_found", "safety notification not found", json!({})))?;
+        let mut block = record.safety_block.clone()
+            .ok_or_else(|| error("safety_block_not_found", "notification is not a safety block", json!({})))?;
+        if block.state == "dismissed" {
+            return Ok(json!({"notification":record,"block":block}));
+        }
+        if !block.is_open() {
+            return Err(error("safety_block_closed", "safety block was already decided", json!({"notification":record})));
+        }
+        block.state = "dismissed".into();
+        block.decided_at = Some(crate::asks::now_rfc3339(now));
+        let notification = state.update_safety_block(&record.agent_id, block.clone(), now)
+            .map_err(owner_error)?.0;
+        Ok(json!({"notification":notification,"block":block}))
+    }).map_err(unavailable)?
 }
 
 /// Session cutex methods (`cutex/safetyCheck/*`).

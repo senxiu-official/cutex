@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:model-context-settings",
+  "title": "Unified Profile model and context settings",
+  "description": "Owner-set per-model overrides > Profile defaults > catalog built-ins, with upgrade-preserved conflict values. Runtime support is independent; Native requires modelContextSettingsV2. Default label numbers are resolved by the backend.",
+  "$defs": {
+    "nullableCount": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "nullablePercent": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 100
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "model",
+        "profile",
+        "catalog",
+        "default90Percent",
+        "runtimeDefault",
+        "unsupported",
+        "unknown",
+        "reference",
+        "notApplicable",
+        "preserved"
+      ]
+    },
+    "support": {
+      "type": "object",
+      "required": [
+        "supported",
+        "reason"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "claudeCompaction": {
+      "type": "object",
+      "required": [
+        "percent"
+      ],
+      "properties": {
+        "window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 100000,
+          "maximum": 1000000
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    },
+    "profileFields": {
+      "type": "object",
+      "required": [
+        "modelAutoCompactPercent",
+        "modelContextSettingsV1",
+        "modelContextSettingsSupport"
+      ],
+      "properties": {
+        "modelAutoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "modelContextSettingsV1": {
+          "type": "boolean"
+        },
+        "modelContextSettingsSupport": {
+          "$ref": "#/$defs/support"
+        }
+      }
+    },
+    "profileWrite": {
+      "type": "object",
+      "properties": {
+        "modelAutoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "modelAutoCompactTokenLimit": {
+          "$ref": "#/$defs/nullableCount"
+        },
+        "claudeCompaction": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/claudeCompaction"
+            }
+          ]
+        },
+        "claudeCompactionModels": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/claudeCompaction"
+          }
+        }
+      },
+      "not": {
+        "required": [
+          "modelAutoCompactPercent",
+          "modelAutoCompactTokenLimit"
+        ],
+        "properties": {
+          "modelAutoCompactPercent": {
+            "type": "integer"
+          },
+          "modelAutoCompactTokenLimit": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "modelWrite": {
+      "type": "object",
+      "properties": {
+        "autoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "autoCompactTokenLimit": {
+          "$ref": "#/$defs/nullableCount"
+        },
+        "restorePreservedContextWindow": {
+          "type": "boolean"
+        },
+        "restorePreservedAutoCompaction": {
+          "type": "boolean"
+        }
+      },
+      "not": {
+        "required": [
+          "autoCompactPercent",
+          "autoCompactTokenLimit"
+        ],
+        "properties": {
+          "autoCompactPercent": {
+            "type": "integer"
+          },
+          "autoCompactTokenLimit": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "effective": {
+      "type": "object",
+      "required": [
+        "contextWindow",
+        "contextWindowSource",
+        "autoCompactTokenLimit",
+        "autoCompactTokenLimitSource"
+      ],
+      "properties": {
+        "contextWindow": {
+          "$ref": "#/$defs/nullableCount"
+        },
+        "contextWindowSource": {
+          "$ref": "#/$defs/source"
+        },
+        "contextWindowIsReference": {
+          "type": "boolean"
+        },
+        "autoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "autoCompactPercentSource": {
+          "$ref": "#/$defs/source"
+        },
+        "autoCompactTokenLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "autoCompactTokenLimitSource": {
+          "$ref": "#/$defs/source"
+        }
+      }
+    },
+    "modelFields": {
+      "type": "object",
+      "required": [
+        "effective"
+      ],
+      "properties": {
+        "autoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "effective": {
+          "$ref": "#/$defs/effective"
+        },
+        "contextSettings": {
+          "$ref": "#/$defs/contextSettings"
+        },
+        "defaultValues": {
+          "$ref": "#/$defs/defaultValues"
+        }
+      }
+    },
+    "modelsResource": {
+      "type": "object",
+      "required": [
+        "modelContextSettingsSupport",
+        "modelContextSettingsV1Supported",
+        "modelContextSettingsV1",
+        "models"
+      ],
+      "properties": {
+        "modelContextSettingsSupport": {
+          "$ref": "#/$defs/support"
+        },
+        "modelContextSettingsV1Supported": {
+          "type": "boolean"
+        },
+        "modelContextSettingsV1": {
+          "type": "boolean"
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelFields"
+          }
+        },
+        "profileDefaultValues": {
+          "type": "object",
+          "properties": {
+            "selectedModel": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "selected": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/effective"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "byModel": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/effective"
+              }
+            }
+          }
+        }
+      }
+    },
+    "contextValues": {
+      "type": "object",
+      "properties": {
+        "contextWindow": {
+          "$ref": "#/$defs/nullableCount"
+        },
+        "autoCompactPercent": {
+          "$ref": "#/$defs/nullablePercent"
+        },
+        "autoCompactTokenLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "contextSettings": {
+      "type": "object",
+      "required": [
+        "catalog",
+        "owner",
+        "preserved"
+      ],
+      "properties": {
+        "catalog": {
+          "$ref": "#/$defs/contextValues"
+        },
+        "owner": {
+          "$ref": "#/$defs/contextValues"
+        },
+        "preserved": {
+          "$ref": "#/$defs/contextValues"
+        }
+      }
+    },
+    "defaultValues": {
+      "type": "object",
+      "required": [
+        "model",
+        "profile"
+      ],
+      "properties": {
+        "model": {
+          "$ref": "#/$defs/effective"
+        },
+        "profile": {
+          "$ref": "#/$defs/effective"
+        }
+      }
+    }
+  }
+}

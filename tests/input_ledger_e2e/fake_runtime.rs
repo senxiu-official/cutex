@@ -61,6 +61,10 @@ pub struct Script {
     /// 057 harness opt-in only: simulate atomic owner request + carried inputs.
     /// This fake does not prove the production adapters implement that contract.
     pub owner_input_carries: bool,
+    /// Harness opt-in for atomic original owner prefixes (not production proof).
+    pub owner_input_batch: bool,
+    /// Opt-in production-shaped v2 passive envelopes for pre-turn barrier tests.
+    pub native_structured_notes: bool,
     /// Claude adapter `ownerCarryReturn`: `thread/externalInput/returnCarries`
     /// gives back the carried notes of a steer an interrupt dropped unread.
     pub owner_carry_return: bool,
@@ -138,6 +142,8 @@ impl Default for Script {
     fn default() -> Self {
         Self {
             owner_input_carries: false,
+            owner_input_batch: false,
+            native_structured_notes: false,
             owner_carry_return: false,
             start_delay: Duration::ZERO,
             steer_delay: Duration::ZERO,
@@ -792,6 +798,8 @@ fn handle(ctx: &Ctx, request: Value, tx: &mpsc::Sender<String>) {
                     "externalInputControlVersion": 1, "externalInputDeliveries": ["after_turn", "passive", "soon"]})
             } else { json!({"userAgent": format!("input-ledger-e2e-fake-{}", ctx.kind.name())}) };
             if script.owner_input_carries { response["ownerInputCarries"] = json!(1); }
+            if script.owner_input_batch { response["ownerInputBatch"] = json!(1); }
+            if script.native_structured_notes { response["externalInputVersions"] = json!([1,2]); }
             if script.owner_carry_return { response["ownerCarryReturn"] = json!(1); }
             Ok(response)
         }
@@ -827,6 +835,7 @@ fn handle(ctx: &Ctx, request: Value, tx: &mpsc::Sender<String>) {
         "claude/runtime/status" => Ok(json!({
             "threadId": ctx.thread, "state": if active(&state.turns).is_some() { "working" } else { "waiting" },
             "sessionId": "fixture-native", "connectionId": state.connection_id,
+            "ownerTaskAlive": true,
         })),
         "claude/input/submit" if params.get("messageId").is_some_and(Value::is_string) => {
             delay = script.start_delay;
@@ -1023,7 +1032,15 @@ fn start_or_steer(ctx: &Ctx, state: &mut State, method: &str, params: &Value, sc
             if ids.contains(&entry.id) { entry.state = "queued".into(); }
         }
     }
-    let turn_id = open_turn(state, vec![item], true);
+    let mut items=Vec::new();
+    if let Some(prefix)=params.get("ownerInputs") {
+        if !script.owner_input_batch {return Err(json!({"code":-32602,"message":"owner input batches unavailable"}));}
+        let prefix=prefix.as_array().ok_or_else(||json!({"code":-32602,"message":"invalid prefix"}))?;
+        for original in prefix {items.push(json!({"type":"userMessage","id":uuid::Uuid::new_v4().to_string(),
+            "clientId":original["clientUserMessageId"],"content":original["input"]}));}
+    }
+    items.push(item);
+    let turn_id = open_turn(state, items, true);
     let turn = state.turns.iter().rev().find(|t| t["id"] == turn_id.as_str()).cloned().unwrap();
     Ok(json!({"turn": turn}))
 }

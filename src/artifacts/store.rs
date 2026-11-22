@@ -95,7 +95,7 @@ pub enum Content {
     /// Copied into the store.
     Blob { bytes: Vec<u8>, sha256: String },
     /// Registered by path (over `maxBlobBytes`); `sha256` only when hashed.
-    External { sha256: Option<String>, bytes: u64 },
+    External { sha256: Option<String>, bytes: u64, source_stamp: Option<super::raw::SourceStamp> },
 }
 
 impl Content {
@@ -374,6 +374,12 @@ impl ArtifactStore {
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (artifact_id, version)
             );
+            CREATE TABLE IF NOT EXISTS artifact_source_stamps (
+                artifact_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                stamp TEXT NOT NULL,
+                PRIMARY KEY (artifact_id, version)
+            );
             CREATE INDEX IF NOT EXISTS artifact_versions_sha ON artifact_versions (sha256);
             CREATE INDEX IF NOT EXISTS artifact_versions_producer ON artifact_versions (producer_session);
             CREATE TABLE IF NOT EXISTS actions (
@@ -421,6 +427,13 @@ impl ArtifactStore {
         Ok(connection)
     }
 
+    pub fn source_stamp(&self, id: &str, version: u64) -> anyhow::Result<Option<super::raw::SourceStamp>> {
+        let text: Option<String> = self.connection()?.query_row(
+            "SELECT stamp FROM artifact_source_stamps WHERE artifact_id = ?1 AND version = ?2",
+            params![id, version as i64], |row| row.get(0)).optional()?;
+        text.map(|text| serde_json::from_str(&text).map_err(Into::into)).transpose()
+    }
+
     pub fn blob_path(&self, sha256: &str) -> PathBuf {
         let prefix = sha256.get(..2).unwrap_or("00");
         self.dir.join("blobs").join(prefix).join(sha256)
@@ -451,7 +464,17 @@ impl ArtifactStore {
             .optional()?;
         let mut changes = Vec::new();
         if let Some(current) = &existing {
-            if same_content(&current.latest, &new) {
+            let same_source = match &new.content {
+                Content::External { source_stamp: Some(stamp), .. } => {
+                    let recorded: Option<String> = transaction.query_row(
+                        "SELECT stamp FROM artifact_source_stamps WHERE artifact_id = ?1 AND version = ?2",
+                        params![current.artifact_id, current.latest.version as i64], |row| row.get(0)).optional()?;
+                    current.latest.source_path == new.source_path && recorded
+                        .and_then(|text| serde_json::from_str::<super::raw::SourceStamp>(&text).ok()).as_ref() == Some(stamp)
+                }
+                _ => true,
+            };
+            if same_source && same_content(&current.latest, &new) {
                 let mut revision = current.revision;
                 if new.kind.as_deref().is_some_and(|kind| kind != current.kind) {
                     changes.push("kind");
@@ -557,6 +580,10 @@ impl ArtifactStore {
                     at,
                 ],
             )?;
+            if let Content::External { source_stamp: Some(stamp), .. } = &new.content {
+                transaction.execute("INSERT INTO artifact_source_stamps (artifact_id, version, stamp) VALUES (?1, ?2, ?3)",
+                    params![artifact_id, version as i64, serde_json::to_string(stamp).map_err(anyhow::Error::from)?])?;
+            }
             Ok(artifact_id)
         })();
         let artifact_id = match result.and_then(|id| transaction.commit().map(|()| id).map_err(StoreError::from)) {
@@ -839,6 +866,7 @@ impl ArtifactStore {
             let rows = statement.query_map([artifact_id], |row| row.get(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        transaction.execute("DELETE FROM artifact_source_stamps WHERE artifact_id = ?1", [artifact_id])?;
         transaction.execute("DELETE FROM artifact_versions WHERE artifact_id = ?1", [artifact_id])?;
         transaction.execute("DELETE FROM artifacts WHERE artifact_id = ?1", [artifact_id])?;
         let mut orphaned = Vec::new();
@@ -1295,7 +1323,7 @@ pub(crate) mod tests {
         store.publish(blob(&project, "dup.md", "12345", agent("cutex.b")), 8, now).unwrap();
         // External files: content not stored; same size + mtime + path = no-op.
         let mut external = blob(&project, "big.bin", "", agent("cutex.a"));
-        external.content = Content::External { sha256: None, bytes: 1 << 40 };
+        external.content = Content::External { sha256: None, bytes: 1 << 40, source_stamp: None };
         external.source_mtime_ms = Some(7);
         let first = store.publish(external.clone(), 8, now).unwrap();
         assert_eq!(first.version.storage, "external");

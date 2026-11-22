@@ -57,7 +57,7 @@ mod tests {
         assert_eq!(provider.store().snapshot().unwrap().agent_archive_audit.len(),1);
         // The authoritative tombstone is durable while session projection remains active.
         let command=UserInputSubmitCommand { management_request_id:"input-gate".into(),cutex_session_id:record.cutex_session_id.clone(),thread_id:"original-thread".into(),
-            params:UserInputSubmitParams {client_user_message_id:"input-gate-message".into(),origin:UserInputOrigin {kind:UserInputOriginKind::Backend,client_id:"test".into()},
+            params:UserInputSubmitParams {interrupt_send:None,client_user_message_id:"input-gate-message".into(),origin:UserInputOrigin {kind:UserInputOriginKind::Backend,client_id:"test".into()},
                 strategy:UserInputStrategy::Auto,input:vec![serde_json::json!({"type":"text","text":"must not send"})],expected_turn_id:None,join_delegation:None} };
         let submit=crate::cli_app::app_server_user_input::submit_v2(command.clone()).unwrap_err();
         assert_eq!(submit.code,"archive_blocks_input");assert!(!submit.outcome_unknown);

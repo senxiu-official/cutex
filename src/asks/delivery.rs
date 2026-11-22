@@ -101,15 +101,60 @@ pub fn record_question_delivery(state: &mut AskState, ask: &AskRecord, question_
     push(state, ask, DeliveryKind::Question, question_id.to_string(), false, now)
 }
 
+// r290 P7: failures are actionable even though the delegation remains open.
+pub(super) fn record_handler_failure(state: &mut AskState, ask: &AskRecord, attempt: u32, now: DateTime<Utc>) -> Option<String> {
+    push(state, ask, DeliveryKind::State, format!("{}{attempt}", super::handler_failure::PREFIX),
+        ask.options.notify == Notify::Passive, now)
+}
+
 /// A state change that wakes waits (§5.8): paused, blocked, held,
 /// rejected, interrupted, failed. Final outcomes are delivered like answers;
 /// holds are passive (shown by the next `agent_wait` / `agent_list`).
 pub fn record_state_delivery(state: &mut AskState, ask: &AskRecord, reason: &str, now: DateTime<Utc>) -> Option<String> {
     if let Some(inbound) = state.asks.get_mut(&ask.ask_id).and_then(|a|a.peer_inbound.as_mut()) { inbound.last_error = Some(reason.to_string()); }
+    if matches!(reason, "held" | "paused") && gate_hold(ask) {
+        if let Some(pause) = state.pauses.get(&ask.target_cutex_session_id)
+            .filter(|pause| pause.origin.as_deref() == Some(super::control::ORIGIN_RUNTIME_GATE)) {
+            let ref_id = format!("held@runtimeGate:{}", pause.since);
+            return push(state, ask, DeliveryKind::State, ref_id, false, now);
+        }
+    }
     let final_outcome = ask.execution.is_terminal();
     let passive = !final_outcome || ask.options.notify == Notify::Passive;
     let ref_id = format!("{reason}@{}", ask.revision);
     push(state, ask, DeliveryKind::State, ref_id, passive, now)
+}
+
+fn gate_hold(ask: &AskRecord) -> bool {
+    matches!(&ask.hold, Some(Hold::HeldByRuntime { native })
+        if native.as_deref() == Some(super::control::NATIVE_GATE_CLOSED))
+}
+
+pub(super) fn is_gate_notice(delivery: &DeliveryRecord) -> bool {
+    delivery.kind == DeliveryKind::State && delivery.ref_id.starts_with("held@runtimeGate:")
+}
+
+fn stale_gate_notice(state: &AskState, delivery: &DeliveryRecord) -> bool {
+    is_gate_notice(delivery) && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
+        ask.is_open() && gate_hold(ask) && state.pauses.get(&ask.target_cutex_session_id)
+            .is_some_and(|pause| pause.origin.as_deref() == Some(super::control::ORIGIN_RUNTIME_GATE)
+                && delivery.ref_id == format!("held@runtimeGate:{}", pause.since))
+    })
+}
+
+/// Retire only notices proved never sent; reserved/unknown/read receipts remain facts.
+pub(super) fn supersede_gate_notices(state: &mut AskState, session: &str, now: DateTime<Utc>) {
+    let ids: Vec<_> = state.deliveries.values().filter(|delivery| {
+        is_gate_notice(delivery) && delivery.state == DeliveryState::Pending
+            && delivery.unsubmitted && delivery.event_id.is_none() && delivery.owner_input_id.is_none()
+            && state.asks.get(&delivery.ask_id).is_some_and(|ask| ask.target_cutex_session_id == session)
+    }).map(|delivery| delivery.delivery_id.clone()).collect();
+    for id in ids {
+        let delivery = state.deliveries.get_mut(&id).unwrap();
+        delivery.state = DeliveryState::Acknowledged;
+        delivery.settled_by = Some(SUPERSEDED.into());
+        delivery.updated_at = now_rfc3339(now);
+    }
 }
 
 /// A sent revision cannot be acknowledged after closure. Report this once per
@@ -177,18 +222,22 @@ pub fn record_owner_stopped_delivery(state: &mut AskState, ask: &AskRecord, now:
     push(state, ask, DeliveryKind::State, ref_id, false, now)
 }
 
+/// Result notifications ended by an explicit settlement, not ordinary completion.
+pub(super) fn settled_for_requester(ask: &AskRecord) -> bool {
+    ask.follow_up_ended || matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
+}
+
 /// Whether a pending delivery can be scheduled automatically (owner-held
 /// items remain available to explicit wait/read calls): not of an
-/// ask the requester already settled (accepted, abandoned or cancelled),
-/// which can only be left over from releases before r208.
+/// ask the requester already settled (accepted, abandoned or cancelled).
+/// Its source records can remain available for explicit reads.
 pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
     delivery.state == DeliveryState::Pending
+        && !stale_gate_notice(state, delivery)
         && !stale_passive_state(state, delivery)
         && !delivery.owner_hold
         && !super::lineage::stopped_parent(state,&super::routing_policy::integration::local_host_id(),&delivery.ask_id)
-        && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
-            matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
-        })
+        && !state.asks.get(&delivery.ask_id).is_some_and(|ask| settled_for_requester(ask))
         && !duplicate_answer(state, delivery)
 }
 
@@ -361,6 +410,7 @@ pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, nativ
     state.events.insert(
         event_id.clone(),
         EventOutboxRecord {
+            held_runtime_generation: None,
             event_id: event_id.clone(),
             cutex_session_id: requester.to_string(),
             delivery_ids: ids,

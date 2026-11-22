@@ -1614,7 +1614,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let reused = execute(&home, request(&plan), actor()).unwrap_err();
-        assert!(reused.to_string().contains("preview already used"));
+        assert!(
+            reused.to_string().contains("preview already used"),
+            "{reused:#}"
+        );
     }
     struct DeleteHookGuard;
     impl Drop for DeleteHookGuard {

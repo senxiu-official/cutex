@@ -1673,7 +1673,12 @@ impl AgentLifecycle for CutexAgentLifecycle {
         };
         if record.claude_session.is_some() {
             return outside("claude online", &|| {
-                cutex::runtime::claude::start(cutex_session_id.as_str()).map_err(unknown("claude_online_failed"))?;
+                cutex::runtime::claude::start(cutex_session_id.as_str()).map_err(|error| {
+                    if cutex::runtime::claude::is_schema_start_refusal(&error) {
+                        LifecycleFailure::definite(cutex::runtime::claude::SCHEMA_START_REFUSAL_CODE,
+                            cutex::runtime::claude::SCHEMA_START_REFUSAL_DETAIL)
+                    } else { unknown("claude_online_failed")(error) }
+                })?;
                 super::claude_runtime::observe(cutex_session_id.as_str()).map_err(unknown("claude_registration_failed"))
             });
         }
@@ -2185,10 +2190,11 @@ pub(super) fn validate_managed_recovery_record(
         Some("pin")
     } else if record.permission_defaults.as_deref().unwrap_or_default() != spec.permissions {
         Some("permissions")
-    } else if record.approval_policy.as_deref().unwrap_or_default() != spec.approval_policy {
-        Some("approval_policy")
-    } else if record.sandbox_mode.as_deref().unwrap_or_default() != spec.sandbox_mode {
-        Some("sandbox_mode")
+    } else if let Some(field) = spec.codex_policy_mismatch(
+        record.approval_policy.as_deref().unwrap_or_default(),
+        record.sandbox_mode.as_deref().unwrap_or_default(),
+    ) {
+        Some(field)
     } else if record.model_defaults.as_deref().unwrap_or_default() != spec.model {
         Some("model")
     } else if record.reasoning_defaults.as_deref().unwrap_or_default() != spec.reasoning {
@@ -2890,6 +2896,31 @@ mod tests {
         record.model_defaults = Some(spec.model.clone());
         record.reasoning_defaults = Some(spec.reasoning.clone());
         record
+    }
+
+    #[test]
+    fn durable_recovery_distinguishes_claude_compatibility_fields_from_native_policy() {
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("claude-recovery-policy").unwrap();
+        let mut desired = spec();
+        desired.runtime_backend = "claude_subscription".into();
+        desired.approval_policy.clear();
+        desired.sandbox_mode.clear();
+        let mut record = managed_recovery_record(&desired);
+        record.approval_policy = Some("never".into());
+        record.sandbox_mode = Some("danger-full-access".into());
+        let id = CutexSessionId::new(record.cutex_session_id.clone()).unwrap();
+        let native = record.codex_session_id.clone().unwrap();
+        validate_managed_recovery_record(&record, &id, &native, &desired).unwrap();
+
+        desired.runtime_backend = "host".into();
+        desired.approval_policy = "on-request".into();
+        desired.sandbox_mode = "workspace-write".into();
+        record.runtime_backend = CutexSessionRuntimeBackend::Host;
+        assert!(validate_managed_recovery_record(&record, &id, &native, &desired)
+            .unwrap_err().detail.ends_with("approval_policy"));
+        record.approval_policy = Some(desired.approval_policy.clone());
+        assert!(validate_managed_recovery_record(&record, &id, &native, &desired)
+            .unwrap_err().detail.ends_with("sandbox_mode"));
     }
 
     #[test]

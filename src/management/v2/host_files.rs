@@ -48,6 +48,7 @@ pub fn is_host_files_path(path: &str) -> bool {
 }
 
 pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value> {
+    let _shares = owner_share_scope(); // r290 P10 (B4/A8)
     let raw = params
         .get("path")
         .map(|raw| raw.trim())
@@ -127,6 +128,7 @@ pub(crate) fn refuse_credential_entry_metadata(path: &std::path::Path, metadata:
 }
 pub(crate) fn credential_request() -> impl Drop { secret_path_cache::pin_credential_request() }
 fn refuse_credential_path(path: &std::path::Path, listing: bool) -> WorkspaceResult<()> {
+    let _shares = owner_share_scope(); // r290 P10 (B4/A8)
     crate::artifacts::paths::validate_resolved_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))?;
     if narrowed_credential_read() {
         use secret_path_cache::CredentialDecision;
@@ -154,6 +156,9 @@ pub(crate) fn is_narrowed_credential_file(path: &std::path::Path) -> bool {
 
 pub(crate) fn narrowed_credential_read() -> bool {
     crate::management::listeners::current_client_token().is_some_and(|token| !token.scope.is_full())
+        // A shared-access user (project viewer / collaborator) never reads
+        // credential locations either, whatever its device scope.
+        || crate::management::users::current_principal().is_some_and(|principal| !principal.is_owner())
 }
 fn credential_read_denied() -> WorkspaceError {
     WorkspaceError::new(403,"credential_read_denied",
@@ -215,9 +220,43 @@ pub(crate) fn is_relay_private_path(path: &std::path::Path) -> bool {
     secret_path_cache::classify_validated(path, true)
 }
 pub(crate) fn validate_path(path: &std::path::Path) -> WorkspaceResult<()> {
+    let _shares = owner_share_scope(); // r290 P10 (B4/A8)
     crate::artifacts::paths::validate_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))
 }
+
+/// r290 P10 (B4/A8): the request may open the owner's network shares
+/// (`\\wsl$`, `\\wsl.localhost`, settings `ownerShares`). The owner principal
+/// (root credential, or a token bound to the owner) with a FULL device scope,
+/// on a Management connection: the desktop on the host, an SSH-tunnelled
+/// desktop and a paired full-scope owner device pass; a narrowed (read/chat)
+/// token, a shared-access user, an unbound token, agents (never on these
+/// routes; their own tools never install the allowance) and work outside a
+/// request thread (no connection) do not. Not `request_is_owner_local`:
+/// opening a share is what the owner's paired desktop does on the host's
+/// behalf, like any other host path it already previews; the setting that
+/// widens it is owner-local (`settings_api`).
+pub(crate) fn owner_share_request() -> bool {
+    let on_request = crate::management::listeners::current_connection().is_some()
+        || crate::management::relay::current_peer().is_some();
+    on_request
+        && crate::management::users::caller_is_owner()
+        && crate::management::listeners::current_client_token()
+            .is_none_or(|token| token.principal.is_owner() && token.scope.is_full())
+}
+
+/// The owner share allowance for the current request (inactive otherwise).
+pub(crate) fn owner_share_scope() -> crate::artifacts::paths::OwnerShareScope {
+    // An outer scope (installed once per route) keeps its resolved roots.
+    if !crate::artifacts::paths::owner_shares_active() && owner_share_request() {
+        crate::artifacts::paths::OwnerShareScope::from_settings(
+            crate::management::users::request_has_owner_local_secret_access(),
+        )
+    } else {
+        crate::artifacts::paths::OwnerShareScope::inactive()
+    }
+}
 pub(crate) fn refuse_private_tree(path: &std::path::Path) -> WorkspaceResult<()> {
+    let _shares = owner_share_scope(); // r290 P10 (B4/A8)
     crate::artifacts::paths::validate_resolved_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))?;
     if narrowed_credential_read() && secret_path_cache::narrowed_credential(path, true) {
         return Err(credential_read_denied());
@@ -1192,5 +1231,71 @@ mod tests {
             (400, "invalid_request")
         );
         assert!(read_host_file(&HashMap::new()).is_err());
+    }
+
+
+    // r290 P10 (B4/A8): who gets the owner network-share allowance.
+    #[test]
+    fn owner_share_allowance_is_for_full_scope_owner_requests_only() {
+        use crate::management::client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken};
+        use crate::management::{listeners, users};
+        let guard = RequestContextGuard::new();
+        // Outside a Management request (agent bus, background threads): never.
+        listeners::set_current_connection(None);
+        listeners::set_current_client_token(None);
+        users::set_current_principal(None);
+        assert!(!owner_share_request());
+        guard.request(false, None);
+        assert!(owner_share_request(), "root credential on loopback (the desktop on the host)");
+        guard.request(false, Some(IssuedVia::HostCli));
+        assert!(owner_share_request(), "owner token issued on the host (SSH desktop)");
+        guard.request(true, Some(IssuedVia::Pairing));
+        assert!(owner_share_request(), "a paired full-scope owner device");
+        {
+            let _scope = owner_share_scope();
+            assert!(crate::artifacts::paths::owner_shares_active());
+        }
+        let refused = |token: VerifiedClientToken, principal: users::Principal| {
+            guard.request(false, None);
+            listeners::set_current_client_token(Some(token));
+            users::set_current_principal(Some(principal));
+            let _scope = owner_share_scope();
+            assert!(!crate::artifacts::paths::owner_shares_active());
+            !owner_share_request()
+        };
+        for scope in [DeviceScope::Read, DeviceScope::Chat] {
+            let mut narrowed = VerifiedClientToken::test_token("mct-narrowed");
+            narrowed.scope = scope;
+            assert!(refused(narrowed, users::Principal::Owner), "a narrowed owner token");
+        }
+        let mut pending = VerifiedClientToken::test_token("mct-unbound");
+        pending.principal = users::Principal::Pending;
+        assert!(refused(pending, users::Principal::Pending), "an unbound token");
+        let member = users::Principal::User { id: "u-member".into(), name: "Member".into(), grant: Default::default() };
+        let mut token = VerifiedClientToken::test_token("mct-member");
+        token.principal = member.clone();
+        assert!(refused(token, member), "a shared-access user");
+    }
+
+    // r290 P10 (B4/A8): refused requests never reach the network (textual refusal first).
+    #[test]
+    fn network_previews_stay_refused_without_the_owner_allowance() {
+        use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
+        use crate::management::listeners;
+        let guard = RequestContextGuard::new();
+        guard.request(false, None);
+        let mut narrowed = VerifiedClientToken::test_token("mct-read");
+        narrowed.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(narrowed));
+        for path in [r"\\wsl$\Ubuntu\etc\hostname", r"\\wsl.localhost\Ubuntu\etc\hostname", "//wsl$/Ubuntu/etc/hostname"] {
+            let error = read_host_file(&params(path, None)).unwrap_err();
+            assert_eq!((error.status, error.code), (403, "path_forbidden"), "{path}");
+        }
+        // Even the owner: device and alternate-stream forms.
+        guard.request(false, None);
+        for path in [r"\\.\pipe\cutex", r"\\?\GLOBALROOT\Device\x", r"\??\C:\x", r"\\wsl$\Ubuntu\etc\hostname:ads"] {
+            let error = read_host_file(&params(path, None)).unwrap_err();
+            assert_eq!((error.status, error.code), (403, "path_forbidden"), "{path}");
+        }
     }
 }

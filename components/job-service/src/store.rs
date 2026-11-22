@@ -102,6 +102,14 @@ impl Store {
         let now = crate::service::now_secs();
         let mut changed = false;
         for job in state.jobs.values_mut() {
+            if job.launch_pending {
+                job.launch_pending = false;
+                if job.state == JobState::Unconfirmed {
+                    job.revision += 1;
+                    job.updated_at_epoch_secs = now;
+                }
+                changed = true;
+            }
             if job.completion_delivery.enabled != completion_enabled {
                 job.completion_delivery.enabled = completion_enabled;
                 changed = true;
@@ -466,6 +474,7 @@ pub(crate) fn terminal_status(state: JobState) -> &'static str {
         JobState::Failed => "failed",
         JobState::Cancelled => "cancelled",
         JobState::Interrupted => "interrupted",
+        JobState::Unconfirmed => "unconfirmed",
         JobState::Registered
         | JobState::Queued
         | JobState::Stale
@@ -509,6 +518,8 @@ mod tests {
 
     fn terminal_job() -> JobRecord {
         JobRecord {
+            launch_pending: false,
+            follow_up_ended: None,
             external: None,
             schema: CONTRACT.into(),
             job_id: "job_0123456789abcdef".into(),

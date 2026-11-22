@@ -340,6 +340,35 @@ pub fn enqueue_agent_bus_message_once_with_id(
     stable_message_id: Option<String>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
+    // IO precedes the bus mutex. A stable occurrence disposed by the owner
+    // must stay disposed even after recent_sends and all runtime queues restart.
+    if let Some(id) = stable_message_id.as_deref() {
+        if crate::management::v2::agent_bus_state::live_discarded_default(id)? {
+            return Ok(AgentBusSendOutcome {
+                deduplicated: true,
+                record: AgentBusRecentSend {
+                    id: id.into(),
+                    kind,
+                    from: sender.into(),
+                    to: target_id.into(),
+                    to_name: target_name.into(),
+                    trigger_turn: delivery_mode.trigger_turn(),
+                    delivery_mode,
+                    queued: false,
+                    created_at_epoch_secs: now,
+                    sender_kind,
+                    display_source,
+                    submit_mode,
+                    control_type,
+                    control_payload,
+                    external_action_id,
+                    external_message_id,
+                },
+            });
+        }
+    }
+    let stable_occurrence = stable_message_id.is_some();
+    let bus_state = state;
     let dedupe_key = agent_bus_send_dedupe_key(
         sender,
         target_id,
@@ -425,7 +454,7 @@ pub fn enqueue_agent_bus_message_once_with_id(
         .entry(target_id.to_string())
         .or_default()
         .push_back(message);
-    let record = AgentBusRecentSend {
+    let mut record = AgentBusRecentSend {
         id: message_id,
         kind,
         from: sender.to_string(),
@@ -449,6 +478,20 @@ pub fn enqueue_agent_bus_message_once_with_id(
     state
         .send_reservations
         .retain(|_, (reserved_id, _)| reserved_id != &record.id);
+    drop(state);
+    // Close the persist/withdraw versus enqueue race without holding a bus
+    // mutex over storage IO. If discard commits after this read it withdraws
+    // the already-visible entry; if it committed before enqueue, we withdraw.
+    if stable_occurrence
+        && crate::management::v2::agent_bus_state::live_discarded_default(&record.id)?
+    {
+        withdraw_agent_messages(bus_state, std::slice::from_ref(&record.id))?;
+        record.queued = false;
+        return Ok(AgentBusSendOutcome {
+            record,
+            deduplicated: true,
+        });
+    }
     Ok(AgentBusSendOutcome {
         record,
         deduplicated: false,
@@ -705,6 +748,92 @@ mod tests {
         let after_enqueue = reserve(12);
         assert!(after_enqueue.already_enqueued);
         assert_eq!(after_enqueue.message_id, original.record.id);
+    }
+
+    #[test]
+    fn live_only_discard_survives_reopen_and_actual_producer_reenqueue() {
+        use crate::management::v2::{
+            agent_bus_state::AgentBusMessageRepository,
+            agent_bus_stuck::{discard, DiscardRequest, LiveBus},
+        };
+        let root = crate::config::paths::runtime_dir()
+            .unwrap()
+            .join("management-v2");
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let state = Arc::new(Mutex::new(AgentBusState::default()));
+        let id = format!("live-discard-{}", Uuid::new_v4());
+        let enqueue = |queue: &Arc<Mutex<AgentBusState>>, now| {
+            enqueue_agent_bus_message_once_with_id(
+                queue,
+                "producer",
+                "target",
+                "target",
+                "hello",
+                AgentBusEnvelopeKind::Message,
+                AgentDeliveryMode::Soon,
+                AgentMessageKind::Agent,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(id.clone()),
+                now,
+            )
+            .unwrap()
+        };
+        assert!(enqueue(&state, 1).record.queued);
+        struct Bus(Arc<Mutex<AgentBusState>>);
+        impl LiveBus for Bus {
+            fn queued(&self) -> anyhow::Result<Vec<QueuedAgentBusMessage>> {
+                queued_agent_messages(&self.0)
+            }
+            fn withdraw(&self, ids: &[String], _reason: &str) -> anyhow::Result<Vec<(String, String)>> {
+                withdraw_agent_messages(&self.0, ids)
+            }
+        }
+        let request = DiscardRequest {
+            message_id: id.clone(),
+            reason: "owner discard".into(),
+            expected_semantic_sha256: None,
+            allow_protected: false,
+        };
+        let first = discard(
+            &repo,
+            &Bus(state.clone()),
+            &request,
+            chrono::Utc::now(),
+            &|_| {},
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first["changed"], true);
+        assert!(!enqueue(&state, 10000).record.queued);
+        let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        assert!(reopened.live_discarded(&id).unwrap());
+        assert!(reopened
+            .suppress_native_delivery("unresolved-recipient", &id)
+            .unwrap());
+        let restarted = Arc::new(Mutex::new(AgentBusState::default()));
+        let retry = enqueue(&restarted, 1000000);
+        assert!(retry.deduplicated);
+        assert!(!retry.record.queued);
+        assert!(queued_agent_messages(&restarted).unwrap().is_empty());
+        assert_eq!(
+            discard(
+                &reopened,
+                &Bus(restarted),
+                &request,
+                chrono::Utc::now(),
+                &|_| {}
+            )
+            .unwrap()
+            .unwrap()["changed"],
+            false
+        );
     }
 
     #[test]

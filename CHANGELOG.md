@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.5 "Beautiful World" (2026-11-23)
+
+- Preserves ordered owner input through interruption and recovery. Uncertain deliveries remain visible, and resend is offered only when the host can prove an input was not sent.
+  在中断和恢复过程中保留用户输入的原始顺序；投递结果未确认时保留可见记录，仅在主机能够确认尚未发送时提供重发。
+- Admits pending notes at new-turn boundaries with bounded work and explains missing delivery or read evidence without blocking turns.
+  在新轮次开始时以有界处理接收待投递便条，并说明缺失的投递或已读证据，保持轮次可用。
+- Improves Linux runtime process supervision and recovery while preserving the detected user service-manager environment.
+  改进 Linux 运行时进程监管与恢复，并保留已检测到的用户服务管理器环境。
+- Before manually returning to 0.2.4, stop all stock Native and Claude scopes with 0.2.5 and verify they are empty or collected.
+  手动退回 0.2.4 前，先用 0.2.5 停止全部 stock Native 和 Claude scope，并确认已经清空或回收。
+- Includes Job Service 0.1.3 with explicit follow-up disposition. After that disposition is saved, Job Service 0.1.2 cannot read the store; retain a backup and do not downgrade the component.
+  提供 Job Service 0.1.3 和明确的后续处理结束记录；保存该记录后，Job Service 0.1.2 无法读取存储，请保留备份并不要降级该组件。
+- Includes Native 0.169.0-r65 and Claude claude-r55. Existing agents retain their selected runtime.
+  提供 Native 0.169.0-r65 和 Claude claude-r55；已有智能体保留运行时选择。
+
 ## 0.2.4 "Beautiful World" (2026-11-14)
 
 - Adds authoritative disposal receipts for queued input and closes ended delegation requests as Stopped when dismissed, preventing stale actions and stuck deliveries.

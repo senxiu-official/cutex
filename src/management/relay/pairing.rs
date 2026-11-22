@@ -44,6 +44,12 @@ struct Request {
     existing_token: Option<String>,
     // Stored only inside the AEAD-protected journal. Never returned by owner APIs.
     result: Option<Value>,
+    /// r290 P10 (a): the device this pairing replaces (same phone paired
+    /// again): its token is removed in the same write that activates the new
+    /// one. Found by the CSR key (an unrevoked certificate of a device of the
+    /// invite's user) or by `previousToken` in apply.
+    #[serde(default)]
+    replaces: Option<String>,
 }
 fn epoch() -> &'static str {
     static E: OnceLock<String> = OnceLock::new();
@@ -229,8 +235,31 @@ fn public(i: &Invite) -> Value {
         v["csrSha256"] = json!(r.csr_hash);
         v["keySha256"] = json!(r.key_hash);
         v["shortCode"] = json!(r.short_code);
+        v["replacesDeviceId"] = json!(r.replaces); // r290 P10 (a)
     }
     v
+}
+/// r290 P10 (a): the device a new pairing replaces: the device whose token
+/// the phone presents (`previousToken`), else the device holding an
+/// unrevoked certificate for the same key; only a device of `user`. A
+/// stale / unknown previous token is ignored (it is already gone).
+fn predecessor(store: &Store, user: &str, key_hash: &str, previous: Option<&str>) -> anyhow::Result<Option<String>> {
+    let state = super::super::users::UserStore::beside(&store.tokens)
+        .snapshot()
+        .map_err(|_| err(503, "relay_unavailable"))?;
+    let of_user = |id: &str| state.user_of_token(id).is_some_and(|u| u.id == user);
+    if let Some(previous) = previous {
+        if let Some(id) = store.tokens.device_of(previous)?.filter(|id| of_user(id)) {
+            return Ok(Some(id));
+        }
+    }
+    let devices = store.tokens.list()?;
+    let records = if store.dir.join("certificates.json").try_exists()? { store.registry()?.certificates } else { vec![] };
+    Ok(records
+        .iter()
+        .filter(|c| !c.revoked && !c.key_sha256.is_empty() && c.key_sha256 == key_hash)
+        .map(|c| c.device_id.clone())
+        .find(|id| of_user(id) && devices.iter().any(|t| &t.token_id == id && t.kind == KIND_DEVICE)))
 }
 pub(super) fn create(store: &Store, b: &Value) -> anyhow::Result<Value> {
     create_with_urls(store, b, crate::management::listeners::pairing_urls())
@@ -384,7 +413,8 @@ fn complete(store: &Store, rows: &mut [Invite], index: usize) -> anyhow::Result<
             }
             credentials::certificate_reply(store, c)?
         } else {
-            store.issue_locked(&id, &r.csr, None)?
+            // r290 P10 (a): the replaced device may hold the same key.
+            store.issue_locked_replacing(&id, &r.csr, None, r.replaces.as_deref())?
         };
         checkpoint("certificate")?;
         rows[index]
@@ -407,9 +437,15 @@ fn complete(store: &Store, rows: &mut [Invite], index: usize) -> anyhow::Result<
             .result
             .as_ref()
             .unwrap();
-        store
+        // r290 P10 (a): activation and removal of the replaced device's
+        // token are one store write.
+        let replaces = rows[index].request.as_ref().and_then(|r| r.replaces.clone());
+        if store
             .tokens
-            .activate_relay_device(&id, field(result, "token")?)?;
+            .activate_relay_device_replacing(&id, field(result, "token")?, replaces.as_deref())?
+        {
+            store.audit("pair_replace", replaces.as_deref(), None);
+        }
     }
     checkpoint("activated")?;
     rows[index].status = "approved".into();
@@ -567,6 +603,14 @@ fn dispatch_locked(store: &Store, action: &str, b: &Value, route: &str) -> anyho
             }
         };
         let request_id = format!("rpr-{}", uuid::Uuid::new_v4().simple());
+        // r290 P10 (a): re-pairing the same phone replaces its old device.
+        let replaces = if i.existing_device.is_some() {
+            None
+        } else {
+            let user = i.user.clone();
+            predecessor(store, &user, &key_hash, b["previousToken"].as_str())?
+        };
+        let i = &mut rows[index];
         i.request = Some(Request {
             id: request_id.clone(),
             csr: csr.into(),
@@ -585,6 +629,7 @@ fn dispatch_locked(store: &Store, action: &str, b: &Value, route: &str) -> anyho
                 None
             },
             result: None,
+            replaces,
         });
         i.status = "pending".into();
         let response = json!({"requestId":request_id,"status":"pending","expiresAt":date(i.expires),"retryAfterSeconds":2});
@@ -1142,6 +1187,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(f.store.tokens.verify(&pending.token).unwrap(), None);
+    }
+    // r290 P10 (a): the same phone (same key) paired again replaces its old
+    // device; the old token goes in the activating write; another key is a
+    // new device as before.
+    #[test]
+    fn r290_p10_repairing_the_same_key_replaces_the_old_device() {
+        let mut f = Fixture::new("full");
+        f.apply();
+        f.decision("approve").unwrap();
+        let devices = |store: &Store| store.tokens.list().unwrap().into_iter().filter(|t| t.kind == KIND_DEVICE).map(|t| t.token_id).collect::<Vec<_>>();
+        let first = devices(&f.store);
+        assert_eq!(first.len(), 1);
+        let pair_again = |f: &mut Fixture, key: &KeyPair| {
+            f.invite = create(&f.store, &json!({"scope":"full"})).unwrap();
+            f.apply = json!({"inviteId":f.invite["inviteId"],"secret":f.invite["payload"]["secret"],"csrPem":CertificateParams::default().serialize_request(key).unwrap().pem().unwrap(),"clientNonce":random(),"deviceName":"fake phone","platform":"android"});
+            f.apply();
+            let row = list(&f.store).unwrap()["invites"].as_array().unwrap().iter().find(|i| i["inviteId"] == f.invite["inviteId"]).unwrap().clone();
+            owner(&f.store, "POST", &format!("/v2/pairing/invites/{}/approve", f.invite["inviteId"].as_str().unwrap()), &json!({"requestId":row["requestId"],"shortCode":row["shortCode"],"confirm":true})).unwrap();
+            row
+        };
+        let key = KeyPair::from_pem(&f.key.serialize_pem()).unwrap();
+        let row = pair_again(&mut f, &key);
+        assert_eq!(row["replacesDeviceId"], json!(first[0]));
+        let second = devices(&f.store);
+        assert_eq!(second.len(), 1, "the old device token is gone");
+        assert_ne!(second[0], first[0]);
+        let registry = f.store.registry().unwrap();
+        let active = registry.certificates.iter().find(|c| c.device_id == second[0]).unwrap();
+        assert!(f.store.active_uncached(&active.certificate_id).unwrap().is_some());
+        // A different key is a new device; nothing is replaced.
+        let row = pair_again(&mut f, &KeyPair::generate().unwrap());
+        assert_eq!(row["replacesDeviceId"], Value::Null);
+        assert_eq!(devices(&f.store).len(), 2);
     }
     fn store_revoke(store: &Store, id: &str) -> anyhow::Result<()> {
         store.tokens.revoke(id)?;

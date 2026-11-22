@@ -29,7 +29,9 @@
                 "accountId": { "type": ["string", "null"], "description": "Claude account of the agent (claude-accounts)." },
                 "turnId": { "type": ["string", "null"], "description": "The turn that hit the limit." },
                 "scheduledAt": { "type": "string" },
-                "estimated": { "type": "boolean", "description": "The reset was not known: resetAt is an estimate and the continuation is a probe (30 min after the failure, doubling up to 4 h, at most 8 in a row). Absent from older hosts (= false)." }
+                "estimated": { "type": "boolean", "description": "The reset was not known: resetAt is an estimate and the continuation is a probe (30 min after the failure, doubling up to 4 h, at most 8 in a row). Absent from older hosts (= false)." },
+                "asksRedelivered": { "type": "boolean", "const": false, "description": "A pending check does not establish ask redelivery or execution." },
+                "probeCount": { "type": "integer", "minimum": 0, "description": "Estimated probes already fired since the last successful turn; not a promise of another execution." }
               }
             },
             { "type": "null" }
@@ -45,7 +47,8 @@
                 "at": { "type": "string" },
                 "result": { "enum": ["fired", "skipped", "cancelled", "failed"] },
                 "reason": { "type": ["string", "null"], "description": "Known values: queued / started (fired: submit disposition), resetUnknown, windowAlreadyContinued, offline, archived, runtimeRestarted, paused, asksRedelivered (skipped), owner, ownerMessage, ownerStop, runtimeOffline, disabled, turnCompleted (cancelled); failed: the submit error." },
-                "resetAt": { "type": ["string", "null"] }
+                "resetAt": { "type": ["string", "null"] },
+                "asksRedelivered": { "type": "boolean", "description": "The recorded quota outcome used delegation redelivery (reason asksRedelivered); does not confirm execution." }
               }
             },
             { "type": "null" }

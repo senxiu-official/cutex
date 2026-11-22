@@ -40,6 +40,7 @@ pub enum Route {
     Collection,
     Ask(String),
     Answer(String),
+    Close(String),
     Artifact(String),
     /// `GET /v2/asks/provenance`: child-agent provenance of every agent.
     Provenance,
@@ -65,6 +66,7 @@ pub fn parse_path(path: &str) -> Option<Route> {
     match rest.split_once('/') {
         None => valid_id(rest, "ask-").then(|| Route::Ask(rest.to_string())),
         Some((id, "answer")) if valid_id(id, "ask-") => Some(Route::Answer(id.to_string())),
+        Some((id, "close")) if valid_id(id, "ask-") => Some(Route::Close(id.to_string())),
         _ => None,
     }
 }
@@ -109,6 +111,7 @@ fn route_json_with_receipt_loader(
     };
     let query = |key: &str| crate::http::query::query_value(full_path, key);
     match route {
+        Route::Close(_) => Err(bad_request("use POST to close an ask")),
         Route::Collection => {
             let filter = AskFilter {
                 project: query("project"),
@@ -246,12 +249,142 @@ fn route_json_with_receipt_loader(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnerCloseRequest {
+    pub outcome: String,
+    pub action_id: String,
+}
+
+/// Root authority is checked before opening the store. No target session read.
+pub fn owner_close(
+    store: &AskStore,
+    ask_id: &str,
+    request: &OwnerCloseRequest,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, crate::asks::store::AskError> {
+    use crate::asks::{operations, store::AskError};
+    if !matches!(
+        request.outcome.as_str(),
+        "stop" | "abandoned" | "accepted" | "followUpEnded"
+    ) {
+        return Err(AskError::new(
+            "invalid_arguments",
+            "outcome: stop, abandoned, accepted or followUpEnded",
+        ));
+    }
+    let canonical = json!({"askId":ask_id,"outcome":request.outcome});
+    store
+        .with_records(&[ask_id], |state| {
+            operations::execute(
+                state,
+                "owner",
+                "owner.ask.close",
+                &request.action_id,
+                &canonical,
+                now,
+                |state| {
+                    let result = crate::asks::tools::close_in_state(
+                        state,
+                        None,
+                        ask_id,
+                        &request.outcome,
+                        false,
+                        now,
+                    )?;
+                    let ask = state
+                        .asks
+                        .get(ask_id)
+                        .ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
+                    let mut response = json!({"ask":crate::asks::view::owner_view(state,ask)});
+                    if let Some(stopping) = result.get("stopping") {
+                        response["stopping"] = stopping.clone();
+                    }
+                    Ok((response, operations::EffectState::Committed))
+                },
+            )
+        })
+        .map_err(|error| AskError::new("asks_unavailable", format!("{error:#}")))?
+}
+
+fn handle_owner_close(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    ask_id: &str,
+) -> anyhow::Result<()> {
+    if request.method != "POST" {
+        return super::server::write_v2_error(
+            stream,
+            405,
+            "Method Not Allowed",
+            "method_not_allowed",
+            "use POST",
+            false,
+            json!({}),
+        );
+    }
+    let parsed: OwnerCloseRequest = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(_) => {
+            return super::server::write_v2_error(
+                stream,
+                400,
+                "Bad Request",
+                "invalid_request",
+                "expected only outcome and actionId",
+                false,
+                json!({}),
+            )
+        }
+    };
+    let store = AskStore::open_default()?;
+    let result = crate::asks::pause_admission::try_with_authority(|_| {
+        Ok(owner_close(&store, ask_id, &parsed, chrono::Utc::now()))
+    })?;
+    let response = match result {
+        crate::asks::pause_admission::Admission::Ready(result) => result,
+        crate::asks::pause_admission::Admission::Deferred => {
+            Err(crate::asks::store::AskError::new(
+                "admission_busy",
+                "owner disposition is busy; retry with the same actionId",
+            ))
+        }
+    };
+    publish_pending_notices(&store);
+    match response {
+        Ok(value) => write_json_response(stream, 200, "OK", &value),
+        Err(error) => {
+            let status = match error.code {
+                "ask_not_found" => 404,
+                "invalid_arguments" => 400,
+                "asks_unavailable" | "admission_busy" => 503,
+                _ => 409,
+            };
+            super::server::write_v2_error(
+                stream,
+                status,
+                match status {
+                    400 => "Bad Request",
+                    404 => "Not Found",
+                    503 => "Service Unavailable",
+                    _ => "Conflict",
+                },
+                error.code,
+                &error.detail,
+                status == 503,
+                error.extra,
+            )
+        }
+    }
+}
+
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     let Some(route) = parse_path(path) else {
         return super::server::write_v2_error(stream, 404, "Not Found", "route_not_found",
             "no such ask route", false, json!({}));
     };
+    if let Route::Close(id) = &route { return handle_owner_close(stream,request,id); }
     if request.method != "GET" {
         return super::server::write_v2_error(stream, 405, "Method Not Allowed", "method_not_allowed",
             "asks are read with GET; changes are cutex/ask/* requests", false, json!({}));
@@ -578,7 +711,8 @@ pub(super) fn dispatch_command(
     method: &str,
     params: &Value,
 ) -> Result<Value, super::user_input::UserInputExecutionError> {
-    if owner.is_none() {
+    if owner.is_none() && !super::access::scoped_ask_command_authorized(cutex_session_id,method,params)
+        .map_err(|error|operation_error(crate::asks::store::AskError::new("asks_unavailable",format!("{error:#}"))))? {
         return Err(super::user_input::UserInputExecutionError {
             stage: "route".into(),
             code: "cutex_method_denied".into(),
@@ -610,6 +744,54 @@ mod tests {
     use super::*;
     use crate::asks::model::*;
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER};
+
+    #[test]
+    fn owner_close_without_target_session_is_durable_and_replays_action() {
+        let (store, dir) = temp_store("owner-close-orphan");
+        let now = chrono::Utc::now();
+        let id = store
+            .with_state(|state| {
+                state
+                    .create_ask(new_ask("orphan", "pending"), now)
+                    .unwrap()
+                    .0
+                    .ask_id
+            })
+            .unwrap();
+        let request = OwnerCloseRequest {
+            outcome: "abandoned".into(),
+            action_id: "owner-dispose-1".into(),
+        };
+        let first = owner_close(&store, &id, &request, now).unwrap();
+        assert_eq!(first["ask"]["closed"], "abandoned");
+        let reopened = AskStore::at(&dir);
+        assert_eq!(first, owner_close(&reopened, &id, &request, now).unwrap());
+        let conflict = owner_close(
+            &reopened,
+            &id,
+            &OwnerCloseRequest {
+                outcome: "stop".into(),
+                action_id: request.action_id,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(conflict.code, "idempotency_conflict");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owner_follow_up_ended_closes_orphan_without_runtime_commands_and_replays() {
+        let (store,dir)=temp_store("owner-end-orphan");let now=chrono::Utc::now();
+        let id=store.with_state(|state|state.create_ask(new_ask("end-orphan","pending"),now).unwrap().0.ask_id).unwrap();
+        let request=OwnerCloseRequest {outcome:"followUpEnded".into(),action_id:"owner-end-1".into()};
+        let response=owner_close(&store,&id,&request,now).unwrap();
+        super::super::schema_export::assert_valid("owner-dispositions","askCloseResult",&response);
+        assert_eq!(response["ask"]["closed"],"stopped");assert_eq!(response["ask"]["followUpEnded"],true);
+        assert_eq!(response,owner_close(&AskStore::at(&dir),&id,&request,now).unwrap());
+        assert!(store.inspect(|state|state.commands.is_empty()).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn cleanup_list(store: &AskStore, path: &str) -> Result<Value, RouteError> {
         route_json_with_receipt_loader(store, path, &Route::Collection, &|_| Default::default())

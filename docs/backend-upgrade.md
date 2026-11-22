@@ -322,3 +322,9 @@ failure never fails or rolls back the cutex update. See [components/README.md](.
 - On Windows the logon start of the supervisor task and the absence of a
   console window under Task Scheduler were not covered by the end-to-end
   drill; busy waiting / `deferred` was not drilled on either platform.
+
+## Job Service 0.1.3 compatibility
+
+Job Service 0.1.3 can persist unconfirmed jobs when follow-up is ended. Job Service 0.1.2 cannot read that state. Retain an offline backup and do not downgrade the Job Service or restore older binaries over a store containing those records.
+
+Job Service 0.1.3 在结束后续处理时可持久保存 unconfirmed 作业。Job Service 0.1.2 无法读取该状态。请保留离线备份；包含这些记录后，不要降级 Job Service 或用旧二进制覆盖该存储。

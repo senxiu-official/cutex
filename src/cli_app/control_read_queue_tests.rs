@@ -88,7 +88,7 @@ fn context() -> ManagementRequestContext {
     let mut context = super::control_load_tests::http_context();
     context.forward_native_request = history_forward;
     context.load_bootstrap_state =
-        |_, _| Ok(json!({"userInputQueue":[],"pendingServerRequests":[],"agentBusMessages":[]}));
+        |_, _, _| Ok(json!({"userInputQueue":[],"pendingServerRequests":[],"agentBusMessages":[]}));
     context.load_latest_plan = |_| Value::Null;
     context.load_latest_token_usage = |_| Value::Null;
     context

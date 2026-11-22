@@ -27,6 +27,19 @@ pub struct TokenUsageBreakdown {
 }
 
 impl TokenUsageBreakdown {
+    // r290 P8: bound background shares to the recorded parent usage.
+    /// Each count no larger than the same count of `cap`.
+    pub(super) fn capped_by(&self, cap: &Self) -> Self {
+        Self {
+            total_tokens: self.total_tokens.min(cap.total_tokens),
+            input_tokens: self.input_tokens.min(cap.input_tokens),
+            cached_input_tokens: self.cached_input_tokens.min(cap.cached_input_tokens),
+            cache_write_input_tokens: self.cache_write_input_tokens.min(cap.cache_write_input_tokens),
+            output_tokens: self.output_tokens.min(cap.output_tokens),
+            reasoning_output_tokens: self.reasoning_output_tokens.min(cap.reasoning_output_tokens),
+        }
+    }
+
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
             ("totalTokens", self.total_tokens),
@@ -226,6 +239,10 @@ pub struct UsageSample {
     /// reports its SDK steps, `tokenUsage.modelRequests`); absent = 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_requests: Option<u64>,
+    /// Part of `tokens` used by the session's Claude background subagents
+    /// (`tokenUsage.backgroundTotal` delta, claude-r35+); absent = not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_tokens: Option<TokenUsageBreakdown>,
     pub tokens: TokenUsageBreakdown,
     pub cumulative_total: TokenUsageBreakdown,
 }
@@ -299,6 +316,9 @@ impl UsageSample {
         }
         self.tokens.validate()?;
         self.cumulative_total.validate()?;
+        if let Some(background) = &self.background_tokens {
+            background.validate()?;
+        }
         if self.tokens.detailed_is_zero() {
             anyhow::bail!("usage sample must contain detailed token activity");
         }
@@ -432,6 +452,9 @@ pub(super) struct UsageCounterState {
     pub rerouted_models: HashMap<String, String>,
     #[serde(default)]
     pub previous_total: Option<TokenUsageBreakdown>,
+    /// `tokenUsage.backgroundTotal` seen with `previous_total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_background_total: Option<TokenUsageBreakdown>,
     #[serde(default)]
     pub counter_epoch: u64,
     #[serde(default)]

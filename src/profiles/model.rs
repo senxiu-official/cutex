@@ -408,6 +408,11 @@ pub struct CodezConfig {
     /// never received user input instead of archiving it.
     #[serde(default = "default_archive_delete_empty")]
     pub archive_delete_empty: bool,
+    // r290 P10 (B4/A8): network shares the owner's requests may open (file preview,
+    // workspace tree, folder picker, writable roots, local images, owner publish):
+    // `\\server\share` roots or drive letters (`Z:`). Inert off Windows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_shares: Vec<String>,
     /// Quick chats without a name get a generated title after their first
     /// message (a hidden ephemeral turn, as the TUI does).
     #[serde(default = "default_true")]
@@ -611,6 +616,7 @@ impl Default for CodezConfig {
             claude_usage_refresh_minutes: default_claude_usage_refresh_minutes(),
             profile_quota_refresh_minutes: default_profile_quota_refresh_minutes(),
             archive_delete_empty: default_archive_delete_empty(),
+            owner_shares: Vec::new(),
             queue: QueueSettings::default(),
             image_input: Default::default(),
             auto_thread_titles: true,

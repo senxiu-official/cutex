@@ -5,6 +5,9 @@
   "description": "GET /v2/users → userList (owner; capability users); GET|PATCH /v2/users/me → selfProfile, PATCH body selfProfilePatch, GET /v2/users/{id}/avatar → the image bytes with an ETag (capability users-self-profile); /v2/capabilities user → capabilityUser; cutex/userInput/routeAccepted params.actingUser → actingUser. Person identity (capability person-identity): GET /v2/identity/challenge → identityChallenge, POST /v2/identity/claim body identityClaim → identityClaimResult, PUT /v2/users/{id}/person-keys body personKeysPut → personKeysResult (owner); DELETE /v2/users/token-persons/{tokenId}/previous → tokenPersonPreviousCleared (owner; capability person-identity-ack). Own devices (capability user-own-devices; owner, root or a bound user, pending: 403 user_pending): GET /v2/users/me/devices → ownDevices, DELETE /v2/users/me/devices/{tokenId} → ownDeviceRevoked (404 client_token_not_found for a token not bound to the caller). Capability user-own-token: capabilityUser.token → ownToken or null (root credential). New owner devices (capability owner-device-notice; owner principals): GET /v2/users/owner/new-devices → ownerNewDevices, POST /v2/users/owner/new-devices/{tokenId}/ack → ownerDeviceAck. Capability device-scope: capabilityUser.scope, ownToken.scope, token items scope. Capability owner-local-only: capabilityUser.ownerLocal, ownToken.issuedVia, token items issuedVia. Capability peer-owner-profile: user.profileSource; host event cutex/users/changed {userId, reason: peerProfile, peerId} when a peer changed a user's displayName / avatar. Home page (capability user-home; own record only, owner or a bound user, pending: 403 access_pending; device scope read may only read): GET /v2/users/me/home → homeView, PUT body homePut → homeView (pins of kind page: capability user-home-page-pins; 409 home_revision_conflict {revision}, 400 invalid_home, 413 home_too_large); GET /v2/users/me/home/cover → the image bytes with an ETag (404 cover_not_found), PUT body homeCoverPut → homeView (400 invalid_cover, 413 cover_too_large), DELETE → homeView.",
   "anyOf": [
     { "$ref": "#/$defs/userList" },
+    { "$ref": "#/$defs/userProjectRoleResult" },
+    { "$ref": "#/$defs/userTokenIssued" },
+    { "$ref": "#/$defs/userTokenRevoked" },
     { "$ref": "#/$defs/selfProfile" },
     { "$ref": "#/$defs/selfProfilePatch" },
     { "$ref": "#/$defs/capabilityUser" },
@@ -140,7 +143,12 @@
       "properties": {
         "projects": { "oneOf": [{ "const": "all" }, { "type": "array", "items": { "type": "string" } }] },
         "standaloneAgents": { "type": "array", "items": { "type": "string" } },
-        "send": { "type": "boolean" }
+        "send": { "type": "boolean" },
+        "projectRoles": {
+          "type": "object",
+          "description": "r290 user-project-roles: projectId -> role. A project with a role is visible and follows the role for sending (viewer: read-only, collaborator: send).",
+          "additionalProperties": { "$ref": "#/$defs/projectRole" }
+        }
       }
     },
     "user": {
@@ -197,7 +205,25 @@
               "ownerName": { "type": ["string", "null"], "maxLength": 60, "description": "Owner-given display name (capability client-token-rename)." },
               "scope": { "$ref": "#/$defs/deviceScope" },
               "issuedVia": { "$ref": "#/$defs/issuedVia" },
-              "person": { "oneOf": [{ "$ref": "#/$defs/tokenPerson" }, { "type": "null" }] }
+              "person": { "oneOf": [{ "$ref": "#/$defs/tokenPerson" }, { "type": "null" }] },
+              "relayCertificate": {
+                "description": "The device's newest unrevoked relay certificate, null = none (capability relay-certificate-grace).",
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["certificateId", "expiresAt", "renewableFrom", "graceUntil", "state"],
+                    "properties": {
+                      "certificateId": { "type": "string" },
+                      "expiresAt": { "type": "string" },
+                      "renewableFrom": { "type": "string" },
+                      "graceUntil": { "type": "string" },
+                      "state": { "enum": ["active", "renewable", "grace", "expired"] }
+                    }
+                  },
+                  { "type": "null" }
+                ]
+              }
             }
           }
         },
@@ -364,6 +390,47 @@
             }
           }
         }
+      }
+    },
+    "projectRole": { "enum": ["viewer", "collaborator"] },
+    "userProjectRoleResult": {
+      "type": "object",
+      "description": "PUT|DELETE /v2/users/{id}/projects/{projectId} (capability user-project-roles).",
+      "additionalProperties": false,
+      "required": ["userId", "projectId", "role", "changed", "user", "revision"],
+      "properties": {
+        "userId": { "type": "string" },
+        "projectId": { "type": "string" },
+        "role": { "oneOf": [{ "$ref": "#/$defs/projectRole" }, { "type": "null" }], "description": "null after DELETE." },
+        "changed": { "type": "boolean" },
+        "user": { "$ref": "#/$defs/user" },
+        "revision": { "type": "integer" }
+      }
+    },
+    "userTokenIssued": {
+      "type": "object",
+      "description": "POST /v2/users/{id}/tokens (capability user-token-issue): token is the secret, returned only here.",
+      "additionalProperties": false,
+      "required": ["tokenId", "label", "token", "createdAt", "userId", "pending", "scope"],
+      "properties": {
+        "tokenId": { "type": "string" },
+        "label": { "type": "string" },
+        "token": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "userId": { "type": "string" },
+        "pending": { "const": false },
+        "scope": { "$ref": "#/$defs/deviceScope" }
+      }
+    },
+    "userTokenRevoked": {
+      "type": "object",
+      "description": "DELETE /v2/users/{id}/tokens/{tokenId} (capability user-token-issue).",
+      "additionalProperties": false,
+      "required": ["tokenId", "userId", "revoked"],
+      "properties": {
+        "tokenId": { "type": "string" },
+        "userId": { "type": "string" },
+        "revoked": { "const": true }
       }
     },
     "ownDeviceRevoked": {

@@ -6,6 +6,7 @@ mod agent_bus_config;
 mod agent_bus_runtime;
 mod agent_bus_server;
 mod agent_name_notices;
+mod profile_quota_notes; // r290 P12.
 mod agent_cli;
 mod agent_context;
 mod agent_management;
@@ -16,6 +17,7 @@ mod app_server_runtime;
 mod app_server_state_sync;
 mod app_server_user_input;
 mod owner_carries;
+mod turn_notes;
 mod asks_claude;
 mod tool_gate;
 mod asks_dsh;

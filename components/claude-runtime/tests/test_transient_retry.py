@@ -48,12 +48,14 @@ async def test_explicit_silent_transient_failure_then_success_in_same_turn(ph, m
     assert client.options.env['CLAUDE_CODE_MAX_RETRIES'] == '0'
 
 
-async def test_exhaustion_is_three_total_attempts(ph, monkeypatch):
+async def test_silent_transport_probes_outlive_checkpoint_budget(ph, monkeypatch):
     monkeypatch.setattr('cute_claude.transient_retry.retry_delay', lambda e, n: 0 if n < 2 else None)
-    tid, client = await install_query(ph, [failure('API Error: 500 internal error')])
+    tid, client = await install_query(ph, [failure('API Error: 500 internal error')] * 5 + [{'type':'assistant','content':[{'type':'text','text':'recovered'}]}])
     turn = await ph.turn(tid, 'original')
     await ph.drain()
-    assert ph.store.turn(turn)['status'] == 'failed' and client.query_count == 3
+    assert ph.store.turn(turn)['status'] == 'completed' and client.query_count == 6
+    assert not ph.store.thread(tid)['halted']
+    assert not ph.store.db.execute('SELECT 1 FROM sdk_recovery_attempts').fetchone()
 
 
 @pytest.mark.parametrize('code,text', [('authentication_failed', 'API Error: 401 refused'),
@@ -84,19 +86,23 @@ async def test_any_output_tool_receipt_or_hook_blocks_replay(ph, kind):
                                                      'item': {'type': 'commandExecution', 'id': 'once'}})
         elif kind == 'hook':
             await client.events.put({'type': 'system', 'subtype': 'hook_started'})
-    tid, client = await install_query(ph, [failure('API Error: Connection dropped (ECONNRESET).')], barrier)
+    tid, client = await install_query(ph, [failure('API Error: Connection dropped (ECONNRESET).')] * 3 + [{'type':'assistant','content':[{'type':'text','text':'recovered'}]}], barrier)
     turn = await ph.turn(tid, 'original')
     await ph.drain()
-    assert ph.store.turn(turn)['status'] == 'failed' and client.query_count == 1
     if kind == 'receipt':
-        assert len([e for e in ph.out if e.get('method') == 'claude/input/contextPersisted' and e['params'].get('messageId') == 'once']) == 1
+        assert ph.store.turn(turn)['status'] == 'completed' and client.query_count == 4
+    else:
+        assert ph.store.turn(turn)['status'] == 'failed' and client.query_count == 1
+    if kind == 'receipt':
+        assert len([e for e in ph.out if e.get('method') == 'claude/input/contextPersisted' and e['params'].get('messageId') == 'once']) == 4
 
 
 async def test_cancel_interrupts_backoff_without_another_query(ph, monkeypatch):
     monkeypatch.setattr('cute_claude.transient_retry.retry_delay', lambda *args: 60)
+    monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 60)
     tid, client = await install_query(ph, [failure('API Error: 500 internal error')])
     turn = await ph.turn(tid, 'original')
-    await until(lambda: turn in ph.engine.retry_waiting)
+    await until(lambda: tid in ph.engine.queue_backoffs)
     async with asyncio.timeout(1):
         await ph.call('turn/interrupt', {'threadId': tid, 'turnId': turn})
     assert ph.store.turn(turn)['status'] == 'interrupted' and client.query_count == 1
@@ -105,9 +111,10 @@ async def test_cancel_interrupts_backoff_without_another_query(ph, monkeypatch):
 
 async def test_close_cancels_backoff_before_closing_the_idle_native(ph, monkeypatch):
     monkeypatch.setattr('cute_claude.transient_retry.retry_delay', lambda *args: 60)
+    monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 60)
     tid, client = await install_query(ph, [failure('API Error: 500 internal error')])
     turn = await ph.turn(tid, 'original')
-    await until(lambda: turn in ph.engine.retry_waiting)
+    await until(lambda: tid in ph.engine.queue_backoffs)
     async with asyncio.timeout(1):
         await ph.engine.close()
     assert ph.store.turn(turn)['status'] == 'interrupted' and client.query_count == 1
@@ -125,14 +132,16 @@ def test_backoff_floor_jitter_budget_and_retry_after(monkeypatch):
     assert retry_delay(e, 0) is None
 
 
-async def test_receipt_arriving_during_backoff_vetoes_next_query(ph, monkeypatch):
+async def test_receipt_during_backoff_does_not_consume_the_retained_input(ph, monkeypatch):
     monkeypatch.setattr('cute_claude.transient_retry.retry_delay', lambda *args: 0.05)
-    tid, client = await install_query(ph, [failure('API Error: 500 internal error')])
+    monkeypatch.setattr('cute_claude.queue_recovery.BASE_DELAY', 0.05)
+    tid, client = await install_query(ph, [failure('API Error: 500 internal error')] * 3 + [{'type':'assistant','content':[{'type':'text','text':'recovered'}]}])
     turn = await ph.turn(tid, 'original')
-    await until(lambda: turn in ph.engine.retry_waiting)
+    await until(lambda: tid in ph.engine.queue_backoffs)
     await ph.engine.emit(tid, 'claude/input/contextPersisted', {'threadId': tid, 'messageId': 'late-once'})
     await ph.drain()
-    assert ph.store.turn(turn)['status'] == 'failed' and client.query_count == 1
+    assert ph.store.turn(turn)['status'] == 'completed' and client.query_count == 4
+    assert not ph.store.thread(tid)['halted']
 
 
 async def test_uncertain_stream_outcome_is_never_replayed(ph, monkeypatch):

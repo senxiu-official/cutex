@@ -83,7 +83,33 @@ impl<'de> Deserialize<'de> for Projects {
     }
 }
 
+/// A user's role in one project (`projectRoles`, capability
+/// `user-project-roles`). `viewer`: the project's agents, their history,
+/// summaries, workspace files and artifacts, read-only. `collaborator`:
+/// viewer, and send to the project's agents under the scoped send rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectRole {
+    Viewer,
+    Collaborator,
+}
+
+impl ProjectRole {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "viewer" => Some(Self::Viewer),
+            "collaborator" => Some(Self::Collaborator),
+            _ => None,
+        }
+    }
+}
+
 /// What a non-owner user may see and do. Default: nothing, read-only.
+///
+/// `projects` / `standaloneAgents` make agents visible and `send` lets
+/// the user send to every visible agent. `projectRoles` grants single
+/// projects with their own role; a project with a role follows that role
+/// for sending (a `viewer` project is read-only even with `send: true`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Grant {
@@ -93,6 +119,8 @@ pub struct Grant {
     pub standalone_agents: Vec<String>,
     #[serde(default)]
     pub send: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_roles: BTreeMap<String, ProjectRole>,
 }
 
 impl Grant {
@@ -100,7 +128,26 @@ impl Grant {
         if let Projects::Only(ids) = &self.projects {
             validate_ids(ids, "projects")?;
         }
+        let roles: Vec<String> = self.project_roles.keys().cloned().collect();
+        validate_ids(&roles, "projectRoles")?;
         validate_ids(&self.standalone_agents, "standaloneAgents")
+    }
+
+    /// The project is visible: listed in `projects` (or `all`) or given a role.
+    pub fn sees_project(&self, project_id: &str) -> bool {
+        self.project_roles.contains_key(project_id)
+            || match &self.projects {
+                Projects::All => true,
+                Projects::Only(ids) => ids.iter().any(|id| id == project_id),
+            }
+    }
+
+    /// May send to a visible agent of `project` (`None`: a standalone agent).
+    pub fn sends_in(&self, project: Option<&str>) -> bool {
+        match project.and_then(|project| self.project_roles.get(project)) {
+            Some(role) => *role == ProjectRole::Collaborator,
+            None => self.send,
+        }
     }
 
     fn normalized(mut self) -> Self {
@@ -367,6 +414,14 @@ thread_local! {
 /// client-token request (root credential, internal callers): the owner.
 pub fn current_principal() -> Option<Principal> {
     CURRENT.with(|cell| cell.borrow().clone())
+}
+
+/// Owner powers on the current request: the owner, or a direct root / bridge
+/// caller with no user principal. A shared-access user's request carries a
+/// Human principal for its granted routes, but that is not owner proof (the
+/// client-token bearer is normalized to the root credential).
+pub fn caller_is_owner() -> bool {
+    current_principal().is_none_or(|principal| principal.is_owner())
 }
 
 pub fn set_current_principal(principal: Option<Principal>) {
@@ -714,6 +769,57 @@ impl UserStore {
         Ok(user)
     }
 
+    /// Set (`Some`) or remove (`None`) one project's role for a user
+    /// (owner only, through the access gate). Removing also drops the
+    /// project from an explicit `projects` list, so the project is no longer
+    /// visible (`projects: "all"` stays as it is). Returns the user and
+    /// whether anything changed.
+    pub fn set_project_role(
+        &self,
+        id: &str,
+        project_id: &str,
+        role: Option<ProjectRole>,
+        actor: &str,
+    ) -> Result<(User, bool), UserError> {
+        if id == OWNER {
+            return Err(UserError::new(400, "owner_immutable", "the owner has every right; it has no grant"));
+        }
+        validate_ids(&[project_id.to_string()], "projectId")?;
+        let (user, changed) = self.with(|state| {
+            let user = state
+                .users
+                .iter_mut()
+                .find(|user| user.id == id)
+                .ok_or_else(|| UserError::new(404, "user_not_found", "no user with this id"))?;
+            let mut grant = user.grant.clone().unwrap_or_default();
+            match role {
+                Some(role) => {
+                    grant.project_roles.insert(project_id.to_string(), role);
+                }
+                None => {
+                    grant.project_roles.remove(project_id);
+                    if let Projects::Only(ids) = &mut grant.projects {
+                        ids.retain(|project| project != project_id);
+                    }
+                }
+            }
+            grant.validate()?;
+            let grant = grant.normalized();
+            let changed = user.grant.as_ref() != Some(&grant);
+            if changed {
+                user.grant = Some(grant);
+                user.updated_at = crate::management::instance::now_utc();
+            }
+            Ok((user.clone(), changed))
+        })?;
+        if changed {
+            audit(&self.dir, "userProjectRoleChanged", json!({
+                "userId": id, "projectId": project_id, "role": role, "actor": actor,
+            }));
+        }
+        Ok((user, changed))
+    }
+
     /// Refused while a token or peer is bound to the user.
     pub fn delete_user(&self, id: &str, bound_peers: &[String], actor: &str) -> Result<(), UserError> {
         if id == OWNER {
@@ -855,6 +961,213 @@ pub fn owner_local_details(mut extra: Value) -> Value {
     extra
 }
 
+// r290 P10 (B6) ---------------------------------------- owner device actions
+//
+// The owner-local rule above still decides who may act without asking. On
+// top of it, a FULL-scope owner device on any listener (LAN / tailnet /
+// relay, or a paired token on loopback) may:
+// - always TURN OFF / remove / revoke (`OWNER_TURN_OFF_ACTIONS`): these never
+//   widen anyone's access, and that device already has a host terminal;
+// - WIDEN (`OWNER_WIDENING_ACTIONS`) only with a fresh, explicit confirm:
+//   the first call answers 428 `owner_confirm_required` with what will
+//   happen and a single-use `confirmToken` (bound to this token and action,
+//   2 minutes); the same request repeated with `?ownerConfirm=<token>` runs
+//   and every owner device is told (host event
+//   `cutex/access/ownerRemoteAction`, users audit `ownerRemoteAction`).
+// Narrowed (read / chat) tokens, other users' and pending tokens stay
+// refused (403 `owner_local_only`, or earlier by the scope / user gates).
+
+/// Actions that only turn something off, remove or revoke.
+pub const OWNER_TURN_OFF_ACTIONS: &[&str] = &[
+    "peerDisable",              // PATCH /v2/peers/{id} {enabled:false}
+    "peerRemove",               // DELETE /v2/peers/{id}
+    "peersDisable",             // PATCH /v2/settings {peers:{enabled:false}}
+    "publicPairingOff",         // POST /v2/relay/pairing {enabled:false}
+    "relayCertificateRevoke",   // DELETE /v2/relay/certificates/{id}
+    "pairingInviteCancel",      // DELETE /v2/pairing/invites/{id}, POST …/{id}/deny
+    "deviceRevoke",             // DELETE /v2/client-tokens/{id} (already open to owner devices)
+    "relayCertificateRenewOwn", // POST /v2/relay-certificate/renew: the device's own key, incl. grace
+];
+
+/// Actions that hand out or widen access.
+pub const OWNER_WIDENING_ACTIONS: &[&str] = &[
+    "pairingCode",             // POST /v2/pairing-codes (still loopback listener only: v1 codes)
+    "pairingInvite",           // POST /v2/pairing/invites (QR v2: a new device)
+    "pairingInviteApprove",    // POST /v2/pairing/invites/{id}/approve
+    "relayCertificateApprove", // POST /v2/relay/certificates (enrollment approval)
+    "peerPair",                // POST /v2/peers, POST /v2/peers/invites
+    "peerEnable",              // PATCH /v2/peers/{id} {enabled:true}
+    "peersEnable",             // PATCH /v2/settings {peers:{enabled:true}}
+    "publicPairingOn",         // POST /v2/relay/pairing {enabled:true}
+    "disableOwnerApproval",    // PATCH /v2/users/settings {ownerRequiresApproval:false}
+];
+
+/// Host event every owner device sees after a confirmed remote widening action.
+pub const OWNER_REMOTE_ACTION: &str = "cutex/access/ownerRemoteAction";
+const OWNER_CONFIRM_TTL: Duration = Duration::from_secs(120);
+const MAX_OWNER_CONFIRMS: usize = 64;
+
+struct OwnerConfirm {
+    action: String,
+    token_id: String,
+    request_digest: String,
+    expires: Instant,
+}
+
+fn owner_confirms() -> &'static Mutex<BTreeMap<String, OwnerConfirm>> {
+    static CONFIRMS: OnceLock<Mutex<BTreeMap<String, OwnerConfirm>>> = OnceLock::new();
+    CONFIRMS.get_or_init(Default::default)
+}
+
+/// A full-scope token bound to the owner (any listener, any origin).
+pub fn request_is_full_owner_device() -> bool {
+    crate::management::listeners::current_client_token()
+        .is_some_and(|token| token.principal.is_owner() && token.scope.is_full())
+}
+
+/// May the current request run a turning-off action (`OWNER_TURN_OFF_ACTIONS`)?
+pub fn owner_may_turn_off() -> bool {
+    request_is_owner_local() || request_is_full_owner_device()
+}
+
+/// `?ownerConfirm=<token>` of a request path.
+pub fn owner_confirm_param(path: &str) -> Option<&str> {
+    path.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("ownerConfirm="))
+        .filter(|value| !value.is_empty())
+}
+
+fn owner_action_summary(action: &str) -> &'static str {
+    match action {
+        "pairingCode" => "create a pairing code: whoever redeems it gets a new device token",
+        "pairingInvite" => "create a QR pairing invite: the scanned phone becomes a new device",
+        "pairingInviteApprove" => "approve a pending phone: it gets a device token and a relay certificate",
+        "relayCertificateApprove" => "issue a relay certificate to a device",
+        "peerPair" => "pair this host with another host",
+        "peerEnable" => "enable a paired host",
+        "peersEnable" => "turn cross-host peers on",
+        "publicPairingOn" => "turn public pairing (the relay bootstrap endpoint) on",
+        "disableOwnerApproval" => "let owner devices act without the owner's approval",
+        _ => "widen access to this host",
+    }
+}
+
+/// Gate of a widening action (`OWNER_WIDENING_ACTIONS`). Owner-local: Ok as
+/// before. A full-scope owner device: Ok with a valid `?ownerConfirm=`
+/// (consumed; every owner device is told), else 428
+/// `owner_confirm_required {action, summary, confirmToken, expiresAt,
+/// ttlSeconds, clientToken, issuedVia}`. Anyone else: 403 `owner_local_only`.
+pub fn owner_widening_gate(action: &str, request: &crate::http::server::SimpleHttpRequest) -> Result<(), UserError> {
+    if request_is_owner_local() {
+        return Ok(());
+    }
+    let token = match crate::management::listeners::current_client_token() {
+        Some(token) if token.principal.is_owner() && token.scope.is_full() => token,
+        _ => return Err(owner_local_only(action)),
+    };
+    // Bind confirmation to the exact method, target, query and body. Only
+    // the confirmation parameter itself may change between the two clicks.
+    let (path, query) = request.path.split_once('?').unwrap_or((&request.path, ""));
+    let query: Vec<_> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(name, _)| name != "ownerConfirm").collect();
+    let request_digest = crate::approvals::request_digest(&json!({
+        "method": request.method, "path": path, "query": query, "body": request.body,
+    }));
+    let now = Instant::now();
+    let mut confirms = owner_confirms().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    confirms.retain(|_, confirm| confirm.expires > now);
+    if let Some(presented) = owner_confirm_param(&request.path) {
+        let valid = confirms
+            .get(presented)
+            .is_some_and(|confirm| confirm.action == action && confirm.token_id == token.token_id && confirm.request_digest == request_digest);
+        if valid {
+            confirms.remove(presented);
+            drop(confirms);
+            announce_owner_remote_action(action, &token);
+            return Ok(());
+        }
+    }
+    if confirms.len() >= MAX_OWNER_CONFIRMS {
+        let oldest = confirms.iter().min_by_key(|(_, confirm)| confirm.expires).map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            confirms.remove(&oldest);
+        }
+    }
+    let confirm_token = format!("oc-{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    confirms.insert(
+        confirm_token.clone(),
+        OwnerConfirm { action: action.to_string(), token_id: token.token_id.clone(), request_digest, expires: now + OWNER_CONFIRM_TTL },
+    );
+    let mut error = UserError::new(
+        428,
+        "owner_confirm_required",
+        format!(
+            "{}: confirm on this device, then repeat the request with ?ownerConfirm=<confirmToken>; every owner device will be told",
+            owner_action_summary(action)
+        ),
+    );
+    let expires_at = chrono::Utc::now()
+        + chrono::Duration::from_std(OWNER_CONFIRM_TTL).unwrap_or_default();
+    error.details = owner_local_details(json!({
+        "action": action,
+        "summary": owner_action_summary(action),
+        "confirmToken": confirm_token,
+        "confirmParam": "ownerConfirm",
+        "expiresAt": expires_at.to_rfc3339(),
+        "ttlSeconds": OWNER_CONFIRM_TTL.as_secs(),
+    }));
+    Err(error)
+}
+
+/// Tell every owner device about a confirmed widening action from a device.
+fn announce_owner_remote_action(action: &str, token: &crate::management::client_tokens::VerifiedClientToken) {
+    let summary = ClientTokenStore::open_default()
+        .ok()
+        .and_then(|store| store.list().ok())
+        .and_then(|tokens| tokens.into_iter().find(|t| t.token_id == token.token_id));
+    let connection = if crate::management::relay::current_peer().is_some() {
+        "relay"
+    } else if crate::management::listeners::current_request_is_loopback() {
+        "loopback"
+    } else {
+        "remote"
+    };
+    let details = json!({
+        "action": action,
+        "summary": owner_action_summary(action),
+        "phase": "confirmed",
+        "tokenId": token.token_id,
+        "label": summary.as_ref().map(|t| t.label.clone()),
+        "deviceName": summary.as_ref().and_then(|t| t.device_name.clone()),
+        "platform": summary.as_ref().and_then(|t| t.platform.clone()),
+        "connection": connection,
+        "at": crate::management::instance::now_utc(),
+    });
+    if let Ok(store) = UserStore::open_default() {
+        audit(store.dir(), "ownerRemoteAction", details.clone());
+    }
+    crate::management::v2::documents::publish_host_event(OWNER_REMOTE_ACTION, details);
+}
+
+/// Status line reason of the statuses users errors use.
+pub fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        _ => "Service Unavailable",
+    }
+}
+// r290 P10 (B6) end
+
 pub fn principal_in(state: &State, token_id: &str) -> Principal {
     match state.user_of_token(token_id) {
         Some(user) if user.is_owner() => Principal::Owner,
@@ -920,12 +1233,39 @@ pub fn current_actor() -> String {
 
 // ---------------------------------------------------------------- scope
 
+/// The shared snapshots a [`Scope`] is computed from: the Agent Management
+/// directory (project membership) and the session store.
+struct Membership(
+    Arc<crate::agent_management::AgentManagementSnapshot>,
+    Arc<crate::session::model::CutexSessionStore>,
+);
+
+impl Membership {
+    fn current() -> anyhow::Result<Self> {
+        let directory = crate::agent_management::AgentManagementStore::open_default()?
+            .directory_snapshot_shared()
+            .map_err(anyhow::Error::new)?;
+        Ok(Self(directory, crate::session::store::shared_cutex_session_store()?))
+    }
+
+    /// Both stores' commit revisions: every committed change bumps one.
+    /// (Only the numbers are kept: holding a session snapshot would make
+    /// the next commit copy the whole store.)
+    fn revisions(&self) -> (u64, u64) {
+        (self.0.store_revision, self.1.store_revision.get())
+    }
+}
+
 /// What a non-owner user can see right now: local sessions only (a peer's
 /// agents are never local sessions, so grants cannot be transitive).
 #[derive(Clone, Debug)]
 pub struct Scope {
     pub grant: Grant,
     sessions: HashSet<String>,
+    /// Visible sessions the user may send to.
+    send_sessions: HashSet<String>,
+    /// Visible local projects (known to Agent Management, or named in the grant).
+    projects: HashSet<String>,
 }
 
 impl Scope {
@@ -934,10 +1274,18 @@ impl Scope {
     }
 
     pub fn sees_project(&self, project_id: &str) -> bool {
-        match &self.grant.projects {
-            Projects::All => true,
-            Projects::Only(ids) => ids.iter().any(|id| id == project_id),
-        }
+        self.grant.sees_project(project_id)
+    }
+
+    /// May send to this visible agent (`send`, or its project's
+    /// `collaborator` role; a `viewer` project is read-only).
+    pub fn may_send(&self, cutex_session_id: &str) -> bool {
+        self.send_sessions.contains(cutex_session_id)
+    }
+
+    /// Visible local projects.
+    pub fn projects(&self) -> &HashSet<String> {
+        &self.projects
     }
 
     pub fn sessions(&self) -> &HashSet<String> {
@@ -948,12 +1296,20 @@ impl Scope {
     /// snapshot: persistent (or IM-exposed), not retired, and in a granted project or listed
     /// as a standalone agent (an agent without a project).
     pub fn load(grant: &Grant) -> anyhow::Result<Self> {
-        let snapshot = crate::memory::load_agent_management_directory()?;
+        let Membership(snapshot, store) = Membership::current()?;
+        Ok(Self::load_from(grant, &snapshot, &store))
+    }
+
+    fn load_from(
+        grant: &Grant,
+        snapshot: &crate::agent_management::AgentManagementSnapshot,
+        store: &crate::session::model::CutexSessionStore,
+    ) -> Self {
         let boundary = crate::agent_bus::boundary::AgentBoundary::from_snapshot(
             &crate::config::agent_security::AgentSecurityConfig::default(),
-            &snapshot,
+            snapshot,
         );
-        let sessions = crate::session::store::with_cutex_session_store(|store| {
+        let visible = {
             store
                 .sessions
                 .values()
@@ -966,45 +1322,71 @@ impl Scope {
                         || record.exposed_to_backend)
                         && !record.is_retired()
                 })
-                .filter(|record| {
+                .filter_map(|record| {
                     let id = record.cutex_session_id.as_str();
-                    match boundary.project_of(id) {
-                        Some(project) => match &grant.projects {
-                            Projects::All => true,
-                            Projects::Only(ids) => ids.iter().any(|p| p == project),
-                        },
+                    let project = boundary.project_of(id);
+                    let visible = match project {
+                        Some(project) => grant.sees_project(project),
                         None => grant.standalone_agents.iter().any(|a| a == id),
-                    }
+                    };
+                    visible.then(|| (record.cutex_session_id.clone(), grant.sends_in(project)))
                 })
-                .map(|record| record.cutex_session_id.clone())
-                .collect::<HashSet<_>>()
-        })?;
-        Ok(Self { grant: grant.clone(), sessions })
+                .collect::<Vec<_>>()
+        };
+        let send_sessions = visible.iter().filter(|(_, send)| *send).map(|(id, _)| id.clone()).collect();
+        let sessions = visible.into_iter().map(|(id, _)| id).collect();
+        let mut projects: HashSet<String> = snapshot
+            .projects
+            .keys()
+            .map(|project| project.as_str().to_string())
+            .filter(|project| grant.sees_project(project))
+            .collect();
+        if let Projects::Only(ids) = &grant.projects {
+            projects.extend(ids.iter().cloned());
+        }
+        projects.extend(grant.project_roles.keys().cloned());
+        Self { grant: grant.clone(), sessions, send_sessions, projects }
     }
 
-    /// `load`, cached per grant for a few seconds (peer directory and
-    /// stream filters call it often). Errors see nothing.
+    /// `load`, cached per grant and membership (peer directory and stream
+    /// filters call it often). r290 P1: an entry is reused only while the
+    /// Agent Management directory and the session store are the same
+    /// snapshots it was built from, so a project move, retirement or new
+    /// agent takes effect at once; entries also expire after a few seconds.
+    /// Errors see nothing.
     pub fn cached(grant: &Grant) -> Self {
-        static CACHE: OnceLock<Mutex<Vec<(Grant, Instant, Scope)>>> = OnceLock::new();
+        static CACHE: OnceLock<Mutex<Vec<(Grant, Instant, (u64, u64), Scope)>>> = OnceLock::new();
+        let empty = || Self { grant: grant.clone(), sessions: HashSet::new(), send_sessions: HashSet::new(), projects: HashSet::new() };
+        let membership = match Membership::current() {
+            Ok(membership) => membership,
+            Err(error) => {
+                eprintln!("user scope unavailable; nothing visible: {error:#}");
+                return empty();
+            }
+        };
         let mut cache = CACHE
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.retain(|(_, at, _)| at.elapsed() < SCOPE_MAX_AGE);
-        if let Some((_, _, scope)) = cache.iter().find(|(g, _, _)| g == grant) {
+        let revisions = membership.revisions();
+        cache.retain(|(_, at, held, _)| at.elapsed() < SCOPE_MAX_AGE && *held == revisions);
+        if let Some((_, _, _, scope)) = cache.iter().find(|(g, _, _, _)| g == grant) {
             return scope.clone();
         }
-        let scope = Self::load(grant).unwrap_or_else(|error| {
-            eprintln!("user scope unavailable; nothing visible: {error:#}");
-            Self { grant: grant.clone(), sessions: HashSet::new() }
-        });
-        cache.push((grant.clone(), Instant::now(), scope.clone()));
+        let scope = Self::load_from(grant, &membership.0, &membership.1);
+        cache.push((grant.clone(), Instant::now(), revisions, scope.clone()));
         scope
     }
 
     #[cfg(test)]
     pub fn for_tests(grant: Grant, sessions: &[&str]) -> Self {
-        Self { grant, sessions: sessions.iter().map(|s| s.to_string()).collect() }
+        let sessions: HashSet<String> = sessions.iter().map(|s| s.to_string()).collect();
+        let send_sessions = if grant.send { sessions.clone() } else { HashSet::new() };
+        let mut projects: HashSet<String> = grant.project_roles.keys().cloned().collect();
+        if let Projects::Only(ids) = &grant.projects {
+            projects.extend(ids.iter().cloned());
+        }
+        Self { grant, sessions, send_sessions, projects }
     }
 }
 

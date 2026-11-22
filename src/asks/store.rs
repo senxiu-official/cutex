@@ -36,6 +36,10 @@ const MAX_NOTICES: usize = 2000;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Presence {
+    /// Capability observed for this exact runtime generation, never inferred
+    /// from a daemon feature flag or inherited across a runtime restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_answer_generation: Option<u64>,
     pub online: bool,
     pub busy: bool,
     pub paused: bool,
@@ -656,6 +660,7 @@ impl AskState {
             answer_id: None,
             target_reverted: false,
             closed: None,
+            follow_up_ended: false,
             closed_at: None,
             created_at: now_text.clone(),
             updated_at: now_text,
@@ -774,9 +779,10 @@ impl AskState {
         let ask = self.asks.get_mut(ask_id)?;
         let before = (ask.execution, ask.hold.clone(), ask.review, ask.closed);
         let attempt_before = ask.current_attempt().map(|attempt| (attempt.n, attempt.turn_id.clone(), attempt.state));
-        let stop_before = ask.current_attempt().and_then(|attempt| attempt.stop_intent.clone());
+        let stop_before = ask.current_attempt().map(|a| (a.stop_intent.clone(), a.stop_deadline.clone(), a.stop_unconfirmed));
         let extras_before = (ask.jobs.clone(), ask.awaiting.clone(), ask.resume.clone(), ask.revisions.clone());
         let before_value = serde_json::to_value(&*ask).ok();
+        let wait_before = super::view::continuation_wait(ask); // r290 P14
         let result = mutate(ask);
         // Source admission intent, never a projection/retry callback. Busy
         // native requeue (Admitted -> Queued) retains the same occurrence.
@@ -799,7 +805,11 @@ impl AskState {
         // delegation-await §7: jobs, wait, resume and revisions changes
         // without a state change get `cutex/ask/updated` (clients refetch).
         let mut changed = Vec::new();
-        if stop_before != snapshot.current_attempt().and_then(|attempt| attempt.stop_intent.clone()) {
+        // r290 P14: existing clients already refetch for cutex/ask/*.
+        if wait_before != super::view::continuation_wait(&snapshot) {
+            changed.push("continuationWait");
+        }
+        if stop_before != snapshot.current_attempt().map(|a| (a.stop_intent.clone(), a.stop_deadline.clone(), a.stop_unconfirmed)) {
             changed.push("stop");
         }
         if extras_before.0 != snapshot.jobs {
@@ -834,7 +844,12 @@ impl AskState {
                     "hold": snapshot.hold,
                     "review": snapshot.review,
                     "revision": snapshot.revision,
+                    // r290 P7: attach the diagnostic to the existing state event.
+                    "handlerFailure": snapshot.current_attempt().filter(|r| attempt_before != attempt_after
+                        && matches!(r.state, AttemptState::Failed | AttemptState::Interrupted))
+                        .and_then(|r| r.handler_failure.as_ref()),
                     "attempt": snapshot.current_attempt().map(|attempt| json!({"n": attempt.n, "turnId": attempt.turn_id, "state": attempt.state})),
+                    "continuationWait": super::view::continuation_wait(&snapshot), // r290 P14
                 }),
             );
         }
@@ -1335,6 +1350,19 @@ impl AskStore {
         } else {
             self.dir.join(crate::management::v2::hot_store::DATABASE_FILE)
         }
+    }
+
+    // r290 P6: indexed day counts also include permanent cold asks.
+    pub fn board_closed_counts(&self,start:DateTime<Utc>,end:DateTime<Utc>)->anyhow::Result<BTreeMap<String,u64>> {
+        if let Some(counts)=super::archive::board_closed_counts(&self.database_path(),start,end)? {return Ok(counts);}
+        anyhow::ensure!(!crate::management::v2::hot_store::has_store(&self.database_path(),"asks")?,"board refuses unverified ask rows");
+        let state=self.shared()?;let mut counts=BTreeMap::new();
+        for ask in state.asks.values() {
+            if ask.closed.is_some() && ask.closed_at.as_deref().and_then(super::parse_time).is_some_and(|at|at>=start && at<end) {
+                if let Some(project)=&ask.project_id {*counts.entry(project.clone()).or_insert(0)+=1;}
+            }
+        }
+        Ok(counts)
     }
 
     /// Explicit history access. Scheduler, admission and summary must use
@@ -2025,6 +2053,27 @@ impl AskStore {
     #[track_caller]
     pub fn with_records<T>(&self, records:&[&str],mutate:impl FnOnce(&mut AskState)->T) -> anyhow::Result<T> {
         self.with_selection(records,None,mutate)
+    }
+
+    /// Update only the observed capability metadata of one receiver. No ask
+    /// inventory or cold history is needed for this session-keyed write.
+    pub fn record_stop_answer_capability(&self,session:&str,generation:u64,ready:Option<u64>)->anyhow::Result<()> {
+        if !self.inspect(|s|s.presence.get(session).and_then(|p|p.stop_answer_generation)!=ready)? {return Ok(());}
+        self.with_selection(&[],None,|s|{
+            let p=s.presence.entry(session.into()).or_default();
+            if p.runtime_generation.is_some_and(|current|current>generation){return;}
+            p.stop_answer_generation=ready;
+            if ready.is_some(){p.runtime_generation=Some(generation);}
+        })
+    }
+
+    /// An internal/scoped interrupt cannot inherit an older owner Stop proof.
+    /// Preserve the work hold and touch only this receiver's pause metadata.
+    pub fn revoke_stop_answer(&self,session:&str)->anyhow::Result<()> {
+        if !self.inspect(|s|s.pauses.get(session).is_some_and(|p|p.stop_answer_authorized))? {return Ok(());}
+        self.with_selection(&[],None,|s|{
+            if let Some(p)=s.pauses.get_mut(session){p.stop_answer_authorized=false;}
+        })
     }
 
     #[track_caller]

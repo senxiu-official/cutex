@@ -471,6 +471,7 @@ fn dismiss_removes_the_uncertain_owner_inputs_queue_item() {
     let session = format!("c2-dismiss-{}", uuid::Uuid::new_v4().simple());
     let repository = super::super::user_input::user_input_repository().unwrap();
     let params = UserInputSubmitParams {
+                interrupt_send: None,
         client_user_message_id: "d1".into(),
         origin: super::super::user_input::UserInputOrigin {
             kind: super::super::user_input::UserInputOriginKind::Backend,
@@ -777,7 +778,8 @@ fn queue_merge_is_one_batch_with_one_state_revision() {
         f.step(id, Step::Waiting("explicitQueue"), Queue);
     }
     let records = f.ledger.get("s1", &["a".into(), "b".into(), "c".into(), "unknown".into()]).unwrap().records;
-    let batch = merge_batch(&records, "a", &["b".into(), "c".into(), "unknown".into()]);
+    let merged = vec![json!({"type":"text","text":"A B C"}),json!({"type":"localImage","path":"D:/images/one.png"})];
+    let batch = merge_batch(&records, "a", &["b".into(), "c".into(), "unknown".into()], &merged);
     assert_eq!(batch.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"], "unknown records are left out");
     let transitions = f.ledger.transition_batch("s1", batch).unwrap();
     let revisions: std::collections::BTreeSet<u64> = transitions.iter().map(|t| t.state_revision).collect();
@@ -786,21 +788,25 @@ fn queue_merge_is_one_batch_with_one_state_revision() {
     let survivor = f.record("a").unwrap();
     assert_eq!((survivor.state, survivor.reason.as_deref(), survivor.surface), (InputState::Waiting, Some("explicitQueue"), Surface::NextUp));
     assert_eq!(survivor.details["mergedFrom"], json!(["b", "c"]));
+    assert_eq!(survivor.preview, "A B C [image]");
     for id in ["b", "c"] {
         let record = f.record(id).unwrap();
         assert_eq!((record.state, record.reason.as_deref(), record.surface, record.superseded_by.as_deref()),
             (InputState::Superseded, Some("mergedInsert"), Surface::None, Some("a")));
         assert_eq!(record.state_revision, survivor.state_revision);
     }
-    // Merged again (nothing left open to absorb): no batch.
+    // Merged again: the survivor still gets its content checked, without
+    // producing another observable change or duplicating mergedFrom.
     let records = f.ledger.get("s1", &["a".into(), "b".into()]).unwrap().records;
-    assert!(merge_batch(&records, "a", &["b".into()]).is_empty());
+    let replay = merge_batch(&records, "a", &["b".into()], &merged);
+    assert!(f.ledger.transition_batch("s1",replay).unwrap().iter().all(|t|!t.changed));
 }
 
 #[test]
 fn route_context_stays_empty_with_the_switch_off() {
     let pin = ledger::pin_enabled(Some(false));
     let params = UserInputSubmitParams {
+                interrupt_send: None,
         client_user_message_id: "off-1".into(),
         origin: super::super::user_input::UserInputOrigin {
             kind: super::super::user_input::UserInputOriginKind::Backend,
@@ -816,7 +822,7 @@ fn route_context_stays_empty_with_the_switch_off() {
     native_refused("s-off", "off-1", Some("hostBusy"));
     materialize("s-off", "off-1");
     offline_waiting("s-off", "off-1");
-    assert!(queue_merged("s-off", "off-1", &["off-2".into()]).is_empty());
+    assert!(queue_merged("s-off", "off-1", &["off-2".into()], &params.input).is_empty());
     CONTEXT.with(|context| {
         let context = context.borrow();
         assert!(context.pending.is_none() && context.sending_from.is_none(), "switch off: nothing remembered");

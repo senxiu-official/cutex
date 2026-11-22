@@ -20,7 +20,8 @@ import time
 from typing import Any, Awaitable, Callable
 import uuid
 
-from .provider import ProviderError
+from .provider import ProviderError, TransportFailure
+from .runtime_tasks import stop_outcome
 from .subscription_auth import SubscriptionSetupError
 
 
@@ -45,6 +46,13 @@ def tool_results(message: Any) -> bool:
     return isinstance(content, list) and any(
         (block.get('type') if isinstance(block, dict) else type(block).__name__) in {'tool_result', 'ToolResultBlock'}
         for block in content)
+
+
+def recovery_activity(message: Any) -> bool:
+    return (message_type(message) in {'StreamEvent', 'stream_event', 'AssistantMessage', 'assistant',
+            'UserMessage', 'user', 'ResultMessage', 'result', 'TaskStartedMessage', 'TaskProgressMessage',
+            'TaskNotificationMessage', 'TaskUpdatedMessage', 'ConversationResetMessage'}
+            or field(message, 'subtype') in {'hook_started', 'hook_response', 'compact_boundary'})
 
 
 class TurnInterrupted(ProviderError):
@@ -138,6 +146,10 @@ def safe_error(exc: BaseException, stage: str) -> ProviderError:
     if isinstance(exc, SubscriptionSetupError):
         return ProviderError(str(exc))
     kind = type(exc).__name__
+    if stage in {'connect', 'receive', 'stream'} and isinstance(exc, (TimeoutError, ConnectionError)):
+        failure = TransportFailure(f'Official Claude transport failed ({kind}); the input is not replayed.')
+        failure.before_submission = stage == 'connect'
+        return failure
     hint = ('Check the selected CLI and isolated official login.' if stage == 'connect'
             else 'Inspect the native session and tool journal; the input is not replayed.')
     return ProviderError(f'SDK {stage} failed ({kind}). {hint}')
@@ -299,6 +311,7 @@ class Control:
 @dataclass
 class Event:
     message: Any
+    recovery_revision: int | None = None
 
 
 @dataclass
@@ -342,6 +355,8 @@ class RuntimeOwner:
         self.model_catalog: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
         self.native_connection_generation = 1
+        self.recovery_revision = 0
+        self.recovery_arrivals = 0
         # A -> B -> A must not confirm A using evidence from before either change.
         self.model_selection_id = str(uuid.uuid4())
         self.process_exit_confirmed: bool | None = None
@@ -416,6 +431,8 @@ class RuntimeOwner:
             raise ProviderError('Unknown native runtime control operation')
         await asyncio.shield(self.ready)
         if not self.accepting or self.task.done():
+            if kind == 'task_stop':
+                return stop_outcome(self.tid, arguments['task_id'], 'refused', 'runtimeOffline')
             raise ProviderError('Runtime is offline; start it before using native controls')
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(self._observe)
@@ -507,12 +524,16 @@ class RuntimeOwner:
         """The only application reader for this client. No ResultMessage break."""
         try:
             async for message in self.client.receive_messages():
-                await self.mailbox.put(Event(message))
+                if recovery_activity(message):
+                    self.recovery_arrivals += 1
+                await self.mailbox.put(Event(message, self.recovery_arrivals))
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            self.recovery_arrivals += 1
             await self.mailbox.put(End(exc))
         else:
+            self.recovery_arrivals += 1
             await self.mailbox.put(End())
 
     def _check_identity(self, message: Any) -> None:
@@ -599,9 +620,16 @@ class RuntimeOwner:
         await self.engine.emit(self.tid, 'thread/status/changed', {
             'threadId': self.tid, 'status': {'type': 'active', 'activeFlags': flags} if active else {'type': 'idle'}})
 
-    async def _event(self, message: Any) -> None:
+    async def _event(self, message: Any, recovery_revision: int | None = None) -> None:
         self._check_identity(message)
         typ = message_type(message)
+        if recovery_revision is None:
+            self.recovery_arrivals += int(recovery_activity(message))
+            recovery_revision = self.recovery_arrivals
+        self.recovery_revision = recovery_revision
+        checkpoint = getattr(self.engine, 'checkpoints', {}).get(self.active.turn_id) if self.active else None
+        if checkpoint is not None:
+            checkpoint.observe(message)
         if self.active and (field(message, 'subtype') in {'hook_started', 'hook_response'}
                             or typ in {'TaskStartedMessage', 'TaskProgressMessage', 'TaskNotificationMessage'}):
             # These events bypass the ordinary turn callback, but may describe
@@ -655,6 +683,9 @@ class RuntimeOwner:
         if terminal:
             if field(message, 'session_id') != self.session_id:
                 raise OutcomeUncertain('Terminal result omitted the bound native session ID.')
+            if checkpoint is not None:
+                from .queue_recovery import owner_stamp
+                checkpoint.empty_terminal_stamp = owner_stamp(self)
             # Close tool-context admission before callbacks emit/await receipts.
             # A late PostToolUse cannot claim another input at the turn boundary.
             self.bridge.accepting = False
@@ -666,6 +697,8 @@ class RuntimeOwner:
             except ProviderError:
                 if not active.interrupted:
                     raise
+            if checkpoint is not None:
+                checkpoint.terminal(self, message)
             await self.bridge.end_turn()
             self.active = None
             if self.notified_in_turn:
@@ -708,18 +741,58 @@ class RuntimeOwner:
                 return True
             self.autonomous_until = None
             await self._publish_notification_hold()
+            checkpoint = getattr(self.engine, 'checkpoints', {}).get(command.turn_id)
+            if checkpoint is not None and checkpoint.pending_note is not None and not checkpoint.stable(self):
+                command.future.set_exception(ProviderError('Continuation checkpoint changed; no request was submitted.'))
+                return True
+            queue_retry = checkpoint is not None and getattr(checkpoint, 'queue_retry', False)
+            if queue_retry:
+                from .queue_recovery import QueueRetryHeld, verified_receipt
+                if (not checkpoint.queue_authorized and not await verified_receipt(self.engine, self.tid, command.turn_id, checkpoint.queue_receipt, self)) or checkpoint.live_effects(self) or self.recovery_arrivals != self.recovery_revision:
+                    command.future.set_exception(QueueRetryHeld('New runtime activity arrived; the original input stays queued for Resume.'))
+                    return True
+                checkpoint.queue_revision = self.recovery_arrivals
             self.engine.metrics.context.pop(self.tid, None)
             self.active = command
             self.finishing_turn_id = None
             self.bridge.begin_turn(command.turn_id)
+            if checkpoint is not None and checkpoint.pending_note is not None:
+                self.bridge.native.turn_diff = checkpoint.prior_diff
             await self.status('working')
+            if checkpoint is not None and checkpoint.pending_note is not None and (
+                    self.engine.closing or self.tid in self.engine.offline_threads
+                    or command.turn_id in self.cancelled_turns
+                    or self.engine.tool_gate.closed(self.tid)
+                    or self.recovery_arrivals != checkpoint.snapshot[2]):
+                await self.bridge.end_turn()
+                self.active = None
+                command.future.set_exception(TurnInterrupted('Continuation stopped before query submission.'))
+                await self.status('waiting')
+                return True
+            if queue_retry and (self.engine.closing or self.tid in self.engine.offline_threads
+                    or command.turn_id in self.cancelled_turns or self.engine.tool_gate.closed(self.tid)
+                    or self.recovery_arrivals != checkpoint.queue_revision or checkpoint.live_effects(self)
+                    or (not checkpoint.queue_authorized and not await verified_receipt(self.engine, self.tid, command.turn_id, checkpoint.queue_receipt, self))):
+                from .queue_recovery import QueueRetryHeld
+                await self.bridge.end_turn()
+                self.active = None
+                command.future.set_exception(QueueRetryHeld('Retry stopped before submission; the original input stays queued for Resume.'))
+                await self.status('waiting')
+                return True
             # Native UUID was allocated durably before connect; attempted means
             # "may have reached query", not a model-persisted delivery receipt.
             self.engine.store.db.execute('UPDATE sdk_sessions SET attempted=1 WHERE thread_id=?', (self.tid,))
             try:
                 async with asyncio.timeout(self.engine.settings.api_timeout):
                     prompt = command.prompt
+                    if queue_retry:
+                        from .queue_recovery import dispatch_probe
+                        dispatch_probe(self.engine.store, command.turn_id, 'dispatching')
                     await self.client.query(one_message(prompt) if isinstance(prompt, dict) else prompt)
+                    if queue_retry:
+                        dispatch_probe(self.engine.store, command.turn_id, 'submitted')
+                    if checkpoint is not None:
+                        await checkpoint.submitted()
             except BaseException as exc:
                 raise OutcomeUncertain(str(safe_error(exc, 'query'))) from None
             return True
@@ -746,8 +819,21 @@ class RuntimeOwner:
                             result = await self.client._query._send_control_request(
                                 {'subtype': 'apply_flag_settings', 'settings': args['settings']})
                         elif command.kind == 'task_stop':
-                            self.tasks.require_running(args['task_id'])
-                            result = await self.client.stop_task(args['task_id'])
+                            try:
+                                if args.get('expected_connection_id', self.connection_id) != self.connection_id:
+                                    raise ProviderError('Runtime owner changed before stop')
+                                self.tasks.require_running(args['task_id'])
+                            except ProviderError:
+                                result = stop_outcome(self.tid, args['task_id'], 'refused', 'taskNotRunning')
+                            else:
+                                try:
+                                    await self.client.stop_task(args['task_id'])
+                                except Exception:
+                                    # SDK errors may follow a successful write. They do not
+                                    # distinguish a native refusal from a lost reply.
+                                    result = stop_outcome(self.tid, args['task_id'], 'unknown', 'stopUnconfirmed')
+                                else:
+                                    result = stop_outcome(self.tid, args['task_id'], 'accepted', 'sdkAcknowledged')
                         else:
                             result = await self.client.rewind_files(args['user_message_id'])
                 command.future.set_result(result)
@@ -900,6 +986,8 @@ class RuntimeOwner:
         resets this budget; an immediately dying replacement cannot spin forever.
         The logical connection ID stays stable for Cutex's observation binding.
         """
+        if self.active and self.engine.open_tools.get(self.active.turn_id):
+            failure.tool_effects_uncertain = True
         if not self.accepting or self.reconnect_attempts >= 1:
             raise failure
         self.reconnect_attempts += 1
@@ -1024,10 +1112,12 @@ class RuntimeOwner:
                             raise OutcomeUncertain('Interrupt result was not drained before deadline; connection closed, input not replayed.') from None
                         continue
                 if isinstance(command, Event):
-                    await self._event(command.message)
+                    await self._event(command.message, command.recovery_revision)
                 elif isinstance(command, End):
                     error = safe_error(command.error, 'receive') if command.error else ProviderError('SDK stream ended unexpectedly')
-                    await self._recover(OutcomeUncertain(f'{error}; input not replayed.'))
+                    failure = OutcomeUncertain(f'{error}; input not replayed.')
+                    failure.transport_failure = getattr(error, 'transport_failure', False)
+                    await self._recover(failure)
                 else:
                     try:
                         if not await self._command(command, released):
@@ -1040,6 +1130,8 @@ class RuntimeOwner:
             failure = OutcomeUncertain('Runtime owner was unexpectedly cancelled; inspect effects, no replay.')
         except BaseException as exc:
             failure = safe_error(exc, stage)
+            if self.active and self.engine.open_tools.get(self.active.turn_id):
+                failure.tool_effects_uncertain = True
         finally:
             self.accepting = False
             # Cleanup failures must not skip the remaining cleanup steps or

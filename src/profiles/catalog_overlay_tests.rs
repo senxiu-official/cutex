@@ -20,7 +20,7 @@ fn ids(rows: &[Value]) -> Vec<&str> {
 fn config(id: &str, base: &str, window: u64) -> Entry {
     let mut overrides = Map::new();
     overrides.insert("context_window".into(), json!(window));
-    Entry { id: id.into(), request_model: Some(base.into()), hidden: false, overrides }
+    Entry { id: id.into(), request_model: Some(base.into()), hidden: false, overrides, ..Entry::default() }
 }
 
 #[test]
@@ -163,7 +163,9 @@ fn official_edits_store_an_overlay_and_new_upstream_models_appear() {
         auto_compact_token_limit: ConfigValueUpdate::Set(700_000), ..ModelPatch::default()
     }).unwrap();
     let base = load(&account).unwrap().unwrap().entries.into_iter().find(|e| e.id == "gpt-6-astra").unwrap();
-    assert_eq!(base.overrides.keys().collect::<Vec<_>>(), ["auto_compact_token_limit"]);
+    // r290 P13: selecting absolute mode also pins the other mode cleared.
+    assert_eq!(base.overrides.keys().collect::<Vec<_>>(), ["auto_compact_percent", "auto_compact_token_limit"]);
+    assert_eq!(base.overrides["auto_compact_percent"],Value::Null);
     catalog_api::reset_model(&account, "gpt-6-astra").unwrap();
     assert!(load(&account).unwrap().unwrap().entries.iter().all(|e| e.id != "gpt-6-astra"));
     // Removing an upstream entry hides it; editing it shows it again.
@@ -486,4 +488,268 @@ fn unavailable_configurations_cannot_be_rebound() {
     catalog_api::remove_model(&account, "Fast").unwrap();
     catalog_api::update_model(&account, "Fast", &patch("gpt-6-astra", 400_000)).unwrap();
     assert_eq!(effective_window(&account, "Fast"), 400_000);
+}
+
+// r290 P13
+#[test]
+fn context_migration_preserves_official_overlay_hidden_and_variant_limits_after_retry() {
+    let (_home, account, bundle, native) = fixture();
+    write_upstream(&native,vec![astra(),row("hidden",300000)]);
+    catalog_api::update_model(&account,"Astra [400K]",&patch("gpt-6-astra",400000)).unwrap();
+    catalog_api::remove_model(&account,"hidden").unwrap();
+    let old_path=pointer(&account).unwrap();
+    let old_bytes=std::fs::read(&old_path).unwrap();
+    settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config: CodexProfileConfigPatch {
+        model_context_window:ConfigValueUpdate::Set(200000),
+        model_auto_compact_token_limit:ConfigValueUpdate::Set(150000),..Default::default()
+    },..Default::default()}).unwrap();
+    crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+    let before=catalog_api::load(&account).unwrap();
+    let before_rows=before.catalog.unwrap()["models"].as_array().unwrap().clone();
+    FAIL_CONTEXT_COMMIT.with(|fail|fail.set(true));
+    assert!(ensure_context_migrated(&account).is_err());
+    assert!(!settings_api::codex_snapshot(&account).model_context_settings_v1);
+    assert_eq!(pointer(&account).as_ref(),Some(&old_path));
+    assert!(ensure_context_migrated(&account).unwrap());
+    assert!(!ensure_context_migrated(&account).unwrap());
+    let overlay=load(&account).unwrap().unwrap();
+    let hidden=overlay.entries.iter().find(|entry|entry.id=="hidden").unwrap();
+    assert!(hidden.hidden);
+    assert!(hidden.overrides.is_empty());
+    assert!(hidden.context_preserved.is_empty());
+    let variant=overlay.entries.iter().find(|entry|entry.id=="Astra [400K]").unwrap();
+    assert_eq!(variant.overrides["context_window"],400000);
+    assert_eq!(variant.context_preserved["context_window"],200000);
+    let after=catalog_api::load(&account).unwrap();
+    for old in &before_rows {
+        let new=after.catalog.as_ref().unwrap()["models"].as_array().unwrap().iter()
+            .find(|r|r["slug"]==old["slug"]).unwrap();
+        let previous=super::super::model_context::resolve(old,&before.snapshot);
+        let current=super::super::model_context::resolve(new,&after.snapshot);
+        assert_eq!((previous.window,previous.absolute),(current.window,current.absolute));
+    }
+    assert_eq!(std::fs::read(&old_path).unwrap(),old_bytes);
+    let mut refreshed=astra(); refreshed["context_window"]=json!(900000);
+    write_upstream(&native,vec![refreshed]);
+    refresh_for_launch(&account.id);
+    let current=catalog_api::models_resource(&account).unwrap();
+    for row in current["models"].as_array().unwrap() {
+        assert_eq!(row["effective"]["contextWindow"],200000);
+        assert_eq!(row["effective"]["autoCompactTokenLimit"],150000);
+        assert_eq!(row["effective"]["contextWindowSource"],if row["id"]=="Astra [400K]" {"preserved"}else{"profile"});
+    }
+}
+
+#[test]
+fn context_migration_custom_catalog_is_immutable_and_unavailable_catalog_stays_legacy() {
+    let (_home, account, bundle, _native)=fixture();
+    // Direct custom catalog path, even on an official profile, stays a snapshot.
+    let mut base=astra(); base["context_window"]=json!(128000); base["max_context_window"]=json!(256000);
+    let dir=catalog_api::profile_dir(&account).unwrap();
+    let original=dir.join(format!("models-{}.json",uuid::Uuid::new_v4()));
+    write_private_pretty_json_atomic(&original,&json!({"models":[base]}),"fixture").unwrap();
+    settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config: CodexProfileConfigPatch {
+        model_catalog_json:ConfigValueUpdate::Set(original.to_string_lossy().into_owned()),
+        model_context_window:ConfigValueUpdate::Set(500000),
+        model_auto_compact_token_limit:ConfigValueUpdate::Set(400000),..Default::default()
+    },..Default::default()}).unwrap();
+    let original_bytes=std::fs::read(&original).unwrap();
+    crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+    assert!(ensure_context_migrated(&account).unwrap());
+    assert!(load(&account).unwrap().is_none());
+    let state=catalog_api::load(&account).unwrap();
+    let value=super::super::model_context::resolve(&state.catalog.unwrap()["models"][0],&state.snapshot);
+    assert_eq!((value.window,value.absolute),(Some(256000),Some(230400)));
+    assert_eq!(std::fs::read(&original).unwrap(),original_bytes);
+    refresh_for_launch(&account.id);
+    let resource=catalog_api::models_resource(&account).unwrap();
+    assert_eq!(resource["catalogPresent"],true);
+    assert_eq!(resource["followsUpstream"],false);
+    assert!(load(&account).unwrap().is_none(),"unknown legacy snapshot must not be inferred as owner edits");
+    assert_eq!(resource["models"][0]["contextSettings"]["owner"]["contextWindow"],Value::Null);
+    use crate::profiles::lifecycle::{create_profile,NewProfile,NewProfileKind};
+    let missing=create_profile(&NewProfile {name:"missing catalog".into(),kind:NewProfileKind::ApiKey,
+        preset:None,base_url:Some("https://example.invalid/v1".into()),model:None,api_key:None}).unwrap();
+    settings_api::update_profile(&missing.id,&ProfileApiPatch {codex_config:CodexProfileConfigPatch {
+        model_catalog_json:ConfigValueUpdate::Set(dir.join("absent.json").to_string_lossy().into_owned()),..Default::default()
+    },..Default::default()}).unwrap();
+    assert!(ensure_context_migrated(&missing).is_err());
+    assert!(!settings_api::codex_snapshot(&missing).model_context_settings_v1);
+}
+
+// r290 P13
+#[test]
+fn context_migration_preserves_legacy_profile_absolute_above_its_window_and_model_edits() {
+    let (_home,account,bundle,_native)=fixture();
+    let files=crate::profiles::materialize::materialized_account_files(&account).unwrap();
+    let raw=std::fs::read_to_string(&files.config_path).unwrap();
+    let mut config:toml::Table=toml::from_str(&raw).unwrap();
+    config.insert("model_context_window".into(),toml::Value::Integer(200000));
+    config.insert("model_auto_compact_token_limit".into(),toml::Value::Integer(500000));
+    std::fs::write(&files.config_path,toml::to_string(&config).unwrap()).unwrap();
+    crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+    assert!(ensure_context_migrated(&account).unwrap());
+    let state=catalog_api::load(&account).unwrap();
+    assert_eq!(state.snapshot.model_auto_compact_token_limit,Some(500000));
+    assert!(state.catalog.is_none(),"ordinary official migration must not select a catalog");
+    let current=catalog_api::models_resource(&account).unwrap()["models"][0]["effective"].clone();
+    assert_eq!((current["contextWindow"].as_i64(),current["autoCompactTokenLimit"].as_i64()),(Some(200000),Some(180000)));
+    // Editing a model's catalog must not revalidate an unchanged legacy default.
+    catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch {
+        auto_compact_percent:ConfigValueUpdate::Set(50),..Default::default()
+    }).unwrap();
+    let state=catalog_api::load(&account).unwrap();
+    assert_eq!(state.snapshot.model_auto_compact_token_limit,Some(500000));
+    let current=super::super::model_context::resolve(&state.catalog.unwrap()["models"][0],&state.snapshot);
+    assert_eq!((current.window,current.absolute),(Some(200000),Some(100000)));
+}
+
+// r290 P13
+#[test]
+fn context_first_custom_model_can_create_a_catalog_after_automatic_migration_defers() {
+    let (_home,_official,bundle,_native)=fixture();
+    use crate::profiles::lifecycle::{create_profile,NewProfile,NewProfileKind};
+    let account=create_profile(&NewProfile {name:"first custom model".into(),kind:NewProfileKind::ApiKey,
+        preset:None,base_url:Some("https://example.invalid/v1".into()),model:None,api_key:None}).unwrap();
+    settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config:CodexProfileConfigPatch {
+        model_context_window:ConfigValueUpdate::Set(200000),
+        model_auto_compact_token_limit:ConfigValueUpdate::Set(150000),..Default::default()
+    },..Default::default()}).unwrap();
+    assert!(catalog_api::load(&account).unwrap().catalog.is_none());
+    crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+    assert!(ensure_context_migrated(&account).is_err());
+    assert!(!settings_api::codex_snapshot(&account).model_context_settings_v1);
+    assert!(catalog_api::update_model(&account,"vendor/new",&ModelPatch {
+        context_window:ConfigValueUpdate::Set(128000),auto_compact_percent:ConfigValueUpdate::Set(50),..Default::default()
+    }).unwrap());
+    let state=catalog_api::load(&account).unwrap();
+    assert!(state.snapshot.model_context_settings_v1);
+    assert_eq!(state.snapshot.model_context_window,Some(200000));
+    assert_eq!(state.snapshot.model_auto_compact_token_limit,Some(150000));
+    let model=super::super::model_context::resolve(&state.catalog.unwrap()["models"][0],&state.snapshot);
+    assert_eq!((model.window,model.absolute),(Some(128000),Some(64000)));
+    assert_eq!(model.compact_source,"model");
+    assert!(catalog_api::update_model(&account,"vendor/window-only",&ModelPatch {
+        context_window:ConfigValueUpdate::Set(128000),..Default::default()
+    }).unwrap());
+    let state=catalog_api::load(&account).unwrap();
+    let catalog=state.catalog.unwrap();
+    let row=catalog["models"].as_array().unwrap().iter().find(|row|row["slug"]=="vendor/window-only").unwrap();
+    let model=super::super::model_context::resolve(row,&state.snapshot);
+    assert_eq!((model.window,model.absolute),(Some(128000),Some(115200)));
+    assert_eq!(model.compact_source,"profile");
+    assert!(!ensure_context_migrated(&account).unwrap());
+}
+
+// r290 P13: persistence must retain the same per-field inheritance as the pure resolver.
+#[test]
+fn context_migration_field_pins_preserve_official_and_custom_inheritance() {
+    for official in [true,false] {
+        for window_only in [true,false] {
+            let (_home,base,bundle,native)=fixture();
+            let mut model=astra();model["context_window"]=json!(128000);model["max_context_window"]=json!(256000);
+            let account=if official {write_upstream(&native,vec![model]);base}else{
+                use crate::profiles::lifecycle::{create_profile,NewProfile,NewProfileKind};
+                let account=create_profile(&NewProfile {name:"inheritance custom".into(),kind:NewProfileKind::ApiKey,preset:None,base_url:Some("https://example.invalid/v1".into()),model:None,api_key:None}).unwrap();
+                let file=catalog_api::profile_dir(&account).unwrap().join("custom-inheritance.json");
+                write_private_pretty_json_atomic(&file,&json!({"models":[model]}),"fixture").unwrap();
+                settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config:CodexProfileConfigPatch {model_catalog_json:ConfigValueUpdate::Set(file.to_string_lossy().into_owned()),..Default::default()},..Default::default()}).unwrap();account
+            };
+            let old=if window_only {CodexProfileConfigPatch {model_context_window:ConfigValueUpdate::Set(200000),..Default::default()}}else{CodexProfileConfigPatch {model_auto_compact_token_limit:ConfigValueUpdate::Set(150000),..Default::default()}};
+            settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config:old,..Default::default()}).unwrap();
+            crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+            assert!(ensure_context_migrated(&account).unwrap());
+            if official {assert!(pointer(&account).is_none());assert!(load(&account).unwrap().unwrap().entries.is_empty());}
+            else {assert!(catalog_api::load_edits(&account).is_none());}
+            let new=CodexProfileConfigPatch {model_context_window:ConfigValueUpdate::Set(240000),model_auto_compact_percent:ConfigValueUpdate::Set(75),..Default::default()};
+            settings_api::update_profile(&account.id,&ProfileApiPatch {codex_config:new,..Default::default()}).unwrap();
+            let view=catalog_api::models_resource(&account).unwrap();let limits=&view["models"][0]["effective"];
+            assert_eq!(limits["contextWindow"],240000);assert_eq!(limits["autoCompactTokenLimit"],180000);
+            assert_eq!(limits["contextWindowSource"],"profile");assert_eq!(limits["autoCompactTokenLimitSource"],"profile");
+            assert!(!ensure_context_migrated(&account).unwrap());
+        }
+    }
+}
+
+// r290 P13: prove stored provenance and one-click restore for both catalog kinds.
+#[test]
+fn context_owner_conflict_restore_and_explicit_edit_keep_originals_in_both_stores() {
+    for official in [true,false] {
+        for restore in [true,false] {
+            let (_home,base,bundle,native)=fixture();
+            let mut model=astra();model["context_window"]=json!(256000);model["max_context_window"]=json!(256000);
+            let account=if official {write_upstream(&native,vec![model]);base}else{
+                use crate::profiles::lifecycle::{create_profile,NewProfile,NewProfileKind};
+                let a=create_profile(&NewProfile{name:"owner conflict".into(),kind:NewProfileKind::ApiKey,preset:None,base_url:Some("https://example.invalid/v1".into()),model:None,api_key:None}).unwrap();
+                let path=catalog_api::profile_dir(&a).unwrap().join("owner-base.json");
+                write_private_pretty_json_atomic(&path,&json!({"models":[model]}),"fixture").unwrap();
+                settings_api::update_profile(&a.id,&ProfileApiPatch{codex_config:CodexProfileConfigPatch{model_catalog_json:ConfigValueUpdate::Set(path.to_string_lossy().into_owned()),..Default::default()},..Default::default()}).unwrap();a
+            };
+            catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{context_window:ConfigValueUpdate::Set(128000),auto_compact_token_limit:ConfigValueUpdate::Set(90000),..Default::default()}).unwrap();
+            settings_api::update_profile(&account.id,&ProfileApiPatch{codex_config:CodexProfileConfigPatch{model_context_window:ConfigValueUpdate::Set(200000),model_auto_compact_token_limit:ConfigValueUpdate::Set(150000),..Default::default()},..Default::default()}).unwrap();
+            let old=catalog_api::load(&account).unwrap();let old_path=old.path.unwrap();let old_bytes=std::fs::read(&old_path).unwrap();
+            crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);
+            assert!(ensure_context_migrated(&account).unwrap());
+            let stored=catalog_api::load(&account).unwrap().catalog.unwrap();
+            assert!(stored["models"][0]["context_settings"]["catalog"].is_object(),"Native must always receive the catalog layer");
+            let view=catalog_api::models_resource(&account).unwrap();let row=&view["models"][0];
+            assert_eq!(row["effective"]["contextWindow"],200000);assert_eq!(row["effective"]["autoCompactTokenLimit"],150000);
+            assert_eq!(row["effective"]["contextWindowSource"],"preserved");assert_eq!(row["effective"]["autoCompactTokenLimitSource"],"preserved");
+            assert_eq!(row["contextSettings"]["owner"]["contextWindow"],128000);assert_eq!(row["contextSettings"]["owner"]["autoCompactTokenLimit"],90000);
+            assert_eq!(std::fs::read(old_path).unwrap(),old_bytes);
+            if restore {
+                catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{restore_preserved_context_window:true,restore_preserved_auto_compaction:true,..Default::default()}).unwrap();
+                let view=catalog_api::models_resource(&account).unwrap();let row=&view["models"][0];
+                assert_eq!(row["effective"]["contextWindow"],128000);assert_eq!(row["effective"]["autoCompactTokenLimit"],90000);
+                assert_eq!(row["effective"]["contextWindowSource"],"model");assert_eq!(row["effective"]["autoCompactTokenLimitSource"],"model");
+            }else{
+                catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{auto_compact_percent:ConfigValueUpdate::Set(50),..Default::default()}).unwrap();
+                let view=catalog_api::models_resource(&account).unwrap();let row=&view["models"][0];
+                assert_eq!(row["effective"]["contextWindowSource"],"preserved");assert_eq!(row["effective"]["autoCompactTokenLimit"],100000);
+                assert_eq!(row["effective"]["autoCompactTokenLimitSource"],"model");
+                catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{context_window:ConfigValueUpdate::Set(160000),..Default::default()}).unwrap();
+                let view=catalog_api::models_resource(&account).unwrap();let row=&view["models"][0];
+                assert_eq!(row["effective"]["contextWindow"],160000);assert_eq!(row["effective"]["autoCompactTokenLimit"],80000);
+                assert_eq!(row["effective"]["contextWindowSource"],"model");
+            }
+            catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{context_window:ConfigValueUpdate::Clear,..Default::default()}).unwrap();
+            let defaults=catalog_api::models_resource(&account).unwrap();
+            assert_eq!(defaults["models"][0]["effective"]["contextWindow"],200000);
+            assert_eq!(defaults["models"][0]["effective"]["contextWindowSource"],"profile");
+            catalog_api::reset_model(&account,"gpt-6-astra").unwrap();
+            let reset=catalog_api::models_resource(&account).unwrap();
+            assert_eq!(reset["models"][0]["contextSettings"]["owner"]["contextWindow"],Value::Null);
+            assert_eq!(reset["models"][0]["effective"]["contextWindowSource"],"profile");
+            assert_eq!(reset["models"][0]["effective"]["autoCompactTokenLimitSource"],"profile");
+            assert!(!ensure_context_migrated(&account).unwrap());
+        }
+    }
+}
+
+// r290 P13: B validates owner absolute choices against their real inherited window.
+#[test]
+fn context_b_edits_validate_absolute_against_inherited_window_and_cap_untouched_defaults() {
+    for official in [true,false] {
+        let (_home,base,bundle,native)=fixture();
+        let mut model=astra();model["context_window"]=json!(128000);model["max_context_window"]=json!(256000);model["auto_compact_token_limit"]=json!(90000);
+        let account=if official {write_upstream(&native,vec![model]);base}else{
+            use crate::profiles::lifecycle::{create_profile,NewProfile,NewProfileKind};
+            let a=create_profile(&NewProfile{name:"B validation".into(),kind:NewProfileKind::ApiKey,preset:None,base_url:Some("https://example.invalid/v1".into()),model:None,api_key:None}).unwrap();
+            let path=catalog_api::profile_dir(&a).unwrap().join("validation-base.json");
+            write_private_pretty_json_atomic(&path,&json!({"models":[model]}),"fixture").unwrap();
+            settings_api::update_profile(&a.id,&ProfileApiPatch{codex_config:CodexProfileConfigPatch{model_catalog_json:ConfigValueUpdate::Set(path.to_string_lossy().into_owned()),..Default::default()},..Default::default()}).unwrap();a
+        };
+        settings_api::update_profile(&account.id,&ProfileApiPatch{codex_config:CodexProfileConfigPatch{model_context_window:ConfigValueUpdate::Set(200000),..Default::default()},..Default::default()}).unwrap();
+        crate::profiles::model_variants::store_tests::set_context_support(&bundle,true);ensure_context_migrated(&account).unwrap();
+        catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{auto_compact_token_limit:ConfigValueUpdate::Set(150000),..Default::default()}).unwrap();
+        let view=catalog_api::models_resource(&account).unwrap();assert_eq!(view["models"][0]["effective"]["autoCompactTokenLimit"],150000);
+        catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{context_window:ConfigValueUpdate::Set(64000),..Default::default()}).unwrap();
+        catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{display_name:ConfigValueUpdate::Set("small window".into()),..Default::default()}).unwrap();
+        let view=catalog_api::models_resource(&account).unwrap();assert_eq!(view["models"][0]["effective"]["autoCompactTokenLimit"],57600);
+        assert!(catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{auto_compact_token_limit:ConfigValueUpdate::Set(70000),..Default::default()}).is_err());
+        catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{context_window:ConfigValueUpdate::Clear,..Default::default()}).unwrap();
+        catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{auto_compact_token_limit:ConfigValueUpdate::Set(170000),..Default::default()}).unwrap();
+        let view=catalog_api::models_resource(&account).unwrap();assert_eq!(view["models"][0]["effective"]["contextWindow"],200000);assert_eq!(view["models"][0]["effective"]["autoCompactTokenLimit"],170000);
+        assert!(catalog_api::update_model(&account,"gpt-6-astra",&ModelPatch{auto_compact_token_limit:ConfigValueUpdate::Set(210000),..Default::default()}).is_err());
+    }
 }

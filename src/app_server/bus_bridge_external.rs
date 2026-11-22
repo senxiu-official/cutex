@@ -1216,6 +1216,9 @@ pub(super) fn deliver(
     // turn must come after them so the turn reads them all.
     let mut messages = messages;
     messages.sort_by_key(|message| !job_plan.passive.contains(&message.id));
+    crate::agent_bus::runtime_gate_notice::best_effort(|| {
+        crate::agent_bus::runtime_gate_notice::report_existing_holds(repository, &messages, &options.cutex_session_id)
+    });
     for polled in messages {
         let mut fenced_ledger = Vec::new();
         let result = (|| -> anyhow::Result<bool> {
@@ -1389,6 +1392,7 @@ pub(super) fn deliver(
                 }
                 let refused = |error: &anyhow::Error| crate::app_server::external_input::size::is_size_rejection(&format!("{error:#}"));
                 let starts_turn = current.message.delivery != Delivery::Passive && !client.thread_busy()?;
+                if starts_turn { crate::app_server::pre_turn_notes::with_client(&client).attach_to_input(&options.cutex_session_id,&message.id); }
                 let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(&options.cutex_session_id, "delivery", None));
                 // 054 §2.9: frozen, native IO starts now.
                 repository.input_ledger_sending(&options.cutex_session_id, &message.id);
@@ -1536,7 +1540,13 @@ pub(super) fn deliver(
                     );
                 } else {
                     outcome.retained_pending = true;
-                    let _ = repository.record_external_input_error(&polled.id, &error.to_string());
+                    if crate::app_server::external_input::busy_refusal_reason(&error).as_deref() == Some("gate_closed") {
+                        crate::agent_bus::runtime_gate_notice::best_effort(|| {
+                            crate::agent_bus::runtime_gate_notice::record_hold(repository, &polled, &options.cutex_session_id, Some(generation))
+                        });
+                    } else {
+                        let _ = repository.record_external_input_error(&polled.id, &error.to_string());
+                    }
                     mark_error(
                         status,
                         format!("native delivery {} remains pending: {error:#}", polled.id),
@@ -1655,6 +1665,12 @@ pub(super) fn deliver_test_fake(
             })?;
             if !repository.owner_delivery_blocked(owner, &message.id)?
                 && !crate::asks::pause_admission::is_held(&asks, owner)? {
+                if frozen.message.delivery != Delivery::Passive {
+                    let response = client.handle().request("thread/read", serde_json::json!({"threadId":binding.thread_id,"includeTurns":false}))?;
+                    if response["thread"]["status"]["type"] != "active" {
+                        crate::app_server::pre_turn_notes::before_start(owner, &binding.thread_id, Some(binding.runtime_generation)).attach_to_input(owner,&message.id);
+                    }
+                }
                 repository.input_ledger_sending(owner, &message.id);
                 client.handle().request("thread/externalInput/submit", serde_json::to_value(&frozen)?)?;
             }

@@ -80,7 +80,7 @@ pub fn is_alarm(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
         || message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER
 }
 
-/// An owner-approval decision notice (023): a system alarm of the
+/// An immediate system notice (owner approval or a failed runtime gate): a system alarm of the
 /// `cutex.approvals` owner, recognised by its `alarm-approval-` message id
 /// (the alarm store re-checks the owner when the delivery authenticates it).
 pub fn is_approval_notice(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
@@ -88,6 +88,7 @@ pub fn is_approval_notice(message: &crate::agent_bus::model::AgentBusMessage) ->
         && message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER
         && message.external_message_id.as_deref().is_some_and(|id| {
             id.starts_with(crate::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX)
+                || id.starts_with(crate::agent_bus::runtime_gate_notice::MESSAGE_PREFIX)
         })
 }
 

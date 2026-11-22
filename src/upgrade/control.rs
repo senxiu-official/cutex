@@ -341,6 +341,17 @@ pub fn runner_setenv_args(vars: impl Fn(&str) -> Option<std::ffi::OsString>) -> 
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn systemd_upgrade_runner(
+    manager: Option<crate::runtime::process_scope::SystemdUserManager>,
+) -> anyhow::Result<std::process::Command> {
+    let manager = manager
+        .context("cannot start the systemd upgrade runner: restore the service account's user manager and retry")?;
+    let mut command = std::process::Command::new("systemd-run");
+    manager.configure_command(&mut command);
+    Ok(command)
+}
+
 /// Start `cutex upgrade run <runId>` with `exe`, outside the service tree.
 pub fn spawn_runner(layout: &Layout, exe: &Path, run_id: &str) -> anyhow::Result<u32> {
     let dir = layout.run_dir(run_id);
@@ -352,7 +363,12 @@ pub fn spawn_runner(layout: &Layout, exe: &Path, run_id: &str) -> anyhow::Result
         use std::os::unix::process::CommandExt;
         let mut command = if systemd && which("systemd-run") {
             // Its own transient unit: stopping the management unit never reaches it.
+            #[cfg(not(target_os = "linux"))]
             let mut command = std::process::Command::new("systemd-run");
+            #[cfg(target_os = "linux")]
+            let mut command = systemd_upgrade_runner(
+                crate::runtime::process_scope::SystemdUserManager::detect(),
+            )?;
             command
                 .args(["--user", "--collect", "--quiet", &format!("--unit=cutex-upgrade-{run_id}")])
                 .arg(format!("--setenv={}={}", super::layout::INSTALL_BASE_ENV, layout.base.display()))
@@ -687,6 +703,16 @@ mod tests {
     use crate::upgrade::manifest::fixtures::migration;
     use crate::upgrade::minisign::test_key::TestKey;
     use crate::upgrade::stage::fixtures::{installed_layout, publish, temp};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_upgrade_runner_reports_missing_user_manager() {
+        let error = systemd_upgrade_runner(None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot start the systemd upgrade runner: restore the service account's user manager and retry",
+        );
+    }
 
     fn staged_setup(class: MigrationClass) -> (Layout, Vec<PublicKey>, PathBuf) {
         let key = TestKey::new(7);

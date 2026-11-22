@@ -180,6 +180,8 @@ fn sender_kinds_and_required_timing_by_sender() {
 
 fn facts(state: &str) -> BusFacts {
     BusFacts {
+        stale_release_allowed: false, projection_failure: None,
+        delivery_diagnostics: None,
         state: state.into(), timing: Timing::AfterTurn, frozen: false, a2: false, inbox: false, a4: false,
         external_receipt: false, observed: None, turn: None, settlement_closed: false, error_code: None,
         item: None,
@@ -191,7 +193,7 @@ fn every_bus_state_has_its_ledger_target() {
     assert_eq!(target_of(&facts("pending")), Target::Waiting { reason: "afterTurn", details: None });
     assert_eq!(target_of(&BusFacts { timing: Timing::Passive, ..facts("pending") }), Target::Waiting { reason: "passive", details: None });
     assert_eq!(target_of(&BusFacts { timing: Timing::NextStep, ..facts("pending") }), Target::Waiting { reason: "nextStep", details: None });
-    assert_eq!(target_of(&facts("stale_held")), Target::Waiting { reason: "staleHeld", details: None });
+    assert_eq!(target_of(&facts("stale_held")), Target::Waiting { reason: "staleHeld", details: Some(json!({"staleReleaseAllowed":false})) });
     assert_eq!(target_of(&facts("inbox_accepted")), Target::Accepted { turn: None });
     assert_eq!(target_of(&BusFacts { a2: true, ..facts("pending") }), Target::Accepted { turn: None });
     // RC8: native statuses are no longer folded into accepted.
@@ -361,6 +363,121 @@ fn stale_hold_quarantine_and_owner_discard() {
     let (states, surfaces) = path(&events, "s2");
     assert_eq!(states, ["waiting{afterTurn}", "discarded{ownerDiscarded}"]);
     assert_eq!(surfaces, ["nextUp", "none"]);
+}
+
+#[test]
+fn repeated_pre_native_projection_failure_is_stalled_with_cause_and_clears_on_recovery() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("projection-failure")).unwrap();
+        f.repository.record_projection_failure(TO, "projection-failure", Some("sender view missing: fixture")).unwrap();
+        let first = f.record("projection-failure").unwrap();
+        assert!(first.stalled.is_none());
+        assert_eq!(first.details["projectionFailure"]["attempts"], 1);
+        let since = first.details["projectionFailure"]["since"].clone();
+        f.repository.record_projection_failure(TO, "projection-failure", Some("sender view missing: fixture")).unwrap();
+        let repeated = f.record("projection-failure").unwrap();
+        assert_eq!(repeated.stalled.as_ref().unwrap().reason, "noProgress");
+        assert_eq!(repeated.details["projectionFailure"]["message"], "sender view missing: fixture");
+        assert_eq!(repeated.details["projectionFailure"]["since"], since);
+        assert!(super::super::input_ledger_settle::stall_next(&repeated, false, Utc::now(), std::time::Duration::ZERO).is_none());
+        assert_eq!(f.repository.snapshot_by_message_id("projection-failure").unwrap().unwrap().state, "pending");
+        f.repository.record_projection_failure(TO, "projection-failure", None).unwrap();
+        let recovered = f.record("projection-failure").unwrap();
+        assert!(recovered.stalled.is_none());
+        assert!(recovered.details.get("projectionFailure").is_none());
+        assert_eq!(label(&recovered), "waiting{passive}");
+    });
+}
+
+#[test]
+fn projection_blocker_has_exact_id_and_single_failure_keeps_absolute_diagnostic_timer() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("blocked-note")).unwrap();
+        f.repository.record_projection_blocked(TO, "blocked-note", "earlier-failed-note").unwrap();
+        let first = f.record("blocked-note").unwrap();
+        assert_eq!(first.details["blockedByInputId"], "earlier-failed-note");
+        let since = first.details["projectionFailure"]["since"].as_str().unwrap().to_owned();
+        f.repository.record_projection_blocked(TO, "blocked-note", "earlier-failed-note").unwrap();
+        let second = f.record("blocked-note").unwrap();
+        assert_eq!(second.details["projectionFailure"]["since"], since);
+        let after = chrono::DateTime::parse_from_rfc3339(&since).unwrap().with_timezone(&Utc) + chrono::Duration::seconds(31);
+        assert!(super::super::input_ledger_settle::stall_next(&second, false, after, std::time::Duration::from_secs(30)).is_some());
+        assert!(super::super::input_ledger_settle::next_stall_check(&[second], false, std::time::Duration::from_secs(30)).is_some());
+        f.repository.record_projection_failure(TO, "blocked-note", Some("one failed observation")).unwrap();
+        let once = f.record("blocked-note").unwrap();
+        assert_eq!(once.details["projectionFailure"]["attempts"], 1);
+        let after = chrono::DateTime::parse_from_rfc3339(once.details["projectionFailure"]["since"].as_str().unwrap()).unwrap().with_timezone(&Utc) + chrono::Duration::seconds(31);
+        assert!(super::super::input_ledger_settle::stall_next(&once, false, after, std::time::Duration::from_secs(30)).is_some());
+        f.repository.record_projection_failure(TO, "blocked-note", None).unwrap();
+        assert!(f.record("blocked-note").unwrap().details.get("blockedByInputId").is_none());
+    });
+}
+
+#[test]
+fn passive_note_stage_diagnostics_keep_absolute_stage_time_across_attempts_and_status_polls() {
+    let f=Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("diagnostic-note")).unwrap();
+        let queued=f.record("diagnostic-note").unwrap();
+        let queue_since=queued.details["deliveryDiagnostics"]["since"].clone();
+        assert_eq!(queued.details["deliveryDiagnostics"]["stage"],"bus");
+        f.repository.record_note_attempt(TO,"diagnostic-note",Some("fixture native socket unavailable"),"nativeInbox").unwrap();
+        let attempted=f.record("diagnostic-note").unwrap();
+        assert_eq!(attempted.details["deliveryDiagnostics"]["since"],queue_since);
+        assert_eq!(attempted.details["deliveryDiagnostics"]["lastError"],"fixture native socket unavailable");
+        let binding=crate::launch::stock::ExternalInputBinding {version:1,owner_id:TO.into(),thread_id:"diagnostic-thread".into(),runtime_generation:7,canonical_byte_limit:Default::default()};
+        let e=f.repository.freeze_external_input(TO,"diagnostic-note",|m|crate::app_server::bus_bridge::owner_carry_envelope(m,&binding,None,None)).unwrap();
+        let mut status:Status=serde_json::from_value(json!({"messageId":e.message.id,"semanticSha256":e.semantic_sha256,
+            "deliveryState":"pending","processing":{"state":"none","reason":null,"attemptId":null},"receipt":null})).unwrap();
+        f.repository.observe_external_input("diagnostic-note",&e,&status).unwrap();
+        let inbox=f.record("diagnostic-note").unwrap();
+        assert_eq!(inbox.details["deliveryDiagnostics"]["stage"],"inbox");
+        let inbox_since=inbox.details["deliveryDiagnostics"]["since"].clone();
+        f.repository.observe_external_input("diagnostic-note",&e,&status).unwrap();
+        f.repository.record_note_attempt(TO,"diagnostic-note",None,"nativeAcceptance").unwrap();
+        assert_eq!(f.record("diagnostic-note").unwrap().details["deliveryDiagnostics"]["since"],inbox_since);
+        f.repository.record_note_attempt_kind(TO,"diagnostic-note","nativeStatus",Some("fixture status unavailable"),"nativeReconciliation").unwrap();
+        assert_eq!(f.record("diagnostic-note").unwrap().details["deliveryDiagnostics"]["lastError"],"fixture status unavailable");
+        f.repository.observe_external_input("diagnostic-note",&e,&status).unwrap();
+        assert!(f.record("diagnostic-note").unwrap().details["deliveryDiagnostics"]["lastError"].is_null());
+        assert_eq!(f.record("diagnostic-note").unwrap().details["deliveryDiagnostics"]["since"],inbox_since);
+        f.repository.record_external_input_error("diagnostic-note","native pending: Pending/None/None").unwrap();
+        let (_,facts,_)=f.repository.input_ledger_view("diagnostic-note").unwrap().unwrap();
+        assert!(facts.delivery_diagnostics.unwrap()["lastError"].is_null(),"normal pending is a waiting condition, not a failed attempt");
+        let idle=super::super::input_ledger_settle::RuntimeView {connected:true,generation:Some(7),thread_id:Some(binding.thread_id.clone()),..Default::default()};
+        let next=super::super::input_ledger_settle::note_waiting_next(&inbox,&idle).unwrap();
+        assert_eq!(next.details.as_ref().unwrap()["deliveryDiagnostics"]["waitingFor"],"nextTurn");
+        let mut normal=inbox.clone();normal.details=next.details.unwrap();
+        let later=Utc::now()+chrono::Duration::days(2);
+        assert!(super::super::input_ledger_settle::stall_next(&normal,true,later,std::time::Duration::from_secs(30)).is_none());
+        assert!(super::super::input_ledger_settle::next_stall_check(&[normal.clone()],true,std::time::Duration::from_secs(30)).is_none());
+        let mut read=normal.clone();read.details[input_ledger::READ_SIGNAL]=json!("nativeItem");read.turn_id=Some("read-turn".into());read.timeline_item_id=Some("diagnostic-note".into());
+        let next=super::super::input_ledger_settle::note_waiting_next(&read,&idle).unwrap();
+        assert_eq!(next.details.unwrap()["deliveryDiagnostics"]["waitingFor"],"contextReceipt");
+        assert!(super::super::input_ledger_settle::stall_next(&read,true,later,std::time::Duration::from_secs(30)).is_some(),"missing receipt after a real read is not a normal unread nextTurn wait");
+        normal.stalled=Some(input_ledger::Stalled {reason:"noProgress".into(),since:normal.updated_at.clone()});
+        let cleared=super::super::input_ledger_settle::stall_next(&normal,true,later,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(cleared.state,InputState::Accepted);assert_eq!(cleared.stalled,Some(None));
+        let conflicting=super::super::input_ledger_settle::RuntimeView {generation:Some(8),..idle};
+        let next=super::super::input_ledger_settle::note_waiting_next(&inbox,&conflicting).unwrap();
+        assert_eq!(next.details.unwrap()["deliveryDiagnostics"]["waitingFor"],"bindingReconciliation");
+        f.ledger.transition(TO,"diagnostic-note",input_ledger::Expect::ANY,input_ledger::Next::accepted().stalled(Some(input_ledger::Stalled {
+            reason:"noProgress".into(),since:inbox_since.as_str().unwrap().into(),
+        }))).unwrap();
+        status.processing.state=ProcessingState::OutputObserved;
+        status.processing.attempt_id=Some(uuid::Uuid::new_v4().to_string());
+        f.repository.observe_external_input("diagnostic-note",&e,&status).unwrap();
+        let context=f.record("diagnostic-note").unwrap();
+        assert_eq!(context.details["deliveryDiagnostics"]["stage"],"context");
+        assert_eq!(context.details["deliveryDiagnostics"]["waitingFor"],"contextReceipt");
+        assert!(context.stalled.is_none(),"real stage progress clears the previous stage's diagnostic");
+        let since=chrono::DateTime::parse_from_rfc3339(context.details["deliveryDiagnostics"]["since"].as_str().unwrap()).unwrap().with_timezone(&Utc);
+        let marked=super::super::input_ledger_settle::stall_next(&context,false,since+chrono::Duration::seconds(31),std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(marked.state,InputState::Accepted,"diagnosis never resends or changes the delivery state");
+        assert_eq!(marked.stalled.unwrap().unwrap().reason,"noProgress");
+    });
 }
 
 #[test]
@@ -847,4 +964,25 @@ fn claude_offered_binds_the_steer_item() {
     assert_eq!(c1.details[READ_SIGNAL], "offered");
     let c2 = f.record("c-2").unwrap();
     assert_eq!((c2.stage, c2.details[READ_SIGNAL].as_str()), (Some(Stage::Offered), Some("steerEcho")));
+}
+
+#[test]
+fn native_item_binding_clears_only_disconnect_stall_on_already_accepted_note() {
+    let f = Fixture::new();
+    for reason in ["runtimeDisconnected", "noProgress"] {
+        let note = new_input(None, reason, Some(FROM), "passive", "note", None);
+        f.on(|| {
+            sending(TO, reason, &note);
+            drive(TO, reason, &note, &Target::Accepted { turn: None });
+            f.ledger.transition(TO, reason, Expect::ANY, Next::accepted().stalled(Some(input_ledger::Stalled {
+                reason: reason.into(), since: chrono::Utc::now().to_rfc3339(),
+            }))).unwrap();
+            native_item(TO, reason, &note, "turn-after-reconnect");
+        });
+        let bound = f.record(reason).unwrap();
+        assert_eq!(bound.state, InputState::Accepted);
+        assert_eq!(bound.turn_id.as_deref(), Some("turn-after-reconnect"));
+        assert_eq!(bound.timeline_item_id.as_deref(), Some(reason));
+        assert_eq!(bound.stalled.as_ref().map(|s| s.reason.as_str()), if reason == "runtimeDisconnected" {None} else {Some(reason)});
+    }
 }

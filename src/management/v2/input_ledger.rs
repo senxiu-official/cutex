@@ -474,6 +474,8 @@ impl Expect {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Next {
     pub state: InputState,
+    /// Explicit content replacement (for a queued owner merge).
+    pub preview: Option<String>,
     pub reason: Option<String>,
     /// `None`: computed by the §2.5 rules. An explicit surface must still move
     /// forward (`nextUp|pendingNotes → timeline`, `* → none`).
@@ -500,7 +502,7 @@ pub struct Next {
 impl Next {
     pub fn to(state: InputState) -> Self {
         Self {
-            state, reason: None, surface: None, turn_id: None, stage: None, evidence: None,
+            state, preview: None, reason: None, surface: None, turn_id: None, stage: None, evidence: None,
             create: None, details: None, error: None, order: None, timeline_item_id: None,
             runtime_generation: None, superseded_by: None, batch_id: None, carries: None, stalled: None,
             deadline: None,
@@ -524,6 +526,7 @@ impl Next {
     pub fn stage(mut self, stage: Stage) -> Self { self.stage = Some(stage); self }
     pub fn evidence(mut self, evidence: Evidence) -> Self { self.evidence = Some(evidence); self }
     pub fn create(mut self, input: NewInput) -> Self { self.create = Some(input); self }
+    pub fn preview(mut self, text: String) -> Self { self.preview = Some(text); self }
     pub fn details(mut self, details: Value) -> Self { self.details = Some(details); self }
     pub fn stalled(mut self, stalled: Option<Stalled>) -> Self { self.stalled = Some(stalled); self }
     pub fn deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self { self.deadline = Some(deadline); self }
@@ -864,13 +867,44 @@ pub fn stuck_uncertain_reason(record: &InputRecord) -> &'static str {
     }
 }
 
-/// The `actions` of `record` under the session's §2.6 `delivery`.
+/// Director-approved r292 manual recovery: only a proved unsent blocked owner
+/// batch can use Retry from nativeHeld; it is never an automatic retry signal.
+pub fn owner_batch_blocked(record:&InputRecord)->bool {
+    record.kind==InputKind::Owner && record.state==InputState::Waiting
+        && record.reason.as_deref()==Some("nativeHeld")
+        && record.details["interruptBatch"]["blocked"]==true
+        && record.details["interruptBatch"]["deferred"]==false
+        && record.details["interruptBatch"]["attempt"].as_u64()==Some(record.attempt)
+        && record.details["interruptBatch"]["notSubmittedReason"].as_str().is_some_and(|r|!r.is_empty())
+}
+
+/// An unmarked refusal can mean these identities were already admitted.
+/// Reconcile it against history; neither the UI nor retry RPC may resend it.
+pub fn owner_batch_retry_blocked(record: &InputRecord) -> bool {
+    record.kind == InputKind::Owner && record.state == InputState::Uncertain
+        && record.details["interruptBatch"]["retryBlocked"] == true
+        && record.details["interruptBatch"]["attempt"].as_u64() == Some(record.attempt)
+}
+
+/// The owner actions of the full record, including retained batch custody.
 pub fn record_actions(record: &InputRecord, delivery: Option<&Value>) -> Vec<Action> {
-    if owner_stuck(record) {
+    if owner_batch_retry_blocked(record) {
+        return vec![Action::Dismiss];
+    }
+    if owner_stuck(record) || owner_batch_blocked(record) {
         return vec![Action::Retry, Action::Dismiss];
     }
     let mut actions = actions_with_delivery(record.kind, record.state, record.reason.as_deref(), record.turn_id.as_deref(), shown_to_agent(record), delivery);
-    if record.state == InputState::Waiting && record.kind != InputKind::Owner && record.kind != InputKind::DelegationRequest {
+    if record.state == InputState::Waiting && record.reason.as_deref() == Some("staleHeld")
+        && matches!(record.kind, InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm | InputKind::SystemNotice)
+        && record.details.get("staleReleaseAllowed").and_then(Value::as_bool) == Some(true)
+        && record.details.get("ownerHold").and_then(Value::as_bool) != Some(true) {
+        // The source rechecks the pre-native boundary and semantic digest.
+        // This is not permission to resume an uncertain native-held input.
+        actions.push(Action::ReleaseHold);
+    }
+    if record.state == InputState::Waiting
+        && record.kind != InputKind::Owner && record.kind != InputKind::DelegationRequest {
         if let Some(held) = record.details.get("ownerHold").and_then(Value::as_bool) {
             actions.push(if held { Action::ReleaseHold } else { Action::Hold });
         }
@@ -898,6 +932,7 @@ pub fn actions_with_delivery(
 /// Owner actions cutex offers for a record (§2.2 `actions`, §2.14).
 pub fn actions_for(kind: InputKind, state: InputState, reason: Option<&str>) -> Vec<Action> {
     match state {
+        InputState::Waiting if kind==InputKind::DelegationResult && reason==Some("nativeHeld") => vec![Action::Retry,Action::Dismiss],
         InputState::Failed => vec![Action::Retry, Action::Dismiss],
         InputState::Uncertain => vec![Action::Retry, Action::Dismiss],
         InputState::Waiting if kind == InputKind::Owner && reason == Some("explicitQueue") => {
@@ -1023,7 +1058,10 @@ fn apply(
         return Err(LedgerError::Invalid("superseded requires supersededBy".into()));
     }
     let now_text = timestamp(now);
-    let retry = matches!(from, Some(InputState::Uncertain | InputState::Failed)) && next.state == InputState::Waiting;
+    let retry = next.state == InputState::Waiting && (matches!(from, Some(InputState::Uncertain | InputState::Failed))
+        || current.is_some_and(|record|next.reason.as_deref()==Some("ownerRetry") &&
+            (owner_batch_blocked(record) || (record.kind==InputKind::DelegationResult && record.state==InputState::Waiting
+            && record.reason.as_deref()==Some("nativeHeld")))));
     let mut record = match current {
         Some(record) => record.clone(),
         None => {
@@ -1066,6 +1104,7 @@ fn apply(
             }
         }
     };
+    if let Some(text) = &next.preview { record.preview = preview(text); }
     let state_changed = current.is_none_or(|record| record.state != next.state);
     if let Some(carries) = &next.carries {
         if kind != InputKind::Owner || carries.len() > MAX_BATCH_ITEMS {
@@ -1147,10 +1186,22 @@ fn apply(
         // The next attempt is another native item (a new event id).
         record.timeline_item_id = None;
     }
+    let passive_notes=record.details.get("passiveNotes").cloned();
+    let interrupt_batch=record.details.get("interruptBatch").cloned();
     if let Some(details) = &next.details {
         record.details = details.clone();
     } else if state_changed {
         record.details = json!({});
+    }
+    // Admission omissions are audit facts of this trigger, also returned in
+    // its response. Progress/receipts do not erase them or prove the note read.
+    if record.details.get("passiveNotes").is_none() {
+        if let Some(report)=passive_notes {record.details["passiveNotes"]=report;}
+    }
+    // Batch custody is an exactly-once audit fact. Native receipts and turn
+    // settlement must not erase the identity which fences an interrupt replay.
+    if record.details.get("interruptBatch").is_none() {
+        if let Some(batch)=interrupt_batch {record.details["interruptBatch"]=batch;}
     }
     // 054 §2.10: a bus message or delegation result is resent with the same
     // id; the recipient may see it twice. Said on the record that offers the
@@ -1198,6 +1249,10 @@ fn apply(
     record.stalled = match &next.stalled {
         Some(stalled) => stalled.clone(),
         None if state_changed => None,
+        // A carrying turn is new progress even when acceptance is unchanged.
+        // Preserve other stall reasons and explicit stall writes.
+        None if next.turn_id.is_some() && record.stalled.as_ref()
+            .is_some_and(|stall| stall.reason == "runtimeDisconnected") => None,
         None => record.stalled.clone(),
     };
     record.deadline = if next.state.is_settled() {
@@ -2462,6 +2517,20 @@ impl InputLedger {
         })
     }
 
+    /// Admission may be repeated after a merge or send. Only initialize
+    /// here; the sender and merge path explicitly replace the copy.
+    pub fn put_initial_payload(&self, session: &str, input_id: &str, payload: &Value) -> Result<(), LedgerError> {
+        validate_id("cutexSessionId", session)?;
+        validate_id("inputId", input_id)?;
+        let now = self.now();
+        let mut guard = self.lock_write()?;
+        guard.connection.as_mut().expect("opened under lock").execute(
+            "INSERT OR IGNORE INTO input_ledger_payloads (session,input_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4)",
+            params![session,input_id,serde_json::to_string(payload)?,now.timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
     /// Drop retry payloads older than `retention`, at most `limit`.
     pub fn compact_payloads(&self, now: DateTime<Utc>, retention: Duration, limit: usize) -> Result<usize, LedgerError> {
         let cutoff = now.timestamp_millis().saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
@@ -3319,6 +3388,16 @@ pub(super) fn dispatch(
     params: &Value,
     owner: bool,
 ) -> Result<Value, super::user_input::UserInputExecutionError> {
+    dispatch_with_redrive(cutex_session_id, method, params, owner, || {
+        crate::agent_bus::client::AgentBusHttpClient::from_config(&crate::config::store::load_codez_config())
+            .redrive_durable_messages().map(|_| ())
+    })
+}
+
+fn dispatch_with_redrive(
+    cutex_session_id: &str, method: &str, params: &Value, owner: bool,
+    redrive: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<Value, super::user_input::UserInputExecutionError> {
     if method == super::input_disposal::METHOD {
         if !owner {return Err(route_error("owner_required", "disposing an input requires the owner's credential".into(),false));}
         let id=super::input_disposal::parse_request(params).map_err(|error|route_error("invalid_request",error.to_string(),false))?;
@@ -3367,15 +3446,30 @@ pub(super) fn dispatch(
             if !current.actions.contains(&action) {
                 return Err(route_error("input_not_holdable", "input is no longer available for this action".into(), false));
             }
+            let stale_release = !held && current.reason.as_deref() == Some("staleHeld") && current.details.get("ownerHold") != Some(&json!(true))
+                && matches!(current.kind, InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm | InputKind::SystemNotice);
             let changed = match current.kind {
                 InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm | InputKind::SystemNotice =>
-                    super::agent_bus_state::agent_bus_message_repository().and_then(|store| store.set_owner_hold(cutex_session_id, &id, held)),
+                    super::agent_bus_state::agent_bus_message_repository().and_then(|store| {
+                        if stale_release { store.release_stale_input(cutex_session_id, &id) }
+                        else { store.set_owner_hold(cutex_session_id, &id, held) }
+                    }),
                 InputKind::DelegationResult | InputKind::DelegationQuestion | InputKind::DelegationStatus =>
                     crate::asks::store::AskStore::open_default().and_then(|store| crate::asks::owner_carries::set_owner_hold(&store, cutex_session_id, &id, held, Utc::now())),
                 _ => return Err(route_error("input_not_holdable", "only queued notices may be held".into(), false)),
             };
             if !changed.map_err(|error| route_error("input_not_holdable", error.to_string(), false))? {
                 return Err(route_error("input_not_holdable", "the source input is no longer available for this action".into(), false));
+            }
+            if stale_release {
+                // Releasing a startup hold must restore its live queue entry,
+                // not merely change its durable state. Failure is truthful:
+                // the release is committed and a Bus restart redrives it.
+                if let Err(error) = redrive() {
+                    let mut failure = route_error("bus_redrive_failed", format!("release recorded; automatic redrive / Bus recovery will restore delivery: {error:#}"), false);
+                    failure.details = json!({"inputId":id,"releaseRecorded":true,"recovery":"automaticRedriveOrBusRecovery"});
+                    return Err(failure);
+                }
             }
             // Source commits publish the authority change. Ask projections run
             // on their existing writer; give that bounded queue a chance to drain.

@@ -935,8 +935,12 @@ fn failure_before_send_and_restart_settle_original_once() {
             .unwrap();
         cancel_with(&store, &asks, TARGET, "managementRestarted").unwrap();
         let s = asks.snapshot().unwrap();
-        assert_eq!(s.answers.len(), 1);
+        // r290 P7: a failed handler turn is a notice, not a fabricated answer.
+        assert!(s.answers.is_empty());
         assert_eq!(s.asks[&id].attempts[0].state, AttemptState::Failed);
+        assert!(s.asks[&id].is_open());
+        assert_eq!(s.deliveries.values().filter(|d|d.ask_id == id
+            && d.ref_id.starts_with(crate::asks::handler_failure::PREFIX)).count(),1);
         assert!(!s.leases.contains_key(TARGET));
     }
 }

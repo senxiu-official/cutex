@@ -118,6 +118,8 @@ pub fn validate_roots(record: &CutexSessionRecord, roots: &[String], cutex_home:
     let home = cutex_home.canonicalize().unwrap_or_else(|_| cutex_home.to_path_buf());
     let cwd = crate::session::metadata::normalize_session_cwd(crate::session::service::cutex_session_launch_cwd(record));
     let mut kept: Vec<String> = Vec::new();
+    // r290 P10 (B4/A8): the owner may name \\wsl$ or a configured share.
+    let _shares = super::host_files::owner_share_scope();
     for root in roots {
         crate::artifacts::paths::validate_local_path(Path::new(root)).map_err(|_|Refusal::new(400,"invalid_writable_root","unsafe writable root"))?;
         let canonical = Path::new(root)

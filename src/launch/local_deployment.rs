@@ -17,6 +17,29 @@ pub struct LocalDeployment {
 }
 
 impl LocalDeployment {
+    /// Resolve installer inputs with the operation and offending path in each error.
+    pub fn from_install_paths(
+        bundle_manifest: &Path,
+        native_home: &Path,
+        job_descriptor: Option<&Path>,
+        prior_job_mcp: Option<super::job_mcp::JobMcpDescriptor>,
+    ) -> anyhow::Result<Self> {
+        let bundle_manifest = bundle_manifest.canonicalize()
+            .with_context(|| format!("install-runtime: resolve bundle manifest {}", bundle_manifest.display()))?;
+        let native_home = native_home.canonicalize()
+            .with_context(|| format!("install-runtime: resolve native home {}", native_home.display()))?;
+        let job_mcp = match job_descriptor {
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("install-runtime: read Job MCP descriptor {}", path.display()))?;
+                Some(serde_json::from_slice(&bytes)
+                    .with_context(|| format!("install-runtime: parse Job MCP descriptor {}", path.display()))?)
+            }
+            None => prior_job_mcp,
+        };
+        Ok(Self { bundle_manifest, native_home, job_mcp })
+    }
+
     /// Select an installed artifact template; existing agent bindings are not rewritten.
     pub fn install(&self) -> anyhow::Result<()> {
         let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
@@ -24,10 +47,12 @@ impl LocalDeployment {
             cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "local runtime deployment is unsupported on this platform"
         );
-        ensure!(self.native_home.is_dir(), "saved native home missing");
+        ensure!(self.native_home.is_dir(), "install-runtime: native home directory missing: {}", self.native_home.display());
         self.check_instance_paths()?;
         let bundle: super::stock::StockBundle =
-            serde_json::from_slice(&std::fs::read(&self.bundle_manifest)?)?;
+            serde_json::from_slice(&std::fs::read(&self.bundle_manifest)
+                .with_context(|| format!("install-runtime: read bundle manifest {}", self.bundle_manifest.display()))?)
+                .with_context(|| format!("install-runtime: parse bundle manifest {}", self.bundle_manifest.display()))?;
         super::stock::StockBundle::load_references(
             bundle
                 .shared_config
@@ -485,6 +510,32 @@ fn materialize_v3_home(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_runtime_missing_inputs_name_operation_and_path() {
+        let root = std::env::temp_dir().join(format!("cutex-install-paths-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("missing-bundle.json");
+        let home = root.join("missing-home");
+        let descriptor = root.join("missing-job.json");
+        let error = LocalDeployment::from_install_paths(&bundle, &root, None, None).unwrap_err();
+        assert!(error.to_string().contains("resolve bundle manifest"));
+        assert!(error.to_string().contains(&bundle.display().to_string()));
+        std::fs::write(&bundle, b"{}").unwrap();
+        let error = LocalDeployment::from_install_paths(&bundle, &home, None, None).unwrap_err();
+        assert!(error.to_string().contains("resolve native home"));
+        assert!(error.to_string().contains(&home.display().to_string()));
+        let error = LocalDeployment::from_install_paths(&bundle, &root, Some(&descriptor), None).unwrap_err();
+        assert!(error.to_string().contains("read Job MCP descriptor"));
+        assert!(error.to_string().contains(&descriptor.display().to_string()));
+        std::fs::write(&descriptor, b"invalid json").unwrap();
+        let error = LocalDeployment::from_install_paths(&bundle, &root, Some(&descriptor), None).unwrap_err();
+        assert!(error.to_string().contains("parse Job MCP descriptor"));
+        assert!(error.to_string().contains(&descriptor.display().to_string()));
+        // Neither failed input preparation nor malformed descriptors select a runtime.
+        assert!(!root.join("local-deployment.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn v3_upgrade_materialization_is_idempotent_and_provenance_fenced() {

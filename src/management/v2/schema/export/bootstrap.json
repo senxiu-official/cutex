@@ -3,8 +3,36 @@
   "$id": "urn:cutex:management-v2:bootstrap",
   "title": "SessionBootstrap",
   "description": "GET /v2/sessions/{id}/bootstrap[?turnLimit=N][&compact=1] and GET /v2/sessions/{id}/history?limit=&cursor=[&compact=1]. `native.result` is the app-server `thread/read` result (its own generated schema); with compact=1 tool items may carry `truncated: true`.",
-  "anyOf": [{ "$ref": "#/$defs/bootstrap" }, { "$ref": "#/$defs/history" }, { "$ref": "#/$defs/historyTurn" }],
+  "anyOf": [{ "$ref": "#/$defs/bootstrap" }, { "$ref": "#/$defs/history" }, { "$ref": "#/$defs/historyTurn" }, { "$ref": "#/$defs/busHistory" }],
   "$defs": {
+    "busMessagesPage": {
+      "description": "Present only with bus=bounded (bootstrap-bounded-bus). Missing records are not deletions or proof of settlement; page bus-messages and merge by messageId.",
+      "type": "object",
+      "required": ["received", "sent"],
+      "properties": {
+        "received": { "type": "object", "required": ["hasMore"], "properties": { "hasMore": { "type": "boolean" } } },
+        "sent": { "type": "object", "required": ["hasMore"], "properties": { "hasMore": { "type": "boolean" } } }
+      }
+    },
+    "busHistory": {
+      "type": "object",
+      "description": "GET /v2/sessions/{id}/bus-messages?direction=received|sent&limit=50&cursor=. Newest slices, oldest-first within each slice; stable scoped keyset cursor. Includes bootstrap overlaps.",
+      "required": ["contractVersion", "cutexSessionId", "direction", "messages", "page"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "cutexSessionId": { "type": "string" },
+        "direction": { "enum": ["received", "sent"] },
+        "messages": { "type": "array", "items": { "type": "object" } },
+        "page": {
+          "type": "object", "required": ["limit", "nextCursor", "hasMore"],
+          "properties": {
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "nextCursor": { "type": ["string", "null"] },
+            "hasMore": { "type": "boolean" }
+          }
+        }
+      }
+    },
     "autoRetry": {
       "type": "object",
       "additionalProperties": false,
@@ -279,6 +307,7 @@
         "pendingServerRequests": { "type": "array", "items": { "type": "object" } },
         "agentBusMessages": { "type": "array" },
         "agentBusSentMessages": { "type": "array" },
+        "busMessagesPage": { "$ref": "#/$defs/busMessagesPage" },
         "ownerNotifications": { "type": "array", "items": { "type": "object" }, "description": "Agent → owner messages of this session, oldest first (capability owner-messages)." },
         "latestPlan": { "type": ["object", "null"] },
         "latestTokenUsage": { "type": ["object", "null"] },

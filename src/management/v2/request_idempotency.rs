@@ -229,6 +229,24 @@ pub struct RequestClaim {
 const STATE_FORWARDED: &str = "forwarded";
 const STATE_COMPLETED: &str = "completed";
 const STATE_OUTCOME_UNKNOWN: &str = "outcome_unknown";
+// r290 P10 (A1): body hash of an owner "settled none" tombstone (never a hex digest).
+const SETTLED_NONE_BODY: &str = "owner-settled-none";
+
+/// r290 P10 (A1): what an owner lookup of `(session, requestId)` found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnerRequestLookup {
+    /// No row: never arrived, still in transit, or pruned (completed rows: 24 h).
+    NotFound,
+    /// Forwarded by this process and not settled yet.
+    InProgress,
+    /// Forwarded by a process that is gone, or explicitly outcome-unknown.
+    OutcomeUnknown,
+    /// The stored (replayed) response.
+    Completed(StoredHttpResponse),
+    /// A missing id is fenced against late arrival. Its past outcome remains
+    /// unknown because an older completed receipt may have been pruned.
+    FencedMissing,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrowserClearCounts {
@@ -307,6 +325,56 @@ impl RequestIdempotencyRepository {
             Ok(records)
         })
     }
+    // r290 P10 (A1): owner receipt lookup for a lifecycle request by its original id.
+    /// Read-only. Never converts or replays anything.
+    pub fn owner_lookup(&self, cutex_session_id: &str, request_id: &str) -> anyhow::Result<OwnerRequestLookup> {
+        anyhow::ensure!(!cutex_session_id.starts_with("browser:"), "browser rows have their own lookup");
+        self.with_connection(|connection| self.owner_lookup_in(connection, cutex_session_id, request_id))
+    }
+
+    fn owner_lookup_in(&self, connection: &Connection, cutex_session_id: &str, request_id: &str) -> anyhow::Result<OwnerRequestLookup> {
+        let row = connection.query_row(
+            "SELECT body_sha256, state, process_instance_id, response_status, response_reason, response_body, response_sha256
+             FROM requests WHERE cutex_session_id = ?1 AND request_id = ?2",
+            params![cutex_session_id, request_id],
+            |row| Ok(ExistingRow { body_sha256: row.get(0)?, state: row.get(1)?, process_instance_id: row.get(2)?,
+                response_status: row.get(3)?, response_reason: row.get(4)?, response_body: row.get(5)?, response_sha256: row.get(6)? }),
+        ).optional()?;
+        Ok(match row {
+            None => OwnerRequestLookup::NotFound,
+            Some(row) if row.state == STATE_COMPLETED && row.body_sha256 == SETTLED_NONE_BODY => OwnerRequestLookup::FencedMissing,
+            Some(row) if row.state == STATE_COMPLETED => OwnerRequestLookup::Completed(replayed_response(request_id, row)?),
+            Some(row) if row.state == STATE_FORWARDED && row.process_instance_id == self.process_instance_id => OwnerRequestLookup::InProgress,
+            // Forwarded by a process that is gone, or recorded outcome-unknown.
+            Some(_) => OwnerRequestLookup::OutcomeUnknown,
+        })
+    }
+
+    /// Fence a missing id against a late original during normal receipt
+    /// retention. Its past outcome cannot be inferred from the cache miss.
+    /// An existing row is reported unchanged.
+    pub fn owner_settle_none(&self, cutex_session_id: &str, request_id: &str) -> anyhow::Result<OwnerRequestLookup> {
+        anyhow::ensure!(!cutex_session_id.starts_with("browser:"), "browser rows have their own recovery");
+        self.with_connection(|connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let body = json!({"contractVersion": 2, "requestId": request_id, "error": {"source": "cutex",
+                "code": "request_fenced", "message": "a late original is blocked; its past outcome could not be confirmed",
+                "retryable": false, "details": {"cutexSessionId": cutex_session_id}}});
+            let text = serde_json::to_string(&body)?;
+            let now = now_ms();
+            transaction.execute(
+                "INSERT OR IGNORE INTO requests (cutex_session_id, request_id, body_sha256, state, process_instance_id,
+                        created_at, updated_at, response_status, response_reason, response_body, response_sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 409, 'Conflict', ?7, ?8)",
+                params![cutex_session_id, request_id, SETTLED_NONE_BODY, STATE_COMPLETED, self.process_instance_id,
+                    now, text, sha256_hex(text.as_bytes())],
+            )?;
+            let lookup = self.owner_lookup_in(&transaction, cutex_session_id, request_id)?;
+            transaction.commit()?;
+            Ok(lookup)
+        })
+    }
+
     pub fn open(root: impl Into<PathBuf>, process_instance_id: String) -> anyhow::Result<Self> {
         Self::open_with_policy(root, process_instance_id, RetentionPolicy::default())
     }
@@ -1264,6 +1332,35 @@ mod tests {
             BeginRequest::Forward(claim) => claim,
             other => panic!("expected claim, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn owner_lookup_and_settle_none_fence_a_late_original() { // r290 P10 (A1)
+        let root = temp_root("owner-settle");
+        let repository = RequestIdempotencyRepository::open(&root, "p".into()).unwrap();
+        // Missing id: fence late arrival without claiming its past outcome.
+        assert_eq!(repository.owner_lookup("session-1", "lost").unwrap(), OwnerRequestLookup::NotFound);
+        assert_eq!(repository.owner_settle_none("session-1", "lost").unwrap(), OwnerRequestLookup::FencedMissing);
+        assert_eq!(repository.owner_lookup("session-1", "lost").unwrap(), OwnerRequestLookup::FencedMissing);
+        assert_eq!(repository.begin("session-1", "lost", &json!({"requestId":"lost"})).unwrap(), BeginRequest::Conflict);
+        // Same id on another session is a different key.
+        assert_eq!(repository.owner_lookup("session-2", "lost").unwrap(), OwnerRequestLookup::NotFound);
+        // In flight in this process: reported running, settle does not overwrite it.
+        let claim = forward(&repository, "live");
+        assert_eq!(repository.owner_settle_none("session-1", "live").unwrap(), OwnerRequestLookup::InProgress);
+        repository.complete(&claim, 200, "OK", json!({"ok": true})).unwrap();
+        match repository.owner_settle_none("session-1", "live").unwrap() {
+            OwnerRequestLookup::Completed(response) => assert_eq!((response.status, response.body), (200, json!({"ok": true}))),
+            other => panic!("expected completed, got {other:?}"),
+        }
+        // A dead process's forwarded row is outcome-unknown (read-only: not converted).
+        let other = RequestIdempotencyRepository::open(&root, "q".into()).unwrap();
+        let _orphan = forward(&repository, "orphan");
+        assert_eq!(other.owner_lookup("session-1", "orphan").unwrap(), OwnerRequestLookup::OutcomeUnknown);
+        assert_eq!(other.owner_settle_none("session-1", "orphan").unwrap(), OwnerRequestLookup::OutcomeUnknown);
+        assert!(repository.owner_lookup("browser:x", "lost").is_err());
+        drop((repository, other));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

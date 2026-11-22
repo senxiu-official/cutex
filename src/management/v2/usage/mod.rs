@@ -7,6 +7,8 @@ mod pricing;
 mod prices;
 mod query;
 mod quota_history;
+// r290 P8: on-demand quota attribution, available without opt-in.
+pub mod quota_attribution;
 mod reducer;
 mod report;
 mod runtime_context;
@@ -65,6 +67,7 @@ pub use query::UsageSourceLabel;
 pub use query::MAX_RANGE_DAYS;
 pub use quota_history::record_quota_gauges;
 pub use quota_history::read_since as read_quota_history_since;
+pub use quota_history::read_cached_since as read_quota_history_cached_since; // r290 P12.
 pub use quota_history::QuotaSnapshot;
 
 /// Delete derived per-session state; the append-only usage ledger stays intact.

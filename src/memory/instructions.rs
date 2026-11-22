@@ -204,15 +204,18 @@ pub struct LaunchAugmentation {
     /// The `# Cutex` section (`None` when `agent_harness.enabled` is off).
     pub harness: Option<String>,
     pub memory: Option<LaunchMemoryContext>,
+    pub native_subagent: Option<super::NativeSubagentContext>,
 }
 
 /// Build the augmentation for one session (memory lookup is best effort).
 pub fn launch_augmentation_for_session(
     record: &crate::session::model::CutexSessionRecord,
 ) -> LaunchAugmentation {
+    let facts = super::harness::harness_facts(record);
     LaunchAugmentation {
         harness: super::harness::launch_harness(record),
         memory: launch_memory_context_or_warn(&record.cutex_session_id),
+        native_subagent: Some(super::NativeSubagentContext { parent_name:facts.name, project:facts.project }),
     }
 }
 
@@ -237,6 +240,7 @@ pub fn attach_launch_augmentation_to_thread_resume(
 /// Result of resolving an augmentation against the effective config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedLaunchAugmentation {
+    pub native_subagent_instructions: Option<String>,
     /// Value to send as `developerInstructions` (the explicit param when
     /// injection was skipped).
     pub developer_instructions: Option<String>,
@@ -305,6 +309,7 @@ pub fn resolve_launch_augmentation(
     effective_config: Option<&serde_json::Value>,
 ) -> ResolvedLaunchAugmentation {
     let skipped = |explicit| ResolvedLaunchAugmentation {
+        native_subagent_instructions: None,
         developer_instructions: explicit,
         runtime_workspace_roots: None,
         instructions_skipped: true,
@@ -317,6 +322,16 @@ pub fn resolve_launch_augmentation(
         (None, Some(config)) => config_string(config, "developer_instructions"),
         (None, None) => return skipped(None),
     };
+    let native_subagent_instructions = augmentation.native_subagent.as_ref().map(|context| {
+        let child_specific = effective_config.and_then(|config|
+            config.pointer("/features/multi_agent_v2/subagent_developer_instructions")
+                .or_else(|| config.pointer("/multi_agent_v2/subagent_developer_instructions"))
+                .or_else(|| config.get("features.multi_agent_v2.subagent_developer_instructions")))
+            .and_then(serde_json::Value::as_str);
+        let profile_rules = [existing.as_deref(), child_specific].into_iter().flatten()
+            .filter(|s| !s.trim().is_empty()).collect::<Vec<_>>().join("\n\n");
+        super::compose_native_subagent_instructions(context, Some(&profile_rules), cwd, augmentation.memory.as_ref())
+    });
     let composed = compose_launch_instructions(
         augmentation.harness.as_deref(),
         existing,
@@ -334,6 +349,7 @@ pub fn resolve_launch_augmentation(
         _ => None,
     };
     ResolvedLaunchAugmentation {
+        native_subagent_instructions,
         developer_instructions: Some(composed.developer_instructions),
         runtime_workspace_roots,
         instructions_skipped: false,
@@ -564,6 +580,7 @@ mod tests {
 
     fn member() -> LaunchAugmentation {
         LaunchAugmentation {
+            native_subagent: None,
             harness: None,
             memory: Some(LaunchMemoryContext {
                 index_snapshot: None,
@@ -572,6 +589,24 @@ mod tests {
                 project_workspace_root: None,
             }),
         }
+    }
+
+    #[test]
+    fn native_child_composition_keeps_profile_rules_without_parent_harness_or_memory_writes() {
+        let mut augmentation = member();
+        augmentation.harness = Some("PARENT_IDENTITY You are a persistent agent managed by cutex. Director can create.".into());
+        augmentation.native_subagent = Some(super::super::NativeSubagentContext {
+            parent_name:"Parent".into(), project:Some(("Project".into(),"project-id".into())),
+        });
+        let config = serde_json::json!({"developer_instructions":"PROFILE_RULE",
+            "features":{"multi_agent_v2":{"subagent_developer_instructions":"CHILD_PROFILE_RULE"}}});
+        let resolved = resolve_launch_augmentation(&augmentation,None,Some(Path::new("/work")),None,Some(&config));
+        let child = resolved.native_subagent_instructions.unwrap();
+        assert!(child.contains("PROFILE_RULE") && child.contains("CHILD_PROFILE_RULE"));
+        assert!(child.contains("native subagent working for Cutex agent Parent"));
+        assert!(child.contains("Project memory reference"));
+        assert!(!child.contains("PARENT_IDENTITY") && !child.contains("How to save a memory"));
+        assert!(resolved.developer_instructions.unwrap().contains("PARENT_IDENTITY"));
     }
 
     #[test]
@@ -642,6 +677,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedLaunchAugmentation {
+                native_subagent_instructions: None,
                 developer_instructions: None,
                 runtime_workspace_roots: None,
                 instructions_skipped: true,

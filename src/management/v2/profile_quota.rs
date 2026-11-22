@@ -102,6 +102,21 @@ pub struct ProfileGauges {
     pub source: Option<&'static str>,
 }
 
+/// r290 P12: local snapshot only; management's refreshers own upstream polling.
+pub fn cached_gauges(account:&crate::profiles::model::StoredAccount)->anyhow::Result<ProfileGauges> {
+    let now=chrono::Utc::now().timestamp();
+    let (gauges,source)=if super::profile_quota_native::native_quota_applies(account) {
+        (super::profile_quota_native::load_at(&super::profile_quota_native::store_dir()?,&account.id).unwrap_or_default().gauges(now,super::profile_quota_native::display_interval_secs()),Some("native"))
+    } else if super::profile_quota_claude::claude_quota_applies(account) {
+        let key=super::profile_quota_claude::profile_account(account);
+        let registry=crate::runtime::claude_accounts::load_cached();
+        if registry.find(&key).is_some_and(|a|a.kind==crate::runtime::claude_accounts::ClaudeAccountKind::Api) {(Vec::new(),Some("claudeApi"))}else{
+            (super::profile_quota_claude::load_at(&super::profile_quota_native::store_dir()?,&key).unwrap_or_default().gauges(now,super::profile_quota_claude::interval_secs()),Some("claude"))
+        }
+    } else {(quota::cached_gauges(account)?,Some("quotaConfig"))};
+    Ok(ProfileGauges{gauges,native_quota:None,source})
+}
+
 /// Read a profile's gauges (`refresh` = force an upstream read now).
 pub fn read_gauges(account: &crate::profiles::model::StoredAccount, refresh: bool) -> anyhow::Result<ProfileGauges> {
     // Precedence: an enabled quota-config (HTTP reader) wins; native

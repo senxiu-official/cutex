@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 
 use super::input_ledger::{self as il, InputRecord};
 use super::user_input::UserInputExecutionError;
@@ -29,6 +30,53 @@ use super::user_input::UserInputExecutionError;
 pub const METHOD: &str = il::INTERRUPT_SEND_METHOD;
 /// `sending{interruptSend}`.
 pub const SENDING_REASON: &str = "interruptSend";
+pub const MANY_FEATURE: &str = "interrupt-send-many-v1";
+
+/// Ordered original owner identities, fenced against one observed turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterruptSendMany {
+    pub input_ids: Vec<String>,
+    pub expected_revs: std::collections::BTreeMap<String, u64>,
+    pub expected_turn_id: String,
+    pub expected_runtime_generation: u64,
+}
+
+impl InterruptSendMany {
+    pub fn parse(value: &Value, allow_empty: bool) -> Result<Self, UserInputExecutionError> {
+        let invalid = |message: &str| error("invalid_request", message, json!({}));
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| invalid("interrupt batch requires inputIds, expectedRevs, expectedTurnId and expectedRuntimeGeneration"))?;
+        let unique = request.input_ids.iter().collect::<BTreeSet<_>>();
+        if (!allow_empty && request.input_ids.is_empty()) || request.input_ids.len() > il::MAX_BATCH_ITEMS
+            || unique.len() != request.input_ids.len()
+            || request.input_ids.iter().any(|id| id.trim().is_empty() || id.len() > 256)
+            || request.expected_turn_id.trim().is_empty()
+            || request.expected_runtime_generation > super::model::MAX_SAFE_SEQUENCE
+            || request.expected_revs.len() != request.input_ids.len()
+            || request.input_ids.iter().any(|id| request.expected_revs.get(id).is_none_or(|rev| *rev == 0 || *rev > super::model::MAX_SAFE_SEQUENCE)) {
+            return Err(invalid("invalid ordered interrupt batch identities, revisions or turn binding"));
+        }
+        Ok(request)
+    }
+
+    pub fn single(&self, id: &str) -> InterruptSendRequest {
+        InterruptSendRequest { input_id:id.into(), expected_rev:self.expected_revs[id],
+            expected_turn_id:self.expected_turn_id.clone(), expected_runtime_generation:self.expected_runtime_generation }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ManyOutcome {
+    pub outcome: Outcome,
+    pub carrier_input_id: Option<String>,
+    pub already_in_context: Vec<String>,
+    pub submitted: Vec<String>,
+}
+
+pub type ManyHandler = fn(&str, &str, &InterruptSendMany) -> Result<ManyOutcome, UserInputExecutionError>;
+static MANY_HANDLER: OnceLock<ManyHandler> = OnceLock::new();
+pub fn install_many(handler: ManyHandler) { let _ = MANY_HANDLER.set(handler); }
 
 /// The request's params (all four required).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +296,22 @@ pub(super) fn dispatch(
     }
     if !owner {
         return Err(error("owner_required", "cutex/input/interruptSend is the owner's (Management root credential)", json!({})));
+    }
+    if params.get("inputIds").is_some() {
+        let request = InterruptSendMany::parse(params, false)?;
+        let handler = MANY_HANDLER.get().ok_or_else(|| error("interrupt_send_many_unsupported", "this process cannot dispatch owner batches", json!({})))?;
+        let thread = session.pointer("/native/threadId").and_then(Value::as_str).unwrap_or_default();
+        let result = handler(session_id, thread, &request)?;
+        super::input_ledger_settle::mark_dirty(session_id);
+        let latest = il::default_ledger().map_err(|e| il::ledger_error(il::LedgerError::Storage(e)))?
+            .get(session_id, &request.input_ids).map_err(il::ledger_error)?;
+        if matches!(result.outcome, Outcome::Interrupted {started:true,..}) {
+            crate::asks::control::owner_message_default(session_id, "started");
+        }
+        return Ok(json!({"ledgerEpoch":latest.ledger_epoch,"stateRevision":latest.state_revision,
+            "outcome":result.outcome.wire(),"interruptedTurnId":result.outcome.interrupted_turn(),
+            "inputIds":request.input_ids,"records":latest.records,"carrierInputId":result.carrier_input_id,
+            "alreadyInContext":result.already_in_context,"submitted":result.submitted}));
     }
     let request = parse(session_id, params)?;
     let handler = HANDLER.get().ok_or_else(|| {

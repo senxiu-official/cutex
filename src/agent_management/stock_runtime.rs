@@ -152,6 +152,17 @@ impl std::fmt::Display for AutomaticRuntimeStartPaused {
 }
 impl std::error::Error for AutomaticRuntimeStartPaused {}
 
+/// Automatic work must never undo an explicit owner stop. Owner Run bypasses
+/// this automatic-only guard, just as it bypasses the automatic pause check.
+#[derive(Debug)]
+pub struct AutomaticRuntimeStartOwnerStopped;
+impl std::fmt::Display for AutomaticRuntimeStartOwnerStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ownerStopped: explicit online is required")
+    }
+}
+impl std::error::Error for AutomaticRuntimeStartOwnerStopped {}
+
 impl AgentManagementProvider {
     /// Trusted daemon automatic-wake entry only, never an HTTP parameter or
     /// an owner/maintenance restriction. Keep the provider authority guard
@@ -189,6 +200,9 @@ impl AgentManagementProvider {
     fn require_automatic_runtime_start_unpaused(&self,id:&CutexSessionId)->anyhow::Result<()> {
         let roster=self.store().directory_snapshot_shared()?;
         let asks=crate::asks::store::AskStore::open_default()?;
+        if asks.inspect(|state| state.owner_offline.contains(id.as_str()))? {
+            return Err(AutomaticRuntimeStartOwnerStopped.into());
+        }
         let paused=asks.inspect(|state|state.pauses.contains_key(id.as_str())
             ||crate::asks::pause_admission::is_paused_in(state,&roster,id.as_str()))?;
         if paused { return Err(AutomaticRuntimeStartPaused.into()); }
@@ -1505,9 +1519,53 @@ mod review_digest_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     mod native_token_metadata_tests {
         include!("native_token_metadata_tests.rs");
+    }
+
+    fn schedule_stop_at_start_fence(explicit: bool) {
+        let home = AutomaticStartHome::new();
+        let provider = AgentManagementProvider::open_default().unwrap();
+        let asks = crate::asks::store::AskStore::open_default().unwrap();
+        let id = CutexSessionId::new(format!("cutex.{}", uuid::Uuid::new_v4())).unwrap();
+        {
+            let _fence = provider.store().lock_mutations().unwrap();
+            provider.require_automatic_runtime_start_unpaused(&id).unwrap();
+            // Owner stop commits after a successful scheduling preflight.
+            asks.with_state(|state| { state.owner_offline.insert(id.as_str().to_owned()); }).unwrap();
+        }
+        let before = asks.snapshot().unwrap();
+        let missing = home.root.join("never-created.json");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let error = loop {
+            let result = if explicit {
+                provider.execute_reviewed_relaunch(&missing, &id, "owner-schedule:test",
+                    &AgentActionId::new("schedule-stop-race").unwrap(), &mut NeverRuntime).map(|_| ())
+            } else {
+                provider.with_automatic_runtime_start(&id, || -> anyhow::Result<()> {
+                    panic!("an owner stop must prevent the automatic runtime effect")
+                })
+            };
+            let error = result.unwrap_err();
+            if error.is::<crate::asks::pause_admission::Deferred>() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            break error;
+        };
+        assert!(error.is::<AutomaticRuntimeStartOwnerStopped>(), "{error:#}");
+        assert!(!missing.exists());
+        assert_eq!(asks.snapshot().unwrap(), before, "held work creates no launch or admission");
+    }
+
+    #[test]
+    fn schedule_automatic_start_rechecks_owner_stop_under_start_fence() {
+        schedule_stop_at_start_fence(false);
+    }
+    #[test]
+    fn schedule_explicit_relaunch_rechecks_owner_stop_under_start_fence() {
+        schedule_stop_at_start_fence(true);
     }
 
     #[test]

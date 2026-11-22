@@ -398,7 +398,8 @@ def test_preset_append_tells_the_model_the_runtime_limits(tmp_path):
     # one line without tools.
     assert 'are allowed, and preferred for long work' in text and '"Claude Task"' in text
     assert 'cannot use tools' in text and 'reply in one line and use no tools' in text
-    assert 'cannot use cutex tools, start subagents, ask the user, or get approval' in text
+    assert 'explicit cutex read-only tool set' in text and "parent's visible scope" in text
+    assert 'cannot start subagents, ask the user, or get approval' in text
 
 
 def test_preset_append_says_auto_mode_does_not_decide_cutex_approvals(tmp_path):

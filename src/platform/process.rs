@@ -52,8 +52,24 @@ pub fn process_started_at(pid: u32) -> anyhow::Result<DateTime<Utc>> {
 /// Executable image of a live process (`/proc/<pid>/exe` on Linux,
 /// `proc_pidpath` on macOS). A process that does not exist is
 /// `ErrorKind::NotFound`, like the Linux read_link.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn process_executable(pid: u32) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        }};
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() { return Err(std::io::Error::last_os_error()); }
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        let result = unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut length) };
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle); }
+        if result == 0 { return Err(error); }
+        return String::from_utf16(&path[..length as usize]).map(std::path::PathBuf::from)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process executable"));
+    }
     #[cfg(target_os = "linux")]
     {
         std::fs::read_link(format!("/proc/{pid}/exe"))

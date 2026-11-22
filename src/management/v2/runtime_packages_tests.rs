@@ -661,6 +661,10 @@ fn release_labels_parse_linux_and_windows_paths() {
         Some("r49".into())
     );
     assert_eq!(native_release(Some("0.160.0-r50x"), Some("/a/b")), None);
+    assert_eq!(native_release(Some("0.160.0-r52.4"), Some("/releases/r260/codex")), Some("r52.4".into()));
+    assert_eq!(release_dir_label("/releases/r52.4-build/codex"), Some("r52.4".into()));
+    assert_eq!(native_release(Some("0.160.0-r52."), None), None);
+    assert_eq!(native_release(Some("0.160.0-r52..4"), None), None);
     assert_eq!(native_release(None, None), None);
 }
 

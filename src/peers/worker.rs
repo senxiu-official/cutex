@@ -196,6 +196,7 @@ pub fn fail(asks: &AskStore, id: &str, code: &str, unknown: bool) -> Result<()> 
 
 fn has_peer_work(ask: &AskRecord) -> bool {
     if let Some(remote) = &ask.remote {
+        if ask.follow_up_ended { return false; }
         (ask.is_open() && !remote.sync.local_terminal) || !remote.sync.pending_ops.is_empty()
     } else if let Some(inbound) = &ask.peer_inbound {
         ask.is_open() || !inbound.peer_deliveries.is_empty()
@@ -675,6 +676,7 @@ fn current_sender(store: &Store, id: &str) -> Result<Option<Peer>> {
 
 fn has_due_send(ask: &AskRecord, id: &str) -> bool {
     if let Some(r) = ask.remote.as_ref().filter(|r| r.peer_id == id) {
+        if ask.follow_up_ended { return false; }
         due(&r.sync.next_attempt_at)
             && (!r.sync.pending_ops.is_empty()
                 || (r.sync.accepted
@@ -899,6 +901,9 @@ pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
             }
             let reconcile_create =
                 matches!(create_dispatch.as_ref(), Some(CreateDispatch::Reconcile));
+            // A locally ended follow-up retains old operations as evidence;
+            // neither maintenance nor an earlier send inventory may redrive them.
+            if asks.inspect(|s|s.asks.get(&a.ask_id).is_none_or(|current|current.follow_up_ended))? { continue; }
             let result = match op {
                 Some(o) if o.op == "create" && reconcile_create => {
                     super::client::call(store, &peer, "GET", &route, None)

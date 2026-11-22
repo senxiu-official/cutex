@@ -18,13 +18,20 @@ pub fn visible(peer: &super::store::Peer, agent: &crate::asks::directory::AgentI
 
 /// Sending is a separate permission over the same local visibility boundary:
 /// the peer-level switch and, for a non-owner binding, the user's `send`.
+/// r290 P1: decided on the current membership (a fresh scope, not the
+/// directory cache), so an agent just moved into a viewer project is not
+/// sent to under its old project's role.
 pub fn can_deliver(peer: &super::store::Peer, agent: &crate::asks::directory::AgentInfo) -> bool {
+    let fresh = std::cell::OnceCell::new();
     can_deliver_with(peer, agent, |user| {
-        crate::management::users::UserStore::open_default()
-            .and_then(|users| users.snapshot())
-            .ok()
-            .and_then(|state| state.user(user).and_then(|u| u.grant.clone()))
-            .map(|grant| crate::management::users::Scope::cached(&grant))
+        fresh.get_or_init(|| {
+            crate::management::users::UserStore::open_default()
+                .and_then(|users| users.snapshot())
+                .ok()
+                .and_then(|state| state.user(user).and_then(|u| u.grant.clone()))
+                .and_then(|grant| crate::management::users::Scope::load(&grant).ok())
+        })
+        .clone()
     })
 }
 
@@ -56,7 +63,7 @@ pub(crate) fn can_deliver_with(
         return false;
     }
     peer.user_id == super::store::OWNER_USER_ID
-        || scope_of(&peer.user_id).is_some_and(|scope| scope.grant.send)
+        || scope_of(&peer.user_id).is_some_and(|scope| scope.may_send(&agent.cutex_session_id))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,5 +319,149 @@ pub fn needs_review(review: &Review, requester: &Caps, target: &Caps) -> bool {
                 _ => true,
             }
         }
+    }
+}
+
+// r290 P10 (c) ------------------------------------------ own-host preset
+//
+// "这是我自己的主机": a one-click owner-to-owner policy for a peer bound to
+// `owner`. Pairing starts fully closed (no exports, every ask reviewed, peer
+// agents invisible); between two hosts of the same owner that is friction,
+// not protection. The preset opens:
+// - inbound: every active local agent is visible to the peer (exports all),
+//   asks and tells are accepted, wakes are allowed (tellWake), and review is
+//   only needed when the target agent is wider than `workspace-write`
+//   without network (full-access, network or unrestricted services still
+//   go to the owner);
+// - outbound: this host's agents see the peer's agents.
+// Rate limits stay as they are. URLs and transport are untouched: peer
+// tokens still never travel over plain http on the LAN (client::addresses).
+// It applies only on this host (each host sets its own inbound policy) and
+// only to an owner-bound peer. `verified` says whether the peer's owner keys
+// (exchanged at pairing) include one of this host's owner keys; when not,
+// the preset is the owner's explicit choice on this host.
+impl Policy {
+    pub fn own_host(&self) -> Self {
+        let mut next = self.clone();
+        next.inbound.exports = vec![Export::All { all: true }];
+        next.inbound.asks = true;
+        next.inbound.review = Review::IfTargetWider;
+        next.inbound.assumed_caps = Caps {
+            sandbox: Some("workspace-write".into()),
+            network_access: false,
+            unrestricted_services: false,
+        };
+        next.inbound.tell_wake = true;
+        next.outbound.visibility = Visibility::All;
+        next
+    }
+}
+
+/// Does any of the peer's owner keys belong to this host's owner?
+pub(crate) fn owner_keys_overlap(local: &[String], remote: &[String]) -> bool {
+    !local.is_empty() && remote.iter().any(|key| local.contains(key))
+}
+
+/// The peer's owner keys recorded at pairing (`ownerPersonKeys`) include one
+/// of this host's owner keys.
+pub fn own_host_verified(peer_id: &str) -> bool {
+    let remote = crate::management::users::UserStore::open_default()
+        .and_then(|users| users.persons_snapshot())
+        .ok()
+        .and_then(|persons| persons.peer_persons.get(peer_id).cloned())
+        .unwrap_or_default();
+    owner_keys_overlap(&crate::management::persons::local_owner_keys(), &remote)
+}
+
+/// Owner-local, full-scope only: the preset widens what the peer reaches.
+pub fn own_host_allowed() -> bool {
+    crate::management::users::request_is_owner_local()
+        && crate::management::listeners::current_client_token().is_none_or(|token| token.scope.is_full())
+}
+
+/// Apply the preset to an owner-bound peer. Returns the updated peer.
+pub fn apply_own_host(store: &super::store::Store, id: &str) -> Result<super::store::Peer> {
+    store.with(|s| {
+        let peer = s.peers.get_mut(id).ok_or_else(|| Error::new("peer_not_found", 404))?;
+        if peer.user_id != super::store::OWNER_USER_ID {
+            let mut error = Error::new("peer_not_owner_bound", 409);
+            error.details = serde_json::json!({ "userId": peer.user_id });
+            return Err(error);
+        }
+        peer.policy = peer.policy.own_host();
+        peer.policy_revision += 1;
+        Ok(peer.clone())
+    })
+}
+
+/// `ownHost` of a pairing body: absent / false / true; anything else is 400.
+pub fn own_host_requested(body: &serde_json::Value) -> Result<bool> {
+    match body.get("ownHost") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(Error::new("invalid_request", 400)),
+    }
+}
+
+#[cfg(test)]
+mod own_host_tests {
+    use super::*;
+
+    #[test]
+    fn own_host_opens_exports_and_visibility_but_keeps_review_for_wider_targets() {
+        let policy = Policy::default().own_host();
+        assert_eq!(policy.inbound.exports, vec![Export::All { all: true }]);
+        assert_eq!(policy.outbound.visibility, Visibility::All);
+        assert!(policy.inbound.asks && policy.inbound.tell_wake);
+        let caps = |sandbox: &str, network: bool| Caps { sandbox: Some(sandbox.into()), network_access: network, unrestricted_services: false };
+        assert!(!policy.needs_review(&caps("read-only", false)));
+        assert!(!policy.needs_review(&caps("workspace-write", false)));
+        assert!(policy.needs_review(&caps("workspace-write", true)), "network still reviewed");
+        assert!(policy.needs_review(&caps("danger-full-access", false)), "full access still reviewed");
+        assert!(policy.needs_review(&Caps { sandbox: None, network_access: false, unrestricted_services: false }));
+        let mut limited = Policy::default();
+        limited.inbound.asks_per_hour = 7;
+        assert_eq!(limited.own_host().inbound.asks_per_hour, 7, "rate limits are kept");
+        // The default stays fully closed.
+        let closed = Policy::default();
+        assert!(closed.inbound.exports.is_empty() && closed.outbound.visibility == Visibility::None);
+        assert!(closed.needs_review(&caps("read-only", false)));
+    }
+
+    #[test]
+    fn owner_keys_must_overlap_to_verify() {
+        let local = vec!["k1".to_string(), "k2".to_string()];
+        assert!(owner_keys_overlap(&local, &["k2".to_string()]));
+        assert!(!owner_keys_overlap(&local, &["k3".to_string()]));
+        assert!(!owner_keys_overlap(&local, &[]));
+        assert!(!owner_keys_overlap(&[], &["k1".to_string()]));
+    }
+
+    #[test]
+    fn own_host_flag_is_a_strict_boolean() {
+        assert!(!own_host_requested(&serde_json::json!({})).unwrap());
+        assert!(own_host_requested(&serde_json::json!({ "ownHost": true })).unwrap());
+        assert!(own_host_requested(&serde_json::json!({ "ownHost": "yes" })).is_err());
+    }
+
+    #[test]
+    fn own_host_is_owner_local_full_scope_only() {
+        use crate::management::client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken};
+        use crate::management::listeners::{set_current_client_token, set_current_connection, ConnectionInfo};
+        let token = |scope, via| { let mut t = VerifiedClientToken::test_token("ct-own-host"); t.scope = scope; t.issued_via = via; t };
+        let connection = |remote| Some(ConnectionInfo { remote, peer: "127.0.0.1:50000".parse().unwrap() });
+        set_current_connection(connection(false));
+        set_current_client_token(None);
+        assert!(own_host_allowed(), "root credential on loopback");
+        set_current_client_token(Some(token(DeviceScope::Full, IssuedVia::HostCli)));
+        assert!(own_host_allowed(), "host-issued owner token on loopback (SSH desktop)");
+        set_current_client_token(Some(token(DeviceScope::Chat, IssuedVia::HostCli)));
+        assert!(!own_host_allowed(), "narrowed token");
+        set_current_client_token(Some(token(DeviceScope::Full, IssuedVia::Pairing)));
+        assert!(!own_host_allowed(), "paired device token");
+        set_current_connection(connection(true));
+        set_current_client_token(None);
+        assert!(!own_host_allowed(), "remote listener");
+        set_current_connection(None);
     }
 }

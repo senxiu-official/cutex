@@ -3,6 +3,13 @@
   "$id": "urn:cutex:management-v2:artifacts",
   "title": "Artifact store",
   "description": "Capability artifacts (cutex-desktop docs/research/artifacts-api-v1.md): GET/POST /v2/artifact-store, GET/PATCH/DELETE /v2/artifact-store/{artifactId}, GET .../versions/{n|latest}/content, GET .../diff, POST /v2/artifact-store/resolve, GET /v2/artifact-store/usage (root). Host events cutex/artifact/published and cutex/artifact/updated; with capability artifact-show also cutex/artifact/showRequested (an agent published with show: true). Refs af-…@<n> / af-…@latest; links cutex:artifact/<ref>.",
+  "x-rawDownload": {
+    "capability": "artifact-raw-download",
+    "routes": ["GET /v2/artifact-store/{artifactId}/versions/{n|latest}/raw", "HEAD /v2/artifact-store/{artifactId}/versions/{n|latest}/raw"],
+    "description": "Binary streaming, not JSON. Same owner/device access as content; file-transfer admission limit 2, no heavy-read slot; 64 KiB server buffer; no raw size cap; 30s no-progress timeout plus minimum 1 KiB/s per 30s window after 30s grace. Single byte ranges GET 206/416, HEAD ignores Range. If-Range requires the matching strong SHA ETag; weak/date/mismatched validators return 200. External identity/size/mtime must match at open. Legacy external identity unavailable is 409; changed source 409; missing bytes 410. SHA-less external downloads use a weak identity ETag and identity-only integrity.",
+    "headers": { "$ref": "#/$defs/rawDownloadHeaders" },
+    "statuses": [200, 206, 400, 401, 403, 404, 409, 410, 416, 503]
+  },
   "anyOf": [
     { "$ref": "#/$defs/listResponse" },
     { "$ref": "#/$defs/detailResponse" },
@@ -18,6 +25,22 @@
     { "$ref": "#/$defs/usageResponse" }
   ],
   "$defs": {
+    "rawDownloadHeaders": {
+      "type": "object",
+      "required": ["Content-Length", "Content-Type", "Content-Disposition", "ETag", "Accept-Ranges", "X-Cutex-Integrity", "X-Cutex-Artifact-Version"],
+      "properties": {
+        "Content-Length": { "type": "string", "pattern": "^[0-9]+$" },
+        "Content-Type": { "type": "string", "description": "Recorded MIME; APK application/vnd.android.package-archive." },
+        "Content-Disposition": { "type": "string", "description": "attachment; ASCII filename fallback plus RFC 5987 filename*=UTF-8''percent-encoded-name" },
+        "ETag": { "type": "string", "description": "Strong quoted sha256-<64 hex> when recorded SHA exists, otherwise W/quoted identity-<stamp digest>." },
+        "Accept-Ranges": { "const": "bytes" },
+        "Content-Range": { "type": "string", "description": "bytes start-end/total (206), bytes */total (416)." },
+        "X-Cutex-Sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Whole-version digest, including for ranges; absent for SHA-less external content." },
+        "X-Cutex-Integrity": { "enum": ["sha256", "identity-only"] },
+        "X-Cutex-Artifact-Version": { "type": "string", "pattern": "^[1-9][0-9]*$", "description": "Resolved numeric artifact version, including when latest was requested; present on 200, 206 and HEAD." },
+        "X-Cutex-Error": { "type": "string", "description": "artifact_range_not_satisfiable for 416; HEAD failures carry the normal error code without a body." }
+      }
+    },
     "artifactId": { "type": "string", "pattern": "^af-[0-9a-f]{32}$" },
     "timestamp": { "type": "string", "format": "date-time" },
     "kind": { "enum": ["report", "figure", "table", "data", "plan", "handoff", "other"] },
@@ -219,7 +242,8 @@
         "artifact": { "$ref": "#/$defs/artifactSummary" },
         "version": { "$ref": "#/$defs/artifactVersion" },
         "newVersion": { "type": "boolean" },
-        "markdown": { "type": "string" }
+        "markdown": { "type": "string" },
+        "credentialWarning": { "type": ["string", "null"], "description": "r290 P10 (d): set when a full-scope owner published a file agents may not publish (credential name or location); the reason. Null otherwise." }
       }
     },
     "patchRequest": {

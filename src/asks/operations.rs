@@ -74,9 +74,71 @@ pub fn lookup(state: &AskState, caller: &str, action: &str) -> Value {
     }
 }
 
+// r290 P10 (A1): owner settlement of a control action whose response was lost.
+/// Under the AskStore lock: an existing receipt is returned unchanged (nothing
+/// is replayed or reversed). With no receipt the original request either never
+/// arrived or is still in transit; record a durable known-none tombstone so a
+/// late copy is refused (`idempotency_conflict`, never executed) and the answer
+/// "it did not happen" stays true. Tombstones carry the PREFIX: never pruned.
+pub fn settle_none(state: &mut AskState, caller: &str, operation: &str, action: &str, now: DateTime<Utc>) -> Result<Value, AskError> {
+    if caller.is_empty() || action.is_empty() || action.len() > 256
+        || !action.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)) {
+        return Err(AskError::new("invalid_arguments", "nonempty bounded actionId required"));
+    }
+    let key = format!("{caller}\u{1f}{action}");
+    match state.actions.get(&key) {
+        Some(record) if !record.tool.starts_with(PREFIX) =>
+            return Err(AskError::new("idempotency_conflict", "actionId belongs to a different request")),
+        Some(_) => {}
+        None => {
+            let digest = crate::approvals::request_digest(&json!({"settledNone": action, "operation": operation}));
+            let result = json!({"settled": true, "receipt": {
+                "schema": SCHEMA, "actionId": action,
+                "operationId": super::new_id("operation"), "operation": operation,
+                "requestDigest": digest, "status": "completed", "effectState": EffectState::None,
+                "outcomeUnknown": false, "revision": 1, "updatedAt": super::now_rfc3339(now)
+            }});
+            state.actions.insert(key, super::store::ActionRecord {
+                tool: format!("{PREFIX}{operation}"),
+                // Never equal to a real (hex) request digest: a late original conflicts.
+                request_sha256: format!("settled-none:{digest}"),
+                result: Some(result),
+                at: super::now_rfc3339(now),
+            });
+        }
+    }
+    Ok(lookup(state, caller, action))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settle_none_fences_a_late_original_and_keeps_existing_receipts() { // r290 P10 (A1)
+        let mut state = AskState::default();
+        let now = Utc::now();
+        let req = json!({"expectedEpoch":0});
+        // Lost before arrival: settle records known-none; the late original never runs.
+        let settled = settle_none(&mut state,"owner","project.pause","lost",now).unwrap();
+        assert_eq!(settled["status"],"found");
+        assert_eq!(settled["outcomeUnknown"],false);
+        assert_eq!(settled["result"]["receipt"]["effectState"],"none");
+        assert_eq!(settled["result"]["receipt"]["operation"],"project.pause");
+        assert_eq!(settled["result"]["receipt"]["status"],"completed");
+        assert!(settled["result"]["receipt"]["requestDigest"].as_str().unwrap().len()==64);
+        let late = execute(&mut state,"owner","project.pause","lost",&req,now,|_| panic!("late original executed"));
+        assert_eq!(late.unwrap_err().code,"idempotency_conflict");
+        assert_eq!(settle_none(&mut state,"owner","project.pause","lost",now).unwrap(), settled);
+        assert_eq!(lookup(&state,"owner","lost"), settled);
+        // Committed first: settle never rewrites or reverses the receipt.
+        let first = execute(&mut state,"owner","project.pause","done",&req,now,|_| Ok((json!({"changed":true}),EffectState::Committed))).unwrap();
+        let after = settle_none(&mut state,"owner","project.pause","done",now).unwrap();
+        assert_eq!(after["result"], first);
+        assert_eq!(after["result"]["receipt"]["effectState"],"committed");
+        // Another caller's namespace is untouched and not readable through this one.
+        assert_eq!(lookup(&state,"agent-x","done")["status"],"notFound");
+        assert!(settle_none(&mut state,"owner","project.pause","",now).is_err());
+    }
     #[test]
     fn replay_conflict_and_failed_precondition_are_atomic() {
         let mut state = AskState::default();

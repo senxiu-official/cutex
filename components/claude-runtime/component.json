@@ -1,7 +1,7 @@
 {
   "schema": "cutex/component/v1",
   "name": "claude-runtime",
-  "version": "claude-r48",
+  "version": "claude-r55",
   "platforms": [
     "linux-x64",
     "windows-x64",

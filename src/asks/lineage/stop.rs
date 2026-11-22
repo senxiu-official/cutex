@@ -151,6 +151,7 @@ pub fn apply_stop(state:&mut AskState,plan:StopPlan,permission_revision:u64,now:
             Err(error)=>{partial=true;("failed",false,Some(error.code))},
         };
         if let Some(current)=state.asks.get_mut(&ask.ask_id){current.bounded_continuation.cancel("ancestorStopped");}
+        crate::asks::stop_settlement::close_cancelled_continuation(state, &ask.ask_id, now);
         state.notice("cutex/delegation/lineageChanged",AskState::ask_sessions(&ask),
             json!({"projectId":ask.project_id,"resourceId":ask.ask_id,"revision":state.lineage.revision}));
         if selection.readable{outcomes.push(json!({"id":ask.ask_id,"hostId":plan.local_host,"phase":phase,"changed":changed,"retryable":false,"reasonCode":reason}));}

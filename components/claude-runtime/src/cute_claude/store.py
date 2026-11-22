@@ -118,9 +118,14 @@ class Store:
             UNIQUE(thread_id,message_id)
           );
           CREATE INDEX IF NOT EXISTS pending_notes ON notes(thread_id,state,seq);
+          -- Trusted daemon admission for one ANSWER while the queue stays halted.
+          CREATE TABLE IF NOT EXISTS stop_answer_inputs(
+            thread_id TEXT NOT NULL REFERENCES threads(id), message_id TEXT NOT NULL,
+            PRIMARY KEY(thread_id,message_id)
+          );
         ''')
         version = self.db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
-        if version and version[0] not in {"1", "2"}:
+        if version and version[0] not in {"1", "2", "3"}:
             self.close()
             raise RuntimeError("unsupported database version; migration required")
         try:
@@ -129,6 +134,7 @@ class Store:
             self.close()
             raise
         self.recover()
+        self.lower_writer_schema_if_idle()
 
     def _migrate_schema(self):
         # Schema 2 is a writer fence: r7 cannot understand reverted visibility.
@@ -148,7 +154,8 @@ class Store:
             # Rebuildable usage read model (058 S2); turns.usage keeps its format.
             usage_totals.ensure_schema(self.db)
             history_order.ensure_schema(self.db)
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema','2')")
+            self.db.execute("INSERT OR IGNORE INTO meta VALUES('schema','2')")
+            self.db.execute("UPDATE meta SET value='2' WHERE key='schema' AND value='1'")
 
     def thread_properties(self, tid: str) -> dict:
         # The standalone read-only reader also supports pre-r8 databases.
@@ -218,6 +225,12 @@ class Store:
         else:
             self.db.execute("COMMIT")
 
+    def lower_writer_schema_if_idle(self) -> None:
+        # Schema3 fences only the retained queued/existing-turn interpretation.
+        # A keyed prefix range keeps this check independent of unrelated meta.
+        self.db.execute("""UPDATE meta SET value='2' WHERE key='schema' AND value='3'
+            AND NOT EXISTS(SELECT 1 FROM meta WHERE key>='claudeQueueRetry:' AND key<'claudeQueueRetry;' LIMIT 1)""")
+
     def close(self) -> None:
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.db.close()
@@ -233,6 +246,7 @@ class Store:
         # connected when they were written, so a client would otherwise keep
         # showing the turn and its tool as running.
         self.recovered_events: dict[str, list[tuple[str, dict]]] = {}
+        self.recovered_probes: dict[str, str] = {}
         from .native_tools import interrupted_item
         note = "Adapter restarted during this tool call. Outcome is uncertain; inspect side effects before retrying."
         with self.transaction():
@@ -247,11 +261,31 @@ class Store:
                     seen.add(turn_id)
                     settle.append((turn_id, tid))
             for turn_id, tid in settle:
+                if self.db.execute("SELECT 1 FROM inputs WHERE turn_id=? AND state='queued'", (turn_id,)).fetchone() and self.db.execute(
+                        "SELECT 1 FROM meta WHERE key=?", ('claudeQueueRetry:' + turn_id,)).fetchone():
+                    from .queue_recovery import restart_candidate
+                    try:
+                        retry = json.loads(self.db.execute('SELECT value FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,)).fetchone()[0])
+                    except (ValueError, TypeError):
+                        retry = {}
+                    if restart_candidate(self, tid, turn_id, retry):
+                        self.recovered_probes[tid] = turn_id
+                        notice = self.retry_notice(tid, turn_id)
+                        self.event(tid, 'error', notice)
+                        self.recovered_events.setdefault(tid, []).append(('error', notice))
+                        continue  # Activation + native lease/history proof restores it.
+                    # Publish the durable, effect-free hold on the new native
+                    # occurrence too, so the Director's Resume remains usable.
+                    params = {'threadId': tid, 'turnId': turn_id, 'held': True, 'reason': 'silentTransportGuard'}
+                    self.event(tid, 'claude/queue/holdChanged', params)
+                    self.recovered_events.setdefault(tid, []).append(('claude/queue/holdChanged', params))
+                    continue
                 if self.db.execute("SELECT 1 FROM turns WHERE id=? AND state='inProgress'", (turn_id,)).fetchone() is None:
                     # Already terminal (a processing input of a finished turn): inputs only.
                     self.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=? AND state='processing'", (turn_id,))
                     continue
                 self.clear_browser_replay(tid, turn_id)
+                self.db.execute('DELETE FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,))
                 error = {"message": "Server stopped during this turn. Tool effects may be uncertain; inspect before resuming.", "codexErrorInfo": "other", "additionalDetails": None}
                 self.db.execute("UPDATE turns SET state='interrupted',completed=?,error=? WHERE id=?", (time.time(), dump(error), turn_id))
                 self.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=? AND state='processing'", (turn_id,))
@@ -439,7 +473,7 @@ class Store:
             return self.db.execute("SELECT 1 FROM inputs WHERE thread_id=? AND state='processing' LIMIT 1", (tid,)).fetchone() is not None
         return self.pending(tid)
 
-    def enqueue(self, tid: str, mid: str, payload: dict, max_pending: int, *, resume_interrupted: bool = False) -> dict:
+    def enqueue(self, tid: str, mid: str, payload: dict, max_pending: int, *, resume_interrupted: bool = False, stop_answer: bool = False) -> dict:
         require(tid not in self.history_mutations, 'session history mutation is in progress', -32009)
         thread = self.thread(tid)
         require(not thread["archived"], "thread is archived", -32009)
@@ -450,6 +484,9 @@ class Store:
                 self.check_user_continuation(tid)
             old = self.db.execute("SELECT * FROM inputs WHERE thread_id=? AND message_id=?", (tid, mid)).fetchone()
             if old:
+                if stop_answer:
+                    require(self.db.execute("SELECT 1 FROM stop_answer_inputs WHERE thread_id=? AND message_id=?", (tid,mid)).fetchone() is not None,
+                            "messageId admission changed", -32010)
                 require(old["semantic_hash"] == digest, "messageId reused with different semantic content", -32010)
                 return self.receipt(old, True)
             note = self.db.execute("SELECT 1 FROM notes WHERE thread_id=? AND message_id=?", (tid, mid)).fetchone()
@@ -457,29 +494,62 @@ class Store:
             count = self.db.execute("SELECT count(*) FROM inputs WHERE thread_id=? AND state IN ('queued','processing')", (tid,)).fetchone()[0]
             require(count < max_pending, "inbox capacity reached", -32001)
             self.db.execute("INSERT INTO inputs(thread_id,message_id,semantic_hash,payload,turn_id,state,created) VALUES(?,?,?,?,?,'queued',?)", (tid, mid, digest, canonical, identifier(), time.time()))
+            if stop_answer:
+                self.db.execute("INSERT INTO stop_answer_inputs(thread_id,message_id) VALUES(?,?)", (tid,mid))
             self.input_presentation(tid, mid)
             if resume_interrupted:
                 # Accepting a fresh user turn resumes dispatch, never the old input.
                 # Commit both together so invalid submissions cannot unpause the queue.
-                self.db.execute('UPDATE threads SET halted=0 WHERE id=?', (tid,))
+                self.resume_queue(tid)
             return self.input_status(tid, mid)
+
+    def resume_queue(self, tid: str) -> None:
+        self.recovered_probes.pop(tid, None)
+        from .queue_recovery import reset
+        with self.transaction():
+            self.db.execute('UPDATE threads SET halted=0 WHERE id=?', (tid,))
+            reset(self, tid)
+
+    def stop_answer_pending(self, tid: str) -> bool:
+        return self.db.execute("""SELECT 1 FROM inputs i JOIN stop_answer_inputs s
+            ON s.thread_id=i.thread_id AND s.message_id=i.message_id
+            WHERE i.thread_id=? AND i.state IN ('queued','processing') LIMIT 1""", (tid,)).fetchone() is not None
 
     def claim(self, tid: str, message_id: str | None = None) -> dict | None:
         if tid in self.history_mutations:
             return None
         with self.transaction():
             thread = self.thread(tid)
-            if thread["halted"] or thread["archived"]:
+            if thread["archived"] or (thread["halted"] and not self.stop_answer_pending(tid)):
                 return None
             active = self.db.execute("SELECT * FROM inputs WHERE thread_id=? AND state='processing' LIMIT 1", (tid,)).fetchone()
             if active:
+                if thread['halted'] and self.db.execute("SELECT 1 FROM stop_answer_inputs WHERE thread_id=? AND message_id=?",
+                                                       (tid, active['message_id'])).fetchone() is None:
+                    return None
                 return dict(active)
-            row = self.db.execute("SELECT * FROM inputs WHERE thread_id=? AND state='queued' AND (? IS NULL OR message_id=?) ORDER BY seq LIMIT 1", (tid, message_id, message_id)).fetchone()
+            row = self.db.execute("""SELECT * FROM inputs i WHERE thread_id=? AND state='queued'
+                AND (? IS NULL OR message_id=?) AND (?=0 OR EXISTS(SELECT 1 FROM stop_answer_inputs s
+                  WHERE s.thread_id=i.thread_id AND s.message_id=i.message_id)) ORDER BY seq LIMIT 1""",
+                (tid, message_id, message_id, thread['halted'])).fetchone()
             if row is None:
                 return None
             payload = json.loads(row["payload"])
             content = self.project_input(payload)
             now = time.time()
+            existing = self.db.execute("SELECT state FROM turns WHERE id=?", (row['turn_id'],)).fetchone()
+            if existing:
+                require(existing[0] == 'inProgress' and self.db.execute(
+                    "SELECT 1 FROM meta WHERE key=?", ('claudeQueueRetry:' + row['turn_id'],)).fetchone(),
+                    'queued input has no verified silent retry', -32009)
+                self.db.execute("UPDATE inputs SET state='processing' WHERE seq=?", (row['seq'],))
+                prompt = content[0]['text']
+                if payload['source']['kind'] != 'user':
+                    frames = self.turn_note_frames(row['turn_id'])
+                    if frames:
+                        prompt = '\n\n'.join([*frames, prompt])
+                retry = json.loads(self.db.execute('SELECT value FROM meta WHERE key=?', ('claudeQueueRetry:' + row['turn_id'],)).fetchone()[0])
+                return {**dict(row), 'state': 'processing', 'prompt': prompt, 'queue_retry': True, 'retry_continuation': bool(retry.get('continuation')), 'retry_receipt': retry.get('receipt'), 'retry_authorized': self.db.execute('SELECT 1 FROM meta WHERE key=?', ('claudeQueueRecovery:' + tid,)).fetchone() is None}
             self.db.execute("INSERT INTO turns(id,thread_id,state,started) VALUES(?,?,'inProgress',?)", (row["turn_id"], tid, now))
             # Clients saw this thread again once a new turn runs: no more replay.
             self.recovered_events.pop(tid, None)
@@ -489,6 +559,10 @@ class Store:
             item = {"type": "userMessage", "id": identifier(), "clientId": payload.get("clientId"),
                     "content": parts + list(payload.get("display") or [])}
             if owner and not compact:
+                for original in payload.get('metadata', {}).get('ownerInputs', []):
+                    prefix_parts = ([{'type': 'text', 'text': original['text'], 'text_elements': []}] if original['text'] else [])
+                    self.put_item(row['turn_id'], {'type': 'userMessage', 'id': identifier(), 'clientId': original['clientId'],
+                        'content': prefix_parts + list(original.get('display') or [])})
                 self.put_item(row["turn_id"], item)
             # Notes waiting for this thread are read at the start of every turn
             # (Codex reads passive input at a turn's first request too): an owner
@@ -554,12 +628,27 @@ class Store:
     def items(self, turn_id: str) -> list[dict]:
         return [json.loads(row[0]) for row in self.db.execute("SELECT payload FROM items WHERE turn_id=? ORDER BY seq", (turn_id,))]
 
+    def retry_notice(self, tid: str, turn_id: str, error: dict | None = None) -> dict | None:
+        if not self.db.execute('SELECT 1 FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,)).fetchone():
+            return None
+        from .queue_recovery import read
+        state = read(self, tid)
+        if (state and state.get('held')) or (self.thread(tid)['halted'] and tid not in self.recovered_probes):
+            return None
+        result = {'threadId':tid, 'turnId':turn_id, 'willRetry':True, 'retryableInput':True,
+            'error':error or {'message':'Connection interrupted; waiting for network; retrying automatically.', 'codexErrorInfo':'other', 'additionalDetails':None}}
+        if state:
+            result['nextRetryAt'] = int(state['notBefore'] * 1000)
+        return result
+
     def turn(self, turn_id: str, *, include_items: bool = True) -> dict:
         row = self.db.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
         require(row is not None, "turn not found", -32004)
-        return {"id": row["id"], "items": self.items(turn_id) if include_items else [],
+        error = json.loads(row["error"]) if row["error"] else None
+        retry = self.retry_notice(row["thread_id"], turn_id, error) if row["state"] == "inProgress" else None
+        return {**({"claudeRetry":retry} if retry else {}), "id": row["id"], "items": self.items(turn_id) if include_items else [],
                 "itemsView": "full" if include_items else "notLoaded", "status": row["state"],
-                "error": json.loads(row["error"]) if row["error"] else None,
+                "error": None if retry else error,
                 "startedAt": int(row["started"]),
                 "completedAt": int(row["completed"]) if row["completed"] else None,
                 "durationMs": int((row["completed"]-row["started"])*1000) if row["completed"] else None}
@@ -608,12 +697,41 @@ class Store:
         blocks = [result if b.get("tool_use_id") == call_id else b for b in blocks]
         self.db.execute("UPDATE history SET content=? WHERE seq=?", (dump(blocks), seq))
 
-    def finish(self, tid: str, turn_id: str, state: str, error: dict | None = None) -> None:
+    def defer_silent_input(self, tid: str, turn_id: str, recovery: dict, *, continuation: bool = True, error: dict | None = None, receipt: dict | None = None, dispatch: str | None = None) -> None:
+        """Keep the same input/turn/sequence after a proven effect-free failure."""
+        from .queue_recovery import KEY
+        with self.transaction():
+            require(self.turn(turn_id)['status'] == 'inProgress', 'silent retry turn is not active', -32009)
+            require(self.db.execute('SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone() is None,
+                    'a tool-bearing input cannot be requeued', -32009)
+            self.db.execute('UPDATE turns SET error=? WHERE id=?', (dump(error) if error else None, turn_id))
+            self.db.execute("UPDATE inputs SET state='queued' WHERE thread_id=? AND turn_id=? AND state='processing'", (tid, turn_id))
+            # A queued input retaining an existing turn requires this writer.
+            # Older adapters must reject the store instead of re-inserting or
+            # replaying that turn with their legacy queue interpretation.
+            self.db.execute("UPDATE meta SET value='3' WHERE key='schema'")
+            self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('claudeQueueRetry:' + turn_id, dump({'continuation': continuation, 'receipt': receipt, 'dispatch': dispatch or ('terminal-empty' if continuation else 'not-submitted')})))
+            self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (KEY + tid, dump(recovery)))
+            self.db.execute('UPDATE threads SET updated=?,halted=? WHERE id=?', (time.time(), recovery['held'], tid))
+
+    def finish(self, tid: str, turn_id: str, state: str, error: dict | None = None, *, queue_recovery: dict | None = None) -> None:
+        self.recovered_probes.pop(tid, None)
         with self.transaction():
             self.clear_browser_replay(tid, turn_id)
+            self.db.execute('DELETE FROM meta WHERE key=?', ('claudeQueueRetry:' + turn_id,))
+            self.lower_writer_schema_if_idle()
             self.db.execute("UPDATE turns SET state=?,completed=?,error=? WHERE id=?", (state, time.time(), dump(error) if error else None, turn_id))
             self.db.execute("UPDATE inputs SET state=? WHERE turn_id=?", (state, turn_id))
-            self.db.execute("UPDATE threads SET updated=?,halted=? WHERE id=?", (time.time(), state != "completed", tid))
+            from .queue_recovery import KEY, reset
+            if queue_recovery is not None:
+                self.db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)', (KEY + tid, dump(queue_recovery)))
+            else:
+                reset(self, tid)
+            halted = state != "completed" and (queue_recovery is None or queue_recovery['held'])
+            scoped = self.db.execute("""SELECT 1 FROM stop_answer_inputs s JOIN inputs i
+                ON s.thread_id=i.thread_id AND s.message_id=i.message_id WHERE i.turn_id=?""", (turn_id,)).fetchone()
+            keep_halted = bool(scoped and self.thread(tid)['halted'])
+            self.db.execute("UPDATE threads SET updated=?,halted=? WHERE id=?", (time.time(), halted or keep_halted, tid))
             if state != "completed":
                 self.db.execute("UPDATE tool_calls SET state='uncertain' WHERE turn_id=? AND state='started'", (turn_id,))
                 self.drop_unread_steers(tid)

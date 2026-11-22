@@ -66,6 +66,10 @@ fn supports_exclusive(session: &str, generation: u64) -> bool {
     adapter_capabilities(session, generation).is_some_and(|capabilities| offers_exclusive(&capabilities))
 }
 
+pub(crate) fn offers_stop_answer(capabilities: &Value) -> bool {
+    capabilities.pointer("/input/externalInputStopAnswer").and_then(Value::as_u64).is_some_and(|v|v>=1)
+}
+
 /// The adapter's `claude/capabilities` result, cached per runtime generation.
 /// None means the lookup failed, not that a capability was explicitly refused.
 pub(crate) fn adapter_capabilities(session: &str, generation: u64) -> Option<Value> {
@@ -259,8 +263,23 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
         Err(error) => return SubmitOutcome::Unsupported(format!("{error:#}")),
     };
     let views = adapter_capabilities(session, generation).is_some_and(|capabilities| offers_agent_messages_v2(&capabilities));
-    let params = submit_params(&thread_id, session, submission, views);
+    let mut params = submit_params(&thread_id, session, submission, views);
+    let scoped = cutex::asks::store::AskStore::open_default().and_then(|store|
+        store.inspect(|state| cutex::asks::returns::stop_answer_submission(state,session,generation,submission))?);
+    match scoped {
+        Ok(true) => {
+            if !adapter_capabilities(session,generation).is_some_and(|c|offers_stop_answer(&c)) {
+                return SubmitOutcome::Unsupported("stop_answer_unavailable".into());
+            }
+            params["admission"] = json!("stop_answer");
+        },
+        Ok(false) => {},
+        Err(error) => return SubmitOutcome::Busy { reason: format!("{error:#}") },
+    }
     let digest = legacy_digest(&params);
+    if !next_step {
+        super::turn_notes::synchronize_in_lane(session, &thread_id, Some(generation)).attach_to_input(session,&submission.message_id);
+    }
     if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
         return SubmitOutcome::Unsupported(format!("{error:#}"));
     }
@@ -589,6 +608,7 @@ pub(crate) fn interrupt(session: &str, turn_id: &str) -> anyhow::Result<()> {
         handle.request("thread/externalInput/interrupt", params)?;
         return Ok(());
     }
+    super::asks_runtime::revoke_internal_interrupt(session,&thread_id)?;
     handle.request("turn/interrupt", json!({"threadId": thread_id, "turnId": turn_id}))?;
     handle.request("claude/queue/resume", json!({"threadId": thread_id, "acknowledgeUncertainEffects": true}))?;
     Ok(())

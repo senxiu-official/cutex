@@ -660,6 +660,11 @@ pub(crate) fn delete_for_management(
             return Ok(json!({ "cutexSessionId": key, "deleted": false, "notEmptyReason": reason }));
         }
     }
+    // r290 P10 (B7): refuse references before stopFirst can stop this session.
+    let references = references(&key)?;
+    if !references.is_null() {
+        return Err(referenced_error(references));
+    }
     // Busy: a launch in progress or a running turn.
     if let Err(error) = super::management_context::auto_clear_dead_launch_claim(&key) {
         // r271: the claim check only tried the busy host fence (this request
@@ -671,7 +676,8 @@ pub(crate) fn delete_for_management(
     }
     let (_, record) = load(&key)?;
     if record.app_server_launch_claim_id.is_some() {
-        return Err(busy_error("the runtime is being launched; retry when it settled", json!({ "launchInProgress": true })));
+        // r290 P10 (B7): a stopFirst delete waits (bounded) for the launch.
+        return Err(busy_error("the runtime is being launched; retry when it settled", json!({ "launchInProgress": true, "reason": "launchInProgress", "canStopFirst": true })));
     }
     if let Some(turn) = super::app_server_runtime::runtime_manager()
         .status(&key)
@@ -679,14 +685,11 @@ pub(crate) fn delete_for_management(
         .flatten()
         .and_then(|status| status.active_turn_id)
     {
+        // r290 P10 (B7): the owner can retry with `stopFirst: true`.
         return Err(busy_error(
-            "a turn is running; stop it before deleting the session",
-            json!({ "activeTurnId": turn }),
+            "a turn is running; stop it before deleting the session (or delete with stopFirst)",
+            json!({ "activeTurnId": turn, "reason": "activeTurn", "canStopFirst": true }),
         ));
-    }
-    let references = references(&key)?;
-    if !references.is_null() {
-        return Err(referenced_error(references));
     }
 
     let directory = recovery_directory(&key).map_err(|error| failed("creating the recovery directory", error))?;

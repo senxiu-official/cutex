@@ -284,6 +284,9 @@ pub struct GateRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
+    // r290 P6: keyed by native item id, scoped to this attempt's bound turn.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub in_flight_tools: std::collections::BTreeMap<String, String>,
     /// Evidence from this attempt's observed tool/output, never a heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<String>,
@@ -341,6 +344,9 @@ pub enum StopDispatchOutcome { Pending, Claimed, Submitted, Unknown, Unsupported
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttemptRecord {
+    // r290 P7: bounded runtime diagnostic; only terminal failures create a delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_failure: Option<super::handler_failure::HandlerFailure>,
     #[serde(default, skip_serializing_if = "occurrence_zero")]
     pub admission_occurrence: u64,
     /// 1-based; the attempt id is `<askId>#<n>`.
@@ -386,6 +392,12 @@ pub struct AttemptRecord {
     pub stop_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_intent: Option<AttemptStopIntent>,
+    /// Absolute bound from the first stop request; reconnects never renew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_deadline: Option<String>,
+    /// No terminal proof arrived by the deadline. Never resend the interrupt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_unconfirmed: bool,
     pub submitted_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -687,12 +699,33 @@ pub const PROGRESS_KEEP: usize = 5;
 pub struct ProgressNote {
     pub text: String,
     pub at: String,
+    // r290 P6: optional display evidence, never execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<StepProgress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct StepProgress {
+    pub done:u32,
+    pub total:u32,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub current_step:Option<String>,
+}
+impl StepProgress {
+    pub fn validate(&self)->Result<(),super::store::AskError> {
+        if self.done>self.total || self.total>10000 || self.current_step.as_ref().is_some_and(|s|s.chars().count()>300 || s.chars().any(|c|c.is_control() && c!='\n')) {
+            return Err(super::store::AskError::new("invalid_arguments","steps require 0 <= done <= total <= 10000 and currentStep at most 300 characters"));
+        }
+        Ok(())
+    }
 }
 
 impl AttemptRecord {
     /// A new attempt, written before native submission.
     pub fn submitting(n: u32, native_message_id: String, runtime_generation: u64, submitted_at: String) -> Self {
         Self {
+            handler_failure: None,
             n,
             admission_occurrence: 0,
             native_message_id,
@@ -712,6 +745,8 @@ impl AttemptRecord {
             token_usage: None,
             stop_requested: false,
             stop_intent: None,
+            stop_deadline: None,
+            stop_unconfirmed: false,
             submitted_at,
             started_at: None,
             ended_at: None,
@@ -804,6 +839,9 @@ pub struct AskRecord {
     pub target_reverted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<CloseOutcome>,
+    /// Owner ended tracking without asserting the original execution stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follow_up_ended: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<String>,
     pub created_at: String,
@@ -1053,6 +1091,9 @@ pub enum AnswerStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnswerMetadata {
+    // r290 P14: keep the handling turn intact; this is the explicit delivery source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_from: Option<DeliveryProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1078,6 +1119,15 @@ pub struct AnswerMetadata {
     /// may have lost track of the brief.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compacted: bool,
+}
+
+// r290 P14
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryProvenance {
+    pub turn_id: String,
+    pub runtime_generation: u64,
+    pub at: String,
 }
 
 /// An answer revision. A new attempt's answer is a new revision of the ask's
@@ -1205,6 +1255,8 @@ pub struct DeliveryRecord {
     /// `acknowledged` so older releases read the record unchanged. Exception:
     /// `results_outcome_unknown` on Pending/passive durably records a retired
     /// native batch's uncertain member; only explicit retry clears it.
+      /// `nativeHeld:<reason>` on QueuedAsEvent keeps a positively held,
+      /// unread native result for a manual retry, never automatic redelivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<String>,
     /// The session this item actually went to (a wait claimed it or an event
@@ -1260,6 +1312,10 @@ pub struct AdmissionLease {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventOutboxRecord {
+    /// A held Stop-answer may be observed after manual resume, only on this
+    /// original generation. This is bookkeeping outside the frozen envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_runtime_generation: Option<u64>,
     pub event_id: String,
     pub cutex_session_id: String,
     pub delivery_ids: Vec<String>,
@@ -1313,6 +1369,10 @@ pub struct AdmissionPause {
     /// every `ownerStop` pause, and on an explicit pause the owner then stops.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stop_hold: bool,
+    /// Set only by the authenticated owner Stop route, never scoped send or
+    /// raw/internal turn interruptions. Older stored holds default to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_answer_authorized: bool,
     /// Origin `runtimeGate`: the runtime generation whose closed input gate
     /// refused a delivery. A new generation (runtime restart) ends the pause.
     #[serde(default, skip_serializing_if = "Option::is_none")]

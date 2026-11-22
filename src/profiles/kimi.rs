@@ -398,7 +398,12 @@ pub fn models_resource(account: &StoredAccount) -> Value {
         .map(|row| {
             let mut view = super::catalog_api::model_view(row, &snapshot, &[]);
             view["entryDisplayName"] = json!(view["id"].as_str().and_then(|id| account.model_display_names.get(id)));
-            view["effective"]["autoCompactTokenLimitSource"] = json!("notApplicable");
+            // r290 P13: runtime does not support context or compaction overrides.
+            view["effective"] = json!({"contextWindow":null,"contextWindowSource":"unsupported",
+                "autoCompactPercent":null,"autoCompactPercentSource":"unsupported",
+                "autoCompactTokenLimit":null,"autoCompactTokenLimitSource":"unsupported"});
+            view["defaultValues"]=json!({"model":view["effective"],"profile":view["effective"]});
+            view["contextSettings"]=json!({"catalog":{},"owner":{},"preserved":{}});
             view
         })
         .collect::<Vec<_>>();
@@ -415,6 +420,9 @@ pub fn models_resource(account: &StoredAccount) -> Value {
         "catalogSupported":false, "modelVariantsSupported":false, "discoverySupported":false,
         "catalogPath":null, "catalogPresent":false, "selectedModel":selected,
         "modelsSource":{"kind":"kimi"}, "modelsUnavailableReason":unavailable,
+        "modelContextSettingsSupport": super::model_context::support(account),
+        "modelContextSettingsV1Supported":false,"modelContextSettingsV1":false,
+        "profileDefaultValues":{"selectedModel":selected,"selected":rows.iter().find(|row|row["isDefault"]==true).map(|row|row["defaultValues"]["profile"].clone()),"byModel":rows.iter().filter_map(|row|row["id"].as_str().map(|id|(id.to_owned(),row["defaultValues"]["profile"].clone()))).collect::<serde_json::Map<_,_>>()},
         "autoCompactApplies":false, "discovery":null, "models":rows,
         "profileOverrides":{"modelContextWindow":null,"modelAutoCompactTokenLimit":null},
         "unsupportedModelFields":super::catalog_api::UNSUPPORTED_MODEL_FIELDS,

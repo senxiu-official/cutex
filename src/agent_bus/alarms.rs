@@ -168,6 +168,8 @@ fn authenticate_queued_message_at(
     if alarm.state == "scheduled" {
         return Err(AlarmAwaitingQueueCommit.into());
     }
+    ensure!(!message_id.starts_with(super::runtime_gate_notice::MESSAGE_PREFIX)
+        || alarm.owner == super::runtime_gate_notice::OWNER, "invalid gate notice owner");
     ensure!(alarm.state == "queued", "durable alarm is not queued");
     Ok(alarm)
     })().map_err(|error| {
@@ -257,7 +259,9 @@ fn create(
         message: a.message,
         at: due.to_rfc3339(),
         delay_seconds: a.delay_seconds,
-        message_id: if owner == APPROVAL_NOTICE_OWNER {
+        message_id: if owner == super::runtime_gate_notice::OWNER {
+            format!("{}{}", super::runtime_gate_notice::MESSAGE_PREFIX, uuid::Uuid::new_v4())
+        } else if owner == APPROVAL_NOTICE_OWNER {
             safety_id.unwrap_or_else(|| format!("{APPROVAL_NOTICE_MESSAGE_PREFIX}{}", uuid::Uuid::new_v4()))
         } else {
             format!("alarm-{}", uuid::Uuid::new_v4())
@@ -495,6 +499,16 @@ fn tick(
             .collect();
         due.sort_by_cached_key(|a| (timestamp(&a.at).map(|t| t.timestamp_nanos_opt().unwrap_or(i64::MAX)).unwrap_or(i64::MAX), a.message_id.clone()));
         for a in due {
+            match super::runtime_gate_notice::obsolete(a) {
+                Ok(true) => { a.state = "cancelled".into(); continue; }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("warning: runtime gate notice expiry check failed: {error:#}");
+                    a.next_attempt = now.saturating_add(30);
+                    a.last_error = Some(format!("notice expiry check failed: {error:#}").chars().take(2048).collect());
+                    continue;
+                }
+            }
             a.attempts += 1;
             a.last_attempt=DateTime::from_timestamp(now,0).map(|t|t.to_rfc3339());
             match send(a) {
@@ -689,6 +703,53 @@ mod tests {
         assert_eq!(read_all_at(&path).unwrap().len(), 1);
         assert!(set_system_notice_at(&path, to, "x", to, "m", now).is_err(), "a session id is not a system owner");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn broken_gate_notice_does_not_abort_other_due_alarms() {
+        let dir = std::env::temp_dir().join(format!("alarm-broken-notice-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("alarms.json");
+        let now = Utc::now();
+        let to = "cutex.00000000-0000-0000-0000-000000000001";
+        let bad = set_system_notice_at(&path, super::super::runtime_gate_notice::OWNER,
+            "malformed-notice-key", to, "held", now).unwrap();
+        let good = set_system_notice_at(&path, APPROVAL_NOTICE_OWNER,
+            "healthy-approval", to, "continue", now).unwrap();
+        let mut sent = Vec::new();
+        tick(&path, now.timestamp() + 1, |alarm| {
+            sent.push(alarm.message_id.clone());
+            Ok(json!({"id":alarm.message_id,"queued":true}))
+        }).unwrap();
+        assert_eq!(sent, [good.message_id.clone()]);
+        let rows = read_all_at(&path).unwrap();
+        let bad = rows.iter().find(|alarm| alarm.message_id == bad.message_id).unwrap();
+        assert_eq!(bad.state, "scheduled");
+        assert!(bad.next_attempt > now.timestamp() + 1);
+        assert!(bad.receipt.is_none());
+        assert!(bad.last_error.as_ref().unwrap().contains("expiry check failed"));
+        let good = rows.iter().find(|alarm| alarm.message_id == good.message_id).unwrap();
+        assert_eq!(good.state, "queued");
+        assert!(good.receipt.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_gate_notice_is_durable_deduped_and_authenticated() {
+        use super::super::runtime_gate_notice::{OWNER, MESSAGE_PREFIX};
+        let dir = std::env::temp_dir().join(format!("alarm-gate-notice-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("alarms.json");
+        let now = Utc::now();
+        let to = "cutex.00000000-0000-0000-0000-000000000001";
+        let first = set_system_notice_at(&path, OWNER, "source-key", to, "held, needs resume", now).unwrap();
+        let again = set_system_notice_at(&path, OWNER, "source-key", to, "held, needs resume", now).unwrap();
+        assert_eq!(first.message_id, again.message_id);
+        assert!(first.message_id.starts_with(MESSAGE_PREFIX));
+        assert_eq!(read_all_at(&path).unwrap().len(), 1);
+        locked(&path, |rows| { rows.values_mut().next().unwrap().state = "queued".into(); Ok(()) }).unwrap();
+        assert_eq!(authenticate_queued_message_at(&path, &first.message_id, to, "held, needs resume", false).unwrap().owner, OWNER);
+        locked(&path, |rows| { rows.values_mut().next().unwrap().owner = "cutex.other-system".into(); Ok(()) }).unwrap();
+        assert!(authenticate_queued_message_at(&path, &first.message_id, to, "held, needs resume", false).unwrap_err().is::<InvalidAlarmProvenance>());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 023: approval notices get the `alarm-approval-` id (next step on the
