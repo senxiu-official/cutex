@@ -1199,7 +1199,9 @@ impl JobService {
             "launchPending":j.launch_pending,
             "jobId":j.job_id, "actionId":j.request.action_id.chars().take(512).collect::<String>(),
             "sessionId":j.request.subscriber_cutex_session_id, "state":j.state,
-            "terminalReason":j.terminal_reason, "followUpEnded":j.follow_up_ended,
+            // The list exposes a disposition code, never arbitrary terminal diagnostics.
+            "terminalReason":j.terminal_reason.as_deref().filter(|reason| *reason == "followUpEnded"),
+            "followUpEnded":j.follow_up_ended,
             "command":j.request.command_summary.as_deref().map(|c| c.chars().take(crate::model::COMMAND_SUMMARY_MAX_CHARS).collect::<String>()),
             "createdAt":j.created_at_epoch_secs, "updatedAt":j.updated_at_epoch_secs,
             "exitCode":j.exit_code, "cwd":j.request.cwd.chars().take(1024).collect::<String>(),
@@ -1817,8 +1819,26 @@ pub(crate) mod follow_up_tests {
         let closed = service.human_close_follow_up(API, &id, 3, "execution unconfirmed".into()).unwrap();
         assert_eq!(closed.state, JobState::Unconfirmed);
         assert_eq!(closed.revision, 4);
+        assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["terminalReason"], "followUpEnded");
         assert_eq!(service.human_list(API, json!({})).unwrap()["data"][0]["followUpEnded"]["reason"], "execution unconfirmed");
         assert!(service.inner.live.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn human_list_omits_terminal_diagnostics_without_changing_full_record() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, id) = fixture(root.path(), "failed");
+        {
+            let mut state = service.inner.state.lock().unwrap();
+            state.jobs.get_mut(&id).unwrap().terminal_reason = Some("SECRET_SENTINEL".into());
+            service.inner.store.save(&mut state).unwrap();
+        }
+        let before = std::fs::read(root.path().join("state.json")).unwrap();
+        let page = service.human_list(API, json!({})).unwrap();
+        assert!(page["data"][0]["terminalReason"].is_null());
+        assert!(!page.to_string().contains("SECRET_SENTINEL"));
+        assert_eq!(service.query(API, &id).unwrap().terminal_reason.as_deref(), Some("SECRET_SENTINEL"));
+        assert_eq!(std::fs::read(root.path().join("state.json")).unwrap(), before);
     }
 
     #[test]

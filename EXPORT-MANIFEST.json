@@ -1554,8 +1554,8 @@
     },
     {
       "path": "components/job-service/README.md",
-      "sha256": "1cff94eaafea6b4249fcaef085a9a9a5069a67d596a1d25ea9eab41919a75a3c",
-      "size": 4562
+      "sha256": "a5f28572f502ce5c822205649a183cc4bc3d950029b8b9fdab5e33997e5860c0",
+      "size": 4701
     },
     {
       "path": "components/job-service/build.sh",
@@ -1619,8 +1619,8 @@
     },
     {
       "path": "components/job-service/src/service.rs",
-      "sha256": "bb474ff5fa6433d028ad407300ae05ceecc89470db0940c14eedb2b53f3e0701",
-      "size": 79229
+      "sha256": "ac45cf419351022ccd0a3d7dffc67e1abceab6bc97a48ed780932b3265a0e1ea",
+      "size": 80399
     },
     {
       "path": "components/job-service/src/store.rs",
@@ -1634,8 +1634,8 @@
     },
     {
       "path": "components/job-service/tests/core.rs",
-      "sha256": "ed8e1652aba530b47a742b028daad24794c7634b201fb4e862462fe8bc310bca",
-      "size": 39218
+      "sha256": "b0c26e2baa4fea6b9c8eeb65a3481cdc3e495e55f669c56011653375a380e5ea",
+      "size": 39244
     },
     {
       "path": "components/job-service/tests/external.rs",

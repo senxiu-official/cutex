@@ -40,7 +40,9 @@ The capability is `humanOperations: closeFollowUp`; the private socket method is
 `humanCloseFollowUp`. Agents have no corresponding MCP tool.
 
 The root-only socket `humanQuery {jobId}` returns the full record without changing
-state. The await reconciler checks its subscriber session before using it. A close
+state. List rows expose only the stable `followUpEnded` terminal reason code;
+arbitrary terminal diagnostic text remains in `humanQuery` details. The await
+reconciler checks its subscriber session before using it. A close
 socket response also carries a per-call `followUpCommitted` boolean: true only for
 the newly persisted disposition, false on replay or an existing terminal outcome.
 The Management bridge removes this transient receipt flag and invokes the await

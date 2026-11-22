@@ -648,7 +648,7 @@ fn private_unix_protocol_requires_peer_token() {
     let caps = raw(API, "capabilities", json!({}));
     assert_eq!(
         caps["result"]["humanOperations"],
-        json!(["list", "cancel", "readOutput", "markExternal"])
+        json!(["list", "query", "cancel", "readOutput", "markExternal", "closeFollowUp"])
     );
     // Human operations take the root token only: no caller grant.
     let cancel = json!({"jobId":"missing","expectedRevision":1});
