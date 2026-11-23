@@ -373,7 +373,7 @@ mod permission_alias_tests {
     }
 
     #[test]
-    fn tethys_record_repairs_to_explicit_sandbox() {
+    fn linked_host_record_repairs_to_explicit_sandbox() {
         // cutex.01a1141b: full access chosen from the desktop while running.
         let mut r = record(Some("workspace-write"), Some("danger-full-access"));
         r.approval_policy = Some("never".into());

@@ -2027,7 +2027,7 @@ mod tests {
         assert!(frames_for(&context, &claude_event("turn/started", serde_json::json!({"threadId": "root", "turn": {"id": "t"}}))).is_empty());
     }
 
-    /// r247 hachimi (r23-live-check): the adapter's `claude/*` frames reach the
+    /// r247 secondary (r23-live-check): the adapter's `claude/*` frames reach the
     /// observer once it asks for `claudeExtensions`. Only a bound-thread
     /// `claude/task/updated` with `notifyParent` becomes a notice; every other
     /// `claude/*` frame (a subagent-owned command's `turnId: null` included) is
@@ -2040,7 +2040,7 @@ mod tests {
             full_text_item_terminal: false, launched_profile: None, launched_profile_id: None, usage: Default::default(),
             schema: cutex::app_server::journal::AppServerSchemaIdentity { version: "0.3.0+cutex".into(), sha256: "a".repeat(64) },
         };
-        // Recorded on hachimi (adapter events seq 39 and 75), ids shortened.
+        // Recorded on secondary (adapter events seq 39 and 75), ids shortened.
         let subagent_command = serde_json::json!({"threadId": "a43c4add", "task": {"description": "Print eight steps",
             "ownedBySubagent": true, "status": "running", "taskId": "bvvxedjjm", "taskType": "local_bash",
             "toolUseId": "toolu_01Dn", "turnId": null}});

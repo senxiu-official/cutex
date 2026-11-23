@@ -211,7 +211,7 @@ the ones that arrive later after its next tool call. Codex consumes passive Exte
 turn's first input boundary (after the turn's own input). Claude reads them when the adapter claims
 the turn (`Store.claim`); before claude-r21 an owner-started turn skipped them, so they waited for
 its first tool call (PostToolUse) or the next turn, and a turn without tool calls never saw them
-(hachimi 2026-10-19). The owner's wake (`cutex/agentBus/wake`, the desktop's 唤醒 on pending notes)
+(observed 2026-10-19). The owner's wake (`cutex/agentBus/wake`, the desktop's 唤醒 on pending notes)
 is an owner input, `strategy: auto` (also while busy since 023: read at the next step like typed
 input; owner-notify replies likewise), so the turn it starts reads every pending
 note that has reached the inbox at its start; `pendingNotes` in its result is cutex's count. Each

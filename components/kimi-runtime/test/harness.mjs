@@ -13,7 +13,7 @@ import { startMock } from './mock-llm.mjs';
 
 /** The pinned Kimi Code npm tree (`runtime/` of the component, or a private install). */
 export const install = process.env.KIMI_PRODUCT_INSTALL
-  ?? (existsSync('/home/ema/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs') ? '/home/ema/cutex-dev/ext/kimi-code-install' : null);
+  ?? (existsSync('/home/user/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs') ? '/home/user/cutex-dev/ext/kimi-code-install' : null);
 export const kimiMain = install ? join(install, 'node_modules/@moonshot-ai/kimi-code/dist/main.mjs') : null;
 export const delay = ms => new Promise(done => setTimeout(done, ms));
 

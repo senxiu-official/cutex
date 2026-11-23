@@ -119,7 +119,7 @@ WAKE_TEXT = 'Read and handle the unread notes other agents left for you.'
 
 
 async def test_owner_wake_reads_pending_notes_in_its_first_input(ph):
-    """hachimi 2026-10-19: the owner's 唤醒 (cutex/agentBus/wake) started a turn
+    """secondary 2026-10-19: the owner's 唤醒 (cutex/agentBus/wake) started a turn
     whose first request lacked the notes; they came only after the first tool call
     (PostToolUse), and a turn without tools never saw them."""
     tid = await ph.thread()

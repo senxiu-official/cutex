@@ -9,15 +9,15 @@
 #
 #   tests/r266-kimi-refresh-race.sh
 #
-# Environment: R266_RACE_DIR (default /home/ema/cutex-dev/scratch-k2/race, recreated),
+# Environment: R266_RACE_DIR (default /home/user/cutex-dev/scratch-k2/race, recreated),
 # R266_OAUTH_PORT (35881), R266_NODE, R266_KIMI_MAIN (as in r266-kimi-accounts-smoke.sh).
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-dir="${R266_RACE_DIR:-/home/ema/cutex-dev/scratch-k2/race}"
+dir="${R266_RACE_DIR:-/home/user/cutex-dev/scratch-k2/race}"
 port="${R266_OAUTH_PORT:-35881}"
-node="${R266_NODE:-/home/ema/cutex-dev/tools/node24/bin/node}"
-kimi_main="${R266_KIMI_MAIN:-/home/ema/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs}"
+node="${R266_NODE:-/home/user/cutex-dev/tools/node24/bin/node}"
+kimi_main="${R266_KIMI_MAIN:-/home/user/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs}"
 agents="${R266_RACE_AGENTS:-4}"
 
 die() { echo "r266-race: FAIL: $*" >&2; exit 1; }

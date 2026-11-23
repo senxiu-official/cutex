@@ -7,22 +7,22 @@
 #   tests/r266-kimi-accounts-smoke.sh
 #
 # Environment (defaults):
-#   R266_SMOKE_HOME  /home/ema/cutex-dev/scratch-k2/smoke-home (recreated, marked)
+#   R266_SMOKE_HOME  /home/user/cutex-dev/scratch-k2/smoke-home (recreated, marked)
 #   R266_MGMT_PORT   35870      R266_BUS_PORT 35860      R266_OAUTH_PORT 35880
 #   CUTEX_BIN        <repo>/target/debug/cutex
-#   R266_NODE        /home/ema/cutex-dev/tools/node24/bin/node
-#   R266_KIMI_MAIN   /home/ema/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs
+#   R266_NODE        /home/user/cutex-dev/tools/node24/bin/node
+#   R266_KIMI_MAIN   /home/user/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs
 # Exit 0 = every check passed. Every process started here is stopped on exit.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-home="${R266_SMOKE_HOME:-/home/ema/cutex-dev/scratch-k2/smoke-home}"
+home="${R266_SMOKE_HOME:-/home/user/cutex-dev/scratch-k2/smoke-home}"
 mgmt_port="${R266_MGMT_PORT:-35870}"
 bus_port="${R266_BUS_PORT:-35860}"
 oauth_port="${R266_OAUTH_PORT:-35880}"
 bin="${CUTEX_BIN:-$repo/target/debug/cutex}"
-node="${R266_NODE:-/home/ema/cutex-dev/tools/node24/bin/node}"
-kimi_main="${R266_KIMI_MAIN:-/home/ema/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs}"
+node="${R266_NODE:-/home/user/cutex-dev/tools/node24/bin/node}"
+kimi_main="${R266_KIMI_MAIN:-/home/user/cutex-dev/ext/kimi-code-install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs}"
 fake="$repo/tests/fixtures/fake-kimi-oauth.mjs"
 
 die() { echo "r266-smoke: FAIL: $*" >&2; exit 1; }

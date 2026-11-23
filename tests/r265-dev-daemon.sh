@@ -9,20 +9,20 @@
 #   tests/r265-dev-daemon.sh stop      (same as tests/r265-dev-daemon-stop.sh)
 #
 # Environment (defaults):
-#   R265_DEV_HOME   /home/ema/cutex-dev/r265-devhome   (created with a .cutex-test-private-home marker)
+#   R265_DEV_HOME   /home/user/cutex-dev/r265-devhome   (created with a .cutex-test-private-home marker)
 #   R265_MGMT_PORT  34970          R265_BUS_PORT 34960
 #   CUTEX_BIN       <repo>/target/debug/cutex (run `cargo build --locked` first)
-#   R265_NODE_BIN   /home/ema/cutex-dev/tools/node24/bin  (Node >= 24.9 for DSH)
+#   R265_NODE_BIN   /home/user/cutex-dev/tools/node24/bin  (Node >= 24.9 for DSH)
 #   R265_DSH_SOURCE <repo>  (a tree with .dsh-install: DSH 0.2.1-rc.3 node_modules)
 # No provider key is configured here: add a Profile (and its key) in the desktop.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-home="${R265_DEV_HOME:-/home/ema/cutex-dev/r265-devhome}"
+home="${R265_DEV_HOME:-/home/user/cutex-dev/r265-devhome}"
 mgmt_port="${R265_MGMT_PORT:-34970}"
 bus_port="${R265_BUS_PORT:-34960}"
 bin="${CUTEX_BIN:-$repo/target/debug/cutex}"
-node_bin="${R265_NODE_BIN:-/home/ema/cutex-dev/tools/node24/bin}"
+node_bin="${R265_NODE_BIN:-/home/user/cutex-dev/tools/node24/bin}"
 dsh_source="${R265_DSH_SOURCE:-$repo}"
 marker="$home/.cutex-test-private-home"
 pids="$home/daemon.pids"

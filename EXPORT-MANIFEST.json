@@ -1,7 +1,7 @@
 {
   "project": "cutex",
   "version": "0.2.5",
-  "exportDate": "2026-11-22",
+  "exportDate": "2026-11-23",
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
@@ -749,8 +749,8 @@
     },
     {
       "path": "components/claude-runtime/tests/test_agent_messages.py",
-      "sha256": "c1f03c89c1d1cec01a8accc246b306841013e3d3a643ed60a1a5d25e9b06730e",
-      "size": 11479
+      "sha256": "eaeaa051d5ac3f27de3675792ab770d93f774c5e0d61d04e9123f88834e9bb9e",
+      "size": 11481
     },
     {
       "path": "components/claude-runtime/tests/test_api_key_tool_env.py",
@@ -789,8 +789,8 @@
     },
     {
       "path": "components/claude-runtime/tests/test_busy_delivery_native.py",
-      "sha256": "d014ad70a1de00d1fb32b117c29b4a5ea11f97892b90d5014ae7425762ecdcef",
-      "size": 14245
+      "sha256": "f6e0b4122bb93032c1c7fa5a470fa0318b344333d65bda98c49b8732bec0b7d8",
+      "size": 14247
     },
     {
       "path": "components/claude-runtime/tests/test_cache_ttl_usage.py",
@@ -1769,8 +1769,8 @@
     },
     {
       "path": "components/kimi-runtime/test/harness.mjs",
-      "sha256": "621f5e65595270d2b2397b1bea6bf3d945b235e94ed7c27a540a41fdeebeba36",
-      "size": 8093
+      "sha256": "d2e20da9e77e234b5873e7fe33b8e56a2b6c7fa67f26cf150fc5344274cc64e9",
+      "size": 8095
     },
     {
       "path": "components/kimi-runtime/test/mock-llm.mjs",
@@ -1969,8 +1969,8 @@
     },
     {
       "path": "docs/management/user-input-delivery.md",
-      "sha256": "b7ca1b58a325fc4a0eece62a57129c2b6626ac7d9d6e8958bcee010d5f9881d1",
-      "size": 20785
+      "sha256": "feb9cc7f9132a5ace525659ff8bd749d009f142dfffcc1df31505b65acd7bb8d",
+      "size": 20786
     },
     {
       "path": "docs/profile-model-configurations.md",
@@ -2689,8 +2689,8 @@
     },
     {
       "path": "src/app_server/manager.rs",
-      "sha256": "9aafca9c0219ba635454acc75f8bf4dea023af7218b0dba4dc8aa377b13c4daf",
-      "size": 177587
+      "sha256": "a30da07169f703341679aea998d2489ded0c1efcab65dd6a7b28afee2ba4a305",
+      "size": 177589
     },
     {
       "path": "src/app_server/mod.rs",
@@ -3659,8 +3659,8 @@
     },
     {
       "path": "src/cli_app/claude_runtime.rs",
-      "sha256": "da37aa8bdb6c0046aaf3762d6aaa7407a2e32d5c7242bece39bec96a457b417a",
-      "size": 164312
+      "sha256": "9d3fedeb92ec76638d59cbb40a5280c610e457acbfed0e75ddd0842b35893dec",
+      "size": 164316
     },
     {
       "path": "src/cli_app/claude_settlement.rs",
@@ -7444,8 +7444,8 @@
     },
     {
       "path": "src/runtime/args.rs",
-      "sha256": "2d09626cf00346d1483ee0b4e065670a7bf0d1c8bb11bd6967a0967b7313e6f3",
-      "size": 16566
+      "sha256": "69c0bc8bdd50afa332c3dd2896901af42ffd1e8d1f3f8a022dc7b31c2c214678",
+      "size": 16571
     },
     {
       "path": "src/runtime/claude/code_sources.rs",
@@ -8364,18 +8364,18 @@
     },
     {
       "path": "tests/r265-dev-daemon.sh",
-      "sha256": "cbcdd88115f7b0720650ec1841b833abe4180509633199180807eb4152cf07ca",
-      "size": 7285
+      "sha256": "38245bf35ad2d55a8848abad4fa06b754bbfa2d63ea6ccf9fdde8aeef9846e9b",
+      "size": 7289
     },
     {
       "path": "tests/r266-kimi-accounts-smoke.sh",
-      "sha256": "6836832a79ad5de1a1eafec65da848ae708dff463185939b2d4905c7a8042bfc",
-      "size": 11206
+      "sha256": "0867b5eeda68d983995fa92e67756d46100b75f3b21ad97688b93a0144c2ed35",
+      "size": 11212
     },
     {
       "path": "tests/r266-kimi-refresh-race.sh",
-      "sha256": "6d24fd7c4a61337e0547b69690e9a30b8cd92187a26513596ef2780aff756590",
-      "size": 7364
+      "sha256": "9c1c5d0c98d2135b854db59a04ceb2cd3e20283979b7bc97aa74f31033619a7c",
+      "size": 7368
     },
     {
       "path": "tests/selected_profile_private.rs",

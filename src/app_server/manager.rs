@@ -3720,7 +3720,7 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
-    /// Deployed topology of a Claude runtime (r247 hachimi, r23-live-check):
+    /// Deployed topology of a Claude runtime (r247 secondary, r23-live-check):
     /// the Agent Bus launched and observes the adapter, Management observes it
     /// too, one of them owns each event. The fake adapter filters like
     /// cute_claude `Engine.broadcast`: `claude/*` only to a peer that sent

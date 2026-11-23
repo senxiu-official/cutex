@@ -137,7 +137,7 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
 @pytest.mark.parametrize('owner_carry', [False, True])
 async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, monkeypatch, owner_carry):
     """A pending note is in an owner turn's first model request (owner's 唤醒,
-    hachimi 2026-10-19), even without tool calls; Claude Code expands the owner's
+    secondary 2026-10-19), even without tool calls; Claude Code expands the owner's
     @path mention but not one in the note (an earlier text block)."""
     for name in CONFLICTING_ENV:
         monkeypatch.delenv(name, raising=False)
