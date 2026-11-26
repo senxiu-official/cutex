@@ -380,6 +380,9 @@ jobs:
               subprocess.run(["git", "merge-base", "--is-ancestor", commit, ci_commit], check=True)
           for path in (".github/workflows/sign-release.yml", ".github/ci/sign-and-upload.sh", ".github/ci/cutex-release.pub"):
               subprocess.run(["git", "diff", "--exit-code", sign_commit, ci_commit, "--", path], check=True)
+          # The retained receipts must be the policy used by the pinned product build.
+          subprocess.run(["git", "diff", "--exit-code", product_commit, ci_commit, "--",
+                          ".github/ci/fetch-retained-components.py"], check=True)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
               output.write("FORMAL_PRODUCT_COMMIT=" + product_commit + "\n")
           print("Reviewed CI workflow:", ci_commit, "Product source:", product_commit)
@@ -405,30 +408,23 @@ jobs:
           run-id: ${{ inputs.sign_run }}
           name: sign-release-${{ inputs.sign_run }}
           path: ${{ runner.temp }}/formal-sign
-      - name: Validate product BUILD-INFO independently of CI head
+      - name: Validate product builds and original retained component provenance
         env:
           TO_RELEASE: ${{ inputs.to_release }}
         run: |
           set -euo pipefail
           "$E2E_PYTHON" - <<'PY'
-          import json, os, subprocess
+          import importlib.util, os, sys
           from pathlib import Path
-          product_commit = os.environ["FORMAL_PRODUCT_COMMIT"]
-          root = Path(os.environ["RUNNER_TEMP"]) / "formal-build"
-          records = sorted(root.rglob("BUILD-INFO-*.json"))
-          if not records:
-              raise SystemExit("Missing product BUILD-INFO")
-          core_platforms = set()
-          for path in records:
-              info = json.loads(path.read_text(encoding="utf-8"))
-              if info.get("commit") != product_commit:
-                  raise SystemExit("BUILD-INFO does not match product source: " + path.name)
-              if not path.name.startswith("BUILD-INFO-component-"):
-                  if info.get("release") != os.environ["TO_RELEASE"]:
-                      raise SystemExit("BUILD-INFO release label mismatch")
-                  core_platforms.add(info.get("platform"))
-          if core_platforms != {"linux-x64", "windows-x64"}:
-              raise SystemExit("Both product platform BUILD-INFO records are required")
+          spec = importlib.util.spec_from_file_location("formal_upgrade", ".github/ci/upgrade-e2e.py")
+          helper = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = helper
+          spec.loader.exec_module(helper)
+          root = Path(os.environ["RUNNER_TEMP"])
+          helper.formal_build_provenance(
+              root / "formal-build", root / "formal-sign", Path(".github/ci/cutex-release.pub"),
+              os.environ["FORMAL_PRODUCT_COMMIT"], os.environ["TO_RELEASE"],
+          )
           PY
       - name: Retained canonical unpublished native archives
         if: inputs.native_build_run != ''

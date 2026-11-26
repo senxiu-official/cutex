@@ -1362,6 +1362,51 @@ def verify_formal_artifact(path: Path, artifact: dict) -> None:
     require(ce.sha256(path) == artifact.get("sha256"), f"signed artifact hash mismatch: {path.name}")
 
 
+def formal_build_provenance(build: Path, signed: Path, key: Path, commit: str, release: str) -> None:
+    manifest = unique_asset("manifest.json", [signed])
+    verify_minisign(manifest, key)
+    doc = json.loads(manifest.read_text(encoding="utf-8"))
+    require(doc.get("schema") == "cutex/release-manifest/v1" and doc.get("channel") == "release"
+            and doc["cutex"]["commit"] == commit and doc["cutex"]["release"] == release,
+            "signed target manifest does not match the requested product")
+
+    retained = build / "retained-components"
+    expected_records = set()
+    policy = "fetch-retained-components.py"
+    if (HERE / policy).is_file():
+        for name, version, platforms, source, digest, size, signatures in _load("retained_components", policy).PACKAGES:
+            tag = f"component-{name}-{version}"
+            component = doc.get("components", {}).get(name, {})
+            require(component.get("version") == version, f"signed retained component version mismatch: {name}")
+            for platform, signature_digest in zip(platforms, signatures, strict=True):
+                dest = retained / f"{name}-{platform}"
+                record = dest / f"BUILD-INFO-component-{name}-{platform}.json"
+                expected_records.add(record)
+                info = json.loads(record.read_text(encoding="utf-8"))
+                require((info.get("name"), info.get("version"), info.get("platform"), info.get("commit"))
+                        == (name, version, platform, source), f"retained BUILD-INFO mismatch: {record}")
+                asset = dest / f"{tag}-{platform}.tar.gz"
+                artifact = component.get("artifacts", {}).get(platform, {})
+                require((artifact.get("tag"), artifact.get("sha256"), artifact.get("size")) == (tag, digest, size),
+                        f"signed retained asset differs from its original receipt: {asset.name}")
+                verify_formal_artifact(asset, artifact)
+                signature = asset.with_suffix(".gz.minisig")
+                require(ce.sha256(signature) == signature_digest, f"original signature mismatch: {asset.name}")
+                verify_minisign(asset, key)
+    require(set(retained.rglob("BUILD-INFO-*.json")) == expected_records, "unexpected retained BUILD-INFO")
+
+    core_platforms = set()
+    for path in sorted(set(build.rglob("BUILD-INFO-*.json")) - expected_records):
+        info = json.loads(path.read_text(encoding="utf-8"))
+        require(info.get("commit") == commit, f"BUILD-INFO does not match product source: {path.name}")
+        if not path.name.startswith("BUILD-INFO-component-"):
+            platform = info.get("platform")
+            require(info.get("release") == release and platform not in core_platforms,
+                    f"unexpected product BUILD-INFO: {path}")
+            core_platforms.add(platform)
+    require(core_platforms == {"linux-x64", "windows-x64"}, "both product platform BUILD-INFO records are required")
+
+
 def formal_native_build_provenance(run: dict, product_commit: str, workflow_commit: str = "") -> None:
     """Pin the reviewed build workflow independently from the signed payload source commit."""
     expected = workflow_commit or product_commit
