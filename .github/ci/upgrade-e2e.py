@@ -2060,9 +2060,20 @@ def execute_formal_cases(args: argparse.Namespace, docs: dict) -> dict:
             "failure cases require the exact public 0.2.5 -> 0.2.6 one-way transition")
     result = None
     faults = []
-    for case in ("success", "before-swap", "after-swap"):
+    # A stopped service can leave connections in TIME_WAIT. Give each fixture
+    # distinct ports so the next case need not wait for kernel socket expiry.
+    last = max(args.management_port, args.bus_port)
+    extra = range(last + 1, last + 5)
+    require(extra[-1] <= 65535 and FORMAL_RESERVED_PORTS.isdisjoint(extra),
+            "formal cases require four additional non-reserved ports")
+    cases = (("success", args.management_port, args.bus_port),
+             ("before-swap", extra[0], extra[1]),
+             ("after-swap", extra[2], extra[3]))
+    for case, management, bus in cases:
         case_args = argparse.Namespace(**vars(args))
         case_args.work = args.work / case
+        case_args.management_port = management
+        case_args.bus_port = bus
         home = formal_runner_home(case_args)
         case_args.work.mkdir()
         host = FormalHost(case_args, home)
