@@ -13,7 +13,6 @@ pub fn lock() -> anyhow::Result<OperationReservation<'static>> {
         .lock()
         .map_err(|_| anyhow::anyhow!("management v2 session mutation lock poisoned"))
 }
-#[cfg(test)]
 pub(crate) fn try_lock_for_cleanup() -> anyhow::Result<OperationReservation<'static>> {
     MANAGEMENT_V2_SESSION_MUTATION_LOCK
         .get_or_init(OperationLane::new)

@@ -238,14 +238,15 @@ mod tests {
                 ask.closed = Some(CloseOutcome::Completed);
                 ask.execution = ExecutionState::Answered;
             });
-            assert_eq!(state.deliveries.len(), 1, "closure records its revision outcome atomically");
+            assert_eq!(state.deliveries.values().filter(|d|d.ref_id.starts_with("revisionUnacknowledged:")).count(),1,
+                "closure records its revision outcome atomically");
             id
         }).unwrap();
         reconcile(&world, &store, now).unwrap();
         reconcile(&world, &store, now).unwrap();
         let state = store.shared().unwrap();
-        assert_eq!(state.deliveries.len(), 1);
-        let delivery = state.deliveries.values().next().unwrap();
+        assert_eq!(state.deliveries.len(), 2,"revision outcome plus terminal state");
+        let delivery = state.deliveries.values().find(|d|d.ref_id.starts_with("revisionUnacknowledged:")).unwrap();
         assert_eq!(delivery.ref_id, "revisionUnacknowledged:v2");
         assert_eq!(delivery.requester_cutex_session_id, REQUESTER);
         assert!(!delivery.passive);
@@ -258,7 +259,7 @@ mod tests {
         drop(store);
         let reopened = AskStore::at(&dir);
         reconcile(&world, &reopened, now).unwrap();
-        assert_eq!(reopened.shared().unwrap().deliveries.len(), 1, "outcome deduplication survives a store reopen");
+        assert_eq!(reopened.shared().unwrap().deliveries.len(), 2, "outcome deduplication survives a store reopen");
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
         if world_dir.exists() { std::fs::remove_dir_all(world_dir).unwrap(); }

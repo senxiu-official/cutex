@@ -1566,6 +1566,11 @@ impl AgentLifecycle for CutexAgentLifecycle {
         record.sandbox_mode = Some(spec.sandbox_mode.clone());
         record.model_defaults = Some(spec.model.clone());
         record.reasoning_defaults = Some(spec.reasoning.clone());
+        if record.runtime_backend == CutexSessionRuntimeBackend::Host && record.reasoning_resolution.is_none() {
+            if let Ok(configuration) = cutex::launch::stock::local_bootstrap_configuration(spec) {
+                record.reasoning_resolution = configuration.reasoning_resolution;
+            }
+        }
         record
             .bump_durable_revision()
             .map_err(definite("session_revision_failed"))?;

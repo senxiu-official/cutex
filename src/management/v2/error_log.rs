@@ -15,7 +15,10 @@ impl Drop for Scope {fn drop(&mut self){REQUEST.with(|r|*r.borrow_mut()=self.0.t
 pub fn scope(request:&crate::http::server::SimpleHttpRequest)->Scope {
     // This endpoint carries the owner's linking secret. Even malformed
     // requests must never copy body values into diagnostic identifier fields.
-    let body:Value=if request.path.split('?').next()==Some(super::profile_link::SECRET_PATH) || crate::pan::api::is_path(request.path.split('?').next().unwrap_or("")) {
+    let path = request.path.split('?').next().unwrap_or("");
+    let body:Value=if matches!(path, super::profile_link::SECRET_PATH | super::text_rewrite::PATH)
+        || super::feature_profiles::is_path(path) || crate::pan::api::is_path(path)
+        || super::service_notifications::parse_route(path).is_some() {
         Value::Null
     } else {serde_json::from_slice(&request.body).unwrap_or(Value::Null)};
     let mut ids=serde_json::Map::new();

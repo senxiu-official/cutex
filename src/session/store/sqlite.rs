@@ -215,6 +215,14 @@ pub(super) static POOLED_TEST_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new()
 fn pooled(db: &Path) -> bool {
     #[cfg(test)]
     {
+        // A dedicated subprocess can exercise normal pooling for its private
+        // scratch root, including database paths generated inside the check.
+        if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_none()
+            && std::env::var_os("CUTEX_TEST_SESSION_POOL_ROOT")
+                .is_some_and(|root| db.starts_with(Path::new(&root)))
+        {
+            return true;
+        }
         POOLED_TEST_PATHS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -587,6 +595,11 @@ fn write_sessions(
         }
         let json = serde_json::to_string(record)
             .with_context(|| format!("failed to serialize cutex session {key}"))?;
+        if let Some(profile) = record.profile.as_deref().filter(|profile| {
+            before.sessions.get(key).and_then(|before| before.profile.as_deref()) != Some(*profile)
+        }) {
+            crate::management::v2::feature_profiles::require_agent_id(profile)?;
+        }
         name_ledger::validate_session_change(connection,before.sessions.get(key),record)?;
         upsert.execute(params![
             key,
@@ -843,6 +856,11 @@ fn write_touched_sessions(
                 } else {
                     serde_json::to_string(record).with_context(|| format!("failed to serialize cutex session {key}"))?
                 };
+                if let Some(profile) = record.profile.as_deref().filter(|profile| {
+                    base.sessions.get(key).and_then(|before| before.profile.as_deref()) != Some(*profile)
+                }) {
+                    crate::management::v2::feature_profiles::require_agent_id(profile)?;
+                }
                 name_ledger::validate_session_change(connection,base.sessions.get(key),record)?;
                 upsert.execute(params![
                     key,

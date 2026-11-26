@@ -55,6 +55,52 @@ struct Model {
     description: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHandshake {
+    #[serde(default)]
+    pub native_connection_generation: Option<u64>,
+    pub resolved_models: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub resolved_model_display: std::collections::BTreeMap<String, ResolvedModelDisplay>,
+    pub supported_effort_levels: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModelDisplay {
+    pub resolved_display_name: String,
+    pub resolved_display_version: Option<String>,
+}
+
+impl ModelHandshake {
+    pub(crate) fn from_runtime_status(status: &serde_json::Value) -> Option<Self> {
+        let value = status.get("modelResolution")?;
+        if value["source"] != "sdkHandshake" {
+            return None;
+        }
+        let mut handshake: Self = serde_json::from_value(value.clone()).ok()?;
+        handshake.native_connection_generation = status["nativeConnectionGeneration"].as_u64();
+        let valid = |id: &str| !id.is_empty() && id.len() <= 200 && !id.chars().any(|c| c.is_whitespace() || c.is_control());
+        if handshake.resolved_models.len() > 128 || handshake.supported_effort_levels.len() > 128
+            || handshake.resolved_model_display.len() > 128 {
+            return None;
+        }
+        handshake.resolved_models.retain(|alias, target| valid(alias) && valid(target));
+        handshake.supported_effort_levels.retain(|id, levels| valid(id) && levels.len() <= 5
+            && levels.iter().all(|value| super::native_models::CLAUDE_EFFORTS.contains(&value.as_str())));
+        let label = |value: &str, max: usize| {
+            !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+        };
+        handshake.resolved_model_display.retain(|id, display| {
+            valid(id) && handshake.resolved_models.values().any(|target| target == id)
+                && label(&display.resolved_display_name, 200)
+                && display.resolved_display_version.as_ref().is_none_or(|v| label(v, 32))
+        });
+        Some(handshake)
+    }
+}
+
 fn version(value: &str) -> Option<[u64; 3]> {
     let parts: Vec<_> = value.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
@@ -102,7 +148,66 @@ pub fn for_profile(account: &StoredAccount, selected: Option<&str>) -> NativeMod
         Ok(deployment) => deployment,
         Err(_) => return fallback(selected, account_id, None, CatalogError("claude_deployment_unavailable")),
     };
-    from_deployment(&deployment, account_id, selected)
+    let mut models = from_deployment(&deployment, account_id, selected);
+    let Ok(path) = crate::session::store::cutex_sessions_path() else { return models };
+    let home = if account_id == "default" { Some(deployment.claude_home.clone()) }
+        else { crate::runtime::claude_accounts::account_home(account_id).ok() };
+    let host = crate::platform::host::current_host_name();
+    let matching_handshake = |record: &crate::session::model::CutexSessionRecord| {
+        let session = record.claude_session.as_ref()?;
+        let exact_profile = record.profile.as_deref().is_some_and(|name| name == account.name || name == account.id);
+        let same_release = session.deployment.adapter_source == deployment.adapter_source
+            && session.deployment.claude_cli == deployment.claude_cli;
+        (exact_profile && same_release && home.as_ref() == Some(&session.deployment.claude_home)
+            && record.host_id == host && session.connection_id.is_some())
+            .then_some(record.claude_model_handshake.as_ref()).flatten()
+            .filter(|_| record.runtime_pid.is_some_and(|pid|
+                crate::platform::process::process_liveness(pid) == Some(true)))
+            .cloned()
+    };
+    let mut handshakes = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = match crate::session::store::session_page_at(
+            &path, false, cursor.as_deref(), crate::store::PageBudget::LIST_DEFAULT,
+        ) {
+            Ok(Some(page)) => page,
+            Ok(None) => break,
+            Err(_) => return models,
+        };
+        handshakes.extend(page.rows.iter().filter_map(|row| matching_handshake(row)));
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let handshakes = handshakes.iter().collect::<Vec<_>>();
+    add_handshake_resolution(&mut models.rows, &handshakes);
+    models
+}
+
+fn add_handshake_resolution(rows: &mut [serde_json::Value], handshakes: &[&ModelHandshake]) {
+    for row in rows {
+        let Some(id) = row["slug"].as_str() else { continue };
+        let mut targets = handshakes.iter().filter_map(|handshake| handshake.resolved_models.get(id));
+        let target = targets.next().filter(|target| targets.all(|other| other == *target));
+        let mut levels = handshakes.iter().filter_map(|sdk| sdk.supported_effort_levels.get(id));
+        let supported = levels.next().filter(|first| levels.all(|other| other == *first));
+        if let Some(target) = target {
+            row["resolvedModel"] = json!(target);
+            row["resolvedModelSource"] = json!("sdkHandshake");
+            let mut displays = handshakes.iter().filter_map(|sdk| sdk.resolved_model_display.get(target));
+            if let Some(display) = displays.next().filter(|first| displays.all(|other| other == *first)) {
+                row["resolvedDisplayName"] = json!(display.resolved_display_name);
+                row["resolvedDisplayVersion"] = json!(display.resolved_display_version);
+            }
+        }
+        if let Some(supported) = supported {
+            row["supported_reasoning_levels"] = json!(supported.iter().map(|effort| json!({ "effort": effort })).collect::<Vec<_>>());
+            row["effortSupportKnown"] = json!(true);
+            row["effortSupportSource"] = json!("sdkHandshake");
+        }
+    }
 }
 
 fn fallback(selected: Option<&str>, account_id: &str, path: Option<&Path>, error: CatalogError) -> NativeModels {
@@ -111,6 +216,42 @@ fn fallback(selected: Option<&str>, account_id: &str, path: Option<&Path>, error
         "accountId": account_id, "accountAvailability": "unknown", "catalogPath": path,
         "cliVersion": null, "versionConstraints": [], "fallbackReason": error.view()});
     models
+}
+
+/// Validate against the session's installed CLI and adapter reference, never
+/// against the host's current default deployment or a different account.
+pub(crate) fn validate_pinned_selection(
+    session: &crate::runtime::claude::ClaudeSession,
+    model: &str,
+    effort: Option<&str>,
+    require_reference_choice: bool,
+) -> anyhow::Result<()> {
+    let models = from_deployment(&session.deployment, "pinned", Some(model));
+    validate_selection_rows(&models, model, effort, require_reference_choice)
+}
+
+fn validate_selection_rows(
+    models: &NativeModels,
+    model: &str,
+    effort: Option<&str>,
+    require_reference_choice: bool,
+) -> anyhow::Result<()> {
+    use crate::profiles::pinned_selection::Unavailable;
+    let row = models.rows.iter().find(|row| row["slug"] == model && row["source"] == "reference");
+    if models.source["source"] == "adapterReference" {
+        if row.is_some_and(|row| row["cliCompatibility"]["state"] == "incompatible")
+            || (require_reference_choice && row.is_none())
+        {
+            return Err(Unavailable::model(model, effort).into());
+        }
+    }
+    if let (Some(row), Some(chosen)) = (row.filter(|row| row["effortSupportKnown"] == true), effort) {
+        let levels = crate::launch::selected_profile::row_efforts(row);
+        if !levels.iter().any(|offered| offered == chosen) {
+            return Err(Unavailable::effort(model, effort, levels).into());
+        }
+    }
+    Ok(())
 }
 
 fn from_deployment(deployment: &ClaudeDeployment, account_id: &str, selected: Option<&str>) -> NativeModels {
@@ -264,6 +405,60 @@ mod tests {
     fn models(cli: Result<&str, CatalogError>, selected: Option<&str>, account: &str) -> NativeModels {
         let bytes = reference();
         render(parse_catalog(&bytes).unwrap(), &bytes, Path::new("private/reference.json"), account, selected, cli.map(str::to_string))
+    }
+
+    #[test]
+    fn pinned_model_choice_uses_known_compatibility_and_offered_effort() {
+        use crate::profiles::pinned_selection::Unavailable;
+        let old = models(Ok("2.1.10"), Some("pinned-new"), "fixture");
+        let error = validate_selection_rows(&old, "pinned-new", None, false).unwrap_err();
+        assert_eq!(error.downcast_ref::<Unavailable>().unwrap().reason, "modelUnavailable");
+        let error = validate_selection_rows(&old, "pinned-old", Some("max"), false).unwrap_err();
+        let error = error.downcast_ref::<Unavailable>().unwrap();
+        assert_eq!(error.reason, "effortUnavailable");
+        assert_eq!(error.offered, ["low", "high"]);
+        assert!(validate_selection_rows(&old, "pinned-old", Some("low"), true).is_ok());
+        assert!(validate_selection_rows(&old, "unknown-gateway-model", None, false).is_ok());
+    }
+    #[test]
+    fn a_profile_never_guesses_or_combines_conflicting_alias_targets() {
+        let mut rows = [json!({"slug": "opus", "kind": "alias"})];
+        add_handshake_resolution(&mut rows, &[]);
+        assert!(rows[0]["resolvedModel"].is_null());
+        let observed = |target: &str| ModelHandshake::from_runtime_status(&json!({
+            "modelResolution": {
+                "source": "sdkHandshake",
+                "resolvedModels": {"opus": target},
+                "supportedEffortLevels": {"opus": ["medium", "high"]},
+            }
+        })).unwrap();
+        let original = observed("claude-opus-5-5");
+        let changed = observed("claude-opus-5-6");
+        add_handshake_resolution(&mut rows, &[&original, &changed]);
+        assert!(rows[0]["resolvedModel"].is_null());
+        add_handshake_resolution(&mut rows, &[&changed]);
+        assert_eq!(rows[0]["resolvedModel"], "claude-opus-5-6");
+        assert_eq!(rows[0]["resolvedModelSource"], "sdkHandshake");
+    }
+
+    #[test]
+    fn profile_alias_display_metadata_requires_a_resolved_handshake_target() {
+        let handshake = ModelHandshake::from_runtime_status(&json!({
+            "modelResolution": {
+                "source": "sdkHandshake",
+                "resolvedModels": {"opus": "claude-opus-5-5"},
+                "resolvedModelDisplay": {
+                    "claude-opus-5-5": {"resolvedDisplayName":"Opus 5.5","resolvedDisplayVersion":"5.5"},
+                    "unconfirmed": {"resolvedDisplayName":"Unconfirmed","resolvedDisplayVersion":"9"}
+                },
+                "supportedEffortLevels": {}
+            }
+        })).unwrap();
+        assert_eq!(handshake.resolved_model_display.len(), 1);
+        let mut rows = [json!({"slug":"opus"})];
+        add_handshake_resolution(&mut rows, &[&handshake]);
+        assert_eq!(rows[0]["resolvedDisplayName"], "Opus 5.5");
+        assert_eq!(rows[0]["resolvedDisplayVersion"], "5.5");
     }
 
     #[test]

@@ -37,8 +37,8 @@ impl AskRuntime for StopRuntime {
     fn resume_gate(&self, session: &str) -> anyhow::Result<()> { self.inner.resume_gate(session) }
     fn read_turn(&self, session: &str, turn: &str) -> Option<serde_json::Value> { self.inner.read_turn(session, turn) }
     fn respond_question(&self, session: &str, generation: u64, response_id: &str,
-        request_id: &serde_json::Value, result: &serde_json::Value) -> RespondOutcome {
-        self.inner.respond_question(session,generation,response_id,request_id,result)
+        request_id: &serde_json::Value, response: crate::asks::scheduler::QuestionResponse<'_>) -> RespondOutcome {
+        self.inner.respond_question(session,generation,response_id,request_id,response)
     }
 }
 

@@ -143,6 +143,14 @@ pub fn adopt_suspended_child(job: &OwnedHandle, child: &std::process::Child) -> 
     resume_suspended_process(child.id())
 }
 
+/// For short-lived workers, the parent retains the only handle. If it exits,
+/// the kernel stops every worker and descendant.
+pub(crate) fn assign_suspended_worker(job: &OwnedHandle, child: &std::process::Child) -> anyhow::Result<()> {
+    check(unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) })
+        .context("failed to assign the worker to its job")?;
+    resume_suspended_process(child.id())
+}
+
 /// Resume the single initial thread of a process created suspended (std's
 /// `Child` does not expose its main thread handle on stable Rust).
 fn resume_suspended_process(pid: u32) -> anyhow::Result<()> {

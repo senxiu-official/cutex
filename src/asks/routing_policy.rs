@@ -15,6 +15,7 @@ pub mod integration;
 #[cfg(test)]
 pub mod test_support;
 pub mod tools;
+pub mod notifications;
 mod types;
 
 pub use types::*;

@@ -1041,6 +1041,20 @@ pub(super) struct Fingerprint {
     entries: BTreeMap<String, Entry>,
 }
 impl Fingerprint {
+    pub(super) fn entry_identity(&self, name: &str) -> Option<(u64, u64)> {
+        self.entries.get(name).map(|entry| entry.identity)
+    }
+
+    pub(super) fn root_identity(&self) -> Option<(u64, u64)> {
+        self.entries.get("").map(|entry| entry.identity)
+    }
+
+    pub(super) fn only_regular_child(&self, name: &str) -> bool {
+        self.entries.len() == 2
+            && self.entries.get("").is_some_and(|entry| entry.kind == "directory")
+            && self.entries.get(name).is_some_and(|entry| entry.kind == "file")
+    }
+
     pub(super) fn is_regular_file(&self) -> bool {
         self.entries
             .get("")
@@ -1051,6 +1065,78 @@ pub(super) struct PathGuard {
     _parent: Arc<Dir>,
     _file: File,
 }
+pub(super) fn new_stock_directory(root: &Path, path: &Path) -> anyhow::Result<(u64, u64)> {
+    let (parent, name) = parent(root, path, true)?;
+    let dir = parent.new_directory(&name)?;
+    #[cfg(windows)]
+    {
+        crate::platform::private_fs::secure_directory(&dir.path)?;
+    }
+    Ok(file_identity(&dir.file)?)
+}
+
+pub(super) fn stock_directory_identity(root: &Path, path: &Path) -> anyhow::Result<(u64, u64)> {
+    let (parent, name) = parent(root, path, false)?;
+    Ok(file_identity(&parent.directory(&name)?.file)?)
+}
+
+#[cfg(test)]
+pub(super) fn test_stock_claim(root: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let (parent, name) = parent(root, path, true)?;
+    std::io::Write::write_all(&mut parent.create_file(&name)?, bytes)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn test_stock_claim_identity(root: &Path, path: &Path) -> anyhow::Result<(u64, u64)> {
+    let (parent, name) = parent(root, path, false)?;
+    Ok(file_identity(&parent.read_file(&name)?)?)
+}
+
+pub(super) fn stock_children(root: &Path, path: &Path) -> io::Result<Vec<OsString>> {
+    Dir::absolute(&root.join(path))?.entries()
+}
+
+/// Refuse an already open reader/writer on Windows, including handles whose
+/// owner allowed deletion. On Unix Cutex readers take a shared flock, while
+/// the published runtime and its descendants are checked at the scope boundary.
+pub(super) fn lock_stock_scratch(
+    root: &Path, path: &Path, identity: (u64, u64),
+) -> anyhow::Result<Option<File>> {
+    let (parent, name) = parent(root, path, false)?;
+    #[cfg(unix)]
+    let opened = parent.read_file(&name);
+    #[cfg(windows)]
+    let opened = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The no-follow parent pin prevents replacement of path components.
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent.path.join(&name))
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(file.metadata()?.is_file() && file_identity(&file)? == identity,
+        "recorded stock scratch file replaced");
+    #[cfg(windows)]
+    crate::platform::private_fs::validate_private_file(&file)?;
+    #[cfg(unix)]
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    Ok(Some(file))
+}
+
+pub(super) fn stock_claim_file(root: &Path, path: &Path, expected: (u64, u64)) -> anyhow::Result<File> {
+    let (parent, name) = parent(root, path, false)?;
+    let file = parent.read_file(&name)?;
+    ensure!(file_identity(&file)? == expected, "stock claim file replaced");
+    Ok(file)
+}
+
 pub(super) fn pin_regular(root: &Path, path: &Path) -> anyhow::Result<PathGuard> {
     let (parent, name) = parent(root, path, false)?;
     #[cfg(windows)]
@@ -1065,6 +1151,141 @@ pub(super) fn pin_regular(root: &Path, path: &Path) -> anyhow::Result<PathGuard>
         _parent: parent,
         _file: file,
     })
+}
+pub(super) fn open_archive_rollout(root: &Path, path: &Path) -> anyhow::Result<File> {
+    let (parent, name) = parent(root, path, false)?;
+    let file = parent.read_file(&name)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "rollout is not a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(metadata.nlink() == 1, "rollout has additional hard links");
+        ensure!(metadata.dev() == fs::metadata(root)?.dev(), "rollout is on a nested volume");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_STREAM_INFO, FileStreamInfo,
+            GetFileInformationByHandle, GetFileInformationByHandleEx,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        ensure!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0
+                && info.nNumberOfLinks == 1,
+            "rollout link identity is unavailable or shared"
+        );
+        let mut stream_buffer = [0u64; 128];
+        ensure!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(), FileStreamInfo,
+                    stream_buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&stream_buffer) as u32,
+                )
+            } != 0,
+            "rollout data streams could not be inspected"
+        );
+        let stream = stream_buffer.as_ptr().cast::<FILE_STREAM_INFO>();
+        let expected: Vec<_> = "::$DATA".encode_utf16().collect();
+        // Validate the length before accessing the variable-length stream name.
+        ensure!(
+            unsafe { (*stream).NextEntryOffset == 0 }
+                && unsafe { (*stream).StreamNameLength as usize } == expected.len() * 2
+                && unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::addr_of!((*stream).StreamName).cast::<u16>(), expected.len(),
+                    )
+                } == expected.as_slice(),
+            "rollout has an unexpected data stream"
+        );
+    }
+    Ok(file)
+}
+/// Bind an archive location to the physical directory, retaining no-follow
+/// ancestors while checking privacy and the pathname's current identity.
+pub(super) struct ArchiveDirectoryPin {
+    _directory: Arc<Dir>,
+    pub(super) identity: (u64, u64),
+}
+
+pub(super) fn pin_archive_directory(path: &Path) -> anyhow::Result<ArchiveDirectoryPin> {
+    let dir = Dir::absolute(path)?;
+    let identity = file_identity(&dir.file)?;
+    #[cfg(windows)]
+    {
+        let (file, _) = crate::platform::private_fs::open_validated_directory(path)?;
+        ensure!(file_identity(&file)? == identity, "archive location changed");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = dir.file.metadata()?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o700,
+            "archive location must be owned by the Cutex user with mode 0700"
+        );
+        ensure!(file_identity(&Dir::absolute(path)?.file)? == identity, "archive location changed");
+    }
+    Ok(ArchiveDirectoryPin { _directory: dir, identity })
+}
+pub(super) fn archive_directory_identity(path: &Path) -> anyhow::Result<(u64, u64)> {
+    Ok(pin_archive_directory(path)?.identity)
+}
+
+pub(super) fn create_archive_directory(path: &Path) -> anyhow::Result<()> {
+    let parent = path.parent().context("archive location has no parent")?;
+    let name = path.file_name().context("archive location has no name")?;
+    let _directory = Dir::absolute(parent)?.new_directory(name)?;
+    #[cfg(windows)]
+    crate::platform::private_fs::secure_directory(path)?;
+    Ok(())
+}
+pub(super) fn create_archive_file(root: &Path, path: &Path) -> anyhow::Result<File> {
+    let (dir, name) = parent(root, path, true)?;
+    Ok(dir.create_file(&name)?)
+}
+
+pub(super) fn open_archive_rollout_if_exists(root: &Path, path: &Path) -> anyhow::Result<Option<File>> {
+    match open_archive_rollout(root, path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn missing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+pub(super) fn archive_entry(root: &Path, path: &Path) -> anyhow::Result<Option<Entry>> {
+    let result = (|| -> anyhow::Result<Entry> {
+        let (dir, name) = parent(root, path, false)?;
+        let entry = snapshot(&dir, &name)?;
+        ensure!(entry.kind == "file", "archive path is not a regular file");
+        Ok(entry)
+    })();
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) if missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn publish_archive_file(
+    root: &Path, stage: &Path, destination: &Path, expected: &Entry,
+) -> anyhow::Result<()> {
+    let (from, name) = parent(root, stage, false)?;
+    let (to, destination) = parent(root, destination, true)?;
+    Ok(move_child(&from, &name, &to, &destination, expected)?)
+}
+
+pub(super) fn unlink_archive_file(root: &Path, path: &Path, expected: &Entry) -> anyhow::Result<()> {
+    let (dir, name) = parent(root, path, false)?;
+    unlink(&dir, &name, expected)?;
+    dir.sync()?;
+    Ok(())
 }
 pub(super) enum MoveOutcome {
     Moved { trash: PathBuf },

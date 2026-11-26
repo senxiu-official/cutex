@@ -473,26 +473,28 @@ pub fn management_identity(repository: &EventRepository) -> anyhow::Result<Value
 }
 
 pub fn retired_session_list_resource() -> anyhow::Result<Value> {
+    retired_session_list_resource_with_stats(false)
+}
+
+pub(super) fn retired_session_list_resource_with_stats(include_stats: bool) -> anyhow::Result<Value> {
     // The shared snapshot is current as of this read (no whole-store copy).
     let store = crate::session::store::session_catalog(true)?;
     let host_id = crate::platform::host::current_host_name();
     let projects = load_agent_management_snapshot_best_effort();
     let context = ProjectionContext::default();
-    let mut sessions = store
-        .sessions
-        .values()
-        .filter(|record| {
-            crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host_id)
-        })
-        .filter(|record| record.is_retired())
-        .filter(|record| is_durable_management_session(record))
-        .map(|record| {
+    let records: Vec<_> = store.sessions.values()
+        .filter(|record| crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host_id))
+        .filter(|record| record.is_retired() && is_durable_management_session(record))
+        .collect();
+    let details = include_stats.then(|| super::archive::details::read(&records));
+    let mut sessions = records.into_iter().map(|record| {
             let mut value = retired_session_resource_value_with(
                 record,
                 load_activity_best_effort(&record.cutex_session_id).as_ref(),
                 &context,
             );
             annotate_retired_session_project(&mut value, record, projects.as_deref());
+            if let Some(details) = &details { details.annotate(record, &mut value); }
             value
         })
         .collect::<Vec<_>>();
@@ -692,6 +694,84 @@ pub fn focus_resource(cutex_session_id: &str) -> anyhow::Result<Value> {
     })
 }
 
+fn reasoning_resolution_resource(record: &CutexSessionRecord) -> Value {
+    use crate::profiles::reasoning::{is_default, EffortSource};
+    let live_claude = record.claude_session.is_some() && record.runtime_pid.is_some()
+        && record.claude_model_handshake.is_some();
+    let captured = record.reasoning_resolution.as_ref();
+    let configured = if live_claude && captured.is_some() {
+        captured.and_then(|saved| saved.resolution.configured.as_deref())
+    } else {
+        record.claude_session.as_ref().and_then(|session| session.effort.map(|value| value.as_str()))
+            .or_else(|| record.reasoning_defaults.as_deref().filter(|value| !is_default(value)))
+    };
+    let model = if live_claude && captured.is_some() {
+        captured.map(|saved| saved.requested_model.as_str())
+    } else {
+        record.claude_session.as_ref().map(|session| session.model.as_str())
+            .or(record.model_defaults.as_deref())
+            .or_else(|| captured.map(|saved| saved.requested_model.as_str()))
+    };
+    let handshake = record.claude_model_handshake.as_ref();
+    let resolved = model.and_then(|model| handshake.and_then(|sdk| sdk.resolved_models.get(model)));
+    let display = resolved.and_then(|target| handshake?.resolved_model_display.get(target));
+    if let Some(saved) = captured.filter(|saved|
+        model == Some(saved.requested_model.as_str()) && saved.resolution.configured.as_deref() == configured)
+    {
+        return json!({ "configured": configured, "value": saved.resolution.value, "source": saved.resolution.source,
+            "sourceVersion": saved.resolution.source_version, "skipped": saved.resolution.skipped,
+            "requestedModel": model, "resolvedModel": resolved.or(saved.resolved_model.as_ref()),
+            "resolvedModelSource": resolved.map(|_| "sdkHandshake"),
+            "resolvedDisplayName": display.map(|display| &display.resolved_display_name),
+            "resolvedDisplayVersion": display.and_then(|display| display.resolved_display_version.as_ref()) });
+    }
+    let unsupported = model.and_then(|id| handshake.and_then(|sdk| sdk.supported_effort_levels.get(id)))
+        .is_some_and(Vec::is_empty);
+    let source = if configured.is_some() { EffortSource::Session }
+        else if unsupported { EffortSource::Unsupported } else { EffortSource::Unreported };
+    json!({"configured": configured, "value": configured, "source": source, "skipped": [],
+        "requestedModel": model, "resolvedModel": resolved, "resolvedModelSource": resolved.map(|_| "sdkHandshake"),
+        "resolvedDisplayName": display.map(|display| &display.resolved_display_name),
+        "resolvedDisplayVersion": display.and_then(|display| display.resolved_display_version.as_ref())})
+}
+
+fn apply_live_native_reasoning(resolution: &mut Value, settings: &Value) {
+    let Some(model) = settings["model"].as_str() else { return };
+    let model_changed = resolution["requestedModel"] != model;
+    if model_changed {
+        resolution["requestedModel"] = json!(model);
+        resolution["skipped"] = json!([]);
+    }
+    if let Some(effort) = settings["effort"].as_str() {
+        if model_changed || resolution["value"] != effort {
+            resolution["value"] = json!(effort);
+            resolution["source"] = json!(crate::profiles::reasoning::EffortSource::Runtime);
+            resolution["sourceVersion"] = Value::Null;
+        }
+    } else if model_changed {
+        resolution["value"] = Value::Null;
+        resolution["source"] = json!(crate::profiles::reasoning::EffortSource::Unreported);
+        resolution["sourceVersion"] = Value::Null;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_model_switch_reports_the_new_models_observed_effort() {
+    let mut resolution = json!({
+        "requestedModel": "old-model", "configured": null, "value": "high",
+        "source": "profile", "sourceVersion": "old", "skipped": [{"value": "max"}]
+    });
+    apply_live_native_reasoning(&mut resolution, &json!({"model": "new-model", "effort": "medium"}));
+    assert_eq!(resolution, json!({
+        "requestedModel": "new-model", "configured": null, "value": "medium",
+        "source": "runtime", "sourceVersion": null, "skipped": []
+    }));
+    apply_live_native_reasoning(&mut resolution, &json!({"model": "third-model"}));
+    assert_eq!(resolution["value"], Value::Null);
+    assert_eq!(resolution["source"], "unreported");
+}
+
 pub fn runtime_defaults_resource(record: &CutexSessionRecord) -> Value {
     let mut defaults = json!({
         "memoryInjection": record.memory_injection,
@@ -705,6 +785,9 @@ pub fn runtime_defaults_resource(record: &CutexSessionRecord) -> Value {
         "cliArgs": record.default_cli_args,
         "groups": normalized_groups(&record.agent_groups),
     });
+    if record.claude_session.is_some() || record.reasoning_resolution.is_some() {
+        defaults["reasoningResolution"] = reasoning_resolution_resource(record);
+    }
     // session-fast-mode: only when the session has its own tier (absent =
     // the profile config decides), so the frozen v2 field set stays as is.
     if let Some(tier) = &record.service_tier {
@@ -1223,6 +1306,15 @@ fn prepare_session_projection(
         "createdAt": record.created_at,
         "updatedAt": record.updated_at,
     });
+    if record.runtime_backend == CutexSessionRuntimeBackend::Host && record.reasoning_resolution.is_some() {
+        if let Some(settings) = runtime_status.as_ref().filter(|status| status.connected)
+            .and_then(|status| status.thread_settings.as_ref())
+        {
+            apply_live_native_reasoning(&mut value["runtimeDefaults"]["reasoningResolution"], settings);
+        }
+    }
+    value["runtime"]["claudeDiagnostics"] = json!(runtime_status.as_ref().filter(|status| status.connected)
+        .and_then(|status| status.claude_diagnostics.as_ref()));
     value["runtime"]["backgroundWork"] = json!(runtime_status.as_ref().filter(|status| status.connected).and_then(|status| status.background_work.clone()));
     value["runtime"]["turnState"] = json!(if !app_server_connected { "unknown" }
         else if runtime_status.as_ref().is_some_and(|s| s.active_turn_id.is_some()) { "running" } else { "idle" });
@@ -1289,7 +1381,7 @@ fn ensure_focus_timestamp(focus: &mut FocusState) {
 /// agent from the owner. Local-only sessions (old CLI-tracked / unmanaged
 /// sessions, many of them) keep the old rule: visible only when exposed or
 /// visible in the IM registry.
-fn session_is_visible(registry: &ImRegistry, record: &CutexSessionRecord) -> bool {
+pub(super) fn session_is_visible(registry: &ImRegistry, record: &CutexSessionRecord) -> bool {
     record.registration_class == AgentRegistrationClass::Persistent
         || record.exposed_to_backend
         || registry.sessions.values().any(|entry| {
@@ -1299,7 +1391,7 @@ fn session_is_visible(registry: &ImRegistry, record: &CutexSessionRecord) -> boo
         })
 }
 
-fn is_durable_management_session(record: &CutexSessionRecord) -> bool {
+pub(super) fn is_durable_management_session(record: &CutexSessionRecord) -> bool {
     matches!(
         record.registration_class,
         AgentRegistrationClass::Persistent | AgentRegistrationClass::LocalOnly
@@ -1380,6 +1472,7 @@ mod tests {
         record.host_id = "online-submit-host".into();
         record.registration_class = AgentRegistrationClass::LocalOnly;
         let status = AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: record.cutex_session_id.clone(), thread_id: "online-submit-thread".into(),
             runtime_generation: 7, connected: true, active_turn_id: Some("busy-turn".into()),
@@ -1672,6 +1765,7 @@ mod tests {
         record.cutex_session_id = "cutex-native-state".to_string();
         record.runtime_generation = 7;
         let runtime_status = AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: record.cutex_session_id.clone(),
             thread_id: "thread-native-state".to_string(),

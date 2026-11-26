@@ -31,6 +31,8 @@ pub struct Version {
     pub claude_process_inspection: Option<super::runtime_prune_processes::UnresolvedClaude>,
     #[serde(skip)]
     pub targets: Vec<PathBuf>,
+    #[serde(skip)]
+    pub target_identities: Vec<[u64; 3]>,
 }
 
 pub struct Inventory {
@@ -415,6 +417,45 @@ pub(super) fn checked_root(path: &Path) -> anyhow::Result<std::fs::Metadata> {
     Ok(metadata)
 }
 
+/// Bind a preview to a filesystem object. All paths still go through the
+/// normal managed-root and reference checks before they can be staged.
+pub(super) fn inspect_target(path: &Path) -> anyhow::Result<(std::fs::Metadata, [u64; 3])> {
+    let metadata = checked_root(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let opened = file.metadata()?;
+        ensure!(opened.file_attributes() & 0x400 == 0 && opened.is_dir() == metadata.is_dir(),
+            "runtime root changed while opening");
+        let (volume, index) = crate::platform::private_fs::identity(&file)?.publication_key();
+        let identity = [volume, index, opened.creation_time()];
+        Ok((opened, identity))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let created = metadata.created().ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |age| age.as_nanos() as u64);
+        let identity = [metadata.dev(), metadata.ino(), created];
+        Ok((metadata, identity))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        anyhow::bail!("runtime target identity unsupported")
+    }
+}
+
 /// Logical bytes of entries removed. Never follow a contained link/junction out of the version.
 pub fn tree_bytes(path: &Path) -> anyhow::Result<u64> {
     budget::check()?;
@@ -465,6 +506,7 @@ fn candidate(
         blocked_reasons: Vec::new(),
         claude_process_inspection: None,
         targets,
+        target_identities: Vec::new(),
     }
 }
 
@@ -684,6 +726,8 @@ pub(super) fn inspect_reference_snapshot(
         if !rollback_complete {
             reasons.insert("rollback_protection_unavailable");
         }
+        let mut hash = Sha256::new();
+        hash.update(version.id.as_bytes());
         for target in &version.targets {
             let canonical = normalized(target);
             let managed = roots.iter().any(|root| canonical.starts_with(root));
@@ -743,8 +787,12 @@ pub(super) fn inspect_reference_snapshot(
                 }
                 _ => {}
             }
-            match checked_root(target) {
-                Ok(metadata) => {
+            match inspect_target(target) {
+                Ok((metadata, identity)) => {
+                    for part in identity {
+                        hash.update(part.to_be_bytes());
+                    }
+                    version.target_identities.push(identity);
                     if metadata.is_file() {
                         version.bytes = version.bytes.saturating_add(metadata.len());
                     } else {
@@ -756,6 +804,9 @@ pub(super) fn inspect_reference_snapshot(
                     reasons.insert("runtime_size_inspection_failed");
                 }
             }
+        }
+        if version.target_identities.len() == version.targets.len() {
+            version.id = format!("{:x}", hash.finalize());
         }
         version.blocked_reasons = reasons.into_iter().map(str::to_owned).collect();
         if version

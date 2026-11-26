@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:session-search",
+  "title": "Host session and old task search",
+  "description": "The cwd filter is a lexical comparison of the effective launch directory or its descendants. The server does not resolve symlinks or Windows junctions.",
+  "$ref": "#/$defs/response",
+  "$defs": {
+    "row": {
+      "type": "object",
+      "required": ["hostId", "cutexSessionId", "displayName", "cwd", "lifecycle", "updatedAt"],
+      "properties": {
+        "hostId": {"type": "string"},
+        "cutexSessionId": {"type": "string"},
+        "displayName": {"type": "string"},
+        "cwd": {"type": "string"},
+        "lifecycle": {"enum": ["active", "retired"]},
+        "updatedAt": {"type": "string"},
+        "turnId": {"type": "string"},
+        "title": {"type": "string"},
+        "snippet": {"type": "string"},
+        "turnStatus": {"enum": ["completed", "failed", "interrupted"]}
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "allOf": [
+        {"$ref": "#/$defs/row"},
+        {"required": ["turnId", "title", "snippet", "turnStatus"]}
+      ]
+    },
+    "response": {
+      "type": "object",
+      "required": ["contractVersion", "hostId", "mode", "items", "nextCursor", "more", "partial"],
+      "properties": {
+        "contractVersion": {"const": 2},
+        "hostId": {"type": "string"},
+        "mode": {"enum": ["sessions", "tasks"]},
+        "items": {"type": "array", "maxItems": 30, "items": {"$ref": "#/$defs/row"}},
+        "nextCursor": {"type": ["string", "null"]},
+        "more": {"type": "boolean", "description": "Whether another page may be requested. True exactly when nextCursor is present."},
+        "partial": {"type": "boolean", "description": "Some authorized history was unavailable or truncated during this page."}
+      },
+      "if": {"properties": {"mode": {"const": "tasks"}}},
+      "then": {"properties": {"items": {"maxItems": 12, "items": {"$ref": "#/$defs/task"}}}},
+      "additionalProperties": false
+    }
+  }
+}

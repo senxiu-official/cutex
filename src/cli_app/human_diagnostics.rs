@@ -14,6 +14,7 @@ pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool, fin
             report = cutex::management::v2::health::fix(&cutex::management::v2::health::FixRequest {
                 finding_ids: Some(selected_findings(&report, finding_id)?),
                 dry_run: !yes,
+                preview_token: None,
             }, super::management_context::management_request_context()).map_err(anyhow::Error::new)?;
         }
         println!("{}", serde_json::to_string_pretty(&report)?);

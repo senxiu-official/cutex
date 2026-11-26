@@ -1,43 +1,90 @@
 # Host health
 
-`GET /v2/health` is owner-only and returns Management contract version 2,
-scan time and findings. `POST /v2/health/fix` requires the owner credential and
-an `Idempotency-Key`; its JSON body accepts `findingIds` and `dryRun` (default
-true). Inspect `planned` before sending the same selection with `dryRun:false`
-and a new idempotency key. Changed observations return `409 finding_changed`.
+Health is a host-owner feature. Management accepts the root credential or a full
+device credential belonging to the owner. It advertises `health-check` for the
+report and `health-review-v1` for reviewed fixes.
 
-`cutex human doctor` retains its local diagnostic output. `--check` scans;
-`--fix` previews; `--fix --yes` applies safe fixes. The optional session selector
-filters findings. The CLI does not start Management or Bus services.
+1. `GET /v2/health` returns `contractVersion`, `scannedAt`, `findings`, and
+   `claudeObservers`. Each finding has an opaque `id`, stable `code`,
+   `severity`, optional `cutexSessionId`, `detail`, and a nullable `fix`.
+2. `POST /v2/health/fix` with `Idempotency-Key` and
+   `{"findingIds":["<id>"],"dryRun":true}` previews the chosen findings.
+   The response contains `planned` and `skipped`. Multiple findings can
+   describe the same repair. The preview lists each repair once and returns
+   `previewToken` when there is something to apply.
+3. After owner confirmation, POST to the same route with a new
+   `Idempotency-Key` and
+   `{"findingIds":["<planned.id>"],"dryRun":false,"previewToken":"<token>"}`.
+   Send the exact set of IDs in `planned`. The token expires after ten minutes
+   or a Management restart. Every new apply rechecks current evidence. A replay
+   of a retained result uses the same idempotency key and request body.
 
-`config.json` preserves `health: {"scan_on_start":false}`; default true starts
-one background read-only scan in Management and logs warning/error codes.
-Startup never fixes or sends owner notifications.
+Apply reports `applied`, `skipped` and refreshed `findings`. On HTTP 409,
+`error.details` can include `applied`, `skipped`, and `failedFindingId`.
+A missing, expired or mismatched preview returns `preview_required`. A changed
+finding returns `finding_changed`. Refresh and review again after either error.
+A whole-host preview with more than 1,000 planned fixes returns
+`preview_limit`. Choose up to 1,000 finding IDs and preview that selection.
+On an interrupted response or `request_in_progress`, inspect health and
+reconcile the outcome before starting a new apply with a different key.
 
-Runtime cleanup requires local ownership, at least one positive recorded PID,
-every recorded PID verifiably dead, and no pending launch/launch claim. Living,
-possibly reused, absent, zero, or uncertain PIDs are never cleared. Claude
-cleanup also holds its controller lock. Runtime fields are cleared under the
-cross-process session-store writer lock using the existing reconciliation
-helper; no process is stopped and no record/file is deleted. Duplicate and
-orphan identities are report-only if these conditions cannot be proved.
+`cutex human doctor --check` scans. `--fix` previews and `--fix --yes`
+explicitly applies, optionally scoped to a session or `--finding-id`. The
+offline CLI uses its existing local confirmation flag. Configuration
+`health: {"scan_on_start":false}` disables the default read-only startup scan.
 
-Missing-package findings use existing pinned-package evidence. Only an enabled
-local persistent explicit-launch host agent with a v4 manifest, intact native
-home, no runtime claim, and missing pinned files can be offered repair. Existing
-review/apply checks validate the native thread and selected package again and
-refuse changed evidence; other missing packages remain report-only.
+## Runtime evidence
 
-Stuck Bus messages link to the existing owner list/discard interface. Queued
-alarms without a durable message record produce `lost_alarms`; no past alarm is
-replayed or migrated. Findings contain full IDs and no credentials or messages.
-Every applied fix appends a `health_fixed` audit fact and a session runtime event.
+- A local stale runtime binding needs at least one positive PID, all recorded
+  PIDs absent, and no pending launch markers. If a PID is live, reused or
+  unqueryable, leave the binding in place. The Claude previous-boot case
+  instead requires the exact recorded adapter descriptor and binding evidence.
+  Apply rechecks the occurrence under the session writer lock. Claude also
+  checks endpoint reachability, holds its controller lock and checks the Linux
+  adapter scope. The fix clears session runtime fields without signalling a
+  process or deleting files.
+- `unverified_launch_claim` reports a launch marker with missing or absent
+  recorded PIDs. A launch may own a publication lease before a child PID is
+  written. The stock lifecycle reconciles claims using the durable receipt and
+  publication lease under its launch fences. Health keeps those claims
+  report-only. Duplicate and orphan runtime IDs also require safe runtime
+  evidence before they can be cleared.
+- Managed runtime package directories use the existing Runtime Versions cleanup
+  flow. `runtime-prune-v1` provides GET and POST `/v2/runtimes/prune`.
+  GET reports version IDs, logical bytes, eligibility and refusal reasons.
+  After confirmation POST accepts only selected eligible IDs. Apply rechecks
+  pins, sessions, rollback and process evidence under the existing fences.
+  See [runtime cleanup](management/runtime-prune.md). Session runtime data is
+  protected here. Supported disposable agent homes use the separate Storage
+  cleanup inventory and its preview/apply flow.
+- A missing pinned runtime package can offer package repair. The existing
+  package review and apply validate the Native thread, selected package and
+  current session evidence. Other missing package findings are report-only.
+- Stuck Bus messages use the existing owner message action. Lost alarms are
+  report-only. Eligible Unix profile directories can offer a guarded mode
+  repair to 0700. Non-owned directories and unverified paths remain report-only.
 
-On Unix, `profile_directory_writable` reports a `profiles` root or direct profile
-subdirectory with group/other write bits set. Its detail includes the exact path,
-observed octal mode, owner repair guidance in English and Chinese, and a
-`repairCommand` argument array for `chmod 0700 -- <path>`. Review that directory
-before applying the command yourself. These findings are always report-only
-(`fix:null`); neither startup scanning nor `/v2/health/fix` changes permissions.
-Absent directories are left absent; symlinks and nested directories are not
-traversed. This check does not replace the launch-time auth custody validation.
+Successful health fixes append an audit fact. Session runtime fixes also
+publish an offline event when the session still has no successor runtime.
+
+## Desktop Settings handoff
+
+Add **安全体检 / Health check** to host Settings. Use the selected host and the
+existing Electron main host client. Expose only fixed read/preview/apply
+operations through preload. Gate actions on owner/full access and
+`health-review-v1`. Where an older host advertises `health-check` alone,
+show the report in read-only mode.
+
+Scan on entry and on explicit refresh. Show host, scan time, empty state and
+localized finding codes. Link `cutexSessionId` to the agent. Allow selection
+only for actionable rows. Present the returned plan in a confirmation dialog
+and treat `planned` as the exact confirmation scope. Disable duplicate apply
+while a request is in flight. Keep the host and preview paired and clear the
+preview when either the selection or host changes. After apply show results and
+refresh. On partial failure, show the applied IDs before refreshing.
+
+Link to the selected host's existing Runtime Versions cleanup and Storage
+cleanup surfaces if their capabilities are available. These flows own their
+own previews and confirmations. Keep package repair, runtime record cleanup
+and runtime directory deletion distinct in the UI because they change different
+data and use different evidence.

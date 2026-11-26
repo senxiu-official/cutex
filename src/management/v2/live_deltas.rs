@@ -246,15 +246,21 @@ impl LiveHub {
     /// No durable sequence/cursor is allocated and no disk is consulted.
     pub fn publish_background_work(&self, session: &str, host: &str, generation: u64, thread: &str,
         work: Option<crate::app_server::background_work::BackgroundWork>) {
+        self.publish_session_status(session, host, generation, thread, "backgroundWork",
+            crate::app_server::background_work::METHOD,
+            serde_json::json!({"cutexSessionId":session,"runtimeGeneration":generation,"backgroundWork":work}));
+    }
+    pub(super) fn publish_session_status(&self, session: &str, host: &str, generation: u64, thread: &str,
+        item: &str, method: &str, params: Value) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut state);
         let frame = LiveFrame {
             version: 1, kind: "sessionStatus", gap_scope: None,
             cutex_session_id: session.into(), host_id: host.into(), runtime_generation: generation,
-            thread_id: thread.into(), turn_id: None, item_id: "backgroundWork".into(),
-            method: crate::app_server::background_work::METHOD.into(),
+            thread_id: thread.into(), turn_id: None, item_id: item.into(),
+            method: method.into(),
             producer_epoch: self.inner.epoch.clone(), revision: 0, start_offset: 0, end_offset: 0, anchor: None,
-            params: serde_json::json!({"cutexSessionId":session,"runtimeGeneration":generation,"backgroundWork":work}),
+            params,
         };
         fanout(&mut state, Encoded::new(frame));
     }

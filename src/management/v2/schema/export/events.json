@@ -24,6 +24,26 @@
         }
       }
     },
+    "sessionClaudeDiagnosticsChanged": {
+      "type": "object", "required": ["cutexSessionId", "runtimeGeneration", "claudeDiagnostics"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "runtimeGeneration": { "type": "integer", "minimum": 0 },
+        "claudeDiagnostics": {
+          "type": "object", "additionalProperties": false,
+          "required": ["warnings", "activeHooks"],
+          "properties": {
+            "warnings": { "type": "array", "maxItems": 4, "items": {
+              "enum": ["configurationNotApplied", "managedHooksNotLoaded", "mcpConnectionFailed", "mcpAuthenticationRequired"]
+            } },
+            "activeHooks": { "type": "array", "maxItems": 32, "items": {
+              "type": "object", "additionalProperties": false, "required": ["event", "startedAtMs"],
+              "properties": { "event": { "type": "string" }, "startedAtMs": { "type": "integer", "minimum": 1 } }
+            } }
+          }
+        }
+      }
+    },
     "sessionStatusEnvelope": {
       "description": "Ephemeral session_status SSE only, never durable replay or feed cursor advance. No SSE id. Sequence is observation-only and may be zero.",
       "type": "object", "required": ["contractVersion", "source", "cutexSessionId", "hostId", "cutex", "cursor", "sequence"],
@@ -34,10 +54,16 @@
         "hostId": { "type": "string" },
         "cursor": { "const": "" },
         "sequence": { "type": "integer", "minimum": 0 },
-        "cutex": { "type": "object", "required": ["method", "params"], "properties": {
-          "method": { "const": "cutex/session/backgroundWork/changed" },
-          "params": { "$ref": "#/$defs/sessionBackgroundWorkChanged" }
-        } }
+        "cutex": { "type": "object", "required": ["method", "params"], "oneOf": [
+          { "properties": {
+            "method": { "const": "cutex/session/backgroundWork/changed" },
+            "params": { "$ref": "#/$defs/sessionBackgroundWorkChanged" }
+          } },
+          { "properties": {
+            "method": { "const": "cutex/session/claudeDiagnostics/changed" },
+            "params": { "$ref": "#/$defs/sessionClaudeDiagnosticsChanged" }
+          } }
+        ] }
       }
     },
     "checkpoint": {

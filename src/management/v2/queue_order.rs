@@ -62,7 +62,7 @@ pub(super) fn dispatch(
             let before = if params["before"].is_null() { None } else {
                 let reference: super::admission::AdmissionRef = serde_json::from_value(params["before"].clone())
                     .map_err(|_| invalid_user_input_error("before must be a kind/id reference or null"))?;
-                if !matches!(reference.kind.as_str(), "owner" | "ask") || reference.id.is_empty() {
+                if reference.id.is_empty() {
                     return Err(invalid_user_input_error("before must be a kind/id reference or null"));
                 }
                 Some(reference)
@@ -440,7 +440,7 @@ mod tests {
         }
         fn order_revision(&self) -> u64 { self.queue.admission("session").unwrap().order_revision }
         fn move_item(&self, id: &str, expected: u64, before: Option<&str>) -> anyhow::Result<(u64, Vec<super::super::user_input::UserInputQueueItem>, bool)> {
-            let before = before.map(|id| super::super::admission::AdmissionRef { kind: "owner".into(), id: id.into() });
+            let before = before.map(|id| super::super::admission::AdmissionRef::owner(id.into()));
             let (admission, _, items, changed) = self.queue.move_admission_item("session", id, expected, before.as_ref(), true)?;
             Ok((admission.order_revision, items, changed))
         }
@@ -708,9 +708,11 @@ mod tests {
             "queueId":"gone", "expectedRevision": f.order_revision(), "before":null
         }))).unwrap_err();
         assert_eq!(missing_owner.code, "queue_item_not_found");
+        let delivery = json!({"kind":"delivery", "id":"bus"});
+        assert!(serde_json::from_value::<super::super::admission::AdmissionRef>(delivery.clone()).is_err());
         assert!(validate_cutex_request(&json!({"requestId":"delivery", "method":MOVE_METHOD,
             "params":{"queueId":a.queue_id, "expectedRevision":f.order_revision(),
-                "before":{"kind":"delivery", "id":"bus"}}})).is_err());
+                "before":delivery}})).is_err());
     }
 
     #[test]

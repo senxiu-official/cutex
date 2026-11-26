@@ -705,6 +705,15 @@ pub(crate) fn delete_for_management(
         .and_then(|_| write_json(&receipt_path, &receipt))
         .map_err(|error| failed("saving the recovery copy", error))?;
 
+    let archive_recovery = cutex::management::v2::archive_records::prepare_delete_recovery(
+        &record, &directory,
+    ).map_err(|error| failed("saving the archived recovery copy", error))?;
+    if archive_recovery.as_ref().is_some_and(|recovery| recovery.saved()) {
+        receipt["archiveHistory"] = json!("archive-history");
+        write_json(&receipt_path, &receipt)
+            .map_err(|error| failed("saving the archive recovery receipt", error))?;
+    }
+
     let runtime_stopped = super::management_archive::archive_runtime_looks_online(&record)
         .map_err(|error| failed("checking the runtime", error))?;
     if runtime_stopped {
@@ -790,6 +799,7 @@ pub(crate) fn delete_for_management(
     for (label, result) in [
         ("activity", cutex::management::v2::activity::forget_deleted_session(&key)),
         ("usage", cutex::management::v2::usage::forget_deleted_session(&key)),
+        ("interaction history", cutex::management::v2::interaction_history::forget_deleted_session(&key)),
     ] {
         if let Err(error) = result {
             eprintln!("session delete: {label} cleanup failed for {key}: {error:#}");
@@ -819,6 +829,83 @@ pub(crate) fn delete_for_management(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_batch_http_preserves_director_and_rejects_a_concurrent_restore() {
+        use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
+        use cutex::{
+            agent_management::{AgentManagementProvider, AgentManagementSchema, ProjectAuthorityRequest},
+            http::server::read_simple_http_request,
+            management::v2::server::handle_v2_request,
+            session::{archive::commit_restore, model::{CutexSessionArchiveState, CutexSessionStore}, store},
+        };
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("archive-batch-http").unwrap();
+        let host = cutex::platform::host::current_host_name();
+        let make = |id: &str| {
+            let mut record = CutexSessionRecord::new(id.into(), None, host.clone(), test.root().display().to_string(), None).unwrap();
+            record.agent_enabled = true;
+            record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::Persistent;
+            record
+        };
+        let mut director = make("cutex.archive-director");
+        let mut racing = make("cutex.archive-racing");
+        let mut sessions = CutexSessionStore::default();
+        for record in [&director,&racing] {
+            sessions.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        }
+        store::save_cutex_session_store(&sessions).unwrap();
+        AgentManagementProvider::open_default().unwrap().bind_project_authority(&ProjectAuthorityRequest {
+            schema:AgentManagementSchema::V1, action_id:cutex::agent_management::AgentActionId::new("test-archive-director").unwrap(),
+            project_id:cutex::agent_management::ProjectId::new("test-archive-project").unwrap(),
+            authorized_director_session:cutex::role_revision::CutexSessionId::new(director.cutex_session_id.clone()).unwrap(),
+            expected_authorized_director_session:None, expected_authority_epoch:None,
+        }).unwrap();
+        for record in [&mut director,&mut racing] {
+            // Old data can still contain an archived Director. The actual
+            // delete guard must consult authority even for this legacy row.
+            record.archive_state = CutexSessionArchiveState::Retired;
+            record.retired_at = Some("2026-01-01T00:00:00Z".into());
+            sessions.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        }
+        store::save_cutex_session_store(&sessions).unwrap();
+        fn delete_with_restore(id: &str, request: &SessionDeleteRequest) -> Result<Value, UserInputExecutionError> {
+            if id == "cutex.archive-racing" {
+                let before = cutex::session::store::load_cutex_session_store().unwrap();
+                let mut after = before.clone();
+                let row = after.sessions.get_mut(id).unwrap();
+                commit_restore(row, request.expected_revision.unwrap(), "2026-01-02T00:00:00Z".into()).unwrap();
+                cutex::session::store::save_cutex_session_record(&before, &after, id).unwrap();
+            }
+            delete_for_management(id, request)
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = std::thread::spawn(move || {
+            let (mut socket,_) = listener.accept().unwrap();
+            socket.set_nonblocking(false).unwrap();
+            let request = read_simple_http_request(&mut socket).unwrap();
+            let mut ctx = crate::cli_app::management_context::management_request_context();
+            ctx.delete_session = delete_with_restore;
+            handle_v2_request(&mut socket, &request, None, Some("archive-test-owner"), ctx).unwrap();
+        });
+        let body = json!({"action":"delete","requestId":"guard-check","confirmation":"DELETE 2 ARCHIVED AGENTS",
+            "items":[{"sessionId":director.cutex_session_id,"expectedRevision":director.durable_revision()},
+                     {"sessionId":racing.cutex_session_id,"expectedRevision":racing.durable_revision()}]}).to_string();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        write!(client, "POST /v2/sessions/archive-batch HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer archive-test-owner\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        serve.join().unwrap();
+        let (headers,data) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+        let reply: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(reply["items"][0]["error"]["code"], "session_referenced", "{reply}");
+        assert_eq!(reply["items"][1]["error"]["code"], "revision_conflict", "{reply}");
+        let surviving = store::load_cutex_session_store().unwrap();
+        assert!(surviving.sessions[&director.cutex_session_id].is_retired());
+        assert!(surviving.sessions[&racing.cutex_session_id].is_active());
+    }
+
     use super::*;
 
     const ORIGINAL: &str = "018a0000-0000-7000-8000-00000000000a";

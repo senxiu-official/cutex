@@ -70,9 +70,9 @@ struct Capture {
 }
 thread_local! {
     static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
-    static ALIASES: RefCell<Option<Vec<(PathBuf, PathBuf)>>> = const { RefCell::new(None) };
+    static ALIASES: RefCell<Option<BTreeSet<(PathBuf, PathBuf)>>> = const { RefCell::new(None) };
 }
-fn observe(path: &Path) -> Result<()> {
+pub(super) fn observe(path: &Path) -> Result<()> {
     CAPTURE.with(|slot| -> Result<()> {
         let mut slot = slot.borrow_mut();
         let Some(capture) = slot.as_mut() else {
@@ -99,7 +99,7 @@ pub(super) struct PreparedHomeRecheck {
     root: PathBuf,
     action: String,
     files: BTreeMap<PathBuf, Option<Stamp>>,
-    aliases: Vec<(PathBuf, PathBuf)>,
+    aliases: BTreeSet<(PathBuf, PathBuf)>,
 }
 
 /// Broad reference parsing happens here, before acquiring any lifecycle locks.
@@ -143,7 +143,7 @@ pub(super) fn prepare_recheck(
         "selected item is outside cleanup policy"
     );
     CAPTURE.with(|slot| *slot.borrow_mut() = Some(Capture::default()));
-    ALIASES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    ALIASES.with(|slot| *slot.borrow_mut() = Some(BTreeSet::new()));
     // Always drain capture state, including classification errors.
     let result = (|| -> Result<Candidate> {
         metadata(&root, Path::new(PREFIX))?.context("native home root missing")?;
@@ -233,9 +233,7 @@ pub(super) fn prepare_recheck(
         })
     })();
     let capture = CAPTURE.with(|slot| slot.borrow_mut().take()).unwrap();
-    let mut aliases = ALIASES.with(|slot| slot.borrow_mut().take()).unwrap();
-    aliases.sort();
-    aliases.dedup();
+    let aliases = ALIASES.with(|slot| slot.borrow_mut().take()).unwrap();
     let mut ticket = PreparedHomeRecheck {
         candidate: result.unwrap_or_else(|error| {
             decision(
@@ -303,6 +301,7 @@ pub(super) fn recheck(
 
 fn decision(relative: &Path, code: &str, reason: &str) -> Candidate {
     Candidate {
+        stock_owner: None,
         relative: relative.into(),
         eligible: code == "eligible",
         code: code.into(),
@@ -373,11 +372,17 @@ fn path_key(path: &Path) -> Result<String> {
         observe(&prefix)?;
         match prefix.canonicalize() {
             Ok(path) => {
-                ALIASES.with(|capture| {
+                ALIASES.with(|capture| -> Result<()> {
                     if let Some(aliases) = capture.borrow_mut().as_mut() {
-                        aliases.push((prefix.clone(), path.clone()));
+                        let alias = (prefix.clone(), path.clone());
+                        ensure!(
+                            aliases.len() < MAX_RECHECK_STAMPS || aliases.contains(&alias),
+                            "reference alias budget exceeded"
+                        );
+                        aliases.insert(alias);
                     }
-                });
+                    Ok(())
+                })?;
                 break path;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -484,7 +489,7 @@ fn pending_creates(root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-fn references(root: &Path, homes: &[PathBuf], sessions: &CutexSessionStore) -> Result<References> {
+fn filesystem_references(root: &Path, homes: &[PathBuf]) -> Result<References> {
     let mut refs = References {
         paths: Vec::new(),
         selected: None,
@@ -579,25 +584,191 @@ fn references(root: &Path, homes: &[PathBuf], sessions: &CutexSessionStore) -> R
             }
         }
     }
-    for record in sessions
-        .sessions
-        .values()
-        .filter(|record| !record.is_retired() && record.claude_session.is_none())
-    {
-        let Some(_) = record.codex_session_id.as_deref() else {
-            continue;
-        };
-        let native = record
-            .explicit_launch
-            .as_ref()
-            .map(|c| c.native_home.clone())
-            .or_else(|| refs.selected.clone())
-            .unwrap_or_else(|| root.join("codex-home"));
-        // Recovery ancestry is constrained beneath this native home. Protecting
-        // its entire scope is a conservative superset and needs no rollout walk.
-        refs.paths.push((String::new(), path_key(&native)?));
+    Ok(refs)
+}
+
+fn record_reference(root: &Path, refs: &mut References, record: &CutexSessionRecord) -> Result<()> {
+    if record.is_retired() || record.claude_session.is_some() || record.codex_session_id.is_none() {
+        return Ok(());
+    }
+    let native = record.explicit_launch.as_ref()
+        .map(|contract| contract.native_home.clone())
+        .or_else(|| refs.selected.clone())
+        .unwrap_or_else(|| root.join("codex-home"));
+    refs.paths.push((String::new(), path_key(&native)?));
+    Ok(())
+}
+
+fn references(root: &Path, homes: &[PathBuf], sessions: &CutexSessionStore) -> Result<References> {
+    let mut refs = filesystem_references(root, homes)?;
+    for record in sessions.sessions.values() {
+        record_reference(root, &mut refs, record)?;
     }
     Ok(refs)
+}
+
+pub(super) struct ArchiveCutoverEvidence {
+    root: PathBuf,
+    sessions: crate::store::ChangeCursor,
+    roster: Option<crate::agent_management::RosterMeta>,
+    files: BTreeMap<PathBuf, Option<Stamp>>,
+    aliases: BTreeSet<(PathBuf, PathBuf)>,
+}
+
+pub(super) fn prepare_archive_cutover(
+    home: &Path,
+    record: &CutexSessionRecord,
+) -> Result<(ArchiveCutoverEvidence, super::archive_inventory::FileEntry)> {
+    let root = home.canonicalize()?;
+    let sessions = crate::session::store::reference_cursor_at(&root.join("cutex-sessions.json"))?
+        .context("session reference generation unavailable")?;
+    let roster = crate::agent_management::roster_reference_meta_at(
+        &root.join("runtime/agent-management/v1"),
+    )?;
+    CAPTURE.with(|slot| *slot.borrow_mut() = Some(Capture::default()));
+    ALIASES.with(|slot| *slot.borrow_mut() = Some(BTreeSet::new()));
+    let result = (|| {
+        let blocks = archive_dependency_blocks(&root, std::slice::from_ref(record))?;
+        ensure!(
+            blocks.is_empty(),
+            "archive source still has a dependency: {:?}",
+            blocks.values().next()
+        );
+        super::archive_inventory::inventory_rollout(&root, record)
+    })();
+    let capture = CAPTURE.with(|slot| slot.borrow_mut().take()).unwrap();
+    let aliases = ALIASES.with(|slot| slot.borrow_mut().take()).unwrap();
+    let rollout = result?;
+    ensure!(
+        !capture.unstable && aliases.len() <= MAX_RECHECK_STAMPS,
+        "archive source reference evidence changed or exceeded its budget"
+    );
+    Ok((ArchiveCutoverEvidence { root, sessions, roster, files: capture.files, aliases }, rollout))
+}
+
+impl ArchiveCutoverEvidence {
+    /// Recheck identity and membership using metadata and two committed
+    /// generation reads. The caller holds the exclusive reference fence.
+    pub(super) fn verify(&self, home: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        ensure!(home.canonicalize()? == self.root, "archive host home changed");
+        for (path, previous) in &self.files {
+            ensure!(
+                Instant::now() < deadline && stamp(path)?.as_ref() == previous.as_ref(),
+                "archive source reference evidence changed or exceeded its recheck budget"
+            );
+        }
+        for (path, target) in &self.aliases {
+            ensure!(
+                Instant::now() < deadline && path.canonicalize()? == *target,
+                "archive source alias changed or exceeded its recheck budget"
+            );
+        }
+        let sessions = crate::session::store::reference_cursor_at(&self.root.join("cutex-sessions.json"))?;
+        let roster = crate::agent_management::roster_reference_meta_at(
+            &self.root.join("runtime/agent-management/v1"),
+        )?;
+        ensure!(
+            sessions.as_ref() == Some(&self.sessions) && roster == self.roster && Instant::now() < deadline,
+            "archive reference generation changed or exceeded its recheck budget"
+        );
+        Ok(())
+    }
+}
+
+/// Bounded inventory for a requested batch. Reverse references through
+/// provenance protect the source even when another agent has a private home.
+pub(super) fn archive_dependency_blocks(
+    root: &Path,
+    records: &[CutexSessionRecord],
+) -> Result<BTreeMap<String, &'static str>> {
+    let mut homes = Vec::new();
+    if let Some(meta) = metadata(root, Path::new(PREFIX))? {
+        ensure!(meta.is_dir(), "native agents root is not a directory");
+        for entry in fs::read_dir(root.join(PREFIX))? {
+            ensure!(homes.len() < MAX_ENTRIES, "native home inventory limit exceeded");
+            homes.push(Path::new(PREFIX).join(entry?.file_name()));
+        }
+    }
+    let mut refs = filesystem_references(root, &homes)?;
+    let mut relevant = BTreeMap::new();
+    let mut blocked = BTreeMap::new();
+    for record in records {
+        let id = &record.cutex_session_id;
+        let Some(contract) = record.explicit_launch.as_ref() else {
+            blocked.insert(id.clone(), "native_home_unproven");
+            continue;
+        };
+        let expected = Path::new(PREFIX).join(&contract.native_id);
+        if contract.version != 4
+            || !uuid::Uuid::parse_str(&contract.native_id).is_ok_and(|value| value.to_string() == contract.native_id)
+            || record.codex_session_id.as_deref() != Some(contract.native_id.as_str())
+            || !metadata(root, &expected)?.is_some_and(|meta| meta.is_dir())
+            || contract.native_home != root.join(&expected)
+        {
+            blocked.insert(id.clone(), "native_home_unproven");
+            continue;
+        }
+        if !record.is_retired() || !crate::runtime::lifecycle::cutex_session_host_is_local(
+            &record.host_id, &crate::platform::host::current_host_name())
+            || record.claude_session.is_some() || record.dsh_session.is_some()
+            || !matches!(record.runtime_backend,
+                crate::session::model::CutexSessionRuntimeBackend::Host
+                | crate::session::model::CutexSessionRuntimeBackend::HostForeground)
+        {
+            blocked.insert(id.clone(), "not_retired_local_native");
+            continue;
+        }
+        if record.pending_launch_id.is_some()
+            || crate::session::archive::record_has_runtime_claim(record)
+            || refs.pending_creates.contains(&contract.native_id)
+            || registered_runtime(root, &[record], &contract.native_id)?
+        {
+            blocked.insert(id.clone(), "runtime_reference");
+            continue;
+        }
+        let key = path_key(&contract.native_home)?;
+        if other_reference(&refs, &key) {
+            blocked.insert(id.clone(), "shared_history");
+            continue;
+        }
+        relevant.insert(id.clone(), (key, contract.native_id.as_str()));
+    }
+    // A second durable row may use the same underlying home, including
+    // another archived row. Use bounded pages and retain only target matches.
+    let sessions = root.join("cutex-sessions.json");
+    for retired in [false, true] {
+        let mut after = None;
+        loop {
+            let page = crate::session::store::session_page_at(
+                &sessions, retired, after.as_deref(),
+                crate::store::keyed::PageBudget { max_rows: 128, max_bytes: 1024 * 1024 },
+            )?.context("archive session inventory unavailable")?;
+            ensure!(!page.oversize_first, "archive session inventory exceeds page budget");
+            for row in page.rows {
+                // Legacy live rows use the selected deployment or default home.
+                let previous = refs.paths.len();
+                record_reference(root, &mut refs, &row)?;
+                let referenced = refs.paths.len() > previous;
+                for (id, (key, native_id)) in &relevant {
+                    if id == &row.cutex_session_id || blocked.contains_key(id) {
+                        continue;
+                    }
+                    if owns(&row, key, native_id)?
+                        || (referenced && other_reference(&refs, key))
+                    {
+                        blocked.insert(id.clone(), "shared_history");
+                    }
+                }
+                refs.paths.truncate(previous);
+            }
+            after = page.next;
+            if after.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(blocked)
 }
 
 fn other_reference(refs: &References, candidate: &str) -> bool {
@@ -1245,6 +1416,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn archive_inventory_blocks_source_when_live_fork_records_dependency() {
+        let fixture = Fixture::new();
+        let root = fixture.root.canonicalize().unwrap();
+        let mut record = fixture.record(true);
+        record.explicit_launch.as_mut().unwrap().native_home = fixture.native().canonicalize().unwrap();
+        fixture.file(
+            &format!("sessions/rollout-2026-11-25T01-02-03-{ID}.jsonl"),
+            &serde_json::to_vec(&json!({"type":"session_meta","payload":{"id":ID}})).unwrap()
+                .into_iter().chain([b'\n']).collect::<Vec<_>>(),
+        );
+        fixture.save(record.clone());
+        assert!(archive_dependency_blocks(&root, std::slice::from_ref(&record)).unwrap().is_empty());
+        let request = || serde_json::from_value(json!({"sessionIds":[record.cutex_session_id]})).unwrap();
+        let candidate = super::super::archive_inventory::inspect(&root, request()).unwrap();
+        assert_eq!(candidate["candidateCount"], 1);
+        assert_eq!(candidate["items"][0]["files"][0]["relativePath"],
+            json!(Path::new("sessions").join(format!("rollout-2026-11-25T01-02-03-{ID}.jsonl"))));
+
+        let mut fork = fixture.record(false);
+        fork.cutex_session_id = "cutex.44444444-4444-4444-8444-444444444444".into();
+        fork.codex_session_id = Some(OTHER.into());
+        let fork_home = Path::new(PREFIX).join(OTHER);
+        let contract = fork.explicit_launch.as_mut().unwrap();
+        contract.native_id = OTHER.into();
+        contract.native_home = root.join(&fork_home);
+        fixture.state_file(fork_home.join("adoption.json").to_str().unwrap(), json!({
+            "native_id": OTHER,
+            "history_home": record.explicit_launch.as_ref().unwrap().native_home,
+            "source_history": record.explicit_launch.as_ref().unwrap().native_home.join("sessions")
+        }));
+        fixture.save(fork);
+
+        let after = super::super::archive_inventory::inspect(&root, request()).unwrap();
+        assert_eq!(after["candidateCount"], 0);
+        assert_eq!(after["items"][0]["code"], "shared_history");
+    }
     #[test]
     fn sql_approval_obligations_protect_a_retired_home_when_legacy_json_is_stale() {
         let f=Fixture::new();let session=f.record(true);f.save(session.clone());

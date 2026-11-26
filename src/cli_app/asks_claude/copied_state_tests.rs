@@ -32,7 +32,7 @@ impl AskRuntime for OfflineRuntime {
     fn interrupt_keep_gate(&self,_:&str,_:&str)->anyhow::Result<()> {panic!("offline fixture")}
     fn resume_gate(&self,_:&str)->anyhow::Result<()> {panic!("offline fixture")}
     fn read_turn(&self,_:&str,_:&str)->Option<Value>{None}
-    fn respond_question(&self,_:&str,_:u64,_:&str,_:&Value,_:&Value)->RespondOutcome{panic!("offline fixture")}
+    fn respond_question(&self,_:&str,_:u64,_:&str,_:&Value,_:cutex::asks::scheduler::QuestionResponse<'_>)->RespondOutcome{panic!("offline fixture")}
 }
 
 #[test]

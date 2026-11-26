@@ -31,6 +31,30 @@ DEPLOY_EDITS = [
      r'h=self\.identity\(\);self\.service_health\(\);self\.integrity\(\)',
      'h=self.identity();self.service_health();self.orphan_agent_preflight();self.integrity()',
      'self.service_health();self.orphan_agent_preflight();self.integrity()'),
+]
+ORDERED_INPUT_EDITS = [
+    ('ordered-input.check',
+     r'^([ \t]+)(storage=self\.storage\(\);pins=self\.persisted\(\);rows,busy=self\.idle\(\))$',
+     r"\1importlib.import_module('kit_activation_preflight').ordered_input_preflight(self)  # ordered input check{nl}\1\2",
+     '# ordered input check'),
+    ('ordered-input.forward',
+     r"^([ \t]+)(self\.j\.run\('services.start',lambda:self\.service\('start'\)\);self\.j\.run\('post.verify',lambda:self\.post\(pins\)\))$",
+     r"\1importlib.import_module('kit_activation_preflight').ordered_input_preflight(self)  # ordered input after selection{nl}\1\2",
+     '# ordered input after selection'),
+    ('ordered-input.rollback',
+     r'^(    def rollback\(self\):)$',
+     r"\1{nl}        importlib.import_module('kit_activation_preflight').ordered_input_preflight(self, previous=True)  # ordered input before rollback",
+     '# ordered input before rollback'),
+    ('ordered-input.rollback-fenced',
+     r'^(    def rollback_steps\(self,op,act,pins\):)$',
+     r"\1{nl}        importlib.import_module('kit_activation_preflight').ordered_input_preflight(self, previous=True)  # ordered input after rollback fence",
+     '# ordered input after rollback fence'),
+    ('ordered-input.unchanged-recovery',
+     r"^([ \t]+)(self\.j\.run\('recover.unchanged.start',lambda:self\.service\('start'\)\))$",
+     r"\1importlib.import_module('kit_activation_preflight').ordered_input_preflight(self, previous=True)  # ordered input before previous recovery{nl}\1\2",
+     '# ordered input before previous recovery'),
+]
+DEPLOY_EDITS += [
     ('activate.inherited-online-notice',
      r'After activation, auto-online restores only agents this operation confirmed offline\.',
      'After activation, auto-online restores agents confirmed offline by this operation or an earlier failed attempt of this release.',
@@ -112,15 +136,25 @@ def stage(kit_tool):
     if not (kit / 'deploy.py').is_file():
         raise ValueError('kit-tool/deploy.py required')
     # Validate every anchor before changing anything.
-    edit((kit / 'deploy.py').read_bytes().decode('utf-8'), DEPLOY_EDITS, 'deploy.py')
+    deploy_edits = DEPLOY_EDITS + ORDERED_INPUT_EDITS
+    edit((kit / 'deploy.py').read_bytes().decode('utf-8'), deploy_edits, 'deploy.py')
     if (kit / 'owner.sh').is_file():
         edit((kit / 'owner.sh').read_bytes().decode('utf-8'), OWNER_SH_EDITS, 'owner.sh')
     shutil.copyfile(TOOLS / 'upgrade_online_kit.py', kit / 'upgrade_online_kit.py')
     shutil.copyfile(TOOLS / 'kit_activation_preflight.py', kit / 'kit_activation_preflight.py')
-    applied = rewrite(kit / 'deploy.py', DEPLOY_EDITS)
+    applied = rewrite(kit / 'deploy.py', deploy_edits)
     if (kit / 'owner.sh').is_file():
         applied += rewrite(kit / 'owner.sh', OWNER_SH_EDITS)
     return applied
+
+
+def stage_ordered_input(kit_tool):
+    """Stage only the new gate in a descendant kit with its own online phase."""
+    kit = Path(kit_tool).resolve(strict=True)
+    deploy = kit / 'deploy.py'
+    edit(deploy.read_bytes().decode('utf-8'), ORDERED_INPUT_EDITS, 'deploy.py')
+    shutil.copyfile(TOOLS / 'kit_activation_preflight.py', kit / 'kit_activation_preflight.py')
+    return rewrite(deploy, ORDERED_INPUT_EDITS)
 
 
 # Builder's kit unit tests that pin deploy.py source text (r276.1 suite).
@@ -155,9 +189,14 @@ def main():
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument('--kit-tool-dir', type=Path)
     target.add_argument('--kit-tests-dir', type=Path, help="the builder's kit-tests copy (stages its kit-tool, updates pins)")
+    target.add_argument('--ordered-input-only', type=Path, metavar='KIT_TOOL_DIR',
+                        help='stage the ordered-input preflight in a descendant kit')
     args = parser.parse_args()
-    applied = stage(args.kit_tool_dir) if args.kit_tool_dir else stage_tests(args.kit_tests_dir)
-    print('Auto-online staged (%s); regenerate script hashes and rehearse before sealing.'
+    if args.ordered_input_only:
+        applied = stage_ordered_input(args.ordered_input_only)
+    else:
+        applied = stage(args.kit_tool_dir) if args.kit_tool_dir else stage_tests(args.kit_tests_dir)
+    print('Kit changes staged (%s); regenerate script hashes and rehearse before sealing.'
           % (', '.join(applied) or 'already present'))
 
 

@@ -105,6 +105,15 @@ class RuntimeTasks:
         if not task or task['status'] in TERMINAL or task['status'] == 'unknown':
             raise ProviderError('Task is not a known running task of this native session')
 
+    async def approval_denied(self, task_id):
+        row = self.rows.get(task_id)
+        if not row or not row.get('background') or row['status'] not in {'running', 'pending'}:
+            return
+        if row.get('approvalState') == 'deniedUnattended':
+            return
+        row['approvalState'] = 'deniedUnattended'
+        await self.engine.emit(self.tid, 'claude/task/updated', {'threadId': self.tid, 'task': self._public(row)})
+
     def disconnected(self):
         for task in self.rows.values():
             if task['status'] not in TERMINAL | {'lost'}:
@@ -318,7 +327,7 @@ class RuntimeTasks:
             timer = self.timers.pop(task_id, None)
             if timer is not None:
                 timer.cancel()
-            for key in ('_closed', '_notified', '_reason', 'notifyParent'):
+            for key in ('_closed', '_notified', '_reason', 'notifyParent', 'approvalState'):
                 row.pop(key, None)
             row['status'] = 'running'
             row['_noticeId'] = f'{task_id}:run:{start_uuid}'

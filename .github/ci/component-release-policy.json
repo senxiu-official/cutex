@@ -1,4 +1,8 @@
 {
   "schema": "cutex/component-release-policy/v1",
-  "omit": {}
+  "omit": {
+    "job-service": "Reuse the original production-signed Job Service0.1.3 archive; this release does not rebuild or re-sign that immutable version.",
+    "dsh-runtime": "Reuse the original production-signed dsh-r3 archives; source and immutable version are unchanged.",
+    "kimi-runtime": "Reuse the original production-signed kimi-r3 archives; source and immutable version are unchanged."
+  }
 }

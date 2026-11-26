@@ -64,5 +64,3 @@ tools and Result cannot be attributed to or acknowledge it.
 Validation: tests/test_owner_carries.py plus existing ExternalInput, busy/steer,
 autonomous isolation and native context receipt suites. Tests use a marked private HOME,
 fake SDK/native transcript fixtures, and no live credentials or services.
-
-

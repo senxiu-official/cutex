@@ -294,6 +294,37 @@ fn unknown_shared_database_tables_are_not_observation_exemptions() {
 }
 
 #[test]
+fn known_ordered_schema_is_preserved_only_without_ordered_rows() {
+    let f = Fixture::new();
+    let path = f.0.join(MANAGEMENT_DB);
+    use crate::management::v2::hot_store::{commit, RowChange};
+    commit(&path, "asks", 0, vec![RowChange::Delete {
+        collection: "deliveries".into(), key: "fixture".into(),
+    }]).unwrap();
+    let update = |sql| {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(sql).unwrap();
+    };
+
+    check_both(&f, true);
+
+    update("INSERT INTO automatic_input_windows(session) VALUES ('fixture');");
+    for reader in [Reader::R263, Reader::R264] {
+        let error = older_stores::preflight_preserved_stores(&f.0, reader).unwrap_err();
+        assert!(error.to_string().contains("contains ordered input state"));
+    }
+    check_both(&f, false);
+
+    update("DELETE FROM automatic_input_windows WHERE session='fixture';");
+    check_both(&f, true);
+
+    update("CREATE INDEX foreign_window_index ON automatic_input_windows(deadline);");
+    check_both(&f, false);
+    update("DROP INDEX foreign_window_index; CREATE TABLE foreign_table(value TEXT);");
+    check_both(&f, false);
+}
+
+#[test]
 fn removed_observation_namespace_is_unknown_for_both_readers() {
     let f = Fixture::new();
     let path = f.0.join("runtime/management-v2/management-state.sqlite3");

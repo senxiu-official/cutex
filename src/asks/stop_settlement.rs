@@ -12,6 +12,11 @@ pub fn terminal_without_lease(state: &AskState, ask: &AskRecord) -> bool {
             matches!(&lease.holder, LeaseHolder::Ask { ask_id, .. } if ask_id == &ask.ask_id))
 }
 
+fn cancelled_stop(ask:&AskRecord)->bool {
+    !ask.resume_pending() && ask.bounded_continuation.current.as_ref().is_some_and(|c|
+        c.state==super::continuation::Phase::Cancelled && c.cancel_reason.as_deref()!=Some("handler_turn_failed"))
+}
+
 pub fn ensure_deadline(state: &mut AskState, id: &str, attempt: u32, now: DateTime<Utc>) {
     let Some(record) = state.asks.get(id).filter(|a| a.is_open())
         .and_then(|a| a.current_attempt()).filter(|r| r.n == attempt && r.stop_requested && r.stop_deadline.is_none()) else { return; };
@@ -50,8 +55,7 @@ pub fn close_stage(state: &mut AskState, id: &str, now: DateTime<Utc>, cancel: b
 
 pub fn close_cancelled_continuation(state: &mut AskState, id: &str, now: DateTime<Utc>) {
     if state.asks.get(id).is_some_and(|ask| ask.is_open() && terminal_without_lease(state, ask)
-        && ask.bounded_continuation.current.as_ref().is_some_and(|c|
-            c.state == super::continuation::Phase::Cancelled)) {
+        && cancelled_stop(ask)) {
         close_stage(state, id, now, false);
     }
 }
@@ -74,7 +78,7 @@ pub fn reconcile(world: &dyn SchedulerWorld, store: &AskStore, now: DateTime<Utc
         let ask = &snapshot.asks[id];
         retired.contains(id) || (terminal_without_lease(&snapshot, ask)
             && (ask.current_attempt().is_some_and(|r| r.stop_requested)
-                || ask.bounded_continuation.current.as_ref().is_some_and(|c|c.state==super::continuation::Phase::Cancelled)))
+                || cancelled_stop(ask)))
             || ask.current_attempt().is_some_and(|r| r.stop_requested && (r.stop_deadline.is_none()
                 || (!r.stop_unconfirmed && r.stop_deadline.as_deref().and_then(super::parse_time).is_some_and(|d| now >= d))))
     }).collect();
@@ -91,7 +95,7 @@ pub fn reconcile(world: &dyn SchedulerWorld, store: &AskStore, now: DateTime<Utc
                     super::scheduler::fail_ask(state, id, "recipient_archived", now);
                 } else if !record.state.is_terminal() { native_retired.push((id.clone(), target.clone(), attempt)); }
             } else if terminal_without_lease(state, ask) && (record.stop_requested
-                || ask.bounded_continuation.current.as_ref().is_some_and(|c|c.state==super::continuation::Phase::Cancelled)) {
+                || cancelled_stop(ask)) {
                 close_stage(state, id, now, true);
             } else {
                 ensure_deadline(state, id, attempt, now);

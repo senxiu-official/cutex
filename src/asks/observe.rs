@@ -258,6 +258,11 @@ fn observe_inner(
         }
         "turn/started" => {
             store.with_state(|state| {
+                if state.leases.get(session) != Some(&lease) || !attempt_open(state, &ask_id, attempt) { return; }
+                if !state.asks.get(&ask_id).is_some_and(|ask| !ask.execution.is_terminal()
+                    && ask.current_attempt().is_some_and(|record| record.n == attempt && !record.stop_requested
+                        && record.native_message_id == lease.native_message_id && record.runtime_generation == lease.runtime_generation
+                        && record.turn_id == lease.turn_id)) { return; }
                 state.update_ask(&ask_id, now, |ask| {
                     if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
                         if matches!(record.state, AttemptState::Submitting | AttemptState::Admitted) {
@@ -269,7 +274,7 @@ fn observe_inner(
                     if !ask.execution.is_terminal() {
                         ask.execution = ExecutionState::Running;
                     }
-                })
+                });
             })?;
         }
         "item/started" | "item/completed" => {
@@ -417,19 +422,26 @@ fn requeue_quota_failure(
     {
         return Ok(false);
     }
-    // The runtime's text may say the failed input is not retried (true of
-    // the runtime alone); cutex does redeliver it, so say so.
-    let error = turn_outcome(turn).1.map(|error| format!("{error} {QUOTA_REQUEUED_NOTE}"));
     // r290 P7
     let record = ask.attempts.iter().find(|r|r.n == attempt).unwrap();
     let schedule = super::handler_failure::quota_schedule(session, record.runtime_generation, record.turn_id.as_deref());
+    let workflow_step = crate::workflows::asks_bridge::is_workflow_step(&ask);
+    if workflow_step && crate::workflows::asks_bridge::step_may_have_effects(&ask, record) {
+        return Ok(false);
+    }
+    let requeued_note = if workflow_step {
+        "[cutex: the workflow step can continue automatically after a verified quota reset.]"
+    } else {
+        QUOTA_REQUEUED_NOTE
+    };
+    let error = turn_outcome(turn).1.map(|error| format!("{error} {requeued_note}"));
     let mut failure = super::handler_failure::diagnostic(&turn["error"], record.turn_id.as_deref(), &record.activity, now);
     failure.auto_requeued = true;
     failure.resumes_at = schedule.resumes_at;
     if failure.resets_at.is_none() { failure.resets_at = schedule.resets_at; }
     failure.hold = Some(Hold::Blocked { by: BlockedReason::Quota });
     failure.message = format!("{} {}", super::truncate_chars(&failure.message,
-        1200usize.saturating_sub(QUOTA_REQUEUED_NOTE.chars().count()+1)), QUOTA_REQUEUED_NOTE);
+        1200usize.saturating_sub(requeued_note.chars().count()+1)), requeued_note);
     store.with_state(|state| {
         // Another end-of-turn path already ended this attempt: nothing to
         // requeue (and not a second `quota_requeues` count).
@@ -441,6 +453,11 @@ fn requeue_quota_failure(
         // r290 P7: Stop can win while the quota callback runs outside this lock.
         if state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n == attempt))
             .is_some_and(|r|r.stop_requested || super::handler_failure::owner_stopped(state, session, r)) {
+            return false;
+        }
+        if workflow_step && state.asks.get(ask_id).is_some_and(|ask| {
+            ask.current_attempt().is_some_and(|record| crate::workflows::asks_bridge::step_may_have_effects(ask, record))
+        }) {
             return false;
         }
         let mut requeued = false;
@@ -1123,6 +1140,52 @@ mod tests {
             assert!(state.deliveries.values().any(|d|d.ask_id == other
                 && d.ref_id.starts_with(super::super::handler_failure::PREFIX)));
         }
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn workflow_quota_failure_after_a_tool_does_not_redeliver_the_step() {
+        let (world, dir) = world("workflow-quota-tool");
+        let (store, store_dir) = temp_store("workflow-quota-tool");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let mut request = new_ask("wr-0123456789abcdef:0123456789abcdef#1", "x");
+        request.requester = Requester::Owner;
+        let ask_id = store.with_state(|state| state.create_ask(request, now).unwrap().0.ask_id).unwrap();
+        crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+        let state = store.snapshot().unwrap();
+        let ask = &state.asks[&ask_id];
+        assert!(crate::workflows::asks_bridge::is_workflow_step(ask));
+        let attempt = ask.current_attempt().unwrap();
+        let mut pending = crate::management::v2::quota_continue::Pending {
+            at: now.to_rfc3339(),
+            reset_at: now.timestamp(),
+            account_id: Some("fixture-account".into()),
+            turn_id: attempt.turn_id.clone(),
+            runtime_generation: attempt.runtime_generation,
+            scheduled_at: now.to_rfc3339(),
+            estimated: false,
+        };
+        assert!(crate::workflows::asks_bridge::quota_reset_matches(ask, &pending));
+        pending.estimated = true;
+        assert!(!crate::workflows::asks_bridge::quota_reset_matches(ask, &pending));
+        pending.estimated = false;
+        pending.runtime_generation += 1;
+        assert!(!crate::workflows::asks_bridge::quota_reset_matches(ask, &pending));
+        let turn = attempt.turn_id.clone().unwrap();
+
+        store.with_state(|state| {
+            state.update_ask(&ask_id, now, |ask| {
+                ask.current_attempt_mut().unwrap().activity.tool_calls = 1;
+            });
+        }).unwrap();
+        observe_with(&store, TARGET, "turn/completed", &quota_failed(&turn), now, &|| true).unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.asks[&ask_id].execution, ExecutionState::Failed);
+        assert_eq!(state.asks[&ask_id].quota_requeues, 0);
+        let polled = crate::workflows::asks_bridge::poll(&store, &[ask_id.clone()]);
+        assert!(matches!(&polled[&ask_id], crate::workflows::asks_bridge::AskPoll::Failed { code, .. } if code == "outcome_unknown"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
     }

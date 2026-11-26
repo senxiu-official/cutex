@@ -99,27 +99,115 @@ pub fn route_json(store: &AskStore, full_path: &str, route: &Route) -> Result<Va
         &crate::asks::receipt_uncertainty::read_context::load)
 }
 
-fn route_json_with_receipt_loader(
-    store: &AskStore, full_path: &str, route: &Route,
-    read_receipts: &dyn Fn(&[&crate::asks::model::AskRecord]) -> crate::asks::receipt_uncertainty::read_views::ReceiptReadContext,
-) -> Result<Value, RouteError> {
-    let unavailable = |error: anyhow::Error| RouteError {
+/// Resolve positions from the same numbered queue used for admission.
+fn admission_positions(
+    store: &AskStore,
+    state: &crate::asks::store::AskState,
+    asks: &[&crate::asks::model::AskRecord],
+) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+    let sessions: std::collections::BTreeSet<_> = asks.iter()
+        .filter(|ask| super::admission::is_numbered_ask(ask))
+        .map(|ask| ask.target_cutex_session_id.as_str())
+        .collect();
+    store.readonly_admission_positions(state, &sessions)
+}
+
+const SHORT_ID_MAX_LIMIT: usize = 20;
+
+fn store_unavailable(error: anyhow::Error) -> RouteError {
+    RouteError {
         status: 503,
         code: "asks_unavailable",
         message: "the ask store could not be read".into(),
         details: json!({ "diagnostic": format!("{error:#}") }),
+    }
+}
+
+fn list_filter(query: impl Fn(&str) -> Option<String>) -> AskFilter {
+    AskFilter {
+        project: query("project"),
+        requester: query("requester"),
+        target: query("target"),
+        state: query("state"),
+        involving: query("involving"),
+    }
+}
+
+fn matches_peer(ask: &crate::asks::model::AskRecord, peer: Option<&str>) -> bool {
+    peer.is_none_or(|id| {
+        ask.remote.as_ref().is_some_and(|remote| remote.peer_id == id)
+            || matches!(&ask.requester, crate::asks::model::Requester::Peer { peer_id, .. } if peer_id == id)
+    })
+}
+
+/// The short-ID mode projects only data already in each matched ask row.
+pub(super) fn short_id_route(
+    store: &AskStore,
+    full_path: &str,
+    visible: impl Fn(&crate::asks::model::AskRecord) -> bool,
+) -> Result<Option<Value>, RouteError> {
+    let Some((_, query)) = full_path.split_once('?') else { return Ok(None) };
+    let mut params = url::form_urlencoded::parse(query.as_bytes());
+    let Some((_, id)) = params.find(|(name, _)| name == "idPrefix") else { return Ok(None) };
+    if params.any(|(name, _)| name == "idPrefix") {
+        return Err(bad_request("duplicate idPrefix"));
+    }
+    let input = id.trim().to_ascii_lowercase();
+    let input = input.strip_prefix('#').unwrap_or(&input);
+    let input = input.strip_prefix("ask-").unwrap_or(input);
+    let suffix = input.strip_prefix('…').or_else(|| input.strip_prefix("..."));
+    let hex = suffix.unwrap_or(input);
+    if !(6..=32).contains(&hex.len()) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(bad_request("idPrefix must contain 6 to 32 hexadecimal digits"));
+    }
+    if url::form_urlencoded::parse(query.as_bytes())
+        .any(|(name, _)| name == "updatedBefore" || name == "cursor")
+    {
+        return Err(bad_request("idPrefix cannot be combined with cleanup pagination"));
+    }
+    let query = |key: &str| crate::http::query::query_value(full_path, key);
+    let limit = match query("limit") {
+        None => SHORT_ID_MAX_LIMIT,
+        Some(value) => value.parse::<usize>().ok()
+            .filter(|limit| (1..=SHORT_ID_MAX_LIMIT).contains(limit))
+            .ok_or_else(|| bad_request(format!("limit must be 1..={SHORT_ID_MAX_LIMIT} for idPrefix")))?,
     };
+    let filter = list_filter(query);
+    let peer = query("peer");
+    let candidates = store.lookup_short_id(hex, suffix.is_some())
+        .map_err(store_unavailable)?;
+    let mut visible_matches = candidates.asks.iter()
+        .filter(|ask| visible(ask) && filter.matches(ask) && matches_peer(ask, peer.as_deref()));
+    let asks: Vec<_> = visible_matches.by_ref().take(limit).map(|ask| json!({
+        "askId": ask.ask_id,
+        "title": ask.title,
+        "target": ask.target_cutex_session_id,
+        "targetName": ask.target_name,
+        "projectId": ask.project_id,
+        "execution": ask.execution,
+        "closed": ask.closed,
+        "updatedAt": ask.updated_at,
+    })).collect();
+    Ok(Some(json!({
+        "hostId": crate::platform::host::current_host_name(),
+        "asks": asks,
+        "hasMore": candidates.truncated || visible_matches.next().is_some(),
+    })))
+}
+
+fn route_json_with_receipt_loader(
+    store: &AskStore, full_path: &str, route: &Route,
+    read_receipts: &dyn Fn(&[&crate::asks::model::AskRecord]) -> crate::asks::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Result<Value, RouteError> {
+    let unavailable = store_unavailable;
     let query = |key: &str| crate::http::query::query_value(full_path, key);
     match route {
         Route::Close(_) => Err(bad_request("use POST to close an ask")),
         Route::Collection => {
-            let filter = AskFilter {
-                project: query("project"),
-                requester: query("requester"),
-                target: query("target"),
-                state: query("state"),
-                involving: query("involving"),
-            };
+            if let Some(value) = short_id_route(store, full_path, |_| true)? {
+                return Ok(value);
+            }
+            let filter = list_filter(query);
             let limit = match query("limit") {
                 None => DEFAULT_LIMIT,
                 Some(value) => value
@@ -153,28 +241,34 @@ fn route_json_with_receipt_loader(
                     status: if error.code == "invalid_request" { 400 } else { 503 },
                     code: error.code, message: error.detail, details: json!({}),
                 })?;
+                let positions = admission_positions(store, &state, &page.asks).map_err(unavailable)?;
                 let receipts = read_receipts(&page.asks);
                 return Ok(json!({
                     "hostId": crate::platform::host::current_host_name(),
                     "asks": page.asks.into_iter()
-                        .map(|ask| crate::asks::view::summary_with_receipts(&state, ask, &receipts))
+                        .map(|ask| crate::asks::view::summary_with_receipts(
+                            &state, ask, positions.get(&ask.ask_id).copied(), &receipts,
+                        ))
                         .collect::<Vec<_>>(),
                     "hasMore": page.has_more,
                     "nextCursor": page.next_cursor,
                 }));
             }
-            let mut asks: Vec<_> = state.asks.values().map(|ask| &**ask).filter(|ask| filter.matches(ask) && peer.as_ref().is_none_or(|id|ask.remote.as_ref().is_some_and(|r|&r.peer_id==id)||matches!(&ask.requester,crate::asks::model::Requester::Peer{peer_id,..}if peer_id==id))).collect();
+            let mut asks: Vec<_> = state.asks.values().map(|ask| &**ask).filter(|ask| filter.matches(ask) && matches_peer(ask, peer.as_deref())).collect();
             asks.sort_by_key(|ask| std::cmp::Reverse(ask.seq));
             let has_more = asks.len() > limit;
             asks.truncate(limit);
             // history_snapshot returned owned data and released AskStore.
             // Bus receipt + independent current session reads happen here.
+            let positions = admission_positions(store, &state, &asks).map_err(unavailable)?;
             let receipts = read_receipts(&asks);
             Ok(json!({
                 "hostId": crate::platform::host::current_host_name(),
                 "asks": asks
                     .into_iter()
-                    .map(|ask| crate::asks::view::summary_with_receipts(&state, ask, &receipts))
+                    .map(|ask| crate::asks::view::summary_with_receipts(
+                        &state, ask, positions.get(&ask.ask_id).copied(), &receipts,
+                    ))
                     .collect::<Vec<_>>(),
                 "hasMore": has_more,
             }))
@@ -185,8 +279,12 @@ fn route_json_with_receipt_loader(
                 .asks
                 .get(ask_id)
                 .ok_or_else(|| not_found("ask_not_found", "no ask has this id", json!({"askId": ask_id})))?;
+            let positions = admission_positions(store, &state, &[ask]).map_err(unavailable)?;
             let receipts = read_receipts(&[ask]);
-            Ok(json!({ "ask": crate::asks::view::owner_view_with_receipts(&state, ask, &receipts) }))
+            let view = crate::asks::view::owner_view_with_receipts(
+                &state, ask, positions.get(&ask.ask_id).copied(), &receipts,
+            );
+            Ok(json!({ "ask": view }))
         }
         Route::Answer(ask_id) => {
             let state = store.lookup_snapshot(&[ask_id]).map_err(unavailable)?;
@@ -218,7 +316,7 @@ fn route_json_with_receipt_loader(
                     .unwrap_or_default(),
             };
             let page = crate::asks::answer::page(&text, cursor, ANSWER_PAGE_BYTES);
-            Ok(json!({
+            let mut value = json!({
                 "askId": ask.ask_id,
                 "answerId": answer.answer_id,
                 "revision": answer.revision,
@@ -229,7 +327,9 @@ fn route_json_with_receipt_loader(
                 "bytes": answer.bytes,
                 "text": page.text,
                 "metadata": answer.metadata,
-            }))
+            });
+            crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
+            Ok(value)
         }
         Route::Provenance => crate::asks::children::provenance_json().map_err(unavailable),
         Route::Artifact(artifact_id) => {
@@ -296,7 +396,10 @@ pub fn owner_close(
                         .asks
                         .get(ask_id)
                         .ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
-                    let mut response = json!({"ask":crate::asks::view::owner_view(state,ask)});
+                    // A close receipt reports the disposition. A stop still
+                    // in flight has already left the admission queue.
+                    let view = crate::asks::view::owner_view_at_position(state, ask, None);
+                    let mut response = json!({"ask": view});
                     if let Some(stopping) = result.get("stopping") {
                         response["stopping"] = stopping.clone();
                     }
@@ -564,7 +667,8 @@ pub fn execute_command(
     let ask_view = |ask_id: &str| -> Result<Value, AskError> {
         let state = store.lookup_snapshot(&[ask_id]).map_err(unavailable)?;
         let ask = state.asks.get(ask_id).ok_or_else(|| AskError::new("ask_not_found", "no such ask"))?;
-        Ok(crate::asks::view::owner_view(&state, ask))
+        let positions = admission_positions(store, &state, &[ask]).map_err(unavailable)?;
+        Ok(crate::asks::view::owner_view_at_position(&state, ask, positions.get(&ask.ask_id).copied()))
     };
     match method {
         CREATE_METHOD => {
@@ -674,7 +778,7 @@ pub fn execute_command(
             let question = crate::asks::questions::respond_in_store(
                 store,
                 question_id,
-                &crate::asks::questions::Responder::Owner,
+                &crate::asks::questions::Responder::Human(super::interaction_history::Actor::current()),
                 &answers,
                 now,
             )?;
@@ -743,7 +847,7 @@ mod receipt_read_tests;
 mod tests {
     use super::*;
     use crate::asks::model::*;
-    use crate::asks::store::tests::{new_ask, temp_store, REQUESTER};
+    use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
 
     #[test]
     fn owner_close_without_target_session_is_durable_and_replays_action() {
@@ -788,8 +892,64 @@ mod tests {
         let response=owner_close(&store,&id,&request,now).unwrap();
         super::super::schema_export::assert_valid("owner-dispositions","askCloseResult",&response);
         assert_eq!(response["ask"]["closed"],"stopped");assert_eq!(response["ask"]["followUpEnded"],true);
+        // Ending follow-up can leave the execution state queued.
+        assert_eq!(response["ask"]["execution"], "queued");
+        assert_eq!(response["ask"]["queuePosition"], Value::Null);
         assert_eq!(response,owner_close(&AskStore::at(&dir),&id,&request,now).unwrap());
         assert!(store.inspect(|state|state.commands.is_empty()).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queue_position_tracks_numbered_order_across_an_owner_move_and_new_ask() {
+        use crate::management::v2::{
+            admission::AdmissionRef,
+            user_input::{parse_user_input_submit_params, QueueEnqueueDecision},
+        };
+        let (store, dir) = temp_store("numbered-ask-position");
+        let queue = store.queue_repository().unwrap();
+        let now = chrono::Utc::now();
+        let first = store.with_state(|state| {
+            state.create_ask(new_ask("first", "first"), now).unwrap().0.ask_id
+        }).unwrap();
+        let owner = match queue.enqueue(TARGET, "thread", "request", &parse_user_input_submit_params(&json!({
+            "clientUserMessageId": "owner-numbered",
+            "origin": {"kind":"android","clientId":"test"},
+            "strategy":"queue",
+            "input":[{"type":"text","text":"owner","text_elements":[]}]
+        })).unwrap()).unwrap() {
+            QueueEnqueueDecision::Queued(item) => item,
+            _ => panic!("expected the owner input to queue"),
+        };
+
+        let initial = queue.admission(TARGET).unwrap();
+        assert_eq!(initial.items[0].id, first);
+        // The receipt read runs after the route has projected the numbered rows.
+        // Commit a move and a new delegation while the list request is in flight.
+        let old_list = route_json_with_receipt_loader(&store, "/v2/asks", &Route::Collection, &|_| {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    queue.move_admission_item(TARGET, &owner.queue_id, initial.order_revision,
+                        Some(&AdmissionRef::ask(first.clone())), true).unwrap();
+                    store.with_state(|state| {
+                        state.create_ask(new_ask("second", "second"), now).unwrap();
+                    }).unwrap();
+                }).join().unwrap();
+            });
+            Default::default()
+        }).ok().unwrap();
+        assert_eq!(old_list["asks"].as_array().unwrap().len(), 1);
+        assert_eq!(old_list["asks"][0]["queuePosition"], 1);
+
+        let current = queue.admission(TARGET).unwrap();
+        let list = cleanup_list(&store, "/v2/asks?limit=1").ok().unwrap();
+        assert_eq!(list["asks"][0]["askId"], current.items[2].id);
+        assert_eq!(list["asks"][0]["queuePosition"], 3);
+        let detail = route_json_with_receipt_loader(&store, "", &Route::Ask(first), &|_| Default::default())
+            .ok().unwrap();
+        assert_eq!(detail["ask"]["queuePosition"], current.items[1].position);
+        assert_eq!(detail["ask"]["queuePosition"], 2);
+        drop(queue);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -959,6 +1119,62 @@ mod tests {
             assert_eq!(error.status, 400, "{bad}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn short_id_search_finds_hot_and_cold_prefixes_and_suffixes() {
+        let (store, dir) = temp_store("short-id-archive");
+        let old = crate::asks::parse_time("2026-10-01T00:00:00Z").unwrap();
+        let now = crate::asks::parse_time("2026-10-25T00:00:00Z").unwrap();
+        let cold = "ask-deadbe1234567890123456789047c47e";
+        let hot = "ask-47c47e12345678901234567890deadbe";
+        let both = "ask-47c47e1234567890123456789047c47e";
+        store.with_state(|state| {
+            let mut ask = new_ask("cold-hit", "Archived delegation");
+            ask.ask_id = Some(cold.into());
+            state.create_ask(ask, old).unwrap();
+            state.update_ask(cold, old, |ask| {
+                ask.closed = Some(CloseOutcome::Abandoned);
+                ask.execution = ExecutionState::Cancelled;
+                ask.closed_at = Some(crate::asks::now_rfc3339(old));
+            });
+            state.notices.clear();
+            for delivery in state.deliveries.values_mut() {
+                delivery.state = DeliveryState::Acknowledged;
+                delivery.settled_by = Some("read".into());
+            }
+            for id in [hot, both] {
+                let mut ask = new_ask(id, "Active delegation");
+                ask.ask_id = Some(id.into());
+                state.create_ask(ask, now).unwrap();
+            }
+        }).unwrap();
+        assert_eq!(store.archive_before(Some(now), now).unwrap().asks, 1);
+        let read = |query: &str| route_json(&store, &format!("/v2/asks?{query}"), &Route::Collection).ok().unwrap();
+        let all = read("idPrefix=%2347C47E");
+        super::super::schema_export::assert_valid("asks", "askShortIdLookup", &all);
+        let ids = |result: &Value| result["asks"].as_array().unwrap().iter()
+            .map(|ask| ask["askId"].clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&all), [json!(both), json!(hot), json!(cold)]);
+        assert_eq!(all["asks"][2]["closed"], "abandoned");
+        assert_eq!(all["hasMore"], false);
+        assert_eq!(ids(&read("idPrefix=%E2%80%A647c47e")), [json!(both), json!(cold)]);
+        assert_eq!(ids(&read("idPrefix=...9047c47e")), [json!(both), json!(cold)]);
+        assert_eq!(ids(&read("idPrefix=deadbe12")), [json!(cold)]);
+        assert_eq!(ids(&read(&format!("idPrefix=%20%09{}%20", cold.to_uppercase()))), [json!(cold)]);
+        assert_eq!(ids(&read("idPrefix=47c47e&project=alpha")), [json!(both), json!(hot), json!(cold)]);
+        assert!(ids(&read("idPrefix=47c47e&project=%61lpha")).is_empty());
+        assert_eq!(ids(&read("idPrefix=47c47e&state=open")), [json!(both), json!(hot)]);
+        assert_eq!(read("idPrefix=47c47e&limit=1")["hasMore"], true);
+        assert!(ids(&read("idPrefix=ffffff")).is_empty());
+        for query in ["idPrefix=47c47", "idPrefix=47c47z", "idPrefix",
+            "idPrefix=47c47e&id%50refix=47c47e", "idPrefix=47c47e&updatedBefore=x",
+            "idPrefix=47c47e&limit=21",
+        ] {
+            let error = route_json(&store, &format!("/v2/asks?{query}"), &Route::Collection).err().unwrap();
+            assert_eq!(error.status, 400, "{query}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The owner as requester: create (never gated, deduplicated on

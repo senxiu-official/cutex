@@ -57,9 +57,13 @@ pub fn persisted_cutoff(path: &Path) -> anyhow::Result<Option<DateTime<Utc>>> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(Duration::from_secs(5))?;
+    persisted_cutoff_in(&db)
+}
+
+pub(super) fn persisted_cutoff_in(db: &Connection) -> anyhow::Result<Option<DateTime<Utc>>> {
     let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asks_archive_meta')",[],|r|r.get(0))?;
     if !exists {
-        require_no_unmarked_archive(&db)?;
+        require_no_unmarked_archive(db)?;
         return Ok(None);
     }
     let policy: Option<(i64, String)> = db
@@ -70,7 +74,7 @@ pub fn persisted_cutoff(path: &Path) -> anyhow::Result<Option<DateTime<Utc>>> {
         )
         .optional()?;
     if policy.is_none() {
-        require_no_unmarked_archive(&db)?;
+        require_no_unmarked_archive(db)?;
     }
     policy
         .map(|(version, value)| {

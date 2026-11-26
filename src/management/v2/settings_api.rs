@@ -23,12 +23,16 @@ use crate::notify::session::Level;
 use crate::config::new_thread::{LaunchPermissions, NewThreadDefaults, ThreadKind};
 use crate::profiles::model::{CodezConfig, NewSessionDefaults, ProxyConfig};
 
+use super::control_capacity;
 use super::profiles_api::{tri_state, visible_string};
 
 pub const PATH: &str = "/v2/settings";
 
 /// Fields whose new value only takes effect after the daemon restarts.
-const RESTART_REQUIRED: &[&str] = &["agentBusEnabled", "agentBusPort", "managementListen"];
+const HEAVY_READ_CONCURRENCY_FIELD: &str = "heavyReadConcurrency";
+const RESTART_REQUIRED: &[&str] = &[
+    "agentBusEnabled", "agentBusPort", "managementListen", HEAVY_READ_CONCURRENCY_FIELD,
+];
 /// Fields only the loopback listener may change (a remote device token must
 /// not open or close network listeners or widen CORS).
 /// r290 P10 (B6): except a patch that is exactly `{peers: {enabled}}` from a
@@ -51,6 +55,7 @@ const PATCH_FIELDS: &[&str] = &[
     "claudeUsageRefreshMinutes",
     "profileQuotaRefreshMinutes",
     "archiveDeleteEmpty",
+    HEAVY_READ_CONCURRENCY_FIELD,
     // r290 P10 (B4/A8)
     "ownerShares",
     "queue",
@@ -294,6 +299,10 @@ pub fn settings_view(config: &CodezConfig) -> Value {
     // \\wsl.localhost); editable only by the owner on the host (as the proxy).
     view["ownerShares"] = json!(config.owner_shares);
     view["ownerSharesEditable"] = json!(crate::management::users::request_has_owner_local_secret_access());
+    view[HEAVY_READ_CONCURRENCY_FIELD] = json!(control_capacity::heavy_read_override(config));
+    view["heavyReadConcurrencyDefault"] = json!(control_capacity::automatic_heavy_read_limit());
+    view["heavyReadConcurrencyActive"] = json!(control_capacity::active_heavy_read_limit());
+    view["heavyReadConcurrencyOptions"] = json!(control_capacity::HEAVY_READ_CONCURRENCY_OPTIONS);
     view["imageInput"] = json!(config.image_input);
     view["imageInputDefault"] = json!(super::user_input::image_steering::ImageInputSettings::default());
     view["claudeCli"] = json!(config.claude_cli);
@@ -799,6 +808,14 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
         default_profile: tri_state(body, "defaultProfile", visible_string(200))?,
         default_profile_direct_launch: required_bool(body, "defaultProfileDirectLaunch")?,
         archive_delete_empty: required_bool(body, "archiveDeleteEmpty")?,
+        heavy_read_concurrency: tri_state(body, HEAVY_READ_CONCURRENCY_FIELD, |value| {
+            let limit = value
+                .as_u64()
+                .and_then(|limit| usize::try_from(limit).ok())
+                .ok_or("must be an integer or null")?;
+            control_capacity::validate_heavy_read_limit(limit).map_err(|error| error.to_string())?;
+            Ok(limit)
+        })?,
         auto_thread_titles: required_bool(body, "autoThreadTitles")?,
         codex_config_follow_shared: follow_shared(body)?,
         quick_chat_default_profile: tri_state(body, "quickChatDefaultProfile", visible_string(200))?,
@@ -1045,11 +1062,13 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
     let mut patch = request.patch;
     let store = crate::profiles::settings_api::load_store()?;
     if let ConfigValueUpdate::Set(target) = &patch.default_profile {
+        super::feature_profiles::require_agent_id(target)?;
         let account = crate::profiles::settings_api::find(&store, target)
             .ok_or_else(|| anyhow::anyhow!("defaultProfile: no profile has this ID or name"))?;
         patch.default_profile = ConfigValueUpdate::Set(account.name.clone());
     }
     if let ConfigValueUpdate::Set(target) = &patch.quick_chat_default_profile {
+        super::feature_profiles::require_agent_id(target)?;
         let account = crate::profiles::settings_api::find(&store, target)
             .ok_or_else(|| anyhow::anyhow!("quickChatDefaultProfile: no profile has this ID or name"))?;
         patch.quick_chat_default_profile = ConfigValueUpdate::Set(account.name.clone());
@@ -1333,13 +1352,22 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
                         .copied()
                         .filter(|field| {
                             touched.iter().any(|t| t == field)
-                                && before.as_ref().map(|b| &b[*field]) != Some(&view[*field])
+                                && if *field == HEAVY_READ_CONCURRENCY_FIELD {
+                                    control_capacity::selected_heavy_read_limit(&config)
+                                        != control_capacity::active_heavy_read_limit()
+                                } else {
+                                    before.as_ref().map(|b| &b[*field]) != Some(&view[*field])
+                                }
                         })
                         .collect();
                     view["changed"] = json!(changed);
                     view["restartRequired"] = json!(restart_required);
                     write_json_response(stream, 200, "OK", &view)
                 }
+                Err(error) if error.is::<super::feature_profiles::AgentRefusal>() =>
+                    super::server::write_v2_error(stream, 409, "Conflict",
+                        super::feature_profiles::AGENT_REFUSAL_CODE, super::feature_profiles::AGENT_REFUSAL_MESSAGE,
+                        false, json!({})),
                 Err(error) if crate::config::store::is_config_busy(&error) => super::server::write_v2_error(
                     stream, 503, "Service Unavailable", "config_busy", &error.to_string(), true, json!({}),
                 ),
@@ -1386,6 +1414,27 @@ mod tests {
         .unwrap_err()
         .contains("on its own"));
         assert!(parse_patch(br#"{"services":{"unknown":1}}"#).is_err());
+    }
+
+    #[test]
+    fn heavy_read_settings_patch_sets_and_clears_the_override() {
+        let mut config: CodezConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings_view(&config)["heavyReadConcurrency"], Value::Null);
+
+        let set = parse_patch(br#"{"heavyReadConcurrency":6}"#).unwrap();
+        assert!(apply_global_config_patch(&mut config, &set.patch).unwrap());
+        assert_eq!(settings_view(&config)["heavyReadConcurrency"], 6);
+        assert_eq!(control_capacity::selected_heavy_read_limit(&config), 6);
+
+        let clear = parse_patch(br#"{"heavyReadConcurrency":null}"#).unwrap();
+        assert!(apply_global_config_patch(&mut config, &clear.patch).unwrap());
+        assert!(serde_json::to_value(&config).unwrap().get("heavy_read_concurrency").is_none());
+        assert_eq!(
+            control_capacity::selected_heavy_read_limit(&config),
+            control_capacity::automatic_heavy_read_limit()
+        );
+        assert!(parse_patch(br#"{"heavyReadConcurrency":3}"#).is_err());
+        assert!(parse_patch(br#"{"heavyReadConcurrency":"4"}"#).is_err());
     }
 
     #[test]

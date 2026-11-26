@@ -346,3 +346,311 @@ fn a_project_move_changes_send_rights_at_once() {
     assert!(!Scope::cached(&grant).sees_session(S_COLLAB), "moved out of the grant: hidden at once");
     assert!(!crate::peers::policy::visible(&peer, &agent));
 }
+
+#[test]
+fn session_search_honors_project_visibility_path_boundaries_and_turn_anchors() {
+    let _lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let work = seed_projects(&instance);
+    let host = crate::platform::host::current_host_name();
+    let mut sessions = crate::session::store::load_cutex_session_store().unwrap();
+    let visible = sessions.sessions.get_mut(S_VIEW).unwrap();
+    visible.runtime_generation = 1;
+    visible.managed_cwd = Some(work.join("managed").to_string_lossy().into_owned());
+    let managed = visible.managed_cwd.clone().unwrap();
+    sessions.sessions.get_mut(S_COLLAB).unwrap().managed_cwd = Some(work.join("managed-other").to_string_lossy().into_owned());
+    let mut remote = sessions.sessions.get(S_VIEW).unwrap().clone();
+    remote.cutex_session_id = "cutex.search-remote".into();
+    remote.host_id = "foreign-search-host".into();
+    remote.codex_session_id = Some("thread-search-remote".into());
+    sessions.sessions.insert(remote.cutex_session_id.clone(), remote);
+    let mut archived = sessions.sessions.get(S_VIEW).unwrap().clone();
+    archived.cutex_session_id = "cutex.search-archived".into();
+    archived.archive_state = crate::session::model::CutexSessionArchiveState::Retired;
+    archived.codex_session_id = Some("thread-search-archived".into());
+    sessions.sessions.insert(archived.cutex_session_id.clone(), archived);
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+
+    let users = UserStore::open_default().unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let user = users.create_user("Search viewer", None, Grant {
+        projects: Projects::Only(vec![VIEW.into()]), ..Grant::default()
+    }, "root").unwrap();
+    let token = tokens.issue_scoped("search-viewer", DeviceScope::Read).unwrap();
+    users.bind_token(&token.token_id, Some(&user.id), "root").unwrap();
+    let pending = tokens.issue_scoped("search-pending", DeviceScope::Read).unwrap();
+
+    let mut ctx = p2_context();
+    ctx.load_runtime_status = |sid| {
+        assert_eq!(sid, S_VIEW, "no runtime access for another project or host");
+        Ok(Some(search_runtime_status(sid)))
+    };
+    ctx.forward_native_request = |sid, request| {
+        assert_eq!(sid, S_VIEW);
+        assert_eq!(request["method"], "thread/turns/list");
+        assert_eq!(request["params"]["itemsView"], "summary");
+        assert_eq!(request["params"]["limit"], 12);
+        assert_eq!(request["params"]["threadId"], format!("thread-{sid}"));
+        let first = request["params"]["cursor"].is_null();
+        if !first { assert_eq!(request["params"]["cursor"], "private-next"); }
+        Ok(json!({"result":{"data":[{
+            "id":if first {"turn-newer"} else {"turn-older"}, "status":"completed", "itemsView":"summary",
+            "items":[{"type":"userMessage","content":[{"type":"text",
+                "text":if first {"New task match"} else {"Old task match"}
+            }]}]
+        }],"nextCursor":if first {json!("private-next")} else {Value::Null}}}))
+    };
+    let path = |values: &[(&str, &str)]| {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.extend_pairs(values.iter().copied());
+        format!("/v2/sessions/search?{}", query.finish())
+    };
+    let get = |path: &str, bearer: Option<&str>| {
+        let (status, _, bytes) = exchange_with(ctx, "GET", path, bearer, vec![], "application/json", "");
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    assert_eq!(get("/v2/sessions/search", None).0, 401);
+    assert_eq!(get("/v2/sessions/search", Some(&pending.token)).0, 403);
+    let listed = get("/v2/sessions/search", Some(&token.token));
+    assert_eq!(listed.0, 200, "{}", listed.1);
+    assert_eq!(listed.1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(listed.1["items"][0]["cutexSessionId"], S_VIEW);
+    let filtered = get(&path(&[("cwd", &managed)]), Some(ROOT));
+    assert_eq!(filtered.0, 200);
+    assert_eq!(filtered.1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered.1["items"][0]["cwd"], managed);
+    assert_eq!(get(&path(&[("lifecycle","retired")]), Some(&token.token)).0, 403);
+    let retired = get(&path(&[("lifecycle","retired")]), Some(ROOT));
+    assert_eq!(retired.1["items"][0]["cutexSessionId"], "cutex.search-archived");
+
+    let query = [("mode", "tasks"), ("q", "task match")];
+    let first = get(&path(&query), Some(&token.token));
+    assert_eq!(first.0, 200, "{}", first.1);
+    assert_eq!(first.1["items"][0]["turnId"], "turn-newer");
+    assert_eq!(first.1["more"], true);
+    assert_eq!(first.1["partial"], false);
+    let cursor = first.1["nextCursor"].as_str().unwrap();
+    let resumed = get(&path(&[query[0], query[1], ("cursor", cursor)]), Some(&token.token));
+    assert_eq!(resumed.0, 200, "{}", resumed.1);
+    let hit = &resumed.1["items"][0];
+    assert_eq!(hit["hostId"], host);
+    assert_eq!(hit["cutexSessionId"], S_VIEW);
+    assert_eq!(hit["turnId"], "turn-older");
+    assert_eq!(hit["snippet"], "Old task match");
+    crate::management::v2::schema_export::assert_valid("session-search", "response", &resumed.1);
+    assert!(resumed.1["nextCursor"].is_null());
+    assert_eq!(resumed.1["more"], false);
+
+    let no_access = get(&path(&[query[0], query[1], ("sessionId", S_HIDDEN)]), Some(&token.token));
+    assert_eq!(no_access.0, 200);
+    assert_eq!(no_access.1["items"], json!([]));
+    let role = format!("/v2/users/{}/projects/{VIEW}", user.id);
+    assert_eq!(p2_exchange("DELETE", &role, ROOT, &json!({})).0, 200);
+    let revoked = get(&path(&[query[0], query[1], ("cursor", cursor)]), Some(&token.token));
+    assert_eq!(revoked.0, 200);
+    assert_eq!(revoked.1["items"], json!([]));
+    assert!(revoked.1["nextCursor"].is_null());
+}
+
+fn search_runtime_status(sid: &str) -> crate::app_server::manager::AppServerManagedRuntimeStatus {
+    use crate::app_server::manager::AppServerManagedRuntimeStatus;
+    AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
+            background_work: None, cutex_session_id: sid.into(), thread_id: format!("thread-{sid}"),
+            runtime_generation: 1, connected: true, active_turn_id: None, active_turn_observed_at: None,
+            thread_status: None, thread_status_observed_at: None, thread_settings: None,
+            thread_settings_source: None, thread_settings_complete: false, thread_settings_observed_at: None,
+            runtime_workspace_roots: None, instruction_sources: None, resume_snapshot_observed_at: None,
+            event_method_counts: Default::default(), initialized_user_agent: None, last_event_at: None, last_error: None,
+    }
+}
+
+#[test]
+fn session_search_pages_visit_every_eligible_session_in_both_modes() {
+    use crate::agent_bus::model::AgentRegistrationClass;
+    use crate::session::model::{CutexSessionRecord, CutexSessionStore};
+
+    let _lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let work = instance.root.join("eligible");
+    let other = instance.root.join("eligible-sibling");
+    let host = crate::platform::host::current_host_name();
+    let mut store = CutexSessionStore::default();
+    let mut expected = Vec::new();
+    for index in 0..67 {
+        // Deliberately interleave low and high IDs during insertion.
+        let n = index * 37 % 67;
+        let sid = format!("cutex.search-page-{n:02}");
+        let cwd = if n < 65 {
+            expected.push(sid.clone());
+            &work
+        } else {
+            &other
+        };
+        let mut row = CutexSessionRecord::new(
+            sid.clone(), Some(format!("thread-{sid}")), host.clone(),
+            cwd.to_string_lossy().into_owned(), None,
+        ).unwrap();
+        row.registration_class = AgentRegistrationClass::Persistent;
+        row.runtime_generation = 1;
+        store.sessions.insert(sid, row);
+    }
+    expected.sort();
+    crate::session::store::save_cutex_session_store(&store).unwrap();
+
+    let mut ctx = p2_context();
+    ctx.load_runtime_status = |sid| Ok(Some(search_runtime_status(sid)));
+    ctx.forward_native_request = |sid, request| {
+        assert_eq!(request["method"], "thread/turns/list");
+        assert_eq!(request["params"]["threadId"], format!("thread-{sid}"));
+        assert!(request["params"]["cursor"].is_null());
+        let text = match sid {
+            "cutex.search-page-02" => "pagination task near task",
+            "cutex.search-page-04" => "pagination task rare task",
+            _ => "pagination task",
+        };
+        Ok(json!({"result":{"data":[{
+            "id":format!("turn-{sid}"), "status":"completed", "itemsView":"summary",
+            "items":[{"type":"userMessage","content":[{"type":"text","text":text}]}]
+        }],"nextCursor":null}}))
+    };
+
+    for (mode, page_size) in [("sessions", 30), ("tasks", 1)] {
+        let mut cursor = None::<String>;
+        let mut actual = Vec::new();
+        let page_count = expected.len().div_ceil(page_size);
+        for page_index in 0..page_count {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("mode", mode).append_pair("cwd", &work.to_string_lossy());
+            if mode == "tasks" {
+                query.append_pair("q", "pagination task");
+            }
+            if let Some(cursor) = cursor.as_deref() {
+                query.append_pair("cursor", cursor);
+            }
+            let path = format!("/v2/sessions/search?{}", query.finish());
+            let (status, _, bytes) = exchange_with(
+                ctx, "GET", &path, Some(ROOT), vec![], "application/json", "",
+            );
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, 200, "{mode} page {page_index}: {response}");
+            assert_eq!(response["partial"], false);
+            let rows = response["items"].as_array().unwrap();
+            let remaining = expected.len() - page_index * page_size;
+            assert_eq!(rows.len(), remaining.min(page_size), "{mode} page {page_index}");
+            for row in rows {
+                let sid = row["cutexSessionId"].as_str().unwrap();
+                actual.push(sid.to_string());
+                if mode == "tasks" {
+                    assert_eq!(row["turnId"], format!("turn-{sid}"));
+                }
+            }
+            cursor = response["nextCursor"].as_str().map(str::to_string);
+            assert_eq!(cursor.is_some(), page_index + 1 < page_count, "{mode} page {page_index}");
+            assert_eq!(response["more"], cursor.is_some(), "{mode} page {page_index}");
+        }
+        assert_eq!(actual, expected, "{mode} must visit every eligible ID exactly once in order");
+    }
+
+    let tasks = |needle: &str, cursor: Option<&str>| {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("mode", "tasks").append_pair("cwd", &work.to_string_lossy()).append_pair("q", needle);
+        if let Some(cursor) = cursor {
+            query.append_pair("cursor", cursor);
+        }
+        let path = format!("/v2/sessions/search?{}", query.finish());
+        let (status, _, bytes) = exchange_with(ctx, "GET", &path, Some(ROOT), vec![], "application/json", "");
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        response
+    };
+    let near = tasks("near task", None);
+    assert_eq!(near["items"][0]["cutexSessionId"], "cutex.search-page-02");
+    let budget = tasks("rare task", None);
+    assert_eq!(budget["items"], json!([]), "the fifth native page exceeds the scan budget");
+    assert_eq!(budget["more"], true);
+    let next = tasks("rare task", budget["nextCursor"].as_str());
+    assert_eq!(next["items"][0]["cutexSessionId"], "cutex.search-page-04");
+}
+
+#[test]
+fn short_id_search_scopes_hits_before_limit() {
+    use crate::asks::model::{CloseOutcome, DeliveryState, ExecutionState, Requester};
+    use crate::asks::store::{tests::new_ask, AskStore};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    seed_projects(&instance);
+    let users = UserStore::open_default().unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let user = users.create_user("Lookup viewer", None, Grant::default(), "root").unwrap();
+    let device = tokens.issue_scoped("lookup-viewer", DeviceScope::Read).unwrap();
+    users.bind_token(&device.token_id, Some(&user.id), "root").unwrap();
+    let (status, _) = p2_exchange("PUT", &format!("/v2/users/{}/projects/{VIEW}", user.id),
+        ROOT, &json!({"role": "viewer"}));
+    assert_eq!(status, 200);
+
+    let visible = "ask-47c47e00000000000000000000000000";
+    let hidden_target = "ask-0000000000000000000000000047c47e";
+    let hidden_requester = "ask-47c47e00000000000000000000000001";
+    let capabilities = || {
+        let (status, caps) = p2_exchange("GET", "/v2/capabilities", &device.token, &json!({}));
+        assert_eq!(status, 200, "{caps}");
+        caps
+    };
+    let caps = capabilities();
+    assert!(caps["features"].get("asksShortIdLookupV1").is_none());
+    assert!(!caps["featureList"].as_array().unwrap().contains(&json!("asks-short-id-lookup-v1")));
+
+    let old = crate::asks::parse_time("2026-10-01T00:00:00Z").unwrap();
+    let now = crate::asks::parse_time("2026-11-01T00:00:00Z").unwrap();
+    let store = AskStore::open_default().unwrap();
+    store.with_state(|state| {
+        for (id, target, requester) in [
+            (visible, S_VIEW, Requester::Owner),
+            (hidden_target, S_HIDDEN, Requester::Owner),
+            (hidden_requester, S_VIEW, Requester::Agent { cutex_session_id: S_HIDDEN.into(), name: None }),
+        ] {
+            let mut ask = new_ask(id, "Collision");
+            ask.ask_id = Some(id.into());
+            ask.requester = requester;
+            ask.target_cutex_session_id = target.into();
+            state.create_ask(ask, if id == visible { old } else { now }).unwrap();
+            if id == visible {
+                state.update_ask(id, old, |ask| {
+                    ask.closed = Some(CloseOutcome::Abandoned);
+                    ask.execution = ExecutionState::Cancelled;
+                    ask.closed_at = Some(crate::asks::now_rfc3339(old));
+                });
+                state.notices.clear();
+                for delivery in state.deliveries.values_mut() {
+                    delivery.state = DeliveryState::Acknowledged;
+                    delivery.settled_by = Some("read".into());
+                }
+            }
+        }
+    }).unwrap();
+
+    assert_eq!(store.archive_before(Some(now), now).unwrap().asks, 1);
+    let caps = capabilities();
+    assert_eq!(caps["features"]["asksShortIdLookupV1"], true);
+    assert!(caps["featureList"].as_array().unwrap().contains(&json!("asks-short-id-lookup-v1")));
+
+    let path = "/v2/asks?idPrefix=47c47e&limit=1";
+    let (status, owner) = p2_exchange("GET", path, ROOT, &json!({}));
+    assert_eq!(status, 200, "{owner}");
+    assert_eq!(owner["asks"][0]["askId"], hidden_requester);
+    assert_eq!(owner["hasMore"], true);
+    let (status, scoped) = p2_exchange("GET", path, &device.token, &json!({}));
+    assert_eq!(status, 200, "{scoped}");
+    assert_eq!(scoped["asks"].as_array().unwrap().len(), 1);
+    assert_eq!(scoped["asks"][0]["askId"], visible);
+    assert_eq!(scoped["asks"][0]["closed"], "abandoned");
+    let (status, detail) = p2_exchange("GET", &format!("/v2/asks/{visible}"), &device.token, &json!({}));
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["ask"]["askId"], visible);
+    assert_eq!(scoped["hasMore"], false);
+    let (status, scoped) = p2_exchange("GET", "/v2/asks?idPrefix=...47c47e", &device.token, &json!({}));
+    assert_eq!(status, 200, "{scoped}");
+    assert_eq!(scoped["asks"], json!([]));
+    assert_eq!(scoped["hasMore"], false);
+}

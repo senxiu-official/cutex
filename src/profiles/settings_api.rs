@@ -38,7 +38,11 @@ pub const MAX_API_KEY_BYTES: usize = 4096;
 pub fn appearance_revisions(account: &StoredAccount) -> Value {
     use sha2::{Digest, Sha256};
     let mut revisions = serde_json::Map::new();
-    for (field, value) in appearance::appearance_values(&account.options) {
+    let mut fields = appearance::appearance_values(&account.options);
+    if let Some(label) = super::plan_label::sync_value(account) {
+        fields.insert("planLabel", json!(label));
+    }
+    for (field, value) in fields {
         let etag = format!(
             "{:x}",
             Sha256::digest(format!("cutex/profile-appearance/v1\0{field}\0{value}").as_bytes())
@@ -461,6 +465,9 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
     item["autoPick"] = json!(account.auto_pick);
     // Design 059. Outside json!: its recursion limit.
     item["browserToolSurface"] = json!(account.browser_tool_surface.as_str());
+    if let Some(label) = super::plan_label::sync_value(account) {
+        item["planLabelManual"] = json!(label);
+    }
     item["appearanceRevisions"] = appearance_revisions(account);
     // profile-relay-runtimes: one row per provider interface with its
     // address and whether that is the provider's official one (cutex
@@ -943,6 +950,7 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
             ConfigValueUpdate::Clear => *field = None,
         }
     }
+    let before_label = account.plan_label.clone();
     match &patch.plan_label {
         ConfigValueUpdate::Unchanged => {}
         ConfigValueUpdate::Set(label) => {
@@ -960,6 +968,7 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
             }
         }
     }
+    super::plan_label::record_change(account, before_label.as_deref());
     match &patch.claude_account {
         ConfigValueUpdate::Unchanged => {}
         ConfigValueUpdate::Set(_) | ConfigValueUpdate::Clear if codex => {
@@ -1746,6 +1755,45 @@ mod tests {
             profile_item(&profile, &CodezConfig::default(), false)["appearanceRevisions"],
             cleared
         );
+    }
+
+    #[test]
+    fn linked_plan_label_projects_only_manual_values_and_revisions() {
+        let mut profile = account(CliKind::Codex, "api-key");
+        profile.plan_type = Some("legacy display label".into());
+        let view = |profile: &StoredAccount| profile_item(profile, &CodezConfig::default(), false);
+        let before = view(&profile);
+        assert_eq!(before["planLabel"], "legacy display label");
+        assert_eq!(before.get("planLabelManual"), Some(&Value::Null));
+        let revision = |view: &Value| view["appearanceRevisions"]["planLabel"].clone();
+        assert!(revision(&before)["updatedAt"].is_null());
+
+        let set = ProfileApiPatch {
+            plan_label: ConfigValueUpdate::Set(" Team 套餐 ".into()),
+            ..Default::default()
+        };
+        apply_store_options(&mut profile, &set).unwrap();
+        let saved = view(&profile);
+        assert_eq!(saved["planLabelManual"], "Team 套餐");
+        assert_ne!(revision(&saved)["etag"], revision(&before)["etag"]);
+        assert!(revision(&saved)["updatedAt"].is_string());
+        apply_store_options(&mut profile, &set).unwrap();
+        assert_eq!(revision(&view(&profile)), revision(&saved));
+
+        let clear = ProfileApiPatch {
+            plan_label: ConfigValueUpdate::Clear,
+            ..Default::default()
+        };
+        apply_store_options(&mut profile, &clear).unwrap();
+        let cleared = view(&profile);
+        assert_eq!(cleared.get("planLabelManual"), Some(&Value::Null));
+        assert_eq!(revision(&cleared)["etag"], revision(&before)["etag"]);
+        assert!(revision(&cleared)["updatedAt"].as_str().unwrap() > revision(&saved)["updatedAt"].as_str().unwrap());
+
+        profile.plan_label = Some("a".repeat(41));
+        let legacy = view(&profile);
+        assert!(legacy.get("planLabelManual").is_none());
+        assert!(legacy["appearanceRevisions"].get("planLabel").is_none());
     }
 
     #[test]
@@ -2621,7 +2669,11 @@ mod tests {
             (claude.plan_label.as_deref(), claude.plan_type.as_deref()),
             (None, Some("pro"))
         );
-        assert!(!store_fields_changed(&claude, &original));
+        // Linked hosts must observe the clear even though the label returned
+        // to its original value.
+        let mut without_sync_revision = claude.clone();
+        assert!(without_sync_revision.options.appearance_updated_at.remove("planLabel").is_some());
+        assert!(!store_fields_changed(&without_sync_revision, &original));
         let item = profile_item(&claude, &CodezConfig::default(), false);
         assert_eq!(
             (item["planLabel"].clone(), item["planLabelSource"].clone()),

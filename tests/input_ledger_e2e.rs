@@ -14,6 +14,8 @@
 
 #[path = "input_ledger_e2e/daemon.rs"]
 mod daemon;
+#[path = "input_ledger_e2e/crosshost_receipts.rs"]
+mod crosshost_receipts;
 #[path = "input_ledger_e2e/fake_runtime.rs"]
 mod fake_runtime;
 #[path = "input_ledger_e2e/trace.rs"]
@@ -2241,7 +2243,8 @@ fn first_timeline(t: &Trace, id: &str) -> Value {
 // stays `accepted` on nextUp, `stalled{runtimeDisconnected}`, with actions
 // `retry` + `dismiss`, and cutex never sends it again by itself (the runtime
 // sees one `turn/steer` of it until the owner acts).
-// a (`dismiss`): `uncertain{runtimeLost}` → `discarded{ownerDiscarded}`.
+// a (`dismiss`): the durable owner disposition projects directly to
+// `discarded{ownerDiscarded}`, including through the legacy dismiss route.
 // b (`retry`): while the runtime is away the resend is refused before any
 // native IO → `failed{session_offline}` with retry + dismiss; once it is
 // back, the owner's second retry settles it (the runtime had it: history).
@@ -2280,6 +2283,14 @@ fn s32_run(kind: Kind, retry: bool) {
         assert_eq!(sent(&w), 1, "refused before native IO");
     } else {
         let dismissed = w.daemon.cutex(&sid, "cutex/input/dismiss", json!({"inputId": id, "expectedRev": rev(&w)})).expect("dismiss");
+        assert_eq!(dismissed["failed"], json!([]), "{dismissed}");
+        let record = &dismissed["records"][0];
+        assert_eq!(record["inputId"], id);
+        assert_eq!(record["state"], "discarded");
+        assert_eq!(record["reason"], "ownerDiscarded");
+        assert!(record["details"]["ownerDisposition"]["dispositionId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()), "{dismissed}");
         w.recorder.mark("dismiss", dismissed.clone());
     }
     w.fake(0).script(|s| s.refuse_connections = false);
@@ -2303,7 +2314,7 @@ fn s32_run(kind: Kind, retry: bool) {
             "waiting{ownerRetry}", "sending", "inContext(historyRead)"]);
         assert_eq!(t.surfaces(id), ["nextUp", "timeline"]);
     } else {
-        assert_path(&t, id, &["received", "sending", "accepted", "uncertain{runtimeLost}", "discarded{ownerDiscarded}"]);
+        assert_path(&t, id, &["received", "sending", "accepted", "discarded{ownerDiscarded}"]);
     }
     // Never on the timeline before it was read.
     let unread_timeline = t.records("session", id).into_iter()

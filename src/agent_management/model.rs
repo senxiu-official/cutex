@@ -262,6 +262,10 @@ impl ManagedAgentSpec {
         {
             return Err(AgentManagementError::InvalidRequest("invalid_profile"));
         }
+        use crate::management::v2::feature_profiles::{require_agent_id, AGENT_REFUSAL_CODE};
+        if self.profile.as_deref().is_some_and(|profile| require_agent_id(profile).is_err()) {
+            return Err(AgentManagementError::InvalidRequest(AGENT_REFUSAL_CODE));
+        }
         for (value, code) in [
             (&self.name, "invalid_agent_name"),
             (&self.cwd, "invalid_agent_cwd"),

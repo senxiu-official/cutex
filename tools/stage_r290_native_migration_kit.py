@@ -68,3 +68,5 @@ def stage(root):
     ast.parse(result)
     path.write_text(result,encoding="utf-8",newline="\n")
     shutil.copyfile(Path(__file__).with_name("r290_native_migration_kit.py"),root / "r290_native_migration_kit.py")
+    from stage_r296_assistant_rollback import stage as stage_assistant_rollback
+    stage_assistant_rollback(root)

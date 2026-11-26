@@ -28,6 +28,7 @@ struct Store {
 }
 macro_rules! stores { ($(($id:literal,$group:literal,$path:literal,$rule:literal,$kind:literal)),* $(,)?) => { const STORES: &[Store] = &[$(Store { id:$id, group:$group, path:$path, rule:$rule, kind:$kind }),*]; }; }
 stores![
+    ("stock-tmp", "logs", "runtime/stock-tmp", "none", "directory"),
     (
         "light-homes",
         "history",
@@ -561,6 +562,81 @@ fn database(home: &Path) -> anyhow::Result<Connection> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS walk(store TEXT PRIMARY KEY, measured_at TEXT NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS walk_items(store TEXT NOT NULL, path TEXT NOT NULL, bytes INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY(store,path));")?;
     Ok(db)
 }
+/// Per-agent measurements from the latest explicit/periodic storage walk.
+pub(super) fn archived_session_sizes(
+    home: &Path, session_ids: impl IntoIterator<Item = String>,
+) -> anyhow::Result<HashMap<String, Value>> {
+    use rusqlite::OptionalExtension;
+    const DATABASE: &str = "runtime/storage/storage.sqlite3";
+    if !metadata_beneath(home, DATABASE).ok().flatten().is_some_and(|m| m.is_file() && !link(&m)) {
+        return Ok(HashMap::new());
+    }
+    let db = Connection::open_with_flags(home.join(DATABASE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_millis(50))?;
+    let tx = db.unchecked_transaction()?;
+    let measured = |store: &str| -> rusqlite::Result<Option<String>> {
+        tx.query_row("SELECT measured_at FROM walk WHERE store=?1", [store], |row| row.get(0)).optional()
+    };
+    let light_at = measured("light-homes")?;
+    let attachments_at = measured("attachments")?;
+    if light_at.is_none() && attachments_at.is_none() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<_> = session_ids.into_iter().collect();
+    let mut light_bytes = HashMap::<&str, u64>::new();
+    if light_at.is_some() {
+        let conventional_paths: HashMap<_, _> = ids.iter().map(|id|
+            (format!("runtime/light/agents/{}", id.strip_prefix("cutex.").unwrap_or(id)), id.as_str())
+        ).collect();
+        let mut query = tx.prepare(
+            "SELECT path, bytes, json_extract(value,'$.cutexSessionId') FROM walk_items WHERE store='light-homes'"
+        )?;
+        let rows = query.query_map([], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?
+        )))?;
+        // The cache may include a migrated home under a non-conventional path.
+        // Prefer its recorded owner. Older snapshots can be joined by the
+        // conventional path only when the row has no owner annotation.
+        let requested: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+        for row in rows {
+            let (path, count, owner) = row?;
+            let id = match owner.as_deref() {
+                Some(owner) => requested.get(owner).copied(),
+                None => conventional_paths.get(&path).copied(),
+            };
+            if let Some(id) = id {
+                let bytes = light_bytes.entry(id).or_default();
+                *bytes = bytes.saturating_add(u64::try_from(count)?);
+            }
+        }
+    }
+    let mut attachment = tx.prepare("SELECT bytes FROM walk_items WHERE store='attachments' AND path=?1")?;
+    let mut sizes = HashMap::new();
+    for id in &ids {
+        let mut value = serde_json::Map::new();
+        let mut total = 0_u64;
+        if let (Some(at), Some(&bytes)) = (&light_at, light_bytes.get(id.as_str())) {
+            total = bytes;
+            value.insert("lightHomesBytes".into(), json!(bytes));
+            value.insert("lightHomesMeasuredAt".into(), json!(at));
+        }
+        if let Some(at) = &attachments_at {
+            let relative = format!("runtime/attachments/{}", super::attachments::session_dir_name(id));
+            if let Some(bytes) = attachment.query_row([relative], |row| row.get::<_, i64>(0)).optional()? {
+                let bytes = u64::try_from(bytes)?;
+                total = total.saturating_add(bytes);
+                value.insert("attachmentBytes".into(), json!(bytes));
+                value.insert("attachmentsMeasuredAt".into(), json!(at));
+            }
+        }
+        if !value.is_empty() {
+            value.insert("bytes".into(), json!(total));
+            sizes.insert(id.clone(), Value::Object(value));
+        }
+    }
+    Ok(sizes)
+}
+
 fn item_path(path: &str, store: &Store) -> String {
     let parts: Vec<_> = path.split('/').collect();
     let count = match store.id {
@@ -971,6 +1047,9 @@ pub(super) fn handle(
     request: &SimpleHttpRequest,
 ) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if super::archive_location::is_path(path) {
+        return super::archive_location::handle(stream, request);
+    }
     if super::storage_cleanup::is_path(path) {
         return super::storage_cleanup::handle(stream,request);
     }
@@ -1145,6 +1224,33 @@ mod tests {
         assert_eq!(row(&report,"submitted-input-index")["bytes"],4*b"synthetic index bytes".len());
         assert_eq!(row(&report,"other")["bytes"],0);
         let _=fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn archive_sizes_read_only_measured_components_by_exact_session() {
+        let root = std::env::temp_dir().join(format!("archive-size-{}", uuid::Uuid::new_v4()));
+        crate::management::client_tokens::ensure_private_dir(&root).unwrap();
+        assert!(archived_session_sizes(&root, ["cutex.a".into()]).unwrap().is_empty());
+        let db = database(&root).unwrap();
+        db.execute("INSERT INTO walk VALUES ('light-homes','2026-01-01T00:00:00Z','{}')", []).unwrap();
+        db.execute("INSERT INTO walk_items VALUES ('light-homes','runtime/light/agents/a',42,'{}')", []).unwrap();
+        db.execute("INSERT INTO walk_items VALUES ('light-homes','runtime/light/agents/ab',99,'{}')", []).unwrap();
+        db.execute("INSERT INTO walk_items VALUES ('light-homes','runtime/light/agents/migrated',8,?1)",
+            [r#"{"cutexSessionId":"cutex.a"}"#]).unwrap();
+        let sizes = archived_session_sizes(&root, ["cutex.a".into()]).unwrap();
+        assert_eq!(sizes["cutex.a"]["bytes"], 50);
+        assert!(sizes["cutex.a"].get("attachmentBytes").is_none());
+        db.execute("INSERT INTO walk VALUES ('attachments','2026-01-02T00:00:00Z','{}')", []).unwrap();
+        db.execute("INSERT INTO walk_items VALUES ('attachments','runtime/attachments/cutex.a',7,'{}')", []).unwrap();
+        db.execute("INSERT INTO walk_items VALUES ('attachments','runtime/attachments/cutex.empty',0,'{}')", []).unwrap();
+        let sizes = archived_session_sizes(&root, ["cutex.a".into(), "cutex.none".into(), "cutex.empty".into()]).unwrap();
+        assert_eq!(sizes["cutex.empty"]["bytes"], 0);
+        assert!(sizes["cutex.empty"].get("lightHomesBytes").is_none());
+        assert_eq!(sizes["cutex.a"]["bytes"], 57);
+        assert_eq!(sizes["cutex.a"]["attachmentsMeasuredAt"], "2026-01-02T00:00:00Z");
+        assert!(!sizes.contains_key("cutex.none"));
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

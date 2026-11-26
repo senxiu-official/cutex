@@ -579,6 +579,7 @@ pub(crate) fn cmd_management_serve(
     // 2026-10-15: notification presets `legacy` removed; absent / legacy
     // tables are stored as `default` once (record in archive/). Never fatal.
     cutex::config::notification_levels::run_legacy_migration_on_startup("management serve");
+    super::asks_runtime::warm_short_id_indexes();
     let configured = load_codez_config();
     let config = agent_bus_config::ensure_agent_bus_config(true, configured.agent_bus_port)?;
     agent_bus_runtime::ensure_agent_bus_running(&config, true)?;
@@ -586,6 +587,7 @@ pub(crate) fn cmd_management_serve(
     validate_management_port(port)?;
     cutex::management::listeners::set_default_listen_port(port);
     let listen = management_listen_specs(bind, config.management_listen.as_deref(), port)?;
+    cutex::management::v2::control_capacity::configure_heavy_reads(&config);
     cutex::management::listeners::configure_cors_origins(config.management_cors_origins.clone());
     let agent_management_admin_token = management_root_credential(&config, token.as_deref())
         .ok()
@@ -594,6 +596,9 @@ pub(crate) fn cmd_management_serve(
     // Cap malloc arenas and return freed arena memory to the OS (glibc keeps
     // per-thread peaks); before the worker threads below start.
     cutex::platform::heap::start_daemon_heap_maintenance();
+    if let Err(error) = cutex::management::v2::memory_pressure::start_monitor() {
+        eprintln!("management memory pressure monitor warning: {error}");
+    }
     // r219: director_rotate actions an older release left in flight.
     super::agent_management::finish_removed_director_rotations_at_startup();
     // Before anything serves a client: clear the durable claims of runtimes
@@ -656,7 +661,7 @@ pub(crate) fn cmd_management_serve(
     }
     // Asks (委托): admission scheduler and Management v2 ask events.
     if let Err(error) = super::asks_runtime::spawn_scheduler() {
-        eprintln!("asks scheduler warning: {error:#}");
+        eprintln!("asks scheduler startup failed: {error:#}");
     }
     if let Err(error) = cutex::management::v2::services::start_supervisor() {
         eprintln!("services supervisor warning: {error:#}");

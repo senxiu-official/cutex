@@ -147,7 +147,7 @@ mod tests {
                 repair_with_sync(&root, &finding, |_| {
                     Err(std::io::Error::other("injected sync failure"))
                 })
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|_| ())
             })
             .err()
             .unwrap();

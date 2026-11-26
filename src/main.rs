@@ -1,6 +1,12 @@
+#[macro_use]
+mod diagnostic_stderr;
+
 mod cli_app;
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-text-rewrite-worker")) {
+        std::process::exit(cutex::management::v2::text_rewrite::worker_entry());
+    }
     cutex::config::proxy::ensure_process_loopback_no_proxy();
     // r266: the Kimi runtime component answers the Profile layer's probes.
     cutex::components::kimi_runtime::register_profile_hooks();

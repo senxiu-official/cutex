@@ -4,6 +4,10 @@
 pub mod api;
 #[path = "archive_projection.rs"]
 pub mod projection;
+#[path = "archive_batch.rs"]
+pub(super) mod batch;
+#[path = "archive_details.rs"]
+pub(super) mod details;
 
 use std::net::TcpStream;
 
@@ -20,7 +24,7 @@ use super::server::invalid_user_input_error;
 use super::server::post_operation_persistence_error;
 use super::server::write_v2_error;
 use super::server::ValidatedCutexRequest;
-use super::session::retired_session_list_resource;
+use super::session::retired_session_list_resource_with_stats;
 use super::session::session_list_resource_with_hidden;
 use super::user_input::UserInputExecutionError;
 use crate::management::server::ManagementSessionMutationHandler;
@@ -58,6 +62,7 @@ pub(super) fn session_lifecycle_query(path: &str) -> Result<SessionLifecycleQuer
 pub(super) struct SessionCollectionQuery {
     pub(super) lifecycle: SessionLifecycleQuery,
     pub(super) include_hidden: bool,
+    pub(super) include_archive_stats: bool,
 }
 
 pub(super) fn session_collection_query(
@@ -67,14 +72,17 @@ pub(super) fn session_collection_query(
         return Ok(SessionCollectionQuery {
             lifecycle: SessionLifecycleQuery::Active,
             include_hidden: false,
+            include_archive_stats: false,
         });
     };
     let mut lifecycle = None;
     let mut include_hidden = None;
+    let mut include_archive_stats = None;
     for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let slot = match name.as_ref() {
             "lifecycle" => &mut lifecycle,
             "includeHidden" => &mut include_hidden,
+            "includeArchiveStats" => &mut include_archive_stats,
             _ => anyhow::bail!("unsupported sessions query parameter: {name}"),
         };
         if slot.is_some() {
@@ -92,10 +100,13 @@ pub(super) fn session_collection_query(
         Some("true") => true,
         Some(value) => anyhow::bail!("includeHidden must be true or false, got {value}"),
     };
-    Ok(SessionCollectionQuery {
-        lifecycle,
-        include_hidden,
-    })
+    let include_archive_stats = match include_archive_stats.as_deref() {
+        None | Some("false") => false,
+        Some("true") if lifecycle == SessionLifecycleQuery::Retired => true,
+        Some("true") => anyhow::bail!("includeArchiveStats requires lifecycle=retired"),
+        Some(_) => anyhow::bail!("includeArchiveStats must be true or false"),
+    };
+    Ok(SessionCollectionQuery { lifecycle, include_hidden, include_archive_stats })
 }
 
 pub(super) fn handle_session_collection_get(
@@ -119,6 +130,10 @@ pub(super) fn handle_session_collection_get(
             )
         }
     };
+    if query.include_archive_stats && (!root || !crate::management::users::caller_is_owner()) {
+        return write_v2_error(stream, 403, "Forbidden", "owner_required",
+            "archive statistics require the Management owner credential", false, json!({}));
+    }
     if query.include_hidden && !root {
         return write_v2_error(
             stream,
@@ -140,7 +155,7 @@ pub(super) fn handle_session_collection_get(
                 query.include_hidden,
             )?
         }
-        SessionLifecycleQuery::Retired => retired_session_list_resource()?,
+        SessionLifecycleQuery::Retired => retired_session_list_resource_with_stats(query.include_archive_stats)?,
     };
     write_json_response(stream, 200, "OK", &resource)
 }
@@ -517,6 +532,14 @@ mod tests {
     }
 
     #[test]
+    fn archive_stats_query_is_opt_in_and_retired_only() {
+        assert!(!session_collection_query("/v2/sessions?lifecycle=retired").unwrap().include_archive_stats);
+        assert!(session_collection_query("/v2/sessions?lifecycle=retired&includeArchiveStats=true").unwrap().include_archive_stats);
+        assert!(session_collection_query("/v2/sessions?includeArchiveStats=true").is_err());
+        assert!(session_collection_query("/v2/sessions?lifecycle=retired&includeArchiveStats=true&includeArchiveStats=false").is_err());
+    }
+
+    #[test]
     fn collection_query_accepts_root_include_hidden_switch() {
         assert_eq!(
             session_collection_query("/v2/sessions?includeHidden=true&lifecycle=active")
@@ -524,6 +547,7 @@ mod tests {
             SessionCollectionQuery {
                 lifecycle: SessionLifecycleQuery::Active,
                 include_hidden: true,
+                include_archive_stats: false,
             }
         );
         assert_eq!(
@@ -531,6 +555,7 @@ mod tests {
             SessionCollectionQuery {
                 lifecycle: SessionLifecycleQuery::Active,
                 include_hidden: false,
+            include_archive_stats: false,
             }
         );
         assert!(

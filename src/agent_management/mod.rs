@@ -48,6 +48,7 @@ mod sparse;
 mod name_projection;
 mod roster_map;
 mod roster_sql;
+pub(crate) use roster_sql::{reference_meta_at as roster_reference_meta_at, RosterMeta};
 pub use roster_sql::{
     ensure_legacy_authoritative as ensure_roster_legacy_authoritative,
     export_previous as export_roster_previous, import_legacy as import_roster_legacy,

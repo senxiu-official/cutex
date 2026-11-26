@@ -522,13 +522,15 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
+          failure_cases=()
+          if [ "$FROM_RELEASE" = 0.2.5 ] && [ "$TO_RELEASE" = 0.2.6 ]; then failure_cases+=(--one-way-failure-cases); fi
           "$E2E_PYTHON" .github/ci/upgrade-e2e.py formal-assets \
             --build-assets "$RUNNER_TEMP/formal-build" --signed-assets "$RUNNER_TEMP/formal-sign" \
             --old-assets "$RUNNER_TEMP/formal-old" --native-assets "$RUNNER_TEMP/formal-native" \
             --from-release "$FROM_RELEASE" --to-release "$TO_RELEASE" \
             --public-key .github/ci/cutex-release.pub --expected-commit "$FORMAL_PRODUCT_COMMIT" \
             --expected-native-version "$NATIVE_VERSION" --confirm-release "$TO_RELEASE" \
-            --management-port 24391 --bus-port 24392 --work "$RUNNER_TEMP/formal upgrade"
+            --management-port 24391 --bus-port 24392 --work "$RUNNER_TEMP/formal upgrade" "${failure_cases[@]}"
       - name: Keep scrubbed verification receipt and logs
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -538,6 +540,9 @@ jobs:
             ${{ runner.temp }}/formal upgrade/formal-result.json
             ${{ runner.temp }}/formal upgrade/formal-old-baseline.json
             ${{ runner.temp }}/formal upgrade/logs/
+            ${{ runner.temp }}/formal upgrade/*/logs/
+            ${{ runner.temp }}/formal upgrade/*/case-result.json
+            ${{ runner.temp }}/formal upgrade/*/formal-old-baseline.json
             ${{ runner.temp }}/formal-build-run.json
             ${{ runner.temp }}/formal-sign-run.json
             ${{ runner.temp }}/formal-native-run.json

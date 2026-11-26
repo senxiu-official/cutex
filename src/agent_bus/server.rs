@@ -248,6 +248,34 @@ pub fn handle_agent_bus_request(
         && path_only!=crate::agent_bus::native_subagent::PATH {
         return write_json_response(stream,403,"Forbidden",&crate::agent_bus::native_subagent::refusal());
     }
+    // The dedicated session keeps its restricted surface even after disable or
+    // role changes. A copied generic tool name cannot dispatch project work.
+    if let Some(principal) = request.agent() {
+        if path_only != crate::agent_bus::agent_auth::TOOLSET_PATH
+            && path_only != crate::personal_assistants::tools::PATH
+        {
+            let record = crate::session::store::shared_session_row(&principal.cutex_session_id)?;
+            if crate::personal_assistants::host::assistant_session(&principal.cutex_session_id, record.as_deref()) {
+                return write_json_response(stream, 403, "Forbidden",
+                    &serde_json::json!({"error":{"code":"assistant_route_denied"}}));
+            }
+        }
+    }
+    if request.method == "POST" && path_only == crate::personal_assistants::tools::PATH {
+        let caller = request.agent().map(|p| p.cutex_session_id.as_str());
+        let verified = validate_mcp_caller_fence(&request, state).ok().flatten();
+        let Some(caller) = caller.filter(|id| verified.as_ref().is_some_and(|v| v.caller_cutex_session.as_str() == *id)) else {
+            return write_json_response(stream, 403, "Forbidden",
+                &serde_json::json!({"error":{"code":"current_agent_required"}}));
+        };
+        return match crate::personal_assistants::tools::call_body(caller, &request.body) {
+            Ok(value) => write_json_response(stream, 200, "OK", &serde_json::json!({"ok":true,"result":value})),
+            Err(error) => {
+                let (status, code) = crate::personal_assistants::error_status(&error);
+                write_json_response(stream, status, "Personal Assistant request refused", &serde_json::json!({"error":{"code":code,"message":crate::personal_assistants::error_message(code)}}))
+            }
+        };
+    }
     if request.method == "POST" && path_only == crate::pan::api::BUS_PATH {
         let caller = authenticated_pan_caller(&request, state);
         let result = match caller {
@@ -3242,6 +3270,7 @@ mod tests {
     mod archive_bus_http_tests { include!("archive_bus_http_tests.rs"); }
     mod receipt_preflight_http_tests { include!("receipt_preflight_http_tests.rs"); }
     mod native_child_http_tests { include!("native_child_http_tests.rs"); }
+    mod personal_assistants_http_tests { include!("personal_assistants_http_tests.rs"); }
 
     fn route_state() -> Arc<Mutex<AgentBusState>> {
         Arc::new(Mutex::new(AgentBusState::default()))

@@ -159,7 +159,11 @@ pub enum RuntimeCommand {
     /// Gate-preserving interrupt of a running attempt (N2).
     StopAttempt { ask_id: String, attempt: u32 },
     /// Send the resolution of a question to the native pending request.
-    RespondQuestion { question_id: String },
+    RespondQuestion {
+        question_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        human_actor: Option<crate::management::v2::interaction_history::Actor>,
+    },
     /// N2: reopen the native external-input gate after an owner resume.
     ResumeGate { cutex_session_id: String },
     /// `delegation_stop(stop_jobs)`: cancel the delegation's bound jobs
@@ -662,6 +666,8 @@ impl AskState {
             closed: None,
             follow_up_ended: false,
             closed_at: None,
+            terminal_cause: None,
+            terminal_notices: Vec::new(),
             created_at: now_text.clone(),
             updated_at: now_text,
             revision: 1,
@@ -734,6 +740,12 @@ impl AskState {
                 .is_some_and(|previous_ask| previous_ask.is_open() && previous_ask.execution.is_terminal());
             if supersede {
                 let by = ask.ask_id.clone();
+                let actor=match &ask.requester {
+                    Requester::Owner=>super::terminal_notices::Actor::Owner,
+                    Requester::Agent{cutex_session_id,..}=>super::terminal_notices::Actor::Agent{session_id:cutex_session_id.clone()},
+                    Requester::Peer{..}=>super::terminal_notices::Actor::Unknown,
+                };
+                super::terminal_notices::set_cause(self,&previous,actor,"superseded by follow-up");
                 self.update_ask(&previous, now, |previous_ask| {
                     if previous_ask.review == Some(ReviewState::AwaitingAcceptance) {
                         previous_ask.review = Some(ReviewState::ChangesRequested);
@@ -854,6 +866,7 @@ impl AskState {
             );
         }
         if before.3.is_none() && after.3.is_some() {
+            super::terminal_notices::capture_closed(self,&snapshot,now);
             self.notice(
                 "cutex/ask/closed",
                 Self::ask_sessions(&snapshot),
@@ -1336,6 +1349,12 @@ impl AskStore {
         crate::management::v2::user_input::UserInputRepository::open_with_asks(self.queue_root.clone(), self.dir.clone(), self.host_queue)
     }
 
+    pub(crate) fn readonly_admission_positions(
+        &self, state: &AskState, sessions: &std::collections::BTreeSet<&str>,
+    ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+        crate::management::v2::user_input::readonly_admission_positions(&self.queue_root, state, sessions)
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -1350,6 +1369,37 @@ impl AskStore {
         } else {
             self.dir.join(crate::management::v2::hot_store::DATABASE_FILE)
         }
+    }
+
+    pub(crate) fn lookup_short_id(&self, hex: &str, suffix_only: bool) -> anyhow::Result<super::short_id_lookup::ShortIdMatches> {
+        super::short_id_lookup::lookup(&self.database_path(), &self.state_path(), hex, suffix_only, || {
+            self.prepare_short_id_indexes()
+        })
+    }
+
+    /// Warm the short-ID indexes before serving requests. The same exclusive
+    /// lock used by ask writes also fences preparation on a lookup miss.
+    pub fn prepare_short_id_indexes(&self) -> anyhow::Result<()> {
+        use crate::management::v2::hot_store;
+
+        let database = self.database_path();
+        if hot_store::generation(&database, "asks")?.is_none() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let lock = self.lock_file()?;
+        let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::Write, diagnostics::Mode::Exclusive)
+            .context("ask short-ID index preparation lock")?;
+        // A migration or rollback may have changed verification while we waited.
+        if hot_store::generation(&database, "asks")?.is_some() {
+            hot_store::prepare_ask_short_id_indexes(&database)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn short_id_lookup_ready(&self) -> bool {
+        crate::management::v2::hot_store::generation(&self.database_path(), "asks")
+            .is_ok_and(|generation| generation.is_some())
     }
 
     // r290 P6: indexed day counts also include permanent cold asks.
@@ -2382,6 +2432,9 @@ pub(crate) mod tests {
             state.notices.clear();
             ask.ask_id
         }).unwrap();
+        store.with_state(|state| {for item in state.deliveries.values_mut() {
+            item.state=DeliveryState::Acknowledged;item.settled_by=Some("read".into());
+        }}).unwrap();
         assert_eq!(store.archive_before(Some(cutoff), cutoff).unwrap().asks, 1);
         let before = crate::management::v2::hot_store::verified_rows(&store.database_path(), "asks").unwrap().unwrap();
         let first = store.readonly_history_snapshot().unwrap();
@@ -2495,7 +2548,7 @@ pub(crate) mod tests {
                 local_terminal: false, reconcile_at: None, interrupt_reason: None,
                 state: "queued".into(), last_remote_revision: 0, pending_ops: vec![],
                 last_error: Some("temporary failure".into()), next_attempt_at: None,
-                last_received_at: now_rfc3339(Utc::now()), failures: 0, accepted: false,
+                last_received_at: now_rfc3339(Utc::now()), failures: 0, accepted: false, admitted: false,
             },
         });
         state.asks.insert(ask.ask_id.clone(), ask.clone().into());

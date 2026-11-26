@@ -1828,6 +1828,66 @@ mod tests {
     /// the project's Director at the time of the call and by its registrant
     /// while in the project; session services and non-members are unchanged.
     #[test]
+    fn remote_access_nonregistrant_content_changes_close_grant() {
+        let dir = std::env::temp_dir().join(format!("cutex-remote-content-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ServiceStore::new(dir.join("home").join("services"), "fixture").with_port_probe(|_| true);
+        let member = in_project(S1, "proj");
+        let director = in_project(S3, "proj");
+        let request = || RegisterRequest {
+            slug:"content".into(), runtime:Some("managed".into()), owner_scope:Some("project".into()),
+            command:Some(ServiceCommand::Argv(vec!["serve".into(), "first".into()])), ..Default::default()
+        };
+        let grant = |slug: &str| {
+            store.update(slug, UpdateRequest { remote_access:Some(true), ..Default::default() }, &Caller::Owner).unwrap();
+        };
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            store.register(request(), &member).unwrap();
+            grant("content");
+            // An unchanged Director upsert is harmless; the registrant may edit.
+            assert!(store.register(request(), &director).unwrap().0.remote_access);
+            let changed = RegisterRequest {
+                command:Some(ServiceCommand::Argv(vec!["serve".into(), "second".into()])), ..request()
+            };
+            assert!(store.register(changed.clone(), &member).unwrap().0.remote_access);
+            // Same stored registrant, different Director-provided command.
+            assert!(!store.register(request(), &director).unwrap().0.remote_access);
+            assert_eq!(store.get("content").unwrap().owner_cutex_session_id.as_deref(), Some(S1));
+            grant("content");
+            assert!(!store.register(RegisterRequest { port:Some(31023), ..request() }, &director).unwrap().0.remote_access);
+            let patches = [
+                UpdateRequest { command:Some(Some(ServiceCommand::Argv(vec!["other".into()]))), ..Default::default() },
+                UpdateRequest { cwd:Some(Some(dir.to_string_lossy().into_owned())), ..Default::default() },
+                UpdateRequest { port:Some(31024), ..Default::default() },
+                UpdateRequest { path:Some(Some("/different".into())), ..Default::default() },
+                UpdateRequest { proxy_host_header:Some("upstream".into()), ..Default::default() },
+                UpdateRequest { env:Some([("CONTENT".into(), Some("changed".into()))].into()), ..Default::default() },
+            ];
+            for patch in patches {
+                grant("content");
+                assert!(!store.update("content", patch, &director).unwrap().remote_access);
+            }
+            grant("content");
+            assert!(store.update("content", UpdateRequest { display_name:Some("Label only".into()), ..Default::default() }, &director).unwrap().remote_access);
+            assert!(store.update("content", UpdateRequest { command:Some(Some(ServiceCommand::Shell("own edit".into()))), ..Default::default() }, &member).unwrap().remote_access);
+            assert!(!store.update("content", UpdateRequest {
+                command:Some(Some(ServiceCommand::Shell("owner changes source".into()))),
+                remote_access:Some(true), ..Default::default()
+            }, &Caller::Owner).unwrap().remote_access);
+            let first = dir.join("static-a"); let second = dir.join("static-b");
+            std::fs::create_dir_all(&first).unwrap(); std::fs::create_dir_all(&second).unwrap();
+            let static_request = |root: &std::path::Path| RegisterRequest {
+                slug:"static-content".into(), runtime:Some("static".into()), owner_scope:Some("project".into()),
+                root:Some(root.to_string_lossy().into_owned()), static_root_approved:true, ..Default::default()
+            };
+            store.register(static_request(&first), &member).unwrap();
+            grant("static-content");
+            assert!(!store.register(static_request(&second), &director).unwrap().0.remote_access);
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn project_services_follow_the_current_director() {
         let dir = std::env::temp_dir().join(format!("cutex-services-project-{}", uuid::Uuid::new_v4().simple()));
         let store = ServiceStore::new(&dir, "agenthost");

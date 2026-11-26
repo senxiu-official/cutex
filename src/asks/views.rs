@@ -48,6 +48,7 @@ pub fn ask_view(ask: &AskRecord, attempt: u32, gated: bool) -> Value {
     if let Some(parent) = &ask.parent_ask {
         data["parentAsk"] = json!(parent);
     }
+    crate::peers::receipt::insert(&mut data, crate::peers::receipt::delegation(ask));
     json!({"schema": ASK_VIEW, "data": data})
 }
 
@@ -88,26 +89,27 @@ pub fn continuation_view(ask: &AskRecord, attempt: u32, gated: bool, resume: &Re
 }
 
 /// The results view of a coalesced event; `previews` gives each answer's
-/// preview by answer id, `targets` each ask's target `(id, name)`.
-pub fn results_view(
+/// preview by answer id. The ask supplies the target and peer provenance.
+pub fn results_view<'a>(
     items: &[ReturnItem],
-    target_of: &dyn Fn(&str) -> (String, Option<String>),
+    ask_of: &dyn Fn(&str) -> Option<&'a AskRecord>,
     answer_preview: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
-    results_view_with_stop_answer(items,target_of,answer_preview,None)
+    results_view_with_stop_answer(items,ask_of,answer_preview,None)
 }
 
-pub fn results_view_with_stop_answer(
+pub fn results_view_with_stop_answer<'a>(
     items: &[ReturnItem],
-    target_of: &dyn Fn(&str) -> (String, Option<String>),
+    ask_of: &dyn Fn(&str) -> Option<&'a AskRecord>,
     answer_preview: &dyn Fn(&str) -> Option<String>,
     stop_since: Option<&str>,
 ) -> Value {
     let mut rows = Vec::new();
     for item in items {
-        let row = match item {
+        let ask = ask_of(super::returns::return_ask_id(item));
+        let (id, name) = ask.map(|ask| (ask.target_cutex_session_id.as_str(), ask.target_name.as_deref())).unwrap_or_default();
+        let mut row = match item {
             ReturnItem::Answer { ask_id, title, status, answer_id, revision, review, .. } => {
-                let (id, name) = target_of(ask_id);
                 let mut row = json!({"kind": "answer", "askId": ask_id, "title": title,
                     "target": {"id": id, "name": name}, "status": status, "answerId": answer_id,
                     "revision": revision, "preview": answer_preview(answer_id)});
@@ -117,7 +119,6 @@ pub fn results_view_with_stop_answer(
                 row
             }
             ReturnItem::Question { ask_id, title, question_id, questions, .. } => {
-                let (id, name) = target_of(ask_id);
                 let first = questions
                     .as_array()
                     .and_then(|list| list.first())
@@ -128,12 +129,14 @@ pub fn results_view_with_stop_answer(
                     "target": {"id": id, "name": name}, "questionId": question_id, "preview": first})
             }
             // r290 P7
-            ReturnItem::State { ask_id, title, state, failure, .. } => {
-                let (id, name) = target_of(ask_id);
-                json!({"kind": "state", "askId": ask_id, "title": title,
-                    "target": {"id": id, "name": name}, "state": state, "handlerFailure":failure})
+            ReturnItem::State { ask_id, title, state, failure,notice, .. } => {
+                let mut row=json!({"kind": "state", "askId": ask_id, "title": title,
+                    "target": {"id": id, "name": name}, "state": state, "handlerFailure":failure});
+                if let Some(notice)=notice {row["notice"]=json!(notice);}
+                row
             }
         };
+        crate::peers::receipt::insert(&mut row, ask.and_then(crate::peers::receipt::delegation));
         rows.push(row);
     }
     // Fit the view limit: drop trailing items and count them.
@@ -192,9 +195,9 @@ mod tests {
                 review: true, flags: vec![], error: None },
             ReturnItem::Question { ask_id: "ask-1".into(), title: "T".into(), target: "Helper".into(),
                 question_id: "q-1".into(), questions: json!([{"question": "Which file?"}]) },
-            ReturnItem::State { ask_id: "ask-2".into(), title: "U".into(), target: "Helper".into(), state: "busy".into(), failure: None },
+            ReturnItem::State { ask_id: "ask-2".into(), title: "U".into(), target: "Helper".into(), state: "busy".into(), failure: None,notice:None },
         ];
-        let view = results_view(&items, &|_| ("cutex.t".into(), Some("Helper".into())), &|_| Some("done".into()));
+        let view = results_view(&items, &|_| None, &|_| Some("done".into()));
         let rows = view["data"]["items"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["awaitingAcceptance"], true);
@@ -204,9 +207,9 @@ mod tests {
         assert!(view["data"].get("omitted").is_none());
         // Too many items: the tail is omitted and counted.
         let many: Vec<ReturnItem> = (0..200)
-            .map(|n| ReturnItem::State { ask_id: format!("ask-{n}"), title: "x".repeat(100), target: "H".into(), state: "held".into(), failure: None })
+            .map(|n| ReturnItem::State { ask_id: format!("ask-{n}"), title: "x".repeat(100), target: "H".into(), state: "held".into(), failure: None,notice:None })
             .collect();
-        let view = results_view(&many, &|_| ("cutex.t".into(), None), &|_| None);
+        let view = results_view(&many, &|_| None, &|_| None);
         assert!(view["data"]["omitted"].as_u64().unwrap() > 0);
         assert!(fits(&view));
         assert!(is_delegation_view(&view) && !is_delegation_view(&json!({"schema": "cutex.agent-message.v1"})));
@@ -233,6 +236,12 @@ mod tests {
         assert_eq!(view["data"]["requester"]["cutexSessionId"], REQUESTER);
         let state = store.snapshot().unwrap();
         let ask = &state.asks[&ask_id];
+        let mut held = (**ask).clone();
+        held.hold = Some(Hold::Blocked { by: BlockedReason::Quota });
+        let projection = crate::asks::view::summary(&state, &held);
+        assert_eq!(projection["activityLink"]["delegation"]["askId"], ask_id);
+        assert_eq!(projection["activityLink"]["blocker"], "quota");
+        assert_eq!(projection["activityLink"]["next"], "openDelegation");
         let attempt = ask.current_attempt().unwrap();
         assert_eq!(attempt.view.as_ref(), Some(&view));
         // Recovery rebuilds the identical submission.
@@ -272,6 +281,12 @@ mod tests {
         assert_eq!(summary["answerPreview"], "Two issues found in parse_header.");
         assert!(summary["closedAt"].is_string());
         assert_eq!(summary["ownerQuestions"], 0);
+        assert_eq!(summary["activityLink"], json!({
+            "delegation": {"kind":"delegation","askId":ask_id},
+            "approval": null,
+            "result": {"kind":"delegationResult","askId":ask_id,"answerId":summary["answerId"]},
+            "blocker": null, "next":"none",
+        }));
         let answered = state.notices.iter().find(|notice| notice.method == "cutex/ask/answered").unwrap();
         assert_eq!(answered.params["preview"], "Two issues found in parse_header.");
         let _ = std::fs::remove_dir_all(dir);

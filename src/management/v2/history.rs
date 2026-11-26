@@ -1139,6 +1139,45 @@ impl<'a> OfflineReader<'a> {
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum HistorySearchSource { Live, Offline }
+
+/// One summary page. Old runtimes without summary pagination report incomplete
+/// coverage to the search caller. Never fall back to a full thread/read here.
+pub(super) fn search_turn_page(
+    session: &str,
+    thread: &str,
+    connected: bool,
+    limit: u32,
+    resume: Option<(HistorySearchSource, &str)>,
+    forward_native: ManagementNativeRequestHandler,
+    open_offline: OfflineHistoryEndpointOpener,
+) -> Result<(Vec<Value>, Option<String>, HistorySearchSource), HistoryCallError> {
+    use HistorySearchSource::{Live, Offline};
+    let read = |source, cursor| {
+        let params = turns_list_params(thread, cursor, limit, "summary");
+        let native = match source {
+            Live => live_call(forward_native, session, "thread/turns/list", params),
+            Offline => OfflineReader::new(session, open_offline).call("thread/turns/list", params),
+        }?;
+        let (turns, next) = turns_page(native)?;
+        if turns.len() > limit as usize || (turns.is_empty() && next.is_some()) {
+            return Err(HistoryCallError::Unavailable("unusable search history page".into()));
+        }
+        Ok((turns, next, source))
+    };
+    match resume {
+        Some((Live, _)) if !connected => Err(HistoryCallError::Unavailable("live history reader changed".into())),
+        Some((source, cursor)) => read(source, Some(cursor)),
+        None if connected => match read(Live, None) {
+            Err(HistoryCallError::Unavailable(_)) => read(Offline, None),
+            result => result,
+        },
+        None => read(Offline, None),
+    }
+}
+
 #[cfg(test)]
 fn offline_call(session: &str, open: OfflineHistoryEndpointOpener, method: &str, params: Value) -> Result<Value, HistoryCallError> {
     OfflineReader::new(session, open).call(method, params)

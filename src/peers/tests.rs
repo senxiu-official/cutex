@@ -215,6 +215,7 @@ pub(super) fn remote_record() -> (AskState, AskRecord, store::Peer) {
             last_received_at: now(),
             failures: 0,
             accepted: false,
+            admitted: false,
         },
     });
     s.asks.insert(a.ask_id.clone(), a.clone().into());

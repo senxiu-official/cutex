@@ -20,6 +20,7 @@ pub(super) fn database(home: &Path) -> anyhow::Result<Connection> {
     )?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS stock_temp_owners(id TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cleanup_previews(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cleanups(id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, preview_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, created TEXT NOT NULL, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cleanup_items(run_id TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,id));

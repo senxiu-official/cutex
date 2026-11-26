@@ -73,9 +73,8 @@ pub fn update_cutex_session_runtime_defaults_by_key(
     if record.is_retired() {
         anyhow::bail!("cutex session is retired: {key}");
     }
-    let validate_model = record.explicit_launch.is_some()
-        && (patch.model_defaults != CutexSessionValueUpdate::Unchanged
-            || patch.reasoning_defaults != CutexSessionValueUpdate::Unchanged);
+    let model_settings_changed = patch.model_defaults != CutexSessionValueUpdate::Unchanged
+        || patch.reasoning_defaults != CutexSessionValueUpdate::Unchanged;
     let owner_paths=patch.managed_cwd!=CutexSessionValueUpdate::Unchanged
         ||patch.permission_defaults!=CutexSessionValueUpdate::Unchanged
         ||patch.approval_policy!=CutexSessionValueUpdate::Unchanged
@@ -103,7 +102,15 @@ pub fn update_cutex_session_runtime_defaults_by_key(
     }
     // Validate the complete merged patch, matching Management, before either
     // owner-path approval or mutation of the caller's store.
-    if validate_model {crate::launch::stock::current_configuration(record)?;}
+    if model_settings_changed {
+        if record.runtime_backend == super::model::CutexSessionRuntimeBackend::Host
+            && record.reasoning_resolution.is_some()
+        {
+            record.reasoning_resolution = crate::launch::stock::fresh_effort_resolution(record)?;
+        } else if record.explicit_launch.is_some() {
+            crate::launch::stock::current_configuration(record)?;
+        }
+    }
     if owner_paths {crate::agent_management::creator_paths::owner_reapprove(record)?;}
     record.bump_durable_revision()?;
     record.updated_at = chrono::Utc::now().to_rfc3339();

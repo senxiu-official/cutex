@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 #[path = "continuation/runtime.rs"]
 pub mod runtime;
+#[path = "continuation/approval.rs"]
+pub mod approval;
 
 pub const MAX_ROUNDS: u32 = 32;
 pub const MAX_ELAPSED_SECONDS: i64 = 86_400;
@@ -244,6 +246,25 @@ pub struct Wake {
     pub submission: Submission,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WakeBlocker {
+    Quota,
+    Login,
+    RuntimeDown,
+    Budget,
+    RuntimeOffline,
+    Reconnecting,
+    Paused,
+    PlanMode,
+    ProfileSwitchPending,
+    TargetBusy,
+    Admission,
+    Routing,
+    RuntimeUnsupported,
+    Reconciling,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContinuationRecord {
@@ -256,6 +277,8 @@ pub struct ContinuationRecord {
     pub declaration: Declaration,
     pub running_attempt: Option<AttemptIdentity>,
     pub next_wake_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<WakeBlocker>,
     pub wake: Option<Wake>,
     pub limit_reason: Option<LimitReason>,
     pub limit_notice: Option<LimitNotice>,
@@ -335,6 +358,8 @@ pub struct ContinuationData {
     pub stages: Vec<StageNote>,
     pub child_facts: Vec<ChildFact>,
     pub budget_resets: Vec<BudgetResetAudit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<approval::Approval>,
     actions: Vec<ActionEntry>,
 }
 
@@ -461,6 +486,7 @@ impl ContinuationData {
             _ => return Err(Error::StaleWake),
         }
         wake.submission = Submission::Unclaimed;
+        record.blocked_reason = None;
         record.reconciling = false;
         if !matches!(record.state, Phase::Cancelled | Phase::Limited) {
             record.state = Phase::Ready;
@@ -685,6 +711,7 @@ impl ContinuationData {
             },
             running_attempt: Some(context.clone()),
             next_wake_at: None,
+            blocked_reason: None,
             wake: None,
             limit_reason,
             limit_notice: notice,
@@ -851,6 +878,7 @@ impl ContinuationData {
         record.state = Phase::Cancelled;
         record.cancel_reason = Some(reason.into());
         record.next_wake_at = None;
+        record.blocked_reason = None;
         record.revision += 1;
         // Keep original wake/submission and stage notes for reconciliation/audit.
         true
@@ -968,6 +996,7 @@ impl ContinuationData {
             native_message_id: native_message_id.into(),
         };
         record.state = Phase::Resuming;
+        record.blocked_reason = None;
         record.revision += 1;
         Ok(true)
     }
@@ -1097,6 +1126,27 @@ impl ContinuationData {
         guards: Guards,
         now: DateTime<Utc>,
     ) -> Result<MutationReceipt, Error> {
+        self.reset_budget_inner(authority, request, Some(guards), now)
+    }
+
+    /// An approval starts a new budget. The scheduler checks runtime readiness
+    /// when admitting the first wake.
+    fn approve_budget(
+        &mut self,
+        authority: Authority<'_>,
+        request: &ResetRequest,
+        now: DateTime<Utc>,
+    ) -> Result<MutationReceipt, Error> {
+        self.reset_budget_inner(authority, request, None, now)
+    }
+
+    fn reset_budget_inner(
+        &mut self,
+        authority: Authority<'_>,
+        request: &ResetRequest,
+        guards: Option<Guards>,
+        now: DateTime<Utc>,
+    ) -> Result<MutationReceipt, Error> {
         if !authority.may_reset() {
             return Err(Error::Forbidden);
         }
@@ -1109,7 +1159,7 @@ impl ContinuationData {
         if request.action_id.trim().is_empty() {
             return Err(Error::InvalidArguments);
         }
-        if guards.cancelled() || guards.blocked() {
+        if guards.is_some_and(|guards| guards.cancelled() || guards.blocked()) {
             return Err(Error::Guarded);
         }
         let record = self.current.as_mut().ok_or(Error::NotLimited)?;
@@ -1150,6 +1200,7 @@ impl ContinuationData {
         record.limit_reason = None;
         record.limit_notice = None;
         record.next_wake_at = Some(now + Duration::seconds(i64::from(MIN_WAKE_SECONDS)));
+        record.blocked_reason = None;
         record.wake = Some(Wake {
             id: format!(
                 "continuation:{}:{}:reset",

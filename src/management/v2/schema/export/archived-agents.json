@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:archived-agents",
+  "title": "Archived session statistics and owner batch actions",
+  "$defs": {
+    "itemRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "expectedRevision"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 7, "maxLength": 192, "pattern": "^cutex[.]" },
+        "expectedRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "action", "items"],
+      "properties": {
+        "requestId": { "type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,80}$" },
+        "action": { "enum": ["restore", "delete"] },
+        "confirmation": { "type": ["string", "null"], "description": "Delete requires DELETE <number of items> ARCHIVED AGENTS." },
+        "items": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/itemRequest" } }
+      },
+      "if": { "properties": { "action": { "const": "delete" } } },
+      "then": {
+        "required": ["confirmation"],
+        "properties": { "confirmation": { "type": "string", "pattern": "^DELETE ([1-9]|1[0-9]|20) ARCHIVED AGENTS$" } }
+      },
+      "else": { "properties": { "confirmation": { "type": "null" } } }
+    },
+    "itemResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "status"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "status": { "type": "integer", "minimum": 200, "maximum": 599 },
+        "result": { "type": "object" },
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "retryable", "details"],
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "details": {}
+          }
+        }
+      },
+      "oneOf": [{ "required": ["result"] }, { "required": ["error"] }]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractVersion", "requestId", "items"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "requestId": { "type": "string" },
+        "items": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/itemResult" } }
+      }
+    },
+    "archiveFields": {
+      "type": "object",
+      "properties": {
+        "retiredAt": { "type": ["string", "null"] },
+        "localSize": {
+          "type": "object",
+          "required": ["bytes"],
+          "properties": {
+            "bytes": { "$ref": "#/$defs/count" },
+            "lightHomesBytes": { "$ref": "#/$defs/count" },
+            "lightHomesMeasuredAt": { "type": "string" },
+            "attachmentBytes": { "$ref": "#/$defs/count" },
+            "attachmentsMeasuredAt": { "type": "string" }
+          }
+        },
+        "allTimeUsage": {
+          "type": "object",
+          "required": ["inputTokens", "outputTokens", "totalTokens", "turns"],
+          "properties": {
+            "inputTokens": { "$ref": "#/$defs/count" },
+            "outputTokens": { "$ref": "#/$defs/count" },
+            "totalTokens": { "$ref": "#/$defs/count" },
+            "turns": { "$ref": "#/$defs/count" }
+          }
+        },
+        "archiveLaunchBinding": {
+          "type": "object",
+          "required": ["family", "model"],
+          "properties": { "family": { "type": ["string", "null"] }, "model": { "type": ["string", "null"] } }
+        },
+        "lastObservedModel": { "type": "string" }
+      }
+    },
+    "count": { "type": "integer", "minimum": 0 }
+  }
+}

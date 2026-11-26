@@ -50,6 +50,8 @@ struct State {
     next_query_at: u64,
     cursor: Option<String>,
     last_error: Option<String>,
+    #[serde(default)]
+    last_delivery_error: Option<String>,
     query_count: u64,
     jobs: BTreeMap<String, Observation>,
 }
@@ -62,12 +64,16 @@ struct Observation {
     pending_event: Option<Value>,
     #[serde(default)]
     pending_credential_id: Option<String>,
+    #[serde(default)]
+    pending_retry_at: u64,
     /// Short recheck after an end-of-job mail while qstat still shows the job
     /// running (0 = none scheduled).
     #[serde(default)]
     recheck_at: u64,
     #[serde(default)]
     rechecks: u32,
+    #[serde(default)]
+    terminal_observed: bool,
 }
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -545,6 +551,11 @@ fn status_at(path: &Path) -> Result<Value, &'static str> {
     let host_keys = config.as_ref().map(|c| c.ssh.host_keys.clone()).unwrap_or_default();
     let fingerprints: Vec<Option<String>> = host_keys.iter().map(|k| host_key_fingerprint(k)).collect();
     let max_time = |f: fn(&Observation) -> u64| state.jobs.values().map(f).max().filter(|t| *t > 0);
+    let next_check_at = config.as_ref().filter(|c| c.enabled).and_then(|c| {
+        state.jobs.values().filter(|o| !o.terminal_observed)
+            .map(|o| next_due(o, c.ssh.poll_interval_seconds, false))
+            .min().map(|t| t.max(state.next_query_at).max(now()))
+    });
     Ok(
         json!({"configured":config.is_some(),"enabled":config.as_ref().is_some_and(|c|c.enabled),"host":"gadi.nci.org.au","pollIntervalSeconds":config.as_ref().map(|c|c.ssh.poll_interval_seconds).unwrap_or(default_interval()),"minimumQueryIntervalSeconds":MIN_QUERY_INTERVAL,"queryCount":state.query_count,"errorCode":state.last_error,
             "username":config.as_ref().map(|c|&c.ssh.username),
@@ -560,6 +571,10 @@ fn status_at(path: &Path) -> Result<Value, &'static str> {
             "trackedJobs":state.jobs.len(),
             "lastQueryAt":max_time(|o| o.last_attempt_at),
             "lastSuccessAt":max_time(|o| o.last_success_at),
+            "lastVerifiedAt":max_time(|o| o.last_success_at),
+            "nextCheckAt":next_check_at,
+            "pendingDeliveries":state.jobs.values().filter(|o| o.pending_event.is_some()).count(),
+            "deliveryErrorCode":state.last_delivery_error,
             "nextQueryAllowedAt":(state.next_query_at > 0).then_some(state.next_query_at)}),
     )
 }
@@ -637,23 +652,24 @@ fn retry_delay(failures: u32) -> u64 {
         .min(3600)
 }
 fn due(observation: &Observation, time: u64, interval: u64, triggered: bool) -> bool {
-    if time
-        < observation
-            .last_attempt_at
-            .saturating_add(MIN_QUERY_INTERVAL)
-    {
-        return false;
-    }
-    if observation.failures > 0 {
-        return time
-            >= observation
-                .last_attempt_at
-                .saturating_add(retry_delay(observation.failures));
-    }
-    triggered
-        || observation.last_success_at == 0
-        || (observation.recheck_at != 0 && time >= observation.recheck_at)
-        || time >= observation.last_success_at.saturating_add(interval)
+    time >= next_due(observation, interval, triggered)
+}
+
+fn next_due(observation: &Observation, interval: u64, triggered: bool) -> u64 {
+    let floor = if observation.last_attempt_at == 0 {
+        0
+    } else {
+        observation.last_attempt_at.saturating_add(MIN_QUERY_INTERVAL)
+    };
+    let next = if observation.failures > 0 {
+        observation.last_attempt_at.saturating_add(retry_delay(observation.failures))
+    } else if triggered || observation.last_success_at == 0 {
+        0
+    } else {
+        let normal = observation.last_success_at.saturating_add(interval);
+        if observation.recheck_at == 0 { normal } else { normal.min(observation.recheck_at) }
+    };
+    floor.max(next)
 }
 /// Rechecks after an end mail: 5, 10, 20, 40, 60, 60 minutes, then the normal interval.
 const MAX_RECHECKS: u32 = 6;
@@ -777,6 +793,11 @@ fn verify_with(
         observation.pending_event = None;
         observation.pending_credential_id = None;
     }
+    // A mail may arrive while an unrelated target holds the host budget.
+    // Persist its urgency so the next permitted poll sees it.
+    if end_hint && observation.recheck_at == 0 && observation.rechecks < MAX_RECHECKS {
+        observation.recheck_at = time;
+    }
     if observation.pending_event.is_none() {
         if time < state.next_query_at
             || !due(
@@ -802,6 +823,7 @@ fn verify_with(
                     .is_none_or(|e| matches!(e["state"].as_str(), Some("queued" | "running")));
                 observation.last_success_at = time;
                 observation.failures = 0;
+                observation.terminal_observed = !nonterminal;
                 // Mail reported the end but the scheduler has not recorded it yet
                 // (e.g. still exiting): look again soon instead of after the full interval.
                 if nonterminal
@@ -840,20 +862,21 @@ fn verify_with(
     if load_config(path)?.as_ref() != Some(config) {
         return Err("qstat_configuration_changed");
     }
-    let event = state.jobs[&key]
-        .pending_event
+    deliver_pending(state.jobs.get_mut(&key).expect("observation"), &mut ingest)
+}
+
+fn deliver_pending(
+    observation: &mut Observation,
+    ingest: &mut impl FnMut(Value) -> Result<Value, &'static str>,
+) -> Result<Value, &'static str> {
+    let event = observation.pending_event
         .clone()
         .ok_or("qstat_invalid_state")?;
     let reply = ingest(event)?;
     if matches!(
         reply["status"].as_str(),
-        Some("applied" | "duplicate" | "superseded" | "terminal_ignored")
+        Some("applied" | "duplicate" | "superseded" | "terminal_ignored" | "permanent_conflict")
     ) {
-        let observation = state.jobs.get_mut(&key).expect("observation");
-        observation.pending_event = None;
-        observation.pending_credential_id = None;
-    } else if reply["status"] == "permanent_conflict" {
-        let observation = state.jobs.get_mut(&key).expect("observation");
         observation.pending_event = None;
         observation.pending_credential_id = None;
     } else {
@@ -891,7 +914,21 @@ fn poll_once(path: &Path) -> Result<(), &'static str> {
     };
     let snapshot = {
         let _lock = lock_worker(path)?;
-        let state = load_state(path)?;
+        let mut state = load_state(path)?;
+        if state.jobs.values().any(|o| o.pending_event.is_some()) {
+            let attempted = replay_pending(&mut state, &config.credential_id, now(), |event| {
+                if load_config(path)?.as_ref() != Some(&config) {
+                    return Err("qstat_configuration_changed");
+                }
+                human_jobs::ingest_external_event(event).map_err(|e| match e {
+                    ExternalIngestError::Permanent => "job_service_rejected",
+                    ExternalIngestError::Retry(code) => code,
+                })
+            });
+            if attempted {
+                save_state(path, &state)?;
+            }
+        }
         if now() < state.next_query_at {
             return Err("qstat_deferred");
         }
@@ -903,9 +940,15 @@ fn poll_once(path: &Path) -> Result<(), &'static str> {
     let targets = reply["targets"]
         .as_array()
         .ok_or("job_service_operation_unsupported")?;
-    let targets = order_targets(targets, &snapshot)?;
+    let time = now();
+    let targets = order_targets(targets, &snapshot, time)?;
     let mut error = None;
     for target in targets {
+        if snapshot.jobs.get(&state_key(&target))
+            .is_some_and(|o| !due(o, time, config.ssh.poll_interval_seconds, false))
+        {
+            continue;
+        }
         // A fresh lookup prevents a manually settled job from starting a new query.
         let matched = human_jobs::lookup_external_event(json!({"source":"nci","remoteId":target.remote_id,"correlationToken":target.correlation_token})).map_err(|_| "job_service_unavailable")?;
         if matched["status"] != "matched" {
@@ -932,19 +975,51 @@ fn poll_once(path: &Path) -> Result<(), &'static str> {
     save_state(path, &state)
 }
 
-fn order_targets(values: &[Value], state: &State) -> Result<Vec<qstat::Target>, &'static str> {
+fn order_targets(values: &[Value], state: &State, time: u64) -> Result<Vec<qstat::Target>, &'static str> {
     let mut targets: Vec<qstat::Target> = values
         .iter()
         .map(|v| serde_json::from_value(v.clone()).map_err(|_| "qstat_invalid_target"))
         .collect::<Result<_, _>>()?;
     targets.sort_by_cached_key(|t| {
         let key = state_key(t);
-        (
-            state.jobs.get(&key).map(|o| o.last_attempt_at).unwrap_or(0),
-            key,
-        )
+        let observation = state.jobs.get(&key);
+        let recheck_due = observation.is_some_and(|o| o.recheck_at != 0 && o.recheck_at <= time);
+        (!recheck_due, observation.map(|o| o.last_attempt_at).unwrap_or(0), key)
     });
     Ok(targets)
+}
+
+fn replay_pending(
+    state: &mut State,
+    credential_id: &str,
+    time: u64,
+    mut ingest: impl FnMut(Value) -> Result<Value, &'static str>,
+) -> bool {
+    const REPLAY_BATCH: usize = 4;
+    let mut pending: Vec<_> = state.jobs.iter_mut().filter(|(_, o)| {
+        o.pending_event.is_some() && o.pending_credential_id.as_deref() == Some(credential_id)
+    }).collect();
+    // pending_retry_at rotates failures to the back and avoids hammering a
+    // disconnected Job Service past the worker's normal retry cadence.
+    pending.sort_unstable_by(|(left_key, left), (right_key, right)| {
+        (left.pending_retry_at, left_key).cmp(&(right.pending_retry_at, right_key))
+    });
+    let mut attempted = false;
+    let mut error = None;
+    for (_, observation) in pending.into_iter().filter(|(_, o)| o.pending_retry_at <= time).take(REPLAY_BATCH) {
+        attempted = true;
+        match deliver_pending(observation, &mut ingest) {
+            Ok(_) => observation.pending_retry_at = 0,
+            Err(code) => {
+                observation.pending_retry_at = time.saturating_add(30);
+                error = Some(code.into());
+            }
+        }
+    }
+    if attempted {
+        state.last_delivery_error = error;
+    }
+    attempted
 }
 
 #[cfg(test)]
@@ -1483,6 +1558,7 @@ mod tests {
                 serde_json::to_value(&untried).unwrap(),
             ],
             &state,
+            now(),
         )
         .unwrap();
         assert_eq!(ordered[0].remote_id, untried.remote_id);
@@ -1493,6 +1569,32 @@ mod tests {
         e["state"] = json!("running");
         e.as_object_mut().unwrap().remove("exitCode");
         e
+    }
+
+    #[test]
+    fn queued_end_hint_survives_cooldown_and_replay_ignores_ssh_budget() {
+        let (path, config, target) = fixture();
+        let mut state = State { next_query_at: 1200, ..Default::default() };
+        let key = state_key(&target);
+        assert_eq!(verify_with(&path, &config, &mut state, &target, true, true, 1000,
+            |_, _, _, _| panic!("host cooldown"), |_| panic!("no result yet")), Err("qstat_deferred"));
+        assert_eq!(state.jobs[&key].recheck_at, 1000);
+        let mut new = target.clone();
+        new.remote_id = "456.gadi-pbs".into();
+        let ordered = order_targets(&[json!(new), json!(target)], &state, 1200).unwrap();
+        assert_eq!(ordered[0].remote_id, target.remote_id);
+        let result_event = event();
+        assert_eq!(verify_with(&path, &config, &mut state, &target, false, false, 1200,
+            |_, _, _, _| Ok(Some(result_event.clone())), |_| Err("job_service_unavailable")),
+            Err("job_service_unavailable"));
+        assert!(state.next_query_at > 1201);
+        assert!(replay_pending(&mut state, &config.credential_id, 1201, |event| {
+            assert_eq!(event, result_event);
+            Ok(json!({"status":"duplicate"}))
+        }));
+        assert!(state.jobs[&key].pending_event.is_none());
+        assert_eq!(state.query_count, 1);
+        std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn end_mail_while_still_running_schedules_short_bounded_rechecks() {

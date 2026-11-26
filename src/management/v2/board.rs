@@ -284,6 +284,32 @@ pub fn project(inputs: Inputs, now: DateTime<Utc>) -> Value {
         "unassignedNeedsYouCount":if inputs.needs.is_some(){json!(unassigned.len())}else{Value::Null},"projects":rows.into_values().collect::<Vec<_>>()})
 }
 
+fn active_memberships(
+    directory: &crate::agent_management::AgentManagementSnapshot,
+) -> BTreeMap<String, String> {
+    directory
+        .agents
+        .iter()
+        .filter(|(_, a)| {
+            // Soft archives retain membership but have no active session row.
+            a.retired_at.is_none()
+                && !directory
+                    .reversible_archive_projection
+                    .get(&a.cutex_session_id)
+                    .copied()
+                    .unwrap_or(false)
+        })
+        .filter_map(|(id, a)| {
+            Some((
+                id.as_str().into(),
+                crate::agent_management::current_project_id(directory, a)?
+                    .as_str()
+                    .into(),
+            ))
+        })
+        .collect()
+}
+
 fn collect(
     context: ManagementRequestContext,
     repository: &EventRepository,
@@ -303,19 +329,7 @@ fn collect(
         "directorSessionId":p.director_cutex_session_id.as_ref().map(|id|id.as_str())})).collect();
     let directory = crate::agent_management::AgentManagementStore::open_default()?
         .directory_snapshot_shared()?;
-    let memberships = directory
-        .agents
-        .iter()
-        .filter(|(_, a)| a.retired_at.is_none())
-        .filter_map(|(id, a)| {
-            Some((
-                id.as_str().into(),
-                crate::agent_management::current_project_id(&directory, a)?
-                    .as_str()
-                    .into(),
-            ))
-        })
-        .collect::<BTreeMap<String, String>>();
+    let memberships = active_memberships(&directory);
     let now = Utc::now();
     let day = local_day(chrono::Local::now())?;
     let store = crate::asks::store::AskStore::open_default().ok();
@@ -553,6 +567,78 @@ mod tests {
         };
         (inputs, now)
     }
+
+    fn membership_fixture() -> crate::agent_management::AgentManagementSnapshot {
+        use crate::agent_management::{AgentManagementSnapshot, ManagedAgentRecord};
+        let mut directory = AgentManagementSnapshot::empty();
+        for name in ["busy", "idle", "offline", "restored", "archived-a", "archived-b", "retired"] {
+            let agent: ManagedAgentRecord = serde_json::from_value(json!({
+                "project_id":"alpha", "created_by_director_session":null,
+                "cutex_session_id":format!("cutex.{name}"), "native_session_id":name,
+                "spec":{"name":name,"cwd":std::env::current_dir().unwrap(),"profile":"test",
+                    "runtime_backend":"codex","model":"test","reasoning":"medium",
+                    "permissions":"test","approval_policy":"never","sandbox_mode":"read-only",
+                    "groups":[]},
+                "created_at":"2026-11-17T00:00:00Z",
+                "retired_at":if name == "retired" {json!("2026-11-17T00:00:00Z")} else {Value::Null}
+            })).unwrap();
+            if name.starts_with("archived-") || name == "restored" {
+                directory.reversible_archive_projection.insert(
+                    agent.cutex_session_id.clone(), name.starts_with("archived-"),
+                );
+            }
+            directory.agents.insert(agent.cutex_session_id.clone(), agent);
+        }
+        directory
+    }
+
+    #[test]
+    fn board_archived_members_without_session_rows_do_not_inflate_counts_or_problems() {
+        let directory = membership_fixture();
+        for with_archived_sessions in [false, true] {
+            let (mut inputs, now) = fixture();
+            inputs.asks = Some(Arc::new(AskState::default()));
+            inputs.memberships = active_memberships(&directory);
+            assert_eq!(inputs.memberships.len(), 4);
+            inputs.sessions = vec![
+                json!({"cutexSessionId":"cutex.busy","runtime":{"status":"online","activeTurnId":"turn"}}),
+                json!({"cutexSessionId":"cutex.idle","runtime":{"status":"online"}}),
+                json!({"cutexSessionId":"cutex.offline","runtime":{"status":"offline"}}),
+                json!({"cutexSessionId":"cutex.restored","runtime":{"status":"offline"}}),
+            ];
+            if with_archived_sessions {
+                // Archive authority also wins over a stale online session projection.
+                inputs.sessions.extend([
+                    json!({"cutexSessionId":"cutex.archived-a","runtime":{"status":"online"}}),
+                    json!({"cutexSessionId":"cutex.archived-b","runtime":{"status":"online","activeTurnId":"stale"}}),
+                ]);
+            }
+            let body = project(inputs, now);
+            let row = &body["projects"][0];
+            assert_eq!(row["members"], json!({"total":4,"busy":1,"idle":1,"offline":2,
+                "paused":0,"starting":0,"error":0,"unknown":0}));
+            assert_eq!(row["problems"], json!({"count":0,"byCode":{},"items":[]}));
+            assert_eq!(body["projects"][1]["members"]["total"], 0);
+        }
+    }
+
+    #[test]
+    fn board_live_member_without_session_row_still_reports_unavailable() {
+        let (mut inputs, now) = fixture();
+        inputs.asks = Some(Arc::new(AskState::default()));
+        inputs.memberships = active_memberships(&membership_fixture());
+        inputs.sessions = ["busy", "idle", "restored"].into_iter().map(|name| {
+            json!({"cutexSessionId":format!("cutex.{name}"),"runtime":{"status":"offline"}})
+        }).collect();
+        let body = project(inputs, now);
+        let row = &body["projects"][0];
+        assert_eq!(row["members"]["total"], 4);
+        assert_eq!(row["members"]["offline"], 3);
+        assert_eq!(row["members"]["unknown"], 1);
+        assert_eq!(row["problems"], json!({"count":1,"byCode":{"memberUnavailable":1},
+            "items":[{"code":"memberUnavailable","id":"cutex.offline","targetKind":"agent"}]}));
+    }
+
     #[test]
     fn board_needs_have_capped_jump_targets_and_native_ids_are_per_agent() {
         let (mut inputs, now) = fixture();

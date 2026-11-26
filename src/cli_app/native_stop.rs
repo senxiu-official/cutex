@@ -61,6 +61,7 @@ fn stop_and_commit_under_lane(
             &cutex::session::store::cutex_sessions_path()?,
             record,
         )?;
+        cutex::management::v2::stock_temp::wake_after_stop(record);
     }
     Ok(outcome)
 }

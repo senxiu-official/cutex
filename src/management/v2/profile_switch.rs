@@ -215,6 +215,7 @@ pub fn fork_target(
     record: &crate::session::model::CutexSessionRecord,
     requested: &str,
 ) -> Result<crate::profiles::model::StoredAccount, UserInputExecutionError> {
+    check_agent_profile_id(requested)?;
     let store = settings_api::load_store().map_err(store_unavailable)?;
     let current = record
         .profile
@@ -306,6 +307,11 @@ pub(super) fn account_gate(
     }
 }
 
+fn check_agent_profile_id(id: &str) -> Result<(), UserInputExecutionError> {
+    use super::feature_profiles::{require_agent_id, AgentRefusal};
+    require_agent_id(id).map_err(|_| AgentRefusal.user_input_error())
+}
+
 fn gate_profile(store: &crate::profiles::model::AccountsStore, name: &str) -> Option<GateProfile> {
     settings_api::find(store, name).map(|account| GateProfile {
         name: account.name.clone(),
@@ -348,6 +354,7 @@ fn check(
     let store = settings_api::load_store().map_err(store_unavailable)?;
     let current_name = current_profile_name(session);
     let current = current_name.as_deref().and_then(|name| gate_profile(&store, name));
+    check_agent_profile_id(&params.profile)?;
     let target = gate_profile(&store, &params.profile);
     gate(current.as_ref(), target.as_ref(), &params.profile)?;
     let target = target.expect("gated");

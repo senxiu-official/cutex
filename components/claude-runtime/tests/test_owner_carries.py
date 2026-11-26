@@ -72,6 +72,42 @@ async def test_busy_atomic_hook_and_exact_receipt_selection(ph):
     assert ph.store.claim(tid) is None
 
 
+async def test_busy_hook_preserves_reserved_input_turn_while_carries_use_context_turn(ph):
+    tid, active, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    value = carried(tid, 'reserved-turn-notice')
+    mid = 'steer-reserved-turn'
+    await ph.call('turn/steer', steer(tid, 'OWNER', client='reserved-turn', ownerCarries=[value]))
+    before = ph.store.db.execute('SELECT turn_id,state FROM inputs WHERE thread_id=? AND message_id=?',
+                                (tid, mid)).fetchone()
+    reserved = before['turn_id']
+    assert reserved != active and before['state'] == 'queued'
+
+    context = (await post_hook(ph, bridge))['hookSpecificOutput']['additionalContext']
+    await ph.server.busy_delivery.items_published(tid)
+    assert 'NOTICE' in context and context.endswith('OWNER')
+    injected = ph.store.db.execute('SELECT turn_id,state FROM inputs WHERE thread_id=? AND message_id=?',
+                                  (tid, mid)).fetchone()
+    # The daemon's own-start evidence must not confuse a hook injection with
+    # the reserved turn actually starting. BusyDelivery keeps both identities.
+    assert injected['turn_id'] == reserved and injected['state'] == 'injecting'
+    busy = ph.store.db.execute('SELECT context_turn_id FROM busy_inputs WHERE thread_id=? AND message_id=?',
+                              (tid, mid)).fetchone()
+    note = ph.store.db.execute('SELECT turn_id,state FROM notes WHERE thread_id=? AND message_id=?',
+                              (tid, value['message']['id'])).fetchone()
+    assert busy['context_turn_id'] == active
+    assert note['turn_id'] == active and note['state'] == 'injected'
+    assert injected['turn_id'] != note['turn_id']
+    assert service._status(tid, value['message']['id'], value['semanticSha256'])['receipt'] is None
+
+    await ph.server.busy_delivery.acknowledge_messages(tid, active, [mid, value['message']['id']])
+    assert service._status(tid, value['message']['id'], value['semanticSha256'])['receipt']['turnId'] == active
+    assert ph.store.db.execute('SELECT turn_id FROM inputs WHERE thread_id=? AND message_id=?',
+                               (tid, mid)).fetchone()['turn_id'] == reserved
+    ph.store.finish(tid, active, 'completed')
+    assert ph.store.claim(tid) is None, 'the consumed steer must not start its reserved turn later'
+
+
 async def test_capacity_refusal_rolls_back_entire_owner_and_notes(ph):
     install(ph, subscription=True)
     ph.server.settings = replace(ph.server.settings, max_pending=1)

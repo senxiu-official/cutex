@@ -469,6 +469,21 @@ pub(super) fn launch_tmpdir(configured: Option<&str>) -> anyhow::Result<std::pat
     cutex::config::paths::launch_tmp_dir(configured)
 }
 
+#[cfg(test)]
+#[test]
+fn stock_temp_occurrence_keeps_an_explicit_tmpdir() {
+    assert!(use_occurrence_tmp(None));
+    assert!(use_occurrence_tmp(Some("")));
+    assert!(use_occurrence_tmp(Some("/private/.cutex/runtime/stock-tmp/occurrences/previous/shell")));
+    assert!(!use_occurrence_tmp(Some("/explicit/private/tmp")));
+}
+
+fn use_occurrence_tmp(configured: Option<&str>) -> bool {
+    configured.filter(|path| !path.is_empty()).is_none_or(|path| {
+        cutex::config::paths::is_runtime_tmp_path(std::path::Path::new(path))
+    })
+}
+
 pub(super) fn clean_launch(
     program: &std::path::Path,
     home: &std::path::Path,
@@ -1232,12 +1247,24 @@ impl StockRuntimeExecutor for StockExecutor {
                 &record.cwd,
             );
         }
+        let runtime_dir = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir);
+        let ambient = std::env::var("TMPDIR").ok();
+        let default_tmp = use_occurrence_tmp(ambient.as_deref());
+        let directories = cutex::management::v2::stock_temp::register(
+            &runtime_dir, receipt, default_tmp, bundle.common_ingress(),
+        )?;
+        if let Some(path) = directories.shell.as_ref() {
+            let path = path.to_str().context("stock shell temporary path must be UTF-8")?;
+            launch = launch.env("TMPDIR", path);
+            #[cfg(windows)]
+            { launch = launch.env("TEMP", path).env("TMP", path); }
+        }
         let mut args = layout.app_server_args();
         if bundle.common_ingress() {
             // The accepted artifact is the direct app-server, not the stock CLI.
             args.remove(0);
-            let directory = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir);
-            let path = ExternalInputBinding::from_review(receipt).stage(&directory)?;
+            let directory = directories.scratch.as_ref().context("stock ingress scratch missing")?;
+            let path = ExternalInputBinding::from_review(receipt).stage(directory)?;
             args.extend([
                 "--external-input-binding-file".into(),
                 path.to_string_lossy().into_owned(),
@@ -1257,7 +1284,6 @@ impl StockRuntimeExecutor for StockExecutor {
                 ),
             )
             .env("CUTEX_AGENT_BUS_TOKEN", token);
-        let runtime_dir = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir);
         let log = runtime_dir.join("stock.stderr.log");
         // The gate still precedes every exec. After durable publication, the
         // gated child execs systemd-run, which moves itself and execs the
@@ -1326,6 +1352,7 @@ impl StockRuntimeExecutor for StockExecutor {
         }
         .into();
         binding.schema_sha256 = bundle.schema.sha256.as_str().to_string();
+        cutex::management::v2::stock_temp::bind(receipt, &binding)?;
         Ok(binding)
     }
     fn connect(
@@ -1336,8 +1363,9 @@ impl StockRuntimeExecutor for StockExecutor {
         let binding = receipt.binding.as_ref().context("stock binding missing")?;
         let bundle = StockBundle::load_running(&receipt.review.contract)?;
         if bundle.common_ingress() {
-            ExternalInputBinding::from_review(receipt)
-                .verify(std::path::Path::new(&binding.runtime_dir))?;
+            cutex::management::v2::stock_temp::ingress_directory(
+                std::path::Path::new(&binding.runtime_dir), receipt,
+            )?;
         }
         if let Some(child) = &mut self.child {
             child.release()?;

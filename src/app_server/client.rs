@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 #[cfg(unix)]
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
@@ -18,6 +18,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 use std::thread::JoinHandle;
@@ -59,18 +60,21 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_CAPACITY: usize = 128;
 const DEFAULT_EVENT_CAPACITY: usize = 512;
+const EVENT_QUEUE_WIRE_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_COMMANDS_PER_TICK: usize = 64;
 // Timed-out observed calls remain until a late reply or disconnect. Bound new
 // admissions so an otherwise connected, nonreplying runtime cannot grow them
 // forever; never discard an observer for a request already sent to native.
 const MAX_PENDING_REQUESTS: usize = 128;
 
-/// Counts event ownership, not payload bytes. Independent atomics make a
+/// Measures event ownership and queued wire bytes. Independent atomics make a
 /// concurrent snapshot approximate; after quiescence the lifecycle balances.
 #[derive(Default)]
 struct EventQueueMetrics {
     outstanding: AtomicU64,
     peak_outstanding: AtomicU64,
+    reserved_wire_bytes: AtomicU64,
+    peak_reserved_wire_bytes: AtomicU64,
     pending_sends: AtomicU64,
     received: AtomicU64,
     discarded: AtomicU64,
@@ -85,7 +89,10 @@ impl EventQueueMetrics {
     fn snapshot(&self) -> Value {
         json!({
             "schema": 1, "scope": "process", "approximate": true,
-            "bytesMeasured": false,
+            "bytesMeasured": true,
+            "queuedWireByteBudgetPerConnection": EVENT_QUEUE_WIRE_BUDGET,
+            "reservedWireBytes": self.reserved_wire_bytes.load(Ordering::Relaxed),
+            "peakReservedWireBytes": self.peak_reserved_wire_bytes.load(Ordering::Relaxed),
             "countDefinition": "outstanding_includes_send_attempts_buffered_events_and_receive_handoff_not_buffered_depth_pending_calls_may_overlap_received_events",
             "outstandingEvents": self.outstanding.load(Ordering::Relaxed),
             "peakOutstandingEvents": self.peak_outstanding.load(Ordering::Relaxed),
@@ -111,7 +118,8 @@ fn native_event_metrics() -> Arc<EventQueueMetrics> {
 /// return, even if their event was already received. Do NOT subtract the two
 /// to infer buffered depth. Discarded includes rejected sends and receiver-drop
 /// cleanup. Blocking elapsed is the entire synchronous send call, not a claim
-/// that every call waited on a full queue. No event data or byte estimates.
+/// that every call waited on a full queue. Wire-byte reservations cover the
+/// channel and the handoff into it, excluding a producer waiting for room.
 pub(crate) fn event_queue_diagnostics() -> Value {
     native_event_metrics().snapshot()
 }
@@ -119,12 +127,13 @@ pub(crate) fn event_queue_diagnostics() -> Value {
 struct QueuedEvent {
     event: Option<AppServerEvent>,
     metrics: Arc<EventQueueMetrics>,
+    reservation: Option<WireReservation>,
 }
 impl QueuedEvent {
     fn new(event: AppServerEvent, metrics: &Arc<EventQueueMetrics>) -> Self {
         let outstanding = metrics.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         metrics.peak_outstanding.fetch_max(outstanding, Ordering::Relaxed);
-        Self { event: Some(event), metrics: metrics.clone() }
+        Self { event: Some(event), metrics: metrics.clone(), reservation: None }
     }
     fn receive(mut self) -> AppServerEvent {
         self.event.take().expect("queued event is extracted once")
@@ -141,11 +150,58 @@ impl Drop for QueuedEvent {
     }
 }
 
+/// One transport actor and one receiver own this budget. A single message
+/// larger than the budget can occupy an empty queue to preserve native
+/// results and approvals. The WebSocket's existing message ceiling still
+/// applies, and at most one additional message waits in this actor.
+#[derive(Default)]
+struct EventBudget {
+    state: Mutex<BudgetState>,
+    room: Condvar,
+    defer_limit: AtomicBool,
+}
+
+#[derive(Default)]
+struct BudgetState {
+    wire_bytes: usize,
+    closed: bool,
+    #[cfg(test)]
+    waiting_for_bytes: bool,
+}
+
+struct WireReservation {
+    bytes: usize,
+    budget: Arc<EventBudget>,
+    metrics: Arc<EventQueueMetrics>,
+}
+
+impl Drop for WireReservation {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock().unwrap_or_else(|err| err.into_inner());
+        self.metrics.reserved_wire_bytes.fetch_sub(self.bytes as u64, Ordering::Relaxed);
+        state.wire_bytes -= self.bytes;
+        self.budget.room.notify_one();
+    }
+}
+
 struct EventSender {
     sender: SyncSender<QueuedEvent>,
     metrics: Arc<EventQueueMetrics>,
+    budget: Arc<EventBudget>,
+    notification_filter: Option<&'static str>,
 }
-struct EventReceiver(Receiver<QueuedEvent>);
+
+struct EventReceiver {
+    receiver: Receiver<QueuedEvent>,
+    budget: Arc<EventBudget>,
+}
+
+impl Drop for EventReceiver {
+    fn drop(&mut self) {
+        self.budget.state.lock().unwrap_or_else(|err| err.into_inner()).closed = true;
+        self.budget.room.notify_one();
+    }
+}
 
 struct PendingEventSend<'a>(&'a EventQueueMetrics);
 impl Drop for PendingEventSend<'_> {
@@ -156,34 +212,63 @@ impl Drop for PendingEventSend<'_> {
 
 fn event_channel(capacity: usize, metrics: Arc<EventQueueMetrics>) -> (EventSender, EventReceiver) {
     let (sender, receiver) = mpsc::sync_channel(capacity);
-    (EventSender { sender, metrics }, EventReceiver(receiver))
+    let budget = Arc::new(EventBudget::default());
+    (EventSender { sender, metrics, budget: budget.clone(), notification_filter: None }, EventReceiver { receiver, budget })
 }
 
 impl EventSender {
     fn send(&self, event: AppServerEvent) -> Result<(), ()> {
-        self.send_inner(event, false)
+        let bytes = local_event_size(&event);
+        self.send_inner(event, bytes, false)
     }
     fn try_send(&self, event: AppServerEvent) -> Result<(), ()> {
-        self.send_inner(event, true)
+        let bytes = local_event_size(&event);
+        self.send_inner(event, bytes, true)
     }
-    fn send_inner(&self, event: AppServerEvent, nonblocking: bool) -> Result<(), ()> {
+    fn reserve(&self, bytes: usize, nonblocking: bool) -> Result<WireReservation, ()> {
+        let mut state = self.budget.state.lock().unwrap_or_else(|err| err.into_inner());
+        while !state.closed && !self.budget.defer_limit.load(Ordering::Relaxed) && state.wire_bytes != 0
+            && state.wire_bytes.saturating_add(bytes) > EVENT_QUEUE_WIRE_BUDGET
+        {
+            if nonblocking { return Err(()); }
+            #[cfg(test)]
+            { state.waiting_for_bytes = true; }
+            state = self.budget.room.wait(state).unwrap_or_else(|err| err.into_inner());
+            #[cfg(test)]
+            { state.waiting_for_bytes = false; }
+        }
+        if state.closed { return Err(()); }
+        state.wire_bytes += bytes;
+        let total = self.metrics.reserved_wire_bytes.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        self.metrics.peak_reserved_wire_bytes.fetch_max(total, Ordering::Relaxed);
+        Ok(WireReservation { bytes, budget: self.budget.clone(), metrics: self.metrics.clone() })
+    }
+    fn enqueue(&self, mut event: QueuedEvent, bytes: usize, nonblocking: bool) -> Result<(), ()> {
+        event.reservation = Some(self.reserve(bytes.max(1), nonblocking)?);
+        if nonblocking {
+            self.sender.try_send(event).map_err(|_| ())
+        } else {
+            self.sender.send(event).map_err(|_| ())
+        }
+    }
+    fn send_inner(&self, event: AppServerEvent, bytes: usize, nonblocking: bool) -> Result<(), ()> {
         let event = QueuedEvent::new(event, &self.metrics);
         self.metrics.pending_sends.fetch_add(1, Ordering::Relaxed);
         let _pending = PendingEventSend(&self.metrics);
         let result = if nonblocking {
-            self.sender.try_send(event).map_err(|_| ())
+            self.enqueue(event, bytes, true)
         } else {
             let mut timing = crate::management::v2::control_timing::Trace::metrics_only(
                 crate::management::v2::control_timing::Path::NativeEventSend);
             timing.stage(crate::management::v2::control_timing::Stage::QueueWait);
             self.metrics.blocking_calls.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let result = self.sender.send(event);
+            let result = self.enqueue(event, bytes, false);
             let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             self.metrics.blocking_total_ns.fetch_add(elapsed, Ordering::Relaxed);
             self.metrics.blocking_max_ns.fetch_max(elapsed, Ordering::Relaxed);
             timing.status(if result.is_ok() { 200 } else { 503 });
-            result.map_err(|_| ())
+            result
         };
         if result.is_ok() {
             self.metrics.sends_ok.fetch_add(1, Ordering::Relaxed);
@@ -194,11 +279,18 @@ impl EventSender {
     }
 }
 impl EventReceiver {
+    fn enable_byte_limit(&self) {
+        if self.budget.defer_limit.load(Ordering::Relaxed) {
+            let _state = self.budget.state.lock().unwrap_or_else(|err| err.into_inner());
+            self.budget.defer_limit.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn recv(&self) -> Result<AppServerEvent, mpsc::RecvError> {
-        self.0.recv().map(QueuedEvent::receive)
+        self.receiver.recv().map(QueuedEvent::receive)
     }
     fn recv_timeout(&self, timeout: Duration) -> Result<AppServerEvent, RecvTimeoutError> {
-        self.0.recv_timeout(timeout).map(QueuedEvent::receive)
+        self.receiver.recv_timeout(timeout).map(QueuedEvent::receive)
     }
 }
 
@@ -316,6 +408,17 @@ pub enum AppServerEvent {
     ServerRequest(RpcServerRequest),
     ProtocolViolation { message: String },
     Disconnected { reason: String },
+}
+
+fn local_event_size(event: &AppServerEvent) -> usize {
+    match event {
+        AppServerEvent::ProtocolViolation { message } => message.len(),
+        AppServerEvent::Disconnected { reason } => reason.len(),
+        AppServerEvent::Notification(notification) =>
+            crate::management::v2::event_blobs::encoded_len(&notification.raw),
+        AppServerEvent::ServerRequest(request) =>
+            crate::management::v2::event_blobs::encoded_len(&request.raw),
+    }
 }
 
 #[derive(Clone)]
@@ -453,6 +556,18 @@ impl AppServerHandle {
             .map(|response| response.raw)
     }
 
+    /// Internal settlement probes have an absolute deadline shared with lane
+    /// admission. Do not add the normal caller-side polling allowance or run
+    /// request middleware that may consume a separate timeout.
+    pub fn request_raw_message_until(
+        &self,
+        message: Value,
+        deadline: Instant,
+    ) -> Result<Value, AppServerClientError> {
+        self.request_rpc_message_at(message, deadline, deadline, None)
+            .map(|response| response.raw)
+    }
+
     fn request_rpc_with_timeout(
         &self,
         id: Value,
@@ -491,23 +606,37 @@ impl AppServerHandle {
         timeout: Duration,
         response_observer: Option<Box<dyn FnOnce(&RpcResponse) + Send>>,
     ) -> Result<RpcResponse, AppServerClientError> {
+        if timeout.is_zero() {
+            return Err(AppServerClientError::InvalidOptions(
+                "app-server request timeout must be positive".to_string(),
+            ));
+        }
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            AppServerClientError::InvalidOptions(
+                "app-server request timeout exceeds the supported range".to_string(),
+            )
+        })?;
+        let wait_until = deadline.checked_add(ACTOR_POLL_INTERVAL * 2).unwrap_or(deadline);
+        self.request_rpc_message_at(message, deadline, wait_until, response_observer)
+    }
+
+    fn request_rpc_message_at(
+        &self,
+        message: Value,
+        deadline: Instant,
+        wait_until: Instant,
+        response_observer: Option<Box<dyn FnOnce(&RpcResponse) + Send>>,
+    ) -> Result<RpcResponse, AppServerClientError> {
         let (id, method) = request_identity(&message)?;
         if method.is_empty() {
             return Err(AppServerClientError::Protocol(
                 "app-server request method must not be empty".to_string(),
             ));
         }
-        if timeout.is_zero() {
-            return Err(AppServerClientError::InvalidOptions(
-                "app-server request timeout must be positive".to_string(),
-            ));
-        }
         RpcRequestIdKey::from_value(&id)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            AppServerClientError::InvalidOptions(
-                "app-server request timeout exceeds the supported range".to_string(),
-            )
-        })?;
+        if Instant::now() >= deadline {
+            return Err(AppServerClientError::Timeout { method });
+        }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.send_command(ActorCommand::Request {
             id,
@@ -518,7 +647,7 @@ impl AppServerHandle {
             response_observer,
         })?;
         response_rx
-            .recv_timeout(timeout + ACTOR_POLL_INTERVAL + ACTOR_POLL_INTERVAL)
+            .recv_timeout(wait_until.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
                 RecvTimeoutError::Timeout => AppServerClientError::Timeout {
                     method: method.clone(),
@@ -649,16 +778,29 @@ impl ControlEventDrain {
 
 impl AppServerClient {
     pub fn connect(options: AppServerClientOptions) -> Result<Self, AppServerClientError> {
-        Self::connect_with_control_drain(options, false)
+        Self::connect_with_event_policy(options, false, None)
     }
 
     /// Secondary RPC connection only: start consuming before JSON-RPC initialize.
     /// The WebSocket transport handshake still precedes actor creation.
     pub(crate) fn connect_rpc_only(options: AppServerClientOptions) -> Result<Self, AppServerClientError> {
-        Self::connect_with_control_drain(options, true)
+        Self::connect_with_event_policy(options, true, None)
     }
 
-    fn connect_with_control_drain(options: AppServerClientOptions, control: bool) -> Result<Self, AppServerClientError> {
+    /// Keep the one notification the external-input bridge polls. The owner
+    /// connection handles other native events and server requests.
+    pub(crate) fn connect_with_hints(
+        options: AppServerClientOptions,
+        method: &'static str,
+    ) -> Result<Self, AppServerClientError> {
+        Self::connect_with_event_policy(options, false, Some(method))
+    }
+
+    fn connect_with_event_policy(
+        options: AppServerClientOptions,
+        control: bool,
+        notification_filter: Option<&'static str>,
+    ) -> Result<Self, AppServerClientError> {
         if options.command_capacity == 0 || options.event_capacity == 0 {
             return Err(AppServerClientError::InvalidOptions(
                 "app-server channel capacities must be positive".to_string(),
@@ -671,7 +813,14 @@ impl AppServerClient {
         }
         let socket = connect_websocket(&options.endpoint, options.connect_timeout)?;
         let (command_tx, command_rx) = mpsc::sync_channel(options.command_capacity);
-        let (event_tx, event_rx) = event_channel(options.event_capacity, native_event_metrics());
+        let (mut event_tx, event_rx) = event_channel(options.event_capacity, native_event_metrics());
+        // Owner bootstrap (initialize, resume and active-turn recovery) may
+        // require RPC replies before its event loop can consume native events.
+        // Keep the existing count cap through startup and enable the byte
+        // limit at the first read. RPC-only drains and narrow hint
+        // subscriptions can enforce the byte limit from initialize onward.
+        event_tx.budget.defer_limit.store(!control && notification_filter.is_none(), Ordering::Relaxed);
+        event_tx.notification_filter = notification_filter;
         let disconnect_reason = Arc::new(Mutex::new(None));
         let actor_disconnect_reason = disconnect_reason.clone();
         let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_disconnect_reason, MAX_PENDING_REQUESTS));
@@ -736,6 +885,7 @@ impl AppServerClient {
         let receiver = self.event_rx.take().ok_or_else(|| {
             AppServerClientError::InvalidOptions("app-server event receiver already transferred".into())
         })?;
+        receiver.enable_byte_limit();
         let (stop, stopped) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("cutex-control-events".into())
@@ -756,9 +906,11 @@ impl AppServerClient {
     }
 
     fn event_receiver(&self) -> Result<&EventReceiver, AppServerClientError> {
-        self.event_rx.as_ref().ok_or_else(|| {
+        let receiver = self.event_rx.as_ref().ok_or_else(|| {
             AppServerClientError::Disconnected("app-server event stream closed".to_string())
-        })
+        })?;
+        receiver.enable_byte_limit();
+        Ok(receiver)
     }
 
     pub fn recv_event(&self) -> Result<AppServerEvent, AppServerClientError> {
@@ -1352,15 +1504,21 @@ fn run_actor(
                         let _ = pending_request.response_tx.try_send(Ok(response));
                     }
                     Ok(InboundMessage::Notification(notification)) => {
+                        if event_tx.notification_filter.is_some_and(|method| method != notification.method) {
+                            continue;
+                        }
                         if matches!(notification.method.as_str(), "item/started" | "item/completed" | "thread/started" | "claude/task/updated") {
                             if let Some(observer) = &notification_observer { observer(&AppServerEvent::Notification(notification.clone())); }
                         }
-                        if !emit_event(&event_tx, AppServerEvent::Notification(notification)) {
+                        if event_tx.send_inner(AppServerEvent::Notification(notification), text.len(), false).is_err() {
                             break 'actor "app-server event consumer disconnected".to_string();
                         }
                     }
                     Ok(InboundMessage::ServerRequest(request)) => {
-                        if !emit_event(&event_tx, AppServerEvent::ServerRequest(request)) {
+                        if event_tx.notification_filter.is_some() {
+                            continue;
+                        }
+                        if event_tx.send_inner(AppServerEvent::ServerRequest(request), text.len(), false).is_err() {
                             break 'actor "app-server event consumer disconnected".to_string();
                         }
                     }
@@ -1671,7 +1829,7 @@ mod tests {
 
     /// The peer sends more than a full event queue *before* replying to each
     /// RPC, as a busy runtime can do on a cached control subscription.
-    fn notification_burst_peer(rounds: usize) -> (AppServerClientOptions, JoinHandle<()>) {
+    fn notification_burst_peer(rounds: usize, count: usize, payload_bytes: usize) -> (AppServerClientOptions, JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let worker = thread::spawn(move || {
@@ -1695,8 +1853,9 @@ mod tests {
                 let request: Value = serde_json::from_str(request.as_ref()).unwrap();
                 // No approval response may be sent by this secondary consumer.
                 assert_eq!(request["method"], "test/control");
-                for sequence in 0..DEFAULT_EVENT_CAPACITY * 2 {
-                    socket.send(Message::Text(json!({"method":"test/delta","params":{"sequence":sequence}}).to_string().into())).unwrap();
+                let payload = "x".repeat(payload_bytes);
+                for sequence in 0..count {
+                    socket.send(Message::Text(json!({"method":"test/delta","params":{"sequence":sequence,"payload":payload}}).to_string().into())).unwrap();
                 }
                 socket.send(Message::Text(json!({"id":format!("approval-{round}"),"method":"test/approval","params":{}}).to_string().into())).unwrap();
                 socket.send(Message::Text(json!({"id":request["id"],"result":{"round":round}}).to_string().into())).unwrap();
@@ -1718,7 +1877,7 @@ mod tests {
 
     #[test]
     fn rpc_only_control_drain_keeps_replies_live_past_full_event_queue() {
-        let (options, peer) = notification_burst_peer(2);
+        let (options, peer) = notification_burst_peer(2, DEFAULT_EVENT_CAPACITY * 2, 0);
         let mut client = AppServerClient::connect(options).unwrap();
         client.drain_control_events().unwrap();
         assert!(client.recv_event_timeout(Duration::ZERO).is_err());
@@ -1731,7 +1890,7 @@ mod tests {
 
     #[test]
     fn owner_receiver_still_backpressures_and_preserves_all_events() {
-        let (options, peer) = notification_burst_peer(1);
+        let (options, peer) = notification_burst_peer(1, DEFAULT_EVENT_CAPACITY * 2, 0);
         let client = AppServerClient::connect(options).unwrap();
         // One timed-out call: its eventual late response can legitimately
         // produce an unknown-response diagnostic after these preserved events.
@@ -1745,6 +1904,97 @@ mod tests {
         }
         drop(client);
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn bootstrap_rpcs_keep_count_limit_until_owner_starts_reading() {
+        let (options, peer) = notification_burst_peer(2, 3, EVENT_QUEUE_WIRE_BUDGET / 3);
+        let client = AppServerClient::connect(options).unwrap();
+        for round in 0..2 {
+            assert_eq!(client.handle().request("test/control", json!({})).unwrap(), json!({"round":round}));
+        }
+        for round in 0..2 {
+            for sequence in 0..3 {
+                let Some(AppServerEvent::Notification(event)) = client.recv_event_timeout(Duration::from_secs(5)).unwrap() else {
+                    panic!("expected bootstrap notification");
+                };
+                assert_eq!(event.params.unwrap()["sequence"], sequence);
+            }
+            let Some(AppServerEvent::ServerRequest(approval)) = client.recv_event_timeout(Duration::from_secs(5)).unwrap() else {
+                panic!("expected bootstrap approval");
+            };
+            assert_eq!(approval.id, format!("approval-{round}"));
+        }
+        assert!(!client.event_receiver().unwrap().budget.defer_limit.load(Ordering::Relaxed));
+        drop(client);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn external_input_hint_connection_keeps_hints_without_duplicate_payloads() {
+        let (options, peer) = notification_burst_peer(1, 3, EVENT_QUEUE_WIRE_BUDGET / 3);
+        let hints = AppServerClient::connect_with_hints(options, "test/hint").unwrap();
+        assert_eq!(hints.handle().request("test/control", json!({})).unwrap(), json!({"round":0}));
+        assert!(hints.recv_event_timeout(Duration::ZERO).unwrap().is_none());
+        drop(hints);
+        peer.join().unwrap();
+
+        let (options, done, peer) = initialize_burst_peer(2, true, false);
+        let hints = AppServerClient::connect_with_hints(options, "test/initial").unwrap();
+        for sequence in 0..2 {
+            let Some(AppServerEvent::Notification(hint)) = hints.recv_event_timeout(Duration::from_secs(5)).unwrap() else {
+                panic!("expected matching hint");
+            };
+            assert_eq!(hint.params.unwrap()["sequence"], sequence);
+        }
+        assert!(hints.recv_event_timeout(Duration::ZERO).unwrap().is_none());
+        drop(hints);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn native_wire_backpressure_preserves_notifications_and_approval() {
+        let (options, peer) = notification_burst_peer(1, 3, EVENT_QUEUE_WIRE_BUDGET / 3);
+        let client = AppServerClient::connect(options).unwrap();
+        assert!(client.recv_event_timeout(Duration::ZERO).unwrap().is_none());
+        // The three messages exceed the wire budget but are far below the
+        // count limit. The third notification blocks reading the RPC reply.
+        let stalled = client.handle().request_with_timeout("test/control", json!({}), Duration::from_secs(1));
+        assert!(matches!(stalled, Err(AppServerClientError::Timeout { .. })));
+        let budget = &client.event_receiver().unwrap().budget;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let queued_bytes = loop {
+            let state = budget.state.lock().unwrap();
+            if state.waiting_for_bytes {
+                break state.wire_bytes;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "this connection must reach its byte limit");
+            thread::yield_now();
+        };
+        assert!((2 * (EVENT_QUEUE_WIRE_BUDGET / 3)..=EVENT_QUEUE_WIRE_BUDGET).contains(&queued_bytes));
+        let (healthy_options, healthy_done, healthy_peer) = initialize_burst_peer(1, false, false);
+        let started = Instant::now();
+        let healthy = AppServerClient::connect_rpc_only(healthy_options).unwrap();
+        assert_eq!(healthy.handle().request("test/after-init", json!({})).unwrap(), json!({"ok":true}));
+        eprintln!("unrelated loopback connection initialized and served RPC in {:?}", started.elapsed());
+        for sequence in 0..3 {
+            let Some(AppServerEvent::Notification(event)) = client.recv_event_timeout(Duration::from_secs(5)).unwrap() else {
+                panic!("expected native notification");
+            };
+            let params = event.params.unwrap();
+            assert_eq!(params["sequence"], sequence);
+            assert_eq!(params["payload"].as_str().unwrap().len(), EVENT_QUEUE_WIRE_BUDGET / 3);
+        }
+        let Some(AppServerEvent::ServerRequest(approval)) = client.recv_event_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("expected native approval");
+        };
+        assert_eq!(approval.id, "approval-0");
+        drop((client, healthy));
+        peer.join().unwrap();
+        healthy_done.recv_timeout(Duration::from_secs(5)).unwrap();
+        healthy_peer.join().unwrap();
     }
 
     #[test]
@@ -1906,7 +2156,8 @@ mod tests {
         assert_eq!(snapshot["discardedEvents"], 0);
         assert_eq!(snapshot["successfulSends"], 2);
         assert_eq!(snapshot["blockingSendCalls"], 1);
-        assert_eq!(snapshot["bytesMeasured"], false);
+        assert_eq!(snapshot["bytesMeasured"], true);
+        assert_eq!(snapshot["reservedWireBytes"], 0);
         assert_eq!(snapshot["countDefinition"], "outstanding_includes_send_attempts_buffered_events_and_receive_handoff_not_buffered_depth_pending_calls_may_overlap_received_events");
         assert!(!snapshot.to_string().contains("private"));
     }
@@ -1973,6 +2224,76 @@ mod tests {
         assert_eq!(snapshot["receivedEvents"], 2);
         assert_eq!(snapshot["discardedEvents"], 0);
         assert_eq!(snapshot["successfulSends"], 2);
+    }
+
+    #[test]
+    fn event_queue_byte_load_keeps_other_connections_moving() {
+        const HOT_CONNECTIONS: usize = 8;
+        const FRAME: usize = 256 * 1024;
+        const BURST: usize = 64;
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let mut hot = Vec::new();
+        let started = Instant::now();
+        let payload = "x".repeat(FRAME - 2);
+        for _ in 0..HOT_CONNECTIONS {
+            let (tx, rx) = event_channel(DEFAULT_EVENT_CAPACITY, metrics.clone());
+            for index in 0..BURST {
+                let result = tx.try_send(diagnostic_event(&format!("{index:02}{payload}")));
+                assert_eq!(result.is_ok(), index < EVENT_QUEUE_WIRE_BUDGET / FRAME);
+            }
+            hot.push((tx, rx));
+        }
+        let reserved = metrics.reserved_wire_bytes.load(Ordering::Relaxed);
+        assert_eq!(reserved, (HOT_CONNECTIONS * EVENT_QUEUE_WIRE_BUDGET) as u64);
+        let (healthy_tx, healthy_rx) = event_channel(DEFAULT_EVENT_CAPACITY, metrics.clone());
+        let healthy_started = Instant::now();
+        for _ in 0..128 {
+            healthy_tx.send(diagnostic_event("healthy")).unwrap();
+            assert_eq!(healthy_rx.recv().unwrap(), diagnostic_event("healthy"));
+        }
+        let healthy_elapsed = healthy_started.elapsed();
+        for (_, rx) in &hot {
+            for index in 0..EVENT_QUEUE_WIRE_BUDGET / FRAME {
+                let AppServerEvent::ProtocolViolation { message } = rx.recv().unwrap() else {
+                    panic!("expected queued payload");
+                };
+                assert!(message.starts_with(&format!("{index:02}")));
+            }
+        }
+        assert_eq!(metrics.reserved_wire_bytes.load(Ordering::Relaxed), 0);
+        eprintln!(
+            "native queue load: {HOT_CONNECTIONS} connections, {BURST} x {FRAME} B each, \
+             {reserved} B reserved vs {} B admitted by the old count-only limit, \
+             128 healthy round trips in {healthy_elapsed:?}, total {:?}",
+            HOT_CONNECTIONS * BURST * FRAME,
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn native_event_byte_wait_preserves_oversized_messages_and_can_close() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (tx, rx) = event_channel(4, metrics.clone());
+        // Model one large native result and an approval behind it. Charge the
+        // actual would-be wire size without needing a giant socket fixture.
+        let oversized = EVENT_QUEUE_WIRE_BUDGET + 1;
+        tx.send_inner(diagnostic_event("large result"), oversized, false).unwrap();
+        let next = thread::spawn(move || {
+            tx.send_inner(diagnostic_event("approval"), 32, false)?;
+            Ok::<_, ()>(tx)
+        });
+        wait_for_pending_send(&metrics);
+        assert_eq!(metrics.reserved_wire_bytes.load(Ordering::Relaxed), oversized as u64);
+        assert_eq!(rx.recv().unwrap(), diagnostic_event("large result"));
+        let tx = next.join().unwrap().unwrap();
+        assert_eq!(rx.recv().unwrap(), diagnostic_event("approval"));
+
+        tx.send_inner(diagnostic_event("large result 2"), oversized, false).unwrap();
+        let next = thread::spawn(move || tx.send_inner(diagnostic_event("pending"), 32, false));
+        wait_for_pending_send(&metrics);
+        drop(rx);
+        assert!(next.join().unwrap().is_err());
+        assert_eq!(metrics.reserved_wire_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(windows)]
@@ -2161,6 +2482,25 @@ mod tests {
             Err(AppServerClientError::InvalidOptions(message))
                 if message.contains("request id space")
         ));
+    }
+
+    #[test]
+    fn expired_receipt_probe_does_not_enqueue_native_request() {
+        let (command_tx, commands) = mpsc::sync_channel(1);
+        let handle = AppServerHandle {
+            command_tx,
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_secs(30),
+            disconnect_reason: Arc::new(Mutex::new(None)),
+            initialize_response: Default::default(),
+            request_hook: Default::default(),
+        };
+        let message = json!({"id": "deadline-test", "method": "thread/externalInput/status"});
+        assert!(matches!(
+            handle.request_raw_message_until(message, Instant::now()),
+            Err(AppServerClientError::Timeout { .. })
+        ));
+        assert!(matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[test]

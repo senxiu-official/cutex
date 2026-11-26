@@ -93,6 +93,7 @@ pub(super) const CUTEX_TREES: &[&str] = &[
     crate::runtime::claude_accounts::KEYS_DIR,
     crate::profiles::kimi_accounts::HOMES_DIR,
     crate::profiles::stored_keys::KEYS_DIR,
+    crate::management::v2::feature_profiles::DIR,
     "management-clients",
     "archive/claude-tool-defaults",
     "archive/profile-generic-switches",

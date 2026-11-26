@@ -14,9 +14,15 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 pub fn ask_error(error: Error) -> AskError {
+    if let Some(refusal) = super::receipt::RoutingRefusal::from_code(&error.code) {
+        return refusal.ask_error().with(error.details);
+    }
     let code = match error.code.as_str() {
         "peer_not_found" => "peer_not_found",
         "peer_unavailable" => "peer_unavailable",
+        "peer_unreachable" => "peer_unreachable",
+        "peer_protocol_error" => "peer_protocol_error",
+        "persistence_unavailable" | "peer_store_corrupt" => "persistence_unavailable",
         "peer_unsupported" => "peer_unsupported",
         "peer_name_resolution_unsupported" => "peer_name_resolution_unsupported",
         "recipient_archived" => "recipient_archived",
@@ -31,13 +37,21 @@ pub fn ask_error(error: Error) -> AskError {
         "idempotency_conflict" => "idempotency_conflict",
         "peer_rate_limited" => "peer_rate_limited",
         "wake_not_allowed" => "wake_not_allowed",
-        _ => "peer_unavailable",
+        _ => "peer_request_failed",
     };
-    let message = error.details["detail"].as_str().unwrap_or(&error.code).to_owned();
+    let message = error.details["detail"].as_str().unwrap_or(code);
     AskError::new(code, message).with(error.details)
 }
 fn from_ask(e: AskError) -> Error {
-    let mut error = Error::new(e.code, 400);
+    if let Some(refusal) = super::receipt::RoutingRefusal::from_code(&e.code) {
+        return refusal.peer_error();
+    }
+    let status = match e.code {
+        "peer_unavailable" => 409,
+        "persistence_unavailable" => 503,
+        _ => 400,
+    };
+    let mut error = Error::new(e.code, status);
     error.details = e
         .extra
         .as_object()
@@ -45,6 +59,20 @@ fn from_ask(e: AskError) -> Error {
         .unwrap_or_else(|| json!({}));
     error
 }
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn internal_refusal_keeps_a_closed_code_after_crossing_the_ask_boundary() {
+        let mapped = from_ask(ask_error(Error::new("fixture_internal_refusal", 400)));
+        assert_eq!((mapped.code.as_str(), mapped.status), ("peer_request_failed", 400));
+        let unavailable = from_ask(ask_error(Error::new("peer_unavailable", 409)));
+        assert_eq!((unavailable.code.as_str(), unavailable.status), ("peer_unavailable", 409));
+    }
+}
+
 pub fn same_requester(a: &Requester, b: &Requester) -> bool {
     match (a, b) {
         (
@@ -394,7 +422,8 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
         ask.hops = inbound.request.hops;
         ask.peer_inbound = Some(inbound);
         crate::asks::routing_policy::integration::register_created(&mut next, authority, &mut ask,
-            &routing_host, Some(&peer.host_id), now,&controllers).map_err(from_ask)?;
+            &routing_host, Some(&peer.host_id), now,&controllers)
+            .map_err(|_| super::receipt::RoutingRefusal::Destination.peer_error())?;
         next.asks.insert(id.into(), ask.into());
         *state = next;
         Ok(())
@@ -590,6 +619,7 @@ pub fn apply(store: &AskStore, peer: &Peer, mut snapshot: Snapshot) -> Result<()
             r.sync.last_remote_revision = snapshot.revision;
             r.sync.last_received_at = super::now();
             r.sync.accepted = true;
+            r.sync.admitted |= super::receipt::execution_proves_admission(snapshot.execution);
             r.sync.state = "synced".into();
             r.sync.last_error = snapshot.last_error.clone();
             r.sync.interrupt_reason = snapshot.interrupt_reason;
@@ -827,7 +857,8 @@ pub fn delegate_scoped_fenced(
             }
             crate::asks::routing_policy::integration::configure_test_world(s,ctx.world,ctx.now).map_err(from_ask)?;
             crate::asks::routing_policy::integration::check_peer_source(authority,s,&directory,ctx.caller,
-                &crate::asks::routing_policy::integration::local_host_id()).map_err(from_ask)?;
+                &crate::asks::routing_policy::integration::local_host_id())
+                .map_err(|_| super::receipt::RoutingRefusal::Source.peer_error())?;
             let (mut a, created) = s.create_ask(new.clone(), ctx.now).map_err(from_ask)?;
             a.hops = hops;
             a.hold = Some(Hold::PeerUnreachable);
@@ -855,24 +886,34 @@ pub fn delegate_scoped_fenced(
                     last_received_at: super::now(),
                     failures: 0,
                     accepted: false,
+                    admitted: false,
                 },
             });
             s.asks.insert(a.ask_id.clone(), a.clone().into());
             Ok((a, created))
-        })??;
+        })?.map_err(|mut error| {
+            if error.code == super::receipt::RoutingRefusal::Source.code() {
+                use super::receipt::{CrossHost, DeliveryState, Direction, Reason};
+                super::receipt::insert(&mut error.details, CrossHost::new(
+                    Direction::Outbound, &peer.peer_id, &peer.label, DeliveryState::Failed,
+                    Some(Reason::SourceRoutingRefused), None,
+                ));
+            }
+            error
+        })?;
         if hops_exceeded {
             super::worker::fail(ctx.store, &ask.ask_id, "peer_hops_exceeded", false)?;
         }
         super::worker::wake();
-        let ask = ctx.store.snapshot()?.asks[&ask.ask_id].clone();
-        let mut view = crate::asks::view::requester_view(&ctx.store.snapshot()?, &ask);
+        let state = ctx.store.snapshot()?;
+        let mut view = crate::asks::view::requester_view(&state, &state.asks[&ask.ask_id]);
         view["ok"] = json!(true);
         view["created"] = json!(created);
         view["detail"] = json!(if hops_exceeded {
             "Cross-host hop limit exceeded. The delegation failed; its state delivery is available.".to_string()
         } else {
             let arrival = if ctx.wait { crate::asks::tools::ARRIVAL_WAIT } else { crate::asks::tools::ARRIVAL_NO_WAIT };
-            format!("Queued on the other host. Questions go to its owner. {arrival}")
+            format!("Recorded on this host. See the cross-host receipt for delivery status. Questions go to the destination owner. {arrival}")
         });
         if !rename_detail.is_empty() {
             view["detail"] = json!(format!("{} {}", view["detail"].as_str().unwrap_or_default(), rename_detail));

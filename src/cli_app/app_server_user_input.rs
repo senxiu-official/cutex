@@ -1373,8 +1373,19 @@ fn send_user_input_native_request_bound(
         && generation.is_some_and(|generation| super::owner_carries::OwnerCarries::supported(session, generation))
         && !super::owner_carries::OwnerCarries::goes_alone(session, &command.params.client_user_message_id)
             .map_err(|error| execution_error("native_request", "owner_carry_reservation_failed", error, true, false))? {
-        Some(super::owner_carries::OwnerCarries::prepare(session, &command.params.client_user_message_id,
-            &command.thread_id, generation.expect("checked above"))
+        let generation = generation.expect("checked above");
+        let ordered_start = method == "turn/start" && super::asks_claude::adapter_capabilities(session, generation)
+            .is_some_and(|caps| super::claude_runtime::supports_ordered_input(&caps))
+            && !cutex::asks::store::AskStore::open_default()
+                .and_then(|store| store.inspect(|state| state.pauses.contains_key(session)))
+                .unwrap_or(true);
+        let owner_id = &command.params.client_user_message_id;
+        let carry = if ordered_start {
+            super::owner_carries::OwnerCarries::prepare_for_boundary(session, owner_id, &command.thread_id, generation, true)
+        } else {
+            super::owner_carries::OwnerCarries::prepare(session, owner_id, &command.thread_id, generation)
+        };
+        Some(carry
             .map_err(|error| {
                 let unknown = error.is::<super::owner_carries::ExistingReservation>();
                 execution_error("native_request", if unknown { "request_outcome_unknown" } else { "owner_carry_reservation_failed" }, error, !unknown, unknown)
@@ -3622,7 +3633,7 @@ mod tests {
                 session,
                 &items[2].queue_id,
                 repository.admission(session).unwrap().order_revision,
-                Some(&cutex::management::v2::admission::AdmissionRef { kind: "owner".into(), id: items[0].queue_id.clone() }),
+                Some(&cutex::management::v2::admission::AdmissionRef::owner(items[0].queue_id.clone())),
                 true,
             )
             .unwrap();
@@ -3906,7 +3917,7 @@ mod tests {
         let admission = repository.admission(&session).unwrap();
         cutex::management::v2::admission::take_change(&session);
         repository.move_admission_item(&session, &owner.queue_id, admission.order_revision,
-            Some(&cutex::management::v2::admission::AdmissionRef { kind: "ask".into(), id: ask }), true).unwrap();
+            Some(&cutex::management::v2::admission::AdmissionRef::ask(ask)), true).unwrap();
         assert!(cutex::management::v2::admission::take_change(&session));
         assert!(flush_queued_locked(&session, false, &repository, None, idle_thread,
             recording_sender(&sent), recording_events(&events)).unwrap());
@@ -4071,6 +4082,7 @@ mod tests {
         store.with_state(|state| {
             state.leases.insert(session.into(), lease.clone());
             state.events.insert("old-event".into(), EventOutboxRecord {
+                automatic_batch_id: None,
                 held_runtime_generation: None,
                 event_id: "old-event".into(), cutex_session_id: session.into(), delivery_ids: vec![],
                 native_message_id: "accepted-event".into(), event_artifact: None,

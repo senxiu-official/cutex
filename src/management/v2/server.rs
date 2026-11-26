@@ -70,6 +70,36 @@ pub fn handle_v2_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if super::feature_profiles::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "The Management owner credential is required", false, json!({}));
+        }
+        if !super::profile_link::owner_full() {
+            return write_v2_error(stream, 403, "Forbidden", "owner_required",
+                "Feature Profiles require full owner access", false, json!({}));
+        }
+        return super::feature_profiles::handle(stream, request, path);
+    }
+    if path == super::text_rewrite::PATH {
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|principal| !principal.is_owner()) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management owner credential is required for text rewrite", false, json!({}));
+        }
+        return super::text_rewrite::handle(stream, request, super::profile_link::owner_full());
+    }
+    if path == super::archive::batch::PATH {
+        if !crate::management::users::caller_is_owner() {
+            return write_v2_error(stream, 403, "Forbidden", "owner_required",
+                "archive batches require the Management owner", false, json!({}));
+        }
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management credential is required for archive batches", false, json!({}));
+        }
+        return super::archive::batch::handle(stream, request, context);
+    }
     // r290 P6: board reads never resolve/start a runtime.
     if path == super::board::PATH {
         if !authenticated_root_request(request,agent_management_admin_token)
@@ -142,6 +172,10 @@ pub fn handle_v2_request(
             &session_id,
             Some(&crate::management::control_plane::HumanManagementPrincipal::authenticated()),
         );
+    }
+    if let Some(route) = super::service_notifications::parse_route(path) {
+        return super::service_notifications::handle(stream, request, route,
+            authenticated_owner_host_maintenance(request, agent_management_admin_token));
     }
     if super::services::is_services_path(path) {
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -294,7 +328,7 @@ pub fn handle_v2_request(
         return super::runtime_restore_api::handle(stream, request, context.load_runtime_status);
     }
     if path == super::runtime_prune::PATH {
-        if !authenticated_root_request(request, agent_management_admin_token) {
+        if !authenticated_owner_host_maintenance(request, agent_management_admin_token) {
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
                 "the Management owner credential is required for runtime cleanup", false, json!({}));
         }
@@ -391,6 +425,14 @@ pub fn handle_v2_request(
                 "the Management root credential is required for the skills archive", false, json!({}));
         }
         return super::skills_archive::handle(stream, request);
+    }
+    if super::personal_assistants::is_path(path) {
+        let owner = crate::management::users::current_principal().is_none_or(|p| p.is_owner());
+        let full = crate::management::listeners::current_client_token().is_none_or(|t| t.scope == crate::management::client_tokens::DeviceScope::Full);
+        if !super::schedules_api::owner_allowed(authenticated_root_request(request, agent_management_admin_token), owner, full, &request.method) {
+            return write_v2_error(stream, 403, "Forbidden", "assistant_owner_required", "Personal Assistants require the owner. Writes require full device scope.", false, json!({}));
+        }
+        return super::personal_assistants::handle(stream,request,&crate::management::control_plane::HumanManagementPrincipal::authenticated(),&context);
     }
     // r290 P5 schedules: owner-bound read tokens may list; writes need full scope.
     if super::schedules_api::is_path(path) {
@@ -557,7 +599,7 @@ pub fn handle_v2_request(
         return super::admission_cleanup::handle(stream, request);
     }
     if super::health::is_path(path) {
-        if !authenticated_root_request(request, agent_management_admin_token) {
+        if !authenticated_owner_host_maintenance(request, agent_management_admin_token) {
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
                 "the Management root credential is required for health", false, json!({}));
         }
@@ -645,6 +687,13 @@ pub(crate) fn authenticated_root_request(request: &SimpleHttpRequest, root: Opti
         && require_service_bridge_token(request, root, "Management root").is_ok()
 }
 
+fn authenticated_owner_host_maintenance(request: &SimpleHttpRequest, root: Option<&str>) -> bool {
+    authenticated_root_request(request, root)
+        && crate::management::users::caller_is_owner()
+        && crate::management::listeners::current_client_token()
+            .is_none_or(|token| token.scope == crate::management::client_tokens::DeviceScope::Full)
+}
+
 fn authenticated_owner_cutex_request(request: &SimpleHttpRequest, root: Option<&str>) -> bool {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     request.method == "POST"
@@ -706,6 +755,7 @@ fn v2_required_token<'a>(
 
 // r290 P8: usage route classification also covers quota attribution.
 fn agent_management_admin_path(path: &str) -> bool {
+    if path == super::session_search::PATH { return true; }
     if super::session_paths::session_id_from_path(path).is_some() || super::director::is_path(path) || super::quick_chat_promote::path_target(path).is_some() {return true}
     matches!(
         path,
@@ -727,6 +777,7 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/project-presentation"
             | "/v2/agent-management/operator-actions"
             | "/v2/agent-management/project-mutations"
+            | super::project_batch::PATH
             | "/v2/job-service/management-query"
             | "/v2/job-service/capabilities"
             | "/v2/job-service/cancel"
@@ -755,6 +806,7 @@ fn agent_management_admin_path(path: &str) -> bool {
         || super::profile_login::parse_path(path).is_some()
         || super::profile_models::parse_path(path).is_some()
         || super::storage::is_path(path)
+        || path == super::session_search::PATH
         || path == super::settings_api::PATH
         || super::notification_levels::is_path(path)
         || path == super::user_instructions::PATH
@@ -819,8 +871,9 @@ fn handle_v2_request_with_repository(
             handle_agent_reservation_reconciliation(stream, request, context)
         }
         ("GET", "/v2/agent-management/projects") => {
-            handle_management_project_collection(stream, context)
+            handle_management_project_collection(stream, request, context)
         }
+        (_, super::project_batch::PATH) => super::project_batch::handle(stream, request, context),
         ("POST", "/v2/agent-management/native-recovery") => {
             let payload: crate::app_server::external_recovery::RecoveryRequest =
                 match serde_json::from_slice(&request.body) {
@@ -991,7 +1044,7 @@ fn handle_v2_request_with_repository(
         ("GET", path) if management_project_id_from_path(path).is_some() => {
             let project_id = management_project_id_from_path(path)
                 .expect("matched strict Management Project path");
-            handle_management_project_read(stream, context, &project_id)
+            handle_management_project_read(stream, request, context, &project_id)
         }
         ("POST", "/v2/agent-management/project-presentation") => {
             handle_management_project_presentation(stream, request, context)
@@ -1078,6 +1131,7 @@ fn handle_v2_request_with_repository(
         ("GET", "/v2/inbound-mail") | ("PUT", "/v2/inbound-mail/config") | ("DELETE", "/v2/inbound-mail/config") | ("POST", "/v2/inbound-mail/test") => super::inbound_mail::handle(stream, request),
         ("POST", "/v2/job-service/output") => super::human_jobs::handle_output(stream, request),
         ("GET", "/v2/sessions/page" | "/v2/sessions/changes") => super::session_deltas::handle(stream, request, context, repository),
+        ("GET", super::session_search::PATH) => super::session_search::handle(stream, request, context, None),
         ("GET", "/v2/sessions") => {
             super::archive::handle_session_collection_get(stream, request, context, repository, root)
         }
@@ -1113,6 +1167,10 @@ fn handle_v2_request_with_repository(
         ("GET", path) if super::agent_bus_state::history::parse_path(path).is_some() => {
             let session = super::agent_bus_state::history::parse_path(path).expect("matched bus history");
             handle_session_bus_history(stream, request, context, repository, &session)
+        }
+        ("GET", path) if super::interaction_history::session_id_from_path(path).is_some() => {
+            let id = super::interaction_history::session_id_from_path(path).expect("matched interaction history path");
+            handle_session_interaction_history(stream, request, context, repository, &id)
         }
         ("GET", path) if history_session_id_from_path(path).is_some() => {
             let cutex_session_id =
@@ -1219,7 +1277,7 @@ fn handle_v2_request_with_repository(
             }
         }
         ("GET", super::summary::SUMMARY_PATH) => {
-            super::summary::handle_summary(stream, context, repository)
+            super::summary::handle_summary(stream, request, context, repository)
         }
         ("GET", super::summary::SUMMARY_EVENTS_PATH) => super::summary::handle_events(stream, request),
         ("POST", super::summary::SUMMARY_READ_PATH) => super::summary::handle_read(stream, request),
@@ -1392,23 +1450,33 @@ pub(super) fn management_project_id_from_path(path: &str) -> Option<crate::agent
 
 fn handle_management_project_collection(
     stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
     context: ManagementRequestContext,
 ) -> anyhow::Result<()> {
     let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
     match (context.list_management_projects)(&principal) {
-        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Ok(response) => {
+            let mut value = serde_json::to_value(response)?;
+            if super::project_table::enabled(&request.path) { super::project_table::enrich_collection(&mut value, context.load_runtime_status); }
+            write_json_response(stream, 200, "OK", &value)
+        },
         Err(error) => write_agent_management_control_error(stream, error),
     }
 }
 
 fn handle_management_project_read(
     stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
     context: ManagementRequestContext,
     project_id: &crate::agent_management::ProjectId,
 ) -> anyhow::Result<()> {
     let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
     match (context.read_management_project)(&principal, project_id) {
-        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Ok(response) => {
+            let mut value = serde_json::to_value(response)?;
+            if super::project_table::enabled(&request.path) { super::project_table::enrich_workspace(&mut value, context.load_runtime_status); }
+            write_json_response(stream, 200, "OK", &value)
+        },
         Err(error) => write_agent_management_control_error(stream, error),
     }
 }
@@ -1498,6 +1566,13 @@ pub(crate) fn write_agent_management_control_error(
     stream: &mut TcpStream,
     error: crate::agent_management::AgentManagementError,
 ) -> anyhow::Result<()> {
+    let (status, reason, retryable, details) = agent_management_control_error_parts(&error);
+    write_v2_error(stream, status, reason, error.code(), &error.to_string(), retryable, details)
+}
+
+pub(super) fn agent_management_control_error_parts(
+    error: &crate::agent_management::AgentManagementError,
+) -> (u16, &'static str, bool, Value) {
     use crate::agent_management::AgentManagementError;
     let (status, reason, retryable) = match &error {
         AgentManagementError::InvalidRequest(_)
@@ -1533,15 +1608,7 @@ pub(crate) fn write_agent_management_control_error(
     } else {
         json!({})
     };
-    write_v2_error(
-        stream,
-        status,
-        reason,
-        error.code(),
-        &error.to_string(),
-        retryable,
-        details,
-    )
+    (status, reason, retryable, details)
 }
 
 fn handle_bootstrap(
@@ -1712,6 +1779,26 @@ fn handle_session_bus_history(
 }
 
 /// `GET /v2/sessions/{id}/history` (see `history.rs`).
+fn handle_session_interaction_history(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+    repository: &EventRepository,
+    id: &str,
+) -> anyhow::Result<()> {
+    let query = match super::interaction_history::Query::parse(request) {
+        Ok(query) => query,
+        Err(message) => return write_v2_error(stream, 400, "Bad Request", "invalid_request", &message, false, json!({})),
+    };
+    let registry = (context.load_registry)()?;
+    if session_resource_including_hidden(id, &registry, context.load_runtime_status, repository)?.is_none()
+        && session_resource_including_archive(id, &registry, context.load_runtime_status, repository)?.is_none()
+    {
+        return write_v2_error(stream, 404, "Not Found", "session_not_found", "the cutex session does not exist on this host", false, json!({}));
+    }
+    write_json_response(stream, 200, "OK", &super::interaction_history::resource(id, &query)?)
+}
+
 fn handle_session_history(
     stream: &mut TcpStream,
     request: &SimpleHttpRequest,
@@ -2056,6 +2143,9 @@ fn handle_native_server_response(
     root: bool,
 ) -> anyhow::Result<()> {
     let response_id_hint = response_id_hint(&request.body);
+    // Serialize forwarding and history writes with session deletion.
+    let lane = cutex_request_lock(cutex_session_id)?;
+    let _operation = lane.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
     let registry = (context.load_registry)()?;
     let Some(session) = owner_session_resource(
         cutex_session_id,
@@ -2162,16 +2252,9 @@ fn handle_native_server_response(
         &canonical_claim,
         &response.native_message,
     )? {
-        ServerResponseClaimDecision::Submit => {
+        ServerResponseClaimDecision::Submit(native_request) => {
             // "Always allow in this project" answers keep their rules once delivered.
-            let pending_params = server_requests::request_native(
-                cutex_session_id,
-                expected_runtime_generation,
-                &native_request_id,
-            )
-            .ok()
-            .flatten()
-            .and_then(|native| native.get("params").cloned());
+            let pending_params = native_request.get("params").cloned();
             match (context.respond_native_server_request)(
                 cutex_session_id,
                 expected_runtime_generation,
@@ -2182,6 +2265,10 @@ fn handle_native_server_response(
                         cutex_session_id,
                         expected_runtime_generation,
                         &response.response_id,
+                        native_request,
+                        &response.native_message,
+                        super::interaction_history::Actor::current(),
+                        chrono::Utc::now(),
                     )?;
                     if let (Some(params), Some(result)) = (&pending_params, response.native_message.get("result")) {
                         super::claude_permission_rules::remember_from_answer(cutex_session_id, params, result);
@@ -2867,6 +2954,7 @@ fn handle_control_diagnostics(stream: &mut TcpStream, request: &SimpleHttpReques
         "scope":"management_process", "timing":super::control_timing::snapshot(),
         "asksStoreLocks":crate::asks::store::diagnostics::snapshot(),
         "capacity":super::control_capacity::snapshot(),
+        "memoryPressure":super::memory_pressure::status(),
         "queues":{"repository":super::repository::queue_diagnostics(),
             "nativeEvents":crate::app_server::client::event_queue_diagnostics()}});
     // r274 (054 S25): only while the input-ledger switch is on; off, the
@@ -3609,7 +3697,7 @@ fn request_may_resolve_hidden_session(method: &str, authenticated_owner: bool) -
     authenticated_owner || method == "cutex/session/visibility/show"
 }
 
-fn cutex_request_lock(cutex_session_id: &str) -> anyhow::Result<Arc<super::session_coordination::OperationLane>> {
+pub(super) fn cutex_request_lock(cutex_session_id: &str) -> anyhow::Result<Arc<super::session_coordination::OperationLane>> {
     // One lane for HTTP mutations, native input/queue, asks, ingress and
     // revert: an independent outer gate could let a lifecycle change cross
     // an already authorized native send. Nested calls retain the same token.
@@ -4316,12 +4404,13 @@ fn dispatch_session_defaults_update(
         .get("runtimeDefaults")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    for (key, value) in patch {
-        runtime_defaults
-            .as_object_mut()
-            .expect("runtimeDefaults is an object")
-            .insert(key.clone(), value.clone());
-    }
+    let defaults = runtime_defaults
+        .as_object_mut()
+        .expect("runtimeDefaults is an object");
+    // The session resource can include a read-only resolution from before
+    // this edit. The defaultsUpdated contract carries only writable defaults.
+    defaults.remove("reasoningResolution");
+    defaults.extend(patch.clone());
     append_cutex_event(
         event_repository,
         cutex_session_id,
@@ -5677,6 +5766,9 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         "invalid_arguments" | "unsupported_context" => 400,
         "asks_unavailable" | "persistence_unavailable" | "approvals_unavailable" => 503,
         "profile_not_found" | "turn_not_found" => 404,
+        "archive_restore_data_unavailable" => 409,
+        crate::profiles::pinned_selection::CODE | crate::profiles::pinned_selection::UPGRADE_CODE
+        | super::feature_profiles::AGENT_REFUSAL_CODE => 409,
         "history_revert_failed" | "session_delete_failed" | "session_fork_failed" => 502,
         "app_server_unavailable" | "native_request_failed" | "interrupt_timeout" => 502,
         "runtime_stop_failed" => 502,
@@ -6317,6 +6409,7 @@ mod input_disposal_http_tests;
 
 #[cfg(test)]
 mod tests {
+    include!("personal_assistants_http_tests.rs");
     use std::collections::HashMap;
     use std::io::Read;
     use std::net::TcpListener;
@@ -6502,6 +6595,138 @@ mod tests {
             assert!(send(Some("owner-secret"), "POST").starts_with("HTTP/1.1 405"));
             assert!(send(Some("owner-secret"), "GET").starts_with("HTTP/1.1 400"));
         }
+    }
+
+    #[test]
+    fn health_and_runtime_prune_reject_non_owner_host_credentials() {
+        use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
+        use crate::management::{listeners, users};
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                users::set_current_principal(None);
+                listeners::set_current_client_token(None);
+            }
+        }
+        let _reset = Reset;
+        let send = |path, method: &str, bearer| {
+            let mut request = request(path);
+            // A caller admitted by client-token auth may already have its bearer rewritten.
+            request.headers.insert("authorization".into(), format!("Bearer {bearer}"));
+            request.method = method.into();
+            capture_http_response(|stream| handle_v2_request(
+                stream, &request, Some("agent-secret"), Some("owner-secret"), safety_http_context(),
+            ))
+        };
+        use super::super::{health, runtime_prune};
+        for (path, method) in [
+            (health::PATH, "GET"),
+            (health::FIX_PATH, "POST"),
+            (runtime_prune::PATH, "GET"),
+            (runtime_prune::PATH, "POST"),
+        ] {
+            users::set_current_principal(None);
+            assert!(send(path, method, "agent-secret").starts_with("HTTP/1.1 401"));
+
+            users::set_current_principal(Some(users::Principal::Pending));
+            assert!(send(path, method, "owner-secret").starts_with("HTTP/1.1 401"));
+
+            users::set_current_principal(Some(users::Principal::Owner));
+            let mut read = VerifiedClientToken::test_token("read-owner");
+            read.scope = DeviceScope::Read;
+            listeners::set_current_client_token(Some(read));
+            assert!(send(path, method, "owner-secret").starts_with("HTTP/1.1 401"));
+
+            listeners::set_current_client_token(None);
+            assert!(send(path, "DELETE", "owner-secret").starts_with("HTTP/1.1 405"));
+        }
+    }
+
+    #[test]
+    fn health_review_http_previews_then_applies_the_same_runtime_repair() {
+        use crate::config::{instance, paths};
+        use crate::session::{model::CutexSessionRecord, store};
+        use super::super::health;
+
+        let _home = paths::test_home_env_lock();
+        struct Reset(instance::Selection);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                instance::set_test_selection(self.0.clone());
+            }
+        }
+        let _reset = Reset(instance::selected().unwrap());
+        let root = paths::home_dir().unwrap().join(format!("health-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        instance::set_test_selection(instance::Selection::Custom(root));
+        // A custom instance with no Bus configuration cannot contact the owner's Bus.
+        let config = crate::config::store::load_codez_config();
+        assert_eq!(crate::agent_bus::service::agent_bus_port(&config), 0);
+
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit", "0"]).spawn().unwrap();
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        drop(child);
+        assert!(!health::process_may_be_running(pid));
+
+        let id = "cutex.health-http";
+        let mut row = CutexSessionRecord::new(
+            id.into(), None, crate::platform::host::current_host_name(),
+            paths::home_dir().unwrap().display().to_string(), None,
+        ).unwrap();
+        row.runtime_pid = Some(pid);
+        let session_path = store::cutex_sessions_path().unwrap();
+        store::with_locked_session_rows(&session_path, |rows| {
+            rows.insert_session(id, row);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+
+        let send = |method: &str, path, key: &str, body: Value| {
+            let mut request = request(path);
+            request.method = method.into();
+            request.headers.insert("authorization".into(), "Bearer owner-secret".into());
+            request.headers.insert("idempotency-key".into(), key.into());
+            request.body = serde_json::to_vec(&body).unwrap();
+            capture_http_response(|stream| handle_v2_request(
+                stream, &request, Some("agent-secret"), Some("owner-secret"), safety_http_context(),
+            ))
+        };
+
+        let report = send("GET", health::PATH, "scan", Value::Null);
+        assert!(report.starts_with("HTTP/1.1 200"), "{report}");
+        let report = response_json(&report);
+        let finding_id = report["findings"].as_array().unwrap().iter()
+            .find(|item| item["code"] == "stale_runtime_claim" && item["cutexSessionId"] == id)
+            .unwrap()["id"].as_str().unwrap();
+        let missing = send("POST", health::FIX_PATH, "no-preview", json!({
+            "dryRun": false, "findingIds": [finding_id]
+        }));
+        assert!(missing.starts_with("HTTP/1.1 409"), "{missing}");
+        assert_eq!(response_json(&missing)["error"]["code"], "preview_required");
+
+        let preview = send("POST", health::FIX_PATH, "preview", json!({
+            "dryRun": true, "findingIds": [finding_id]
+        }));
+        assert!(preview.starts_with("HTTP/1.1 200"), "{preview}");
+        let preview = response_json(&preview);
+        assert_eq!(preview["planned"][0]["id"], finding_id);
+        let token = preview["previewToken"].as_str().unwrap();
+        assert_eq!(store::load_session_row(&session_path, id).unwrap().unwrap().1.runtime_pid, Some(pid));
+
+        let apply = send("POST", health::FIX_PATH, "apply", json!({
+            "dryRun": false, "findingIds": [finding_id], "previewToken": token
+        }));
+        assert!(apply.starts_with("HTTP/1.1 200"), "{apply}");
+        assert_eq!(response_json(&apply)["applied"], json!([finding_id]));
+        assert_eq!(store::load_session_row(&session_path, id).unwrap().unwrap().1.runtime_pid, None);
+        store::close_session_store(&session_path);
     }
 
     // r290 P5: production route ownership/scope, strict body and action replay.
@@ -6733,6 +6958,13 @@ mod tests {
         assert_eq!(value["scope"], "management_process");
         assert_eq!(value["timing"]["scope"], "process");
         assert_eq!(value["capacity"]["controlConnectionReserve"], 32);
+        assert!(value["capacity"]["heavyReadConcurrencyActive"].is_u64());
+        assert_eq!(value["capacity"]["heavyReadConcurrencyActive"], value["capacity"]["heavyReadLimit"]);
+        let hardware = &value["capacity"]["heavyReadConcurrencyHardware"];
+        for key in ["logicalCpus", "physicalMemoryBytes"] {
+            let input = hardware.get(key).unwrap();
+            assert!(input.is_u64() || input.is_null());
+        }
         assert!(value["queues"]["repository"]["available"].is_boolean());
         assert!(value["queues"]["nativeEvents"]["outstandingEvents"].is_number());
         request.method = "POST".into();
@@ -6754,7 +6986,7 @@ mod tests {
         let off = read(&request);
         let mut keys: Vec<&str> = off.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["asksStoreLocks", "capacity", "contractVersion", "queues", "scope", "timing"]);
+        assert_eq!(keys, ["asksStoreLocks", "capacity", "contractVersion", "memoryPressure", "queues", "scope", "timing"]);
         pin.set(Some(true));
         let on = read(&request);
         drop(pin);
@@ -6889,7 +7121,7 @@ mod tests {
                 &session,
                 &items[1].queue_id,
                 repository.admission(&session).unwrap().order_revision,
-                Some(&crate::management::v2::admission::AdmissionRef { kind: "owner".into(), id: items[0].queue_id.clone() }),
+                Some(&crate::management::v2::admission::AdmissionRef::owner(items[0].queue_id.clone())),
                 true,
             )
             .unwrap();

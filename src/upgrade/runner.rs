@@ -85,7 +85,7 @@ pub trait Host {
     fn move_aside(&self, store: &str, displaced: &Path) -> anyhow::Result<bool>;
     /// Rollback preparation of these migrations (run by the newer binary
     /// while it still runs): hazards that would lose data (empty = safe).
-    fn rollback_prep(&self, migrations: &[Migration]) -> anyhow::Result<Vec<String>>;
+    fn rollback_prep(&self, target: &str, migrations: &[Migration]) -> anyhow::Result<Vec<String>>;
     fn cancel_requested(&self, run_id: &str) -> bool;
     fn record(&self, run: &Run);
     fn sleep(&self, duration: Duration);
@@ -289,7 +289,7 @@ fn roll_back(run: &mut Run, plan: &Plan, host: &dyn Host, from: &str, backup: Op
         }
     }
     if swapped {
-        match host.rollback_prep(&plan.migrations) {
+        match host.rollback_prep(from, &plan.migrations) {
             Ok(hazards) if hazards.is_empty() => {}
             Ok(hazards) => return needs_owner(run, host, format!("rollback would lose data: {}", hazards.join("; ")), manual),
             Err(error) => return needs_owner(run, host, format!("rollback preparation failed: {error:#}"), manual),
@@ -497,7 +497,7 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
         return;
     }
     let manual = vec!["cutex upgrade status".to_string(), "cutex service status".to_string()];
-    match host.rollback_prep(&plan.migrations) {
+    match host.rollback_prep(&plan.to_release, &plan.migrations) {
         Ok(hazards) if hazards.is_empty() => {}
         Ok(hazards) => {
             run.fail(Phase::Failed, "rollback_hazard", format!("rollback would lose data: {}", hazards.join("; ")));
@@ -610,6 +610,7 @@ pub(crate) mod fake {
         pub drop_on_swap: RefCell<Vec<String>>,
         /// Exercise production store preparation without controlling real services.
         pub prepare_stores: Option<Box<dyn Fn(&Path, &str) -> anyhow::Result<Vec<String>>>>,
+        pub rollback_guard: Option<Box<dyn Fn(&str) -> anyhow::Result<()>>>,
     }
 
     impl FakeHost {
@@ -633,6 +634,7 @@ pub(crate) mod fake {
                 online_late: RefCell::new(None),
                 drop_on_swap: RefCell::new(Vec::new()),
                 prepare_stores: None,
+                rollback_guard: None,
             }
         }
         fn step(&self, name: &'static str) -> anyhow::Result<()> {
@@ -740,8 +742,11 @@ pub(crate) mod fake {
             if let Some(prepare) = &self.prepare_stores { return prepare(displaced, target); }
             Ok(vec!["legacy views exported".into()])
         }
-        fn rollback_prep(&self, _migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
+        fn rollback_prep(&self, target: &str, _migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
             self.step("rollback_prep")?;
+            if let Some(guard) = &self.rollback_guard {
+                guard(target)?;
+            }
             Ok(self.hazards.borrow().clone())
         }
         fn cancel_requested(&self, _run_id: &str) -> bool {

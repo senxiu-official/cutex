@@ -180,6 +180,7 @@ fn sender_kinds_and_required_timing_by_sender() {
 
 fn facts(state: &str) -> BusFacts {
     BusFacts {
+        native_timeline: None,
         stale_release_allowed: false, projection_failure: None,
         delivery_diagnostics: None,
         state: state.into(), timing: Timing::AfterTurn, frozen: false, a2: false, inbox: false, a4: false,
@@ -931,9 +932,152 @@ fn claude_native_item_leaves_decided_records_and_follows_a_rereading_turn() {
     });
     // `sending` then the decided state, nothing after.
     assert_eq!(changes(&events, "done").iter().map(label).collect::<Vec<_>>(), ["sending", "inContext(externalInputPersisted)"]);
-    assert_eq!(changes(&events, "lost").iter().map(label).collect::<Vec<_>>(), ["sending", "uncertain{turnInterrupted}"]);
+    assert_eq!(changes(&events, "lost").iter().map(label).collect::<Vec<_>>(), ["sending", "uncertain{turnInterrupted}", "uncertain{turnInterrupted}"]);
+    let lost = f.record("lost").unwrap();
+    assert_eq!(lost.evidence, None, "an audit item is not a persistent receipt");
+    assert_eq!(lost.actions, vec![input_ledger::Action::Dismiss]);
     let again = f.record("again").unwrap();
     assert_eq!((again.surface, again.turn_id.as_deref(), again.deadline.as_deref()), (Surface::Timeline, Some("turn-2"), None));
+}
+
+#[test]
+fn timeline_note_stays_unconfirmed_but_cannot_be_manually_duplicated() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("timeline-note")).unwrap();
+        let binding = crate::launch::stock::ExternalInputBinding { version: 1, owner_id: TO.into(),
+            thread_id: "timeline-thread".into(), runtime_generation: 7, canonical_byte_limit: Default::default() };
+        let envelope = f.repository.freeze_external_input(TO, "timeline-note", |message|
+            crate::app_server::bus_bridge::owner_carry_envelope(message, &binding, None, None)).unwrap();
+        f.repository.record_local_inbox(TO, "timeline-note", &inbox_receipt("timeline-note")).unwrap();
+        let row = f.record("timeline-note").unwrap();
+        f.ledger.transition(TO, "timeline-note", Expect::rev(row.rev), Next::uncertain("receiptTimeout")).unwrap();
+        // Neither another native attempt nor another recipient can claim it.
+        f.repository.input_ledger_native_attempt_item(TO, "timeline-note", "old-native", "turn-1").unwrap();
+        f.repository.input_ledger_native_attempt_item(FROM, "timeline-note", &envelope.message.id, "turn-1").unwrap();
+        assert_eq!(f.record("timeline-note").unwrap().actions, vec![input_ledger::Action::Retry, input_ledger::Action::Dismiss]);
+        f.repository.input_ledger_native_attempt_item(TO, "timeline-note", &envelope.message.id, "turn-1").unwrap();
+        let proven = f.record("timeline-note").unwrap();
+        assert_eq!(proven.state, InputState::Uncertain);
+        assert!(proven.evidence.is_none());
+        assert_eq!(proven.actions, vec![input_ledger::Action::Dismiss]);
+        assert_eq!(proven.details["deliveryDiagnostics"]["retryBlocked"], true);
+        assert_eq!(proven.details["deliveryDiagnostics"]["waitingFor"], "contextReceipt");
+        let source = f.repository.input_ledger_view("timeline-note").unwrap();
+        let late = DateTime::parse_from_rfc3339(&proven.updated_at).unwrap().with_timezone(&Utc) + chrono::Duration::seconds(60);
+        assert_eq!(super::super::input_ledger_settle::bus_drift(&proven, source.as_ref(), late), None,
+            "the derived retry explanation is not source drift");
+        assert!(!super::super::input_ledger_settle::retryable(&proven));
+        assert_eq!(f.repository.input_ledger_redeliverable(TO, "timeline-note").unwrap().unwrap_err().0, "bus_message_not_redeliverable");
+        assert!(!f.repository.input_ledger_redeliver(TO, "timeline-note", Utc::now()).unwrap(), "source fence also protects old clients");
+        assert_eq!(f.repository.snapshot_by_message_id("timeline-note").unwrap().unwrap().external_input_receipt, None);
+        // Reopen the source: losing a process or ledger event cannot clear its fence.
+        let reopened = AgentBusMessageRepository::open(f.root.join("bus")).unwrap();
+        assert!(reopened.input_ledger_redeliverable(TO, "timeline-note").unwrap().is_err());
+        let row = f.record("timeline-note").unwrap();
+        f.ledger.transition(TO, "timeline-note", Expect::rev(row.rev), Next::discarded("ownerDiscarded")).unwrap();
+        reopened.input_ledger_native_attempt_item(TO, "timeline-note", &envelope.message.id, "turn-2").unwrap();
+        assert_eq!(f.record("timeline-note").unwrap().state, InputState::Discarded);
+    });
+}
+
+#[test]
+fn timeline_note_timeout_keeps_retry_blocked_and_missing_ledger_rebuilds_audit_only() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("timeline-rebuild")).unwrap();
+        f.repository.input_ledger_native_item(TO, "timeline-rebuild", "turn-1").unwrap();
+        let accepted = f.record("timeline-rebuild").unwrap();
+        assert_eq!(accepted.state, InputState::Accepted);
+        f.ledger.transition(TO, "timeline-rebuild", Expect::rev(accepted.rev), Next::uncertain("receiptTimeout")).unwrap();
+        let row = f.record("timeline-rebuild").unwrap();
+        assert_eq!(row.actions, vec![input_ledger::Action::Dismiss]);
+        assert_eq!(row.details["deliveryDiagnostics"]["retryBlocked"], true);
+        let (items, _) = f.repository.input_ledger_backfill_items(None, BACKFILL_BATCH).unwrap();
+        let root = f.root.join("rebuilt");
+        let rebuilt = Box::leak(Box::new(InputLedger::open(root.join(DATABASE_FILE))));
+        with_test_ledger(rebuilt, || { backfill_batch(&items, Utc::now()); });
+        let row = rebuilt.get(TO, &["timeline-rebuild".into()]).unwrap().records.pop().unwrap();
+        assert_eq!(row.timeline_item_id.as_deref(), Some("timeline-rebuild"));
+        assert_eq!(row.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(row.state, InputState::Accepted);
+        assert!(row.evidence.is_none());
+    });
+}
+
+#[test]
+fn late_old_timeline_event_does_not_claim_a_retried_native_attempt() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("timeline-retry")).unwrap();
+        let binding = crate::launch::stock::ExternalInputBinding { version: 1, owner_id: TO.into(),
+            thread_id: "timeline-thread".into(), runtime_generation: 7, canonical_byte_limit: Default::default() };
+        let original = f.repository.freeze_external_input(TO, "timeline-retry", |message|
+            crate::app_server::bus_bridge::owner_carry_envelope(message, &binding, None, None)).unwrap();
+        sending(TO, "timeline-retry", &new_input(None, "timeline-retry", Some(FROM), "passive", "note", None));
+        let row = f.record("timeline-retry").unwrap();
+        f.ledger.transition(TO, "timeline-retry", Expect::rev(row.rev), Next::uncertain("outcomeUnknown")).unwrap();
+        f.ledger.transition(TO, "timeline-retry", Expect::ANY, Next::waiting("ownerRetry")).unwrap();
+        assert!(f.repository.input_ledger_redeliver(TO, "timeline-retry", Utc::now()).unwrap());
+        f.repository.input_ledger_native_attempt_item(TO, "timeline-retry", &original.message.id, "old-turn").unwrap();
+        assert!(f.record("timeline-retry").unwrap().timeline_item_id.is_none());
+        assert!(f.repository.input_ledger_redeliverable(TO, "timeline-retry").unwrap().is_ok());
+    });
+}
+
+#[test]
+fn current_turn_history_recovers_old_generation_note_without_inventing_ack() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("old-generation-note")).unwrap();
+        let binding = crate::launch::stock::ExternalInputBinding { version: 1, owner_id: TO.into(),
+            thread_id: "retained-thread".into(), runtime_generation: 6, canonical_byte_limit: Default::default() };
+        let envelope = f.repository.freeze_external_input(TO, "old-generation-note", |message|
+            crate::app_server::bus_bridge::owner_carry_envelope(message, &binding, None, None)).unwrap();
+        f.repository.record_local_inbox(TO, "old-generation-note", &inbox_receipt("old-generation-note")).unwrap();
+        let row = f.record("old-generation-note").unwrap();
+        f.ledger.transition(TO, "old-generation-note", Expect::rev(row.rev), Next::uncertain("outcomeUnknown")).unwrap();
+        let mut turn = json!({"id":"current-turn","status":"inProgress","items":[{
+            "type":"functionCallOutput","name":"external_event","id":envelope.message.id
+        }]});
+        assert!(f.repository.native_timeline_pending(TO).unwrap());
+        f.repository.input_ledger_native_turn(TO, "wrong-thread", &turn).unwrap();
+        assert!(f.record("old-generation-note").unwrap().timeline_item_id.is_none());
+        turn["status"] = json!("completed");
+        f.repository.input_ledger_native_turn(TO, "retained-thread", &turn).unwrap();
+        assert!(f.record("old-generation-note").unwrap().timeline_item_id.is_none());
+        turn["status"] = json!("inProgress");
+        f.repository.input_ledger_native_turn(TO, "retained-thread", &turn).unwrap();
+        let row = f.record("old-generation-note").unwrap();
+        assert_eq!(row.state, InputState::Uncertain);
+        assert!(row.evidence.is_none());
+        assert_eq!(row.turn_id.as_deref(), Some("current-turn"));
+        assert_eq!(row.actions, vec![input_ledger::Action::Dismiss]);
+        assert!(!f.repository.native_timeline_pending(TO).unwrap(), "no repeated history read after recovery");
+        assert_eq!(row.details["deliveryDiagnostics"]["retryBlocked"], true);
+    });
+}
+
+#[test]
+fn native_timeline_wins_before_retry_source_reset_without_duplicate_submission() {
+    let f = Fixture::new();
+    f.on(|| {
+        f.repository.record_queued_isolated(note("timeline-race")).unwrap();
+        let binding = crate::launch::stock::ExternalInputBinding { version: 1, owner_id: TO.into(),
+            thread_id: "timeline-thread".into(), runtime_generation: 7, canonical_byte_limit: Default::default() };
+        let envelope = f.repository.freeze_external_input(TO, "timeline-race", |message|
+            crate::app_server::bus_bridge::owner_carry_envelope(message, &binding, None, None)).unwrap();
+        sending(TO, "timeline-race", &new_input(None, "timeline-race", Some(FROM), "passive", "note", None));
+        let row = f.record("timeline-race").unwrap();
+        f.ledger.transition(TO, "timeline-race", Expect::rev(row.rev), Next::uncertain("outcomeUnknown")).unwrap();
+        // Retry passed its early check; the audit event arrives before source reset.
+        assert!(f.repository.input_ledger_redeliverable(TO, "timeline-race").unwrap().is_ok());
+        f.ledger.transition(TO, "timeline-race", Expect::ANY, Next::waiting("ownerRetry")).unwrap();
+        f.repository.input_ledger_native_attempt_item_bound(TO, "timeline-race", &envelope.message.id, "timeline-thread", "turn-1").unwrap();
+        assert!(!f.repository.input_ledger_redeliver(TO, "timeline-race", Utc::now()).unwrap());
+        assert_eq!(f.repository.snapshot_by_message_id("timeline-race").unwrap().unwrap().external_input.unwrap(), envelope);
+        assert!(f.record("timeline-race").unwrap().evidence.is_none());
+    });
 }
 
 /// `offered` binds the steer item and says it was the read signal; an echo

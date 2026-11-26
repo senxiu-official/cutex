@@ -9,6 +9,35 @@ use super::super::history::{respond_read_shaped_with, respond_read_with, History
 use super::super::media_refs::{self, MediaStore, CACHE_MAX_BYTES, INLINE_MAX, TEXT_MAX};
 use super::*;
 
+#[test]
+fn memory_pressure_reduces_history_cache_then_allows_it_to_regrow() {
+    use super::super::memory_pressure::with_test_pressure;
+
+    const TURN_BYTES: usize = 4 * 1024 * 1024;
+    let session = "history-pressure";
+    let scope = Scope { key: Key::new(session, "thread", "live", 1), live: true, fence: Arc::new(()) };
+    let mut cache = Cache::default();
+    cache.fences.insert(session.into(), Arc::downgrade(&scope.fence));
+    let put = |cache: &mut Cache, range: std::ops::Range<usize>| {
+        for index in range {
+            cache.put(session, &scope, false, index.to_string(), CachedTurn {
+                saved_files: false, meta: Map::new(), turn: Value::Null, media: Vec::new(),
+                refs: 0, bytes: TURN_BYTES,
+            });
+        }
+    };
+    with_test_pressure(false, || put(&mut cache, 0..20));
+    assert_eq!(cache.bytes, MAX_BYTES);
+    assert!(cache.clear_pressure_backlog());
+    assert_eq!(cache.bytes, 0);
+    with_test_pressure(true, || put(&mut cache, 20..25));
+    assert_eq!(cache.bytes, PRESSURE_BYTES);
+    assert_eq!(cache.turns.len(), 2);
+    with_test_pressure(false, || put(&mut cache, 25..42));
+    assert_eq!(cache.bytes, MAX_BYTES);
+    assert!(current_fence(&cache, session, &scope.fence));
+}
+
 /// A native thread: turns oldest first, every call recorded.
 #[derive(Default)]
 struct Native {

@@ -1071,10 +1071,10 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
                 )?;
             }
             3 => {
-                store.accounts[account_index].plan_label = prompt_optional_string(
-                    "Profile plan override",
-                    store.accounts[account_index].plan_label.as_deref(),
-                )?;
+                let account = &mut store.accounts[account_index];
+                let before = account.plan_label.clone();
+                account.plan_label = prompt_optional_string("Profile plan override", before.as_deref())?;
+                cutex::profiles::plan_label::record_change(account, before.as_deref());
             }
             4 => {
                 store.accounts[account_index].email = prompt_optional_string(
@@ -1468,6 +1468,7 @@ fn apply_annotation(
         account.source = Some(source);
     }
 
+    let before_label = account.plan_label.clone();
     if clear_plan {
         account.plan_label = None;
     } else if let Some(plan) = plan {
@@ -1478,6 +1479,8 @@ fn apply_annotation(
         );
         account.plan_label = Some(plan.to_string());
     }
+
+    cutex::profiles::plan_label::record_change(account, before_label.as_deref());
 
     if clear_email {
         account.email = None;

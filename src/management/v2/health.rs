@@ -15,9 +15,12 @@ use std::{
 
 pub const PATH: &str = "/v2/health";
 pub const FIX_PATH: &str = "/v2/health/fix";
+const MAX_FIX_IDS: usize = 1000;
 #[cfg(unix)]
 #[path = "health_profile_permissions.rs"]
 mod profile_permissions;
+#[path = "health_preview.rs"]
+mod preview;
 pub fn is_path(path: &str) -> bool {
     matches!(path.split('?').next(), Some(PATH | FIX_PATH))
 }
@@ -45,6 +48,8 @@ pub struct FixRequest {
     pub finding_ids: Option<Vec<String>>,
     #[serde(default = "yes")]
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_token: Option<String>,
 }
 fn yes() -> bool {
     true
@@ -71,7 +76,8 @@ fn finding(
             &r.app_server_launch_claim_id,
             &r.pending_launch_id
         )),
-        detail
+        detail,
+        action
     ]);
     Finding {
         id: format!("health-{:x}", Sha256::digest(evidence.to_string())),
@@ -100,6 +106,9 @@ fn pids(record: &CutexSessionRecord) -> Vec<u32> {
 /// for an owner cleanup decision (and expensive for many stale records).
 /// Also the liveness check of the Claude dead-adapter cleanup.
 pub(crate) fn process_may_be_running(pid: u32) -> bool {
+    if pid == 0 || (cfg!(unix) && pid > i32::MAX as u32) {
+        return true;
+    }
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::{
@@ -135,13 +144,12 @@ fn local(record: &CutexSessionRecord) -> bool {
             | CutexSessionRuntimeBackend::Kimi
     )
 }
-fn provably_dead(record: &CutexSessionRecord, running: &dyn Fn(u32) -> bool) -> bool {
-    let pids = pids(record);
-    local(record)
-        && !pids.is_empty()
-        && pids.iter().all(|pid| *pid > 0 && !running(*pid))
-        && record.app_server_launch_claim_id.is_none()
-        && record.pending_launch_id.is_none()
+fn has_launch_claim(record: &CutexSessionRecord) -> bool {
+    record.app_server_launch_claim_id.is_some() || record.pending_launch_id.is_some()
+}
+
+fn recorded_pids_absent(pids: &[u32], running: &dyn Fn(u32) -> bool) -> bool {
+    !pids.is_empty() && pids.iter().all(|pid| *pid > 0 && !running(*pid))
 }
 
 fn session_findings(store: &CutexSessionStore, running: &dyn Fn(u32) -> bool) -> Vec<Finding> {
@@ -156,12 +164,19 @@ fn session_findings(store: &CutexSessionStore, running: &dyn Fn(u32) -> bool) ->
     }
     let mut result = Vec::new();
     for record in store.sessions.values().filter(|record| local(record)) {
-        let dead = provably_dead(record, running);
-        let observed_dead =
-            !pids(record).is_empty() && pids(record).iter().all(|pid| *pid > 0 && !running(*pid));
-        let clear = dead.then_some("clear_runtime_fields");
+        let pids = pids(record);
+        let observed_dead = recorded_pids_absent(&pids, running);
+        let clear = (observed_dead && !has_launch_claim(record)).then_some("clear_runtime_fields");
+        if has_launch_claim(record) && (observed_dead || pids.iter().all(|pid| *pid == 0)) {
+            result.push(finding("unverified_launch_claim", Some(record), json!({
+                "pids":pids,
+                "appServerClaim":record.app_server_launch_claim_id.is_some(),
+                "pendingLaunch":record.pending_launch_id.is_some(),
+                "criterion":"launch ownership requires separate recovery evidence"
+            }), None));
+        }
         if observed_dead {
-            result.push(finding("stale_runtime_claim", Some(record), json!({"pids":pids(record),"criterion":"all recorded PIDs absent; pending launch evidence prevents cleanup"}), clear));
+            result.push(finding("stale_runtime_claim", Some(record), json!({"pids":pids,"criterion":"all recorded PIDs absent; pending launch evidence prevents cleanup"}), clear));
         }
         if let Some(id) = &record.current_runtime_agent_id {
             if ids[id.as_str()].len() > 1 {
@@ -187,7 +202,7 @@ fn session_findings(store: &CutexSessionStore, running: &dyn Fn(u32) -> bool) ->
             result.push(finding(
                 "claude_dead_adapter",
                 Some(record),
-                json!({"pids":pids(record),"criterion":"adapter PID absent; no pending launch"}),
+                json!({"pids":pids,"criterion":"adapter PID absent; no pending launch"}),
                 clear,
             ));
         }
@@ -336,6 +351,30 @@ fn integration_dedupe_findings(root: &Path) -> Vec<Finding> {
     }
 }
 
+fn scheduler_worker_finding(code: &str, worker: &crate::asks::scheduler_health::Worker) -> Option<Finding> {
+    let (reason, restarts) = worker.finding()?;
+    let mut issue = finding(code, None, json!({ "reason": reason, "restartCount": restarts }), None);
+    issue.severity = "error".into();
+    Some(issue)
+}
+
+fn admission_session_findings(worker: &crate::asks::scheduler_health::Worker) -> Vec<Finding> {
+    worker
+        .panicking_sessions()
+        .into_iter()
+        .map(|session| {
+            let mut issue = finding(
+                "admission_session_panicked",
+                None,
+                json!({"sessionId": session}),
+                None,
+            );
+            issue.cutex_session_id = Some(session);
+            issue
+        })
+        .collect()
+}
+
 pub fn scan() -> anyhow::Result<Value> {
     let store = crate::session::store::load_cutex_session_store_shared()?;
     let mut findings = session_findings(&store, &process_may_be_running);
@@ -344,6 +383,10 @@ pub fn scan() -> anyhow::Result<Value> {
         let code = detail["condition"].as_str().unwrap_or("event_journal_unavailable");
         findings.push(finding(code, None, detail.clone(), None));
     }
+    use crate::asks::scheduler_health::{ADMISSION, SCHEDULER};
+    findings.extend(scheduler_worker_finding("delegation_scheduler_unavailable", &SCHEDULER));
+    findings.extend(scheduler_worker_finding("admission_worker_unavailable", &ADMISSION));
+    findings.extend(admission_session_findings(&ADMISSION));
     // Report-only and best-effort: a profile store problem must not hide the
     // other findings.
     if let Ok(accounts) = load_accounts() {
@@ -408,24 +451,39 @@ fn clear_observed(
         .cutex_session_id
         .as_deref()
         .context("finding has no session")?;
-    let before = crate::session::store::load_cutex_session_store_from_path(path)?;
-    let Some(record) = before.sessions.get(id) else {
+    let Some((key, record)) = crate::session::store::load_session_row(path, id)? else {
         return Ok(false);
     };
-    let _controller = record
-        .claude_session
-        .as_ref()
-        .map(crate::runtime::claude::lock)
-        .transpose()?;
-    crate::session::store::with_locked_session_rows(path, |rows| {
-        let present = session_findings(rows.committed(), running)
-            .into_iter()
-            .any(|f| f == *expected && f.fix.is_some());
-        if !present {
+    if record.cutex_session_id != id {
+        return Ok(false);
+    }
+    let _controller = if let Some(session) = record.claude_session.as_ref() {
+        if crate::runtime::claude::adapter_is_reachable(&record) {
             return Ok(false);
         }
+        let lock = crate::runtime::claude::lock(session)?;
+        if !crate::runtime::claude::adapter_scope_is_empty(&record, session)? {
+            return Ok(false);
+        }
+        Some(lock)
+    } else {
+        None
+    };
+    crate::session::store::with_locked_session_rows(path, |rows| {
+        // The caller checked the finding against a fresh scan. Fence the
+        // exact row and recheck only its process evidence under the lock.
+        if rows.session(&key) != Some(&record)
+            || !local(&record)
+            || has_launch_claim(&record)
+            || !recorded_pids_absent(&pids(&record), running)
+            || finding(&expected.code, Some(&record), expected.detail.clone(),
+                Some("clear_runtime_fields")) != *expected
+        {
+            return Ok(false);
+        }
+        rows.preserve_unmodified_json(&key);
         let record = rows
-            .session_mut(id)
+            .session_mut(&key)
             .context("finding session disappeared")?;
         crate::session::runtime_reconciliation::clear_runtime_fields(record, false);
         rows.commit()?;
@@ -436,7 +494,7 @@ fn clear_observed(
 fn preboot_finding(record: &CutexSessionRecord) -> Option<Finding> {
     if record.runtime_backend != CutexSessionRuntimeBackend::ClaudeSubscription || !local(record) { return None; }
     let evidence = crate::runtime::claude::preboot_claim_evidence(record).ok().flatten()?;
-    let safe = record.app_server_launch_claim_id.is_none() && record.pending_launch_id.is_none();
+    let safe = !has_launch_claim(record);
     Some(finding("claude_preboot_adapter", Some(record), json!({"evidence":evidence,
         "criterion":"exact recorded adapter descriptor predates this OS boot; today's PID occupant is not that adapter"}),
         safe.then_some("clear_runtime_fields")))
@@ -450,6 +508,9 @@ fn clear_preboot_observed(path: &Path, expected: &Finding) -> anyhow::Result<boo
     if crate::runtime::claude::adapter_is_reachable(&record) { return Ok(false); }
     let Some(session) = record.claude_session.as_ref() else { return Ok(false) };
     let _controller = crate::runtime::claude::lock(session)?;
+    if !crate::runtime::claude::adapter_scope_is_empty(&record, session)? {
+        return Ok(false);
+    }
     let Some((fresh_key, fresh)) = load_session_row(path, &key)? else { return Ok(false) };
     if fresh_key != key || fresh.cutex_session_id != id || preboot_finding(&fresh).as_ref() != Some(expected) { return Ok(false); }
     with_locked_session_rows(path, |rows| {
@@ -482,10 +543,14 @@ impl FixFailure {
         Self { error, applied: Vec::new(), skipped: Vec::new(), failed: None }
     }
 
-    /// `finding_changed` or `health_fix_failed`.
+    /// Stable error code for a refused or interrupted fix.
     pub fn code(&self) -> &'static str {
         if format!("{:#}", self.error).starts_with("finding_changed:") {
             "finding_changed"
+        } else if self.error.to_string().starts_with("preview_required:") {
+            "preview_required"
+        } else if self.error.to_string().starts_with("preview_limit:") {
+            "preview_limit"
         } else {
             "health_fix_failed"
         }
@@ -516,50 +581,44 @@ struct FixOutcome {
     planned: Vec<Value>,
 }
 
-/// The filesystem mutation succeeded, but durability or its audit did not.
+/// The mutation succeeded, but a later durability or reporting step failed.
 /// Preserve this distinction in the API's applied list before returning failure.
 #[derive(Debug)]
 struct RepairAlreadyApplied(anyhow::Error);
 impl std::fmt::Display for RepairAlreadyApplied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "profile permissions changed to 0700; {}", self.0)
+        write!(f, "fix applied, but recording the outcome failed: {:#}", self.0)
     }
 }
 impl std::error::Error for RepairAlreadyApplied {}
 
-/// Walk the selected findings in order; `apply_one` fixes one finding and
-/// returns the session it resolved. Stops at the first failure, reporting
-/// what was applied before it.
+/// Walk the selected findings in order and report what was applied before
+/// the first failure.
 fn apply_findings(
     findings: &[Finding],
     selected: &BTreeSet<String>,
     dry_run: bool,
-    mut apply_one: impl FnMut(&Finding) -> anyhow::Result<String>,
+    mut apply_one: impl FnMut(&Finding) -> anyhow::Result<()>,
 ) -> Result<FixOutcome, FixFailure> {
     let mut outcome = FixOutcome { applied: Vec::new(), skipped: Vec::new(), planned: Vec::new() };
-    let mut cleared = BTreeSet::new();
+    let mut planned_actions = BTreeSet::new();
     for finding in findings.iter().filter(|f| selected.contains(&f.id)) {
-        if finding.fix.is_none() {
+        let Some(fix) = &finding.fix else {
             outcome.skipped.push(json!({"id":finding.id,"reason":"report_only"}));
+            continue;
+        };
+        if finding.cutex_session_id.as_ref().is_some_and(|id| {
+            !planned_actions.insert((id, &fix.action))
+        }) {
+            outcome.skipped.push(json!({"id":finding.id,"reason":"resolved_by_previous_fix"}));
             continue;
         }
         if dry_run {
             outcome.planned.push(json!({"id":finding.id,"fix":finding.fix}));
             continue;
         }
-        if finding
-            .cutex_session_id
-            .as_ref()
-            .is_some_and(|id| cleared.contains(id))
-        {
-            outcome.skipped.push(json!({"id":finding.id,"reason":"resolved_by_previous_fix"}));
-            continue;
-        }
         match apply_one(finding) {
-            Ok(session) => {
-                cleared.insert(session);
-                outcome.applied.push(finding.id.clone());
-            }
+            Ok(()) => outcome.applied.push(finding.id.clone()),
             Err(error) => {
                 if error.downcast_ref::<RepairAlreadyApplied>().is_some() {
                     outcome.applied.push(finding.id.clone());
@@ -595,7 +654,7 @@ pub fn fix(request: &FixRequest, context: ManagementRequestContext) -> Result<Va
     let outcome = apply_findings(&findings, &selected, request.dry_run, |finding| {
         apply_fix(finding, context)
     })?;
-    let after = scan().map_err(|error| FixFailure {
+    let after = if request.dry_run { Ok(initial) } else { scan() }.map_err(|error| FixFailure {
         error,
         applied: outcome.applied.clone(),
         skipped: outcome.skipped.clone(),
@@ -606,8 +665,7 @@ pub fn fix(request: &FixRequest, context: ManagementRequestContext) -> Result<Va
     )
 }
 
-/// Apply one finding's fix; returns the repaired session/directory identity.
-fn apply_fix(finding: &Finding, context: ManagementRequestContext) -> anyhow::Result<String> {
+fn apply_fix(finding: &Finding, context: ManagementRequestContext) -> anyhow::Result<()> {
     #[cfg(unix)]
     if finding.fix.as_ref().is_some_and(|fix| fix.action == "secure_profile_directory") {
         let path = profile_permissions::repair(
@@ -618,7 +676,7 @@ fn apply_fix(finding: &Finding, context: ManagementRequestContext) -> anyhow::Re
             "findingId":finding.id, "code":finding.code, "path":path,
             "action":finding.fix, "mode":"0700"
         })).map_err(|error| RepairAlreadyApplied(error.context("health audit failed; inspect the current directory and preserve this response")))?;
-        return Ok(format!("profile-directory:{}", path.display()));
+        return Ok(());
     }
     if finding
         .fix
@@ -639,26 +697,34 @@ fn apply_fix(finding: &Finding, context: ManagementRequestContext) -> anyhow::Re
     let id = finding.cutex_session_id.clone().context("finding without a session")?;
     crate::agent_bus::audit::append_agent_bus_audit_record(
         json!({"event":"health_fixed","timestamp":chrono::Utc::now().to_rfc3339(),"findingId":finding.id,"code":finding.code,"cutexSessionId":id,"action":finding.fix}),
-    )?;
+    ).map_err(RepairAlreadyApplied)?;
     if finding
         .fix
         .as_ref()
         .is_some_and(|fix| fix.action != "repair_runtime_package")
     {
-        let snapshot = crate::session::store::load_cutex_session_store_shared()?;
-        let row = snapshot
-            .sessions
-            .get(&id)
-            .context("repaired session absent")?;
-        super::server::append_cutex_event(
-            super::repository::management_v2_repository()?,
-            &id,
-            Default::default(),
-            "cutex/runtime/offline",
-            json!({"runtimeGeneration":row.runtime_generation,"backend":row.runtime_backend,"status":"offline","reason":format!("health: {}", finding.code),"occurredAt":chrono::Utc::now().to_rfc3339()}),
-        )?;
+        let notify = || -> anyhow::Result<()> {
+            use crate::session::store::{cutex_sessions_path, load_session_row};
+            let Some((_, row)) = load_session_row(&cutex_sessions_path()?, &id)? else {
+                return Ok(());
+            };
+            if row.runtime_pid.is_some() || row.current_runtime_agent_id.is_some()
+                || row.app_server_runtime.is_some() || has_launch_claim(&row)
+            {
+                return Ok(());
+            }
+            super::server::append_cutex_event(
+                super::repository::management_v2_repository()?,
+                &id,
+                Default::default(),
+                "cutex/runtime/offline",
+                json!({"runtimeGeneration":row.runtime_generation,"backend":row.runtime_backend,"status":"offline","reason":format!("health: {}", finding.code),"occurredAt":chrono::Utc::now().to_rfc3339()}),
+            )?;
+            Ok(())
+        };
+        notify().map_err(RepairAlreadyApplied)?;
     }
-    Ok(id)
+    Ok(())
 }
 
 fn repair_package(finding: &Finding, context: ManagementRequestContext) -> anyhow::Result<()> {
@@ -741,6 +807,33 @@ fn error(stream: &mut TcpStream, status: u16, code: &str, message: &str) -> anyh
         json!({}),
     )
 }
+fn reviewed_fix(request: &FixRequest, context: ManagementRequestContext) -> Result<Value, FixFailure> {
+    if !request.dry_run && !preview::accepts(request) {
+        return Err(FixFailure::before_any(anyhow::anyhow!(
+            "preview_required: preview the fixes and confirm the exact planned IDs"
+        )));
+    }
+    let mut result = fix(request, context)?;
+    if request.dry_run {
+        attach_preview_token(&mut result)?;
+    }
+    Ok(result)
+}
+
+fn attach_preview_token(result: &mut Value) -> Result<(), FixFailure> {
+    let ids: Vec<_> = result["planned"].as_array().into_iter().flatten()
+        .filter_map(|item| item["id"].as_str()).collect();
+    if ids.len() > MAX_FIX_IDS {
+        return Err(FixFailure::before_any(anyhow::anyhow!(
+            "preview_limit: select at most {MAX_FIX_IDS} finding IDs per preview"
+        )));
+    }
+    if !ids.is_empty() {
+        result["previewToken"] = json!(preview::issue(ids).map_err(FixFailure::before_any)?);
+    }
+    Ok(())
+}
+
 pub fn handle(
     stream: &mut TcpStream,
     request: &SimpleHttpRequest,
@@ -760,14 +853,17 @@ pub fn handle(
                 Err(e) => return error(stream, 400, "invalid_request", &e.to_string()),
             };
             if parsed.finding_ids.as_ref().is_some_and(|ids| {
-                ids.len() > 1000 || ids.iter().any(|id| id.is_empty() || id.len() > 200)
+                ids.len() > MAX_FIX_IDS || ids.iter().any(|id| id.is_empty() || id.len() > 200)
             }) {
                 return error(
                     stream,
                     400,
                     "invalid_request",
-                    "findingIds accepts at most 1000 nonempty IDs of at most 200 bytes",
+                    &format!("findingIds accepts at most {MAX_FIX_IDS} nonempty IDs of at most 200 bytes"),
                 );
+            }
+            if parsed.preview_token.as_ref().is_some_and(|token| token.len() > 100 || parsed.dry_run) {
+                return error(stream, 400, "invalid_request", "invalid previewToken");
             }
             let key = match request
                 .headers
@@ -791,7 +887,7 @@ pub fn handle(
                     write_json_response(stream, response.status, &response.reason, &response.body)
                 }
                 BeginRequest::Forward(claim) => {
-                    let (status, body) = match fix(&parsed, context) {
+                    let (status, body) = match reviewed_fix(&parsed, context) {
                         Ok(result) => (200, result),
                         // Lists the fixes applied before the failure.
                         Err(failure) => (
@@ -829,6 +925,68 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_reports_an_admission_worker_panic_until_a_good_pass() {
+        let worker = crate::asks::scheduler_health::Worker::new("injected-admission");
+        let attempts = std::cell::Cell::new(0);
+        let code = "admission_worker_unavailable";
+        worker.supervise(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    panic!("injected admission panic");
+                }
+                worker.tick_finished(true);
+                Ok::<(), &'static str>(())
+            },
+            |_| {
+                let report = serde_json::to_value(scheduler_worker_finding(code, &worker).unwrap()).unwrap();
+                assert_eq!(report["code"], code);
+                assert_eq!(report["severity"], "error");
+                assert_eq!(report["detail"], json!({"reason":"restarting","restartCount":1}));
+            },
+        );
+        assert_eq!(attempts.get(), 2);
+        assert!(scheduler_worker_finding(code, &worker).is_none());
+    }
+
+
+    #[test]
+    fn a_repeated_session_panic_leaves_later_sessions_admissible_and_reports_its_id() {
+        let worker = crate::asks::scheduler_health::Worker::new("injected-admission");
+        assert!(worker.claim());
+        worker.supervise(
+            || {
+                let mut retried = Vec::new();
+                let mut admitted = Vec::new();
+                for session in ["panics", "healthy-a", "panics", "healthy-b"] {
+                    worker.run_admission_session(
+                        session,
+                        || {
+                            if session == "panics" {
+                                panic!("injected per-session panic");
+                            }
+                            admitted.push(session);
+                        },
+                        |session| retried.push(session.to_owned()),
+                    );
+                    worker.tick_finished(true);
+                }
+                assert_eq!(retried, ["panics", "panics"]);
+                assert_eq!(admitted, ["healthy-a", "healthy-b"]);
+                assert!(scheduler_worker_finding("admission_worker_unavailable", &worker).is_none());
+                let issues = admission_session_findings(&worker);
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].code, "admission_session_panicked");
+                assert_eq!(issues[0].cutex_session_id.as_deref(), Some("panics"));
+                worker.run_admission_session("panics", || {}, |_| unreachable!());
+                assert!(admission_session_findings(&worker).is_empty());
+                Ok::<(), &'static str>(())
+            },
+            |_| panic!("the whole worker should not restart"),
+        );
+    }
 
     #[test]
     fn glm_profiles_on_the_chat_completions_path_get_a_report_only_warning() {
@@ -989,6 +1147,28 @@ mod tests {
             .all(|f| f.fix.is_none()));
     }
     #[test]
+    fn unverified_claim_without_pid_is_visible_without_a_cleanup() {
+        let mut r = record("cutex.launching", None);
+        r.current_runtime_agent_id = None;
+        r.pending_launch_id = Some("legacy-launch-id".into());
+        let findings = session_findings(&store(vec![r]), &|_| false);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "unverified_launch_claim");
+        assert!(findings[0].fix.is_none());
+        assert_eq!(findings[0].detail["pendingLaunch"], true);
+    }
+
+    #[test]
+    fn preview_lists_one_action_per_session_even_with_overlapping_findings() {
+        let s = store(vec![record("cutex.first", Some(43210)), record("cutex.second", Some(43211))]);
+        let findings = session_findings(&s, &|_| false);
+        let selected = findings.iter().map(|finding| finding.id.clone()).collect();
+        let outcome = apply_findings(&findings, &selected, true, |_| unreachable!()).unwrap();
+        assert_eq!(outcome.planned.len(), 2);
+        assert_eq!(outcome.skipped.len(), 4);
+    }
+
+    #[test]
     fn missing_manifest_is_report_only_even_without_runtime_claim() {
         let mut r = record("cutex.package", None);
         r.explicit_launch = Some(crate::agent_management::ExplicitLaunchContract {
@@ -1021,6 +1201,17 @@ mod tests {
             .find(|f| f.code == "stale_runtime_claim")
             .unwrap();
         assert!(!clear_observed(&path, &observed, &|_| true).unwrap());
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.session_mut("cutex.health").unwrap().app_server_launch_claim_id = Some("new-launch".into());
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        assert!(!clear_observed(&path, &observed, &|_| false).unwrap());
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.session_mut("cutex.health").unwrap().app_server_launch_claim_id = None;
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
         assert_eq!(
             crate::session::store::load_cutex_session_store_from_path(&path)
                 .unwrap()
@@ -1028,8 +1219,14 @@ mod tests {
                 .runtime_pid,
             Some(43210)
         );
+        let fresh = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        let observed = session_findings(&fresh, &|_| false)
+            .into_iter()
+            .find(|finding| finding.code == "stale_runtime_claim")
+            .unwrap();
         assert!(clear_observed(&path, &observed, &|_| false).unwrap());
         assert!(!clear_observed(&path, &observed, &|_| false).unwrap());
+        crate::session::store::close_session_store(&path);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -1042,12 +1239,12 @@ mod tests {
         assert_eq!(findings.len(), 3);
         let selected: BTreeSet<String> = findings.iter().map(|f| f.id.clone()).collect();
         let mut calls = 0;
-        let failure = apply_findings(&findings, &selected, false, |finding| {
+        let failure = apply_findings(&findings, &selected, false, |_| {
             calls += 1;
             if calls == 2 {
                 anyhow::bail!("finding_changed: runtime evidence changed; scan again")
             }
-            Ok(finding.cutex_session_id.clone().unwrap())
+            Ok(())
         })
         .err()
         .unwrap();
@@ -1067,6 +1264,20 @@ mod tests {
         let outcome = apply_findings(&findings, &selected, true, |_| unreachable!()).ok().unwrap();
         assert_eq!((outcome.applied.len(), outcome.planned.len()), (0, 3));
     }
+    #[test]
+    fn oversized_preview_does_not_issue_an_unusable_token() {
+        let planned: Vec<_> = (0..MAX_FIX_IDS).map(|id| json!({"id": id.to_string()})).collect();
+        let mut result = json!({"planned": planned});
+        attach_preview_token(&mut result).unwrap();
+        assert!(result["previewToken"].is_string());
+
+        let mut planned = result["planned"].as_array().unwrap().clone();
+        planned.push(json!({"id": "extra"}));
+        let mut result = json!({"planned": planned});
+        assert_eq!(attach_preview_token(&mut result).unwrap_err().code(), "preview_limit");
+        assert!(result.get("previewToken").is_none());
+    }
+
     #[test]
     fn request_defaults_to_dry_run_and_rejects_unknown_fields() {
         assert!(

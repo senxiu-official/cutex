@@ -124,7 +124,7 @@ fn read_attachment(root: &Path, session: &str, digest: &str) -> Option<(&'static
 
 /// Directory name for a session: the id itself when it is a plain file
 /// name, otherwise a hash (never a path separator, `.` or `..`).
-fn session_dir_name(cutex_session_id: &str) -> String {
+pub(super) fn session_dir_name(cutex_session_id: &str) -> String {
     let plain = cutex_session_id.len() <= 128
         && cutex_session_id
             .bytes()

@@ -29,6 +29,7 @@ struct ExecuteRequest {
 }
 
 pub(super) struct Candidate {
+    pub stock_owner: Option<(String, u64)>,
     pub relative: PathBuf,
     pub eligible: bool,
     pub code: String,
@@ -146,7 +147,7 @@ fn days(request: &PreviewRequest) -> anyhow::Result<u32> {
             "orphan-homes" => value == 7,
             "old-backups" => value == 14,
             "old-logs" => [7, 30, 90].contains(&value),
-            "retired-homes" | "vacuum" => request.older_than_days.is_none(),
+            "retired-homes" | "vacuum" | "stock-tmp" => request.older_than_days.is_none(),
             _ => false,
         },
         "invalid action or retention window"
@@ -196,6 +197,7 @@ fn candidates(
                     .items
                     .into_iter()
                     .map(|c| Candidate {
+                        stock_owner: None,
                         relative: c.relative,
                         eligible: c.eligible,
                         code: c.code,
@@ -205,6 +207,7 @@ fn candidates(
                 discovered.partial_reason,
             ))
         }
+        "stock-tmp" => super::stock_temp::candidates(home, deadline.context("stock temp preview deadline")?),
         "vacuum" => {
             let store = crate::session::store::load_cutex_session_store_from_path(
                 &home.join("cutex-sessions.json"),
@@ -218,6 +221,7 @@ fn candidates(
                     .iter()
                     .filter(|(_, path)| home.join(path).is_file())
                     .map(|(_, path)| Candidate {
+                        stock_owner: None,
                         relative: PathBuf::from(path),
                         eligible: idle,
                         code: if idle { "compactable" } else { "database_busy" }.into(),
@@ -292,7 +296,7 @@ fn preview_with_limits(
             .is_none_or(|paths| Some(paths.len()) == request.items.as_ref().map(Vec::len)),
         "duplicate paths"
     );
-    let deadline = (request.action == "old-logs").then_some(started + budget);
+    let deadline = matches!(request.action.as_str(), "old-logs" | "stock-tmp").then_some(started + budget);
     let now = chrono::Utc::now();
     let mut items = Vec::new();
     let mut freeable_bytes = 0u64;
@@ -426,7 +430,17 @@ fn preview_with_limits(
         if eligible {
             freeable_bytes = freeable_bytes.saturating_add(reclaimable);
         }
-        items.push(json!({"id":uuid::Uuid::new_v4().to_string(),"path":path,"bytes":bytes,"files":count,"mtime":mtime,"eligible":eligible,"reason":reason,"code":code,"fingerprint":snapshot,"sidecars":sidecars}));
+        let mut item = json!({"id":uuid::Uuid::new_v4().to_string(),"path":path,"bytes":bytes,"files":count,"mtime":mtime,"eligible":eligible,"reason":reason,"code":code,"fingerprint":snapshot,"sidecars":sidecars});
+        if request.action == "stock-tmp" {
+            if let Some((session, generation)) = candidate.stock_owner {
+                item["sessionId"] = json!(session);
+                item["generation"] = json!(generation);
+            }
+            if !eligible {
+                item["blockingReason"] = item["code"].clone();
+            }
+        }
+        items.push(item);
     }
     if let Some(requested) = &request.items {
         anyhow::ensure!(
@@ -434,7 +448,7 @@ fn preview_with_limits(
             "unknown cleanup path"
         );
     }
-    let mut value = json!({"previewId":uuid::Uuid::new_v4().to_string(),"expiresAt":(now+chrono::Duration::minutes(10)).to_rfc3339(),"action":request.action,"risk":if matches!(request.action.as_str(),"orphan-homes"|"retired-homes"|"old-backups"){"high"}else{"medium"},"freeableBytes":freeable_bytes,"inspectedItems":items.len(),"elapsedMs":started.elapsed().as_millis() as u64,"complete":partial_reason.is_none(),"items":items,"actor":actor,"request":body});
+    let mut value = json!({"previewId":uuid::Uuid::new_v4().to_string(),"expiresAt":(now+chrono::Duration::minutes(10)).to_rfc3339(),"action":request.action,"risk":if matches!(request.action.as_str(),"orphan-homes"|"retired-homes"|"old-backups"|"stock-tmp"){"high"}else{"medium"},"freeableBytes":freeable_bytes,"inspectedItems":items.len(),"elapsedMs":started.elapsed().as_millis() as u64,"complete":partial_reason.is_none(),"items":items,"actor":actor,"request":body});
     if let Some(reason) = partial_reason {
         value["partialReason"] = json!(reason);
     }
@@ -542,6 +556,10 @@ pub(super) fn execute(home: &Path, body: Value, actor: Value) -> anyhow::Result<
     }
     anyhow::ensure!(!items.is_empty(), "cleanup preview has no items");
     for item in &mut items {
+        let fields = item.as_object_mut().context("cleanup preview item")?;
+        for key in ["sessionId", "generation", "blockingReason"] {
+            fields.remove(key);
+        }
         item["state"] = json!(if item["eligible"] == true {
             "queued"
         } else {
@@ -612,6 +630,9 @@ fn resume(home: &Path) -> anyhow::Result<()> {
     let lock = operation_lock(home, "worker.lock")?;
     fs2::FileExt::lock_exclusive(&lock)?;
     state::flush_audit(home)?;
+    if let Err(error) = super::stock_temp::drain(home) {
+        eprintln!("stock temp recovery paused; durable evidence retained: {error}");
+    }
     for mut run in state::history(home, true)? {
         run.as_object_mut()
             .context("cleanup receipt is not an object")?
@@ -793,6 +814,7 @@ impl SessionEvidence {
 enum PreparedEligibility {
     Home(super::storage_cleanup_homes::PreparedHomeRecheck),
     Catalog(super::storage_cleanup_catalog::PreparedCatalogRecheck),
+    StockTemp(super::stock_temp::ShellTicket),
 }
 impl PreparedEligibility {
     fn prepare(
@@ -810,6 +832,7 @@ impl PreparedEligibility {
                     SystemTime::now(),
                 )?))
             }
+            "stock-tmp" => Ok(Self::StockTemp(super::stock_temp::prepare(home, relative)?)),
             "old-backups" | "old-logs" => Ok(Self::Catalog(
                 super::storage_cleanup_catalog::prepare_recheck(
                     home,
@@ -828,6 +851,7 @@ impl PreparedEligibility {
         match self {
             Self::Home(ticket) => ticket.candidate.eligible,
             Self::Catalog(ticket) => ticket.candidate.eligible,
+            Self::StockTemp(_) => true,
         }
     }
     fn unchanged(
@@ -848,6 +872,7 @@ impl PreparedEligibility {
             Self::Catalog(ticket) => {
                 super::storage_cleanup_catalog::recheck_prepared(home, ticket, deadline)
             }
+            Self::StockTemp(ticket) => ticket.unchanged(home, relative),
         }
     }
 }
@@ -872,6 +897,29 @@ fn with_cleanup_gate<T>(operation: impl FnOnce() -> anyhow::Result<T>) -> anyhow
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
         .map_err(|_| anyhow::anyhow!("cleanup metadata recheck panicked"))?
 }
+/// Launches and archive changes share this ordering. Runtime-bound checks
+/// and scratch enumeration have already finished; the gate only compares
+/// durable session metadata and renames the pinned directory.
+pub(super) fn move_stock_scratch(
+    home: &Path,
+    prepared: files::PreparedRename,
+    valid: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
+    let store_lock = crate::session::store::cleanup_lock_file(&home.join("cutex-sessions.json"))?;
+    let stamps = SessionEvidence::stamps(home)?;
+    if !valid()? {
+        return Ok(false);
+    }
+    with_cleanup_gate(|| {
+        fs2::FileExt::try_lock_exclusive(&store_lock)?;
+        let deadline = Instant::now() + LOCK_CHECK_BUDGET;
+        if SessionEvidence::stamps(home)? != stamps || Instant::now() >= deadline {
+            return Ok(false);
+        }
+        Ok(matches!(files::rename_prepared(prepared, deadline)?, files::MoveOutcome::Moved { .. }))
+    })
+}
+
 fn process_item(home: &Path, run: &mut Value, index: usize) -> anyhow::Result<()> {
     let relative = PathBuf::from(
         run["items"][index]["path"]
@@ -1078,6 +1126,7 @@ fn refresh_affected(home: &Path, run: &Value) -> anyhow::Result<()> {
     let ids: &[&str] = match run["action"].as_str() {
         Some("orphan-homes" | "retired-homes") => &["light-homes"],
         Some("old-backups") => &["codex-home-backups", "migration-leftovers"],
+        Some("stock-tmp") => &["stock-tmp"],
         Some("old-logs") => &[
             "daemon-logs",
             "release-logs",

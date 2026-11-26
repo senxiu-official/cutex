@@ -410,6 +410,7 @@ mod tests {
 
 /// Runtime entry points call this outside session-store write locks.
 pub fn before_start(record: &CutexSessionRecord) -> anyhow::Result<()> {
+    crate::personal_assistants::host::check_start(record)?;
     let Some(SessionCreatedBy::Agent {
         cutex_session_id, ..
     }) = &record.created_by

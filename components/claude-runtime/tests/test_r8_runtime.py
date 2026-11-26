@@ -33,6 +33,106 @@ async def test_reconnect_keeps_logical_identity_and_accepts_only_fresh_input(ph)
     assert ph.sdk.clients[1].query_count == 1 and owner.reconnect_attempts == 0
 
 
+async def test_reconnect_applies_inherited_effort_before_fresh_input(ph):
+    tid = await ph.thread()
+    before = await ph.engine.start_runtime(tid)
+    owner = ph.engine.driver.owners[tid]
+    await ph.call('claude/effort/applyInherited', {
+        'threadId': tid, 'model': before['model'], 'connectionId': before['connectionId'],
+        'generation': before['nativeConnectionGeneration'], 'effort': 'high',
+    })
+    failed = await ph.turn(tid, 'CRASH')
+    await ph.drain()
+    assert ph.store.turn(failed)['status'] == 'failed'
+    assert owner.native_connection_generation != before['nativeConnectionGeneration']
+    new_client = owner.client
+    assert new_client.options.effort == 'high' and new_client.query_count == 0
+    fresh = await ph.turn(tid, 'fresh instruction')
+    await ph.drain()
+    assert ph.store.turn(fresh)['status'] == 'completed'
+    assert new_client.query_count == 1 and ph.engine.thread_effort(tid) is None
+
+
+async def test_reconnect_holds_query_until_effort_is_resolved_for_the_new_alias_target(ph, monkeypatch):
+    target = 'claude-opus-5'
+
+    async def model_info(client):
+        return {'models': [{'value': 'opus', 'resolvedModel': target,
+                            'supportedEffortLevels': ['medium', 'high']}]}
+
+    monkeypatch.setattr(ph.sdk.ClaudeSDKClient, 'get_server_info', model_info)
+    tid = await ph.thread()
+    ph.engine.save_model_effort(tid, 'opus', None)
+    before = await ph.engine.start_runtime(tid)
+    owner = ph.engine.driver.owners[tid]
+    apply = {'threadId': tid, 'model': 'opus', 'connectionId': before['connectionId'],
+             'generation': before['nativeConnectionGeneration'], 'effort': 'high'}
+    await ph.call('claude/effort/applyInherited', apply)
+
+    # The new model also accepts high, but its inherited default differs.
+    target = 'claude-opus-5-5'
+    owner.process.kill()
+    await until(lambda: owner.native_connection_generation != before['nativeConnectionGeneration'])
+    assert owner.snapshot()['reasoningResolutionPending']
+    assert owner.snapshot()['modelResolution']['resolvedModels']['opus'] == target
+    replacement = owner.client
+    turn = await ph.turn(tid, 'wait for the new model default')
+    await until(lambda: bool(owner.deferred))
+    assert replacement.query_count == 0 and replacement.controls == []
+    await ph.call('claude/effort/applyInherited', apply, error=True)
+    assert replacement.query_count == 0 and owner.snapshot()['reasoningResolutionPending']
+    await ph.call('claude/effort/applyInherited', {
+        **apply, 'generation': owner.native_connection_generation, 'effort': 'medium',
+    })
+    await ph.drain()
+    assert not owner.snapshot()['reasoningResolutionPending']
+    assert replacement.query_count == 1 and replacement.options.effort == 'medium'
+    assert ph.store.turn(turn)['status'] == 'completed'
+
+
+async def test_alias_resolution_timeout_uses_child_default_and_later_recovers(ph, monkeypatch, capsys):
+    from cute_claude import sdk_runtime
+
+    monkeypatch.setattr(sdk_runtime, 'EFFORT_RESOLUTION_WAIT_SECONDS', 0.15)
+    target = 'claude-opus-5'
+
+    async def model_info(client):
+        return {'models': [{'value': 'opus', 'resolvedModel': target,
+                            'supportedEffortLevels': ['medium', 'high']}]}
+
+    monkeypatch.setattr(ph.sdk.ClaudeSDKClient, 'get_server_info', model_info)
+    tid = await ph.thread()
+    ph.engine.save_model_effort(tid, 'opus', None)
+    before = await ph.engine.start_runtime(tid)
+    owner = ph.engine.driver.owners[tid]
+    apply = {'threadId': tid, 'model': 'opus', 'connectionId': before['connectionId'],
+             'generation': before['nativeConnectionGeneration'], 'effort': 'high'}
+    await ph.call('claude/effort/applyInherited', apply)
+    target = 'claude-opus-5-5'
+    owner.process.kill()
+    await until(lambda: owner.native_connection_generation != before['nativeConnectionGeneration'])
+
+    replacement = owner.client
+    for prompt in ('first while host resolution fails', 'second while it still fails'):
+        turn = await ph.turn(tid, prompt)
+        await ph.drain()
+        assert ph.store.turn(turn)['status'] == 'completed'
+        assert owner.snapshot()['reasoningResolutionUnreported']
+        assert not owner.snapshot()['reasoningResolutionPending']
+    assert replacement.query_count == 2
+    assert replacement.options.effort is None and replacement.controls == []
+    assert capsys.readouterr().err.count('effort resolution timed out') == 1
+
+    await ph.call('claude/effort/applyInherited', {
+        **apply, 'generation': owner.native_connection_generation, 'effort': 'medium',
+    })
+    assert not owner.snapshot()['reasoningResolutionUnreported']
+    turn = await ph.turn(tid, 'resolved again')
+    await ph.drain()
+    assert ph.store.turn(turn)['status'] == 'completed'
+    assert replacement.query_count == 3 and replacement.options.effort == 'medium'
+
+
 async def test_reconnect_is_bounded_without_a_successful_turn(ph):
     tid = await ph.thread()
     await ph.engine.start_runtime(tid)

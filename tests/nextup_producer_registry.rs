@@ -303,6 +303,8 @@ fn nextup_registered_producer_constructor_set_is_closed() {
         "src/cli_app/agent_bus_server.rs::send_payload_response_with_projection",
         "src/cli_app/agent_bus_server.rs::submit_job_service_completion_inner",
         "src/cli_app/agent_name_notices.rs::drain",
+        // Canonical durable quota notes are passive; control_type remains None.
+        "src/cli_app/profile_quota_notes.rs::spawn",
         "src/management/v2/agent_bus_state.rs::analyze_backlog",
         "src/management/v2/agent_bus_state.rs::downgrade_pending_peer_wakes",
         "src/management/v2/agent_bus_state.rs::from",

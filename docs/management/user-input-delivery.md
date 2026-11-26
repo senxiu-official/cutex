@@ -223,7 +223,11 @@ base-65536 fraction keys compare lexicographically, allowing repeated owner inse
 between neighbours without renumbering asks. Initial ordering uses enqueue/create times
 (ties: owners first, asks by sequence). Retired rows' keys are collected; only live numbered
 rows remain. Existing owner moves survive reads and restarts. Source changes synchronize
-only affected sessions. Ask writes never scan the bus store; bus candidates use a cached
+only affected sessions. In Management v2 asks list and detail responses, `queuePosition`
+is the one-based position in this numbered order, including owner rows. It is null when
+the delegation has no numbered row. The owner close receipt returns null. Delegation
+tools report the creation-order position among local queued delegations for the target.
+Ask writes never scan the bus store; bus candidates use a cached
 per-session index, rebuilt on store version changes. Scheduler and bridge admission reads
 project cached state without writes; offline scheduling reads only numbered order.
 Bus polling checks file metadata before taking the store lock or refreshing the index.
@@ -279,4 +283,3 @@ rollback, check that `nextStepLeases` in `~/.cutex/runtime/asks/asks-v1.json` is
 clears at the agent's next tool step); otherwise set those deliveries back to `pending` (drop
 `eventId`) and remove the event record in the backup copy you restore. Results then wait for the
 running lease's turn to end again (the old behaviour).
-

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cutex:management-v2:storage-cleanup",
   "title": "Owner desktop storage cleanup",
-  "description": "Explicit preview-bound manual cleanup. Capability storage-cleanup. All pairing tokens (including owner/full phones) fail closed with 403 storage_cleanup_desktop_only until a trusted desktop-specific credential exists. No scheduled deletion. Inventory remains host-storage.",
+  "description": "Explicit preview-bound manual cleanup. Capability storage-cleanup. All pairing tokens (including owner/full phones) fail closed with 403 storage_cleanup_desktop_only until a trusted desktop-specific credential exists. No scheduled deletion of owner data. Inventory remains host-storage.",
   "anyOf": [
     {
       "$ref": "#/$defs/previewRequest"
@@ -28,7 +28,8 @@
         "retired-homes",
         "old-backups",
         "old-logs",
-        "vacuum"
+        "vacuum",
+        "stock-tmp"
       ]
     },
     "actor": {
@@ -136,6 +137,25 @@
             "string",
             "null"
           ]
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For a stock-tmp item with a recorded launch, the owning Cutex session ID."
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For a stock-tmp item with a recorded launch, the Native runtime generation."
+        },
+        "blockingReason": {
+          "enum": [
+            "stock_temp_held",
+            "stock_temp_replaced",
+            "stock_temp_unknown",
+            "unreadable"
+          ],
+          "description": "For a blocked stock-tmp item, the final machine-readable code after inspection."
         }
       },
       "additionalProperties": false,

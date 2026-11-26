@@ -20,6 +20,38 @@ fn handler_failure_cancels_automatic_continuation_and_notifies_controller() {
     assert_eq!(f.runtime.submitted.borrow().len(),1);
 }
 // r290 P14
+#[test]
+fn repeated_handler_failure_after_bounded_resume_is_not_a_silent_stop() {
+    use crate::asks::{handler_failure,terminal_notices};
+    use crate::asks::store::tests::REQUESTER;
+    let f=Fixture::new("terminal-bounded-resume");
+    f.declare(1);f.finish(1,f.now,"completed");f.tick(60);
+    f.finish(2,f.now+Duration::seconds(61),"failed");
+    f.store.with_state(|s|awaits::resume_now(s,&f.ask,Some(REQUESTER),Some("retry"),f.now+Duration::seconds(62))).unwrap().unwrap();
+    f.tick(63);
+    let resumed=f.store.snapshot().unwrap();
+    assert!(resumed.asks[&f.ask].is_open());assert_eq!(resumed.asks[&f.ask].attempts.len(),3);
+    assert_eq!(f.runtime.submitted.borrow().len(),3);
+    f.finish(3,f.now+Duration::seconds(64),"failed");
+    f.finish(3,f.now+Duration::seconds(65),"failed");
+    let failed=f.store.snapshot().unwrap();
+    assert!(failed.asks[&f.ask].is_open());assert!(failed.answers.is_empty());
+    let notices:Vec<_>=failed.deliveries.values().filter(|d|d.ref_id.starts_with(handler_failure::PREFIX)).collect();
+    assert_eq!(notices.len(),2,"one durable notice per actual failed attempt, not per callback");
+    assert!(notices.iter().all(|d|terminal_notices::for_delivery(&failed.asks[&f.ask],d).unwrap().actor==terminal_notices::Actor::System{component:"handlerRuntime".into()}));
+    drop(failed);
+    crate::asks::tools::close_ask(&f.store,None,&f.ask,"stop",f.now+Duration::seconds(66)).unwrap();
+    let reopened=AskStore::at(f.store.dir().to_owned()).snapshot().unwrap();
+    let ask=&reopened.asks[&f.ask];assert_eq!(ask.closed,Some(model::CloseOutcome::Stopped));
+    assert_eq!(terminal_notices::read_state(ask)["actor"]["kind"],"owner");
+    assert_eq!(reopened.deliveries.values().filter(|d|terminal_notices::is_notice(d)).count(),1);
+    let prior_failure=reopened.deliveries.values().find(|d|d.ref_id.starts_with(handler_failure::PREFIX)).unwrap();
+    let item=crate::asks::returns::return_item(&f.store,&reopened,prior_failure).unwrap();
+    let (_,text)=crate::asks::render::return_text(&[item]);
+    assert!(text.contains("already closed"));assert!(!text.contains("Continue with delegation_resume"));
+}
+
+// r290 P14
 #[path = "p14_tests.rs"]
 mod p14;
 
@@ -60,6 +92,7 @@ fn verified_delegation_child_finished_before_declaration_wakes_once(){
     let f=Fixture::new("bounded-child-before");
     let child=f.store.with_state(|state|{
         let mut new=new_ask("child-before","review");
+        new.options.notify=model::Notify::Passive; // Isolate the declared child wake from its separate terminal notice.
         new.requester=model::Requester::Agent{cutex_session_id:TARGET.into(),name:None};
         new.target_cutex_session_id=crate::asks::store::tests::REQUESTER.into();
         let id=state.create_ask(new,f.now).unwrap().0.ask_id;
@@ -557,6 +590,65 @@ fn real_store_limit_outbox_is_once_and_reset_never_erases_stage_or_starts_a_runt
 }
 
 #[test]
+fn reloaded_timed_wait_reports_quota_and_resumes_once_after_release() {
+    let f = Fixture::new("continuation-blocker-reload");
+    let mut request = f.request(1);
+    request.wake = Some(WakeCondition::After {
+        delay_seconds: MIN_WAKE_SECONDS,
+    });
+    f.store.with_state(|state| {
+        let guards = Guards { online: true, permission_valid: true, occurrence_valid: true, ..Default::default() };
+        declare_current(state, TARGET, &f.ask, &request, guards, f.now, None)
+    }).unwrap().unwrap();
+    f.finish(1, f.now, "completed");
+    let store = AskStore::at(f.store.dir());
+    let due = f.now + Duration::seconds(60);
+    f.runtime.status.borrow_mut().get_mut(TARGET).unwrap().blocked =
+        Some(model::BlockedReason::Quota);
+    tick_due(&f.world, &f.runtime, &store, due - Duration::seconds(1)).unwrap();
+    assert!(crate::asks::view::continuation_wait(&store.snapshot().unwrap().asks[&f.ask])
+        .get("blockedReason").is_none());
+
+    tick_due(&f.world, &f.runtime, &store, due).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let ask = &snapshot.asks[&f.ask];
+    let revision = ask.revision;
+    let wait = crate::asks::view::continuation_wait(ask);
+    assert_eq!(wait["state"], "ready");
+    assert_eq!(wait["blockedReason"], "quota");
+    assert_eq!(wait["nextWakeAt"], json!(due));
+    assert!(ask.resume.is_none());
+
+    tick_due(&f.world, &f.runtime, &store, due + Duration::seconds(1)).unwrap();
+    assert_eq!(store.snapshot().unwrap().asks[&f.ask].revision, revision);
+    f.runtime.status.borrow_mut().get_mut(TARGET).unwrap().blocked = None;
+    tick_due(&f.world, &f.runtime, &store, due + Duration::seconds(2)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let ask = &snapshot.asks[&f.ask];
+    assert!(ask.resume.is_some());
+    assert!(crate::asks::view::continuation_wait(ask).get("blockedReason").is_none());
+
+    let wake_id = bounded_wake(ask).unwrap();
+    store.with_state(|state| record_routing_wait(state, &f.ask, &wake_id, due + Duration::seconds(2))).unwrap();
+    tick_due(&f.world, &f.runtime, &store, due + Duration::seconds(3)).unwrap();
+    assert_eq!(crate::asks::view::continuation_wait(&store.snapshot().unwrap().asks[&f.ask])
+        ["blockedReason"], "routing");
+
+    f.runtime.set(TARGET, |status| status.exclusive_admission = false);
+    tick_due(&f.world, &f.runtime, &store, due + Duration::seconds(4)).unwrap();
+    assert_eq!(crate::asks::view::continuation_wait(&store.snapshot().unwrap().asks[&f.ask])
+        ["blockedReason"], "runtimeUnsupported");
+    f.runtime.set(TARGET, |status| status.exclusive_admission = true);
+    tick_due(&f.world, &f.runtime, &store, due + Duration::seconds(5)).unwrap();
+    assert!(crate::asks::view::continuation_wait(&store.snapshot().unwrap().asks[&f.ask])
+        .get("blockedReason").is_none());
+
+    f.tick(66);
+    f.tick(67);
+    assert_eq!(f.runtime.submitted.borrow().len(), 2);
+}
+
+#[test]
 fn yielded_stop_cancels_waiting_and_ready_plans_and_keeps_outer_closed() {
     for ready in [false,true] {
         let f=Fixture::new("yielded-stop-continuation");f.declare(1);f.finish(1,f.now,"completed");
@@ -782,4 +874,383 @@ fn real_scheduler_enforces_elapsed_budget_while_the_target_is_paused() {
     assert!(snapshot.answers.is_empty());
     assert!(f.runtime.interrupts.borrow().is_empty());
     assert_eq!(f.runtime.submitted.borrow().len(), 1);
+}
+
+fn continuation_approval_context(
+    actor: crate::asks::routing_policy::RoutingActor,
+    director: Option<&str>,
+    epoch: u64,
+) -> crate::asks::routing_policy::RoutingContext {
+    use crate::asks::routing_policy::{RoutingContext, RoutingRef};
+    RoutingContext {
+        project_id: "alpha".into(),
+        authority_epoch: epoch,
+        current_director: director.map(|id| RoutingRef::new("local", id).unwrap()),
+        actor,
+        operator_may_route: false,
+    }
+}
+
+fn expired_approval_fixture(label: &str) -> (Fixture, DateTime<Utc>) {
+    let f = Fixture::new(label);
+    f.declare(1);
+    f.finish(1, f.now, "completed");
+    let at = f.now + Duration::seconds(MAX_ELAPSED_SECONDS);
+    tick_due(&f.world, &f.runtime, &f.store, at).unwrap();
+    (f, at)
+}
+
+fn decision_input(
+    a: &super::approval::Approval,
+    decision: crate::asks::routing_policy::RoutingDecision,
+) -> super::approval::DecisionRequest {
+    super::approval::DecisionRequest {
+        action_id: "decide-expired".into(),
+        expected_revision: a.revision,
+        expected_epoch: a.authority_epoch,
+        expected_digest: a.digest.clone(),
+        decision,
+        decision_note: Some("Reviewed the stage".into()),
+    }
+}
+
+#[test]
+fn expired_continuation_approval_survives_reload_and_starts_exactly_once() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision, RoutingRef};
+    use crate::asks::operations::{self, EffectState};
+    let (f, at) = expired_approval_fixture("approval-reload");
+    let director = "director-a";
+    let actor = Actor::Agent { session_id: director.into() };
+    let ctx = continuation_approval_context(
+        RoutingActor::Agent { reference: RoutingRef::new("local", director).unwrap(), name: None },
+        Some(director), 1,
+    );
+    f.store.with_state(|state| {
+        super::approval::sync_one(state, &f.ask, Some(&ctx), at);
+        super::approval::sync_one(state, &f.ask, Some(&ctx), at);
+    }).unwrap();
+    let reopened = AskStore::at(f.store.dir());
+    let request = reopened.inspect(|state| {
+        let ask = &state.asks[&f.ask];
+        let a = ask.bounded_continuation.approval.as_ref().unwrap();
+        assert_eq!(a.director_session_id.as_deref(), Some(director));
+        assert!(a.brief_preview.contains("implement"));
+        assert!(a.progress_preview.as_deref().unwrap().contains("full stage"));
+        assert_eq!(state.deliveries.values().filter(|d| d.ref_id.starts_with("continuationExpired@")).count(), 1);
+        assert!(state.notices.iter().any(|n| n.params["resourceId"] == a.id && n.sessions.iter().any(|s| s == director)));
+        decision_input(a, RoutingDecision::Approve)
+    }).unwrap();
+    let wire = serde_json::to_value(&request).unwrap();
+    let decide = || reopened.with_state(|state| operations::execute(
+        state, director, "continuation.resume", &request.action_id, &wire, at, |state| {
+            super::approval::decide(state, &f.ask, Some(&ctx), &actor, &request, at)
+                .map(|result| (result, EffectState::Committed))
+        },
+    )).unwrap().unwrap();
+    assert_eq!(decide(), decide());
+    reopened.inspect(|state| {
+        let data = &state.asks[&f.ask].bounded_continuation;
+        assert_eq!(data.current.as_ref().unwrap().budget_epoch, 2);
+        assert_eq!(data.budget_resets.len(), 1);
+        assert_eq!(state.deliveries.values().filter(|d| d.ref_id.starts_with("continuationApproved@")).count(), 1);
+    }).unwrap();
+    f.tick(MAX_ELAPSED_SECONDS + i64::from(MIN_WAKE_SECONDS) - 1);
+    assert_eq!(f.runtime.submitted.borrow().len(), 1);
+    f.tick(MAX_ELAPSED_SECONDS + i64::from(MIN_WAKE_SECONDS));
+    f.tick(MAX_ELAPSED_SECONDS + i64::from(MIN_WAKE_SECONDS) + 1);
+    assert_eq!(f.runtime.submitted.borrow().len(), 2);
+}
+
+#[test]
+fn rotated_director_invalidates_old_decisions_and_owner_can_deny_without_a_director() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision, RoutingRef};
+    let (f, at) = expired_approval_fixture("approval-rotation");
+    let old_director = "director-a";
+    let old_actor = Actor::Agent { session_id: old_director.into() };
+    let agent = |id: &str| RoutingActor::Agent {reference: RoutingRef::new("local", id).unwrap(), name: None};
+    let original = continuation_approval_context(agent(old_director), Some(old_director), 1);
+    let replaced = continuation_approval_context(agent(old_director), Some("director-b"), 2);
+    let owner = continuation_approval_context(RoutingActor::Owner, None, 3);
+    f.store.with_state(|state| {
+        super::approval::sync_one(state, &f.ask, Some(&original), at);
+        let first = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        let request = decision_input(&first, RoutingDecision::Deny);
+        assert!(super::approval::list(state, Some(&replaced), true).is_empty());
+        assert!(super::approval::decide(state, &f.ask, Some(&replaced), &old_actor, &request, at).is_err());
+        assert!(super::approval::decide(state, &f.ask, Some(&owner), &Actor::Owner, &request, at).is_err());
+        let new_director = "director-b";
+        let fresh = continuation_approval_context(agent(new_director), Some(new_director), 2);
+        let preview = super::approval::list(state, Some(&fresh), true).remove(0);
+        assert_eq!(preview["revision"], first.revision + 1);
+        assert_eq!(preview["allowedActions"]["approve"], true);
+        assert_eq!(state.asks[&f.ask].bounded_continuation.approval.as_ref().unwrap().revision, first.revision);
+        super::approval::sync_one(state, &f.ask, Some(&fresh), at);
+        let rotated = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        assert_ne!(rotated.digest, first.digest);
+        assert_eq!(preview["digest"], rotated.digest);
+        assert_eq!(super::approval::list(state, Some(&fresh), true)[0]["allowedActions"]["approve"], true);
+        assert!(state.notices.iter().any(|n| n.params["resourceId"] == rotated.id
+            && n.params["revision"] == rotated.revision && n.sessions.iter().any(|s| s == new_director)));
+        super::approval::sync_one(state, &f.ask, Some(&owner), at);
+        let latest = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        assert_eq!(latest.id, first.id);
+        assert_ne!(latest.digest, first.digest);
+        assert_eq!(latest.revision, first.revision + 2);
+        let request = decision_input(&latest, RoutingDecision::Deny);
+        super::approval::decide(state, &f.ask, Some(&owner), &Actor::Owner, &request, at).unwrap();
+        let ask = &state.asks[&f.ask];
+        assert_eq!(ask.closed, Some(model::CloseOutcome::Stopped));
+        assert_eq!(ask.attempts.len(), 1);
+        assert_eq!(ask.terminal_notices.last().unwrap().reason, "Reviewed the stage");
+        assert!(state.deliveries.values().any(|d| d.ask_id == f.ask && d.terminal_notice.is_some()));
+        assert!(super::approval::list(state, Some(&owner), true).is_empty());
+    }).unwrap();
+    f.tick(MAX_ELAPSED_SECONDS + 120);
+    assert_eq!(f.runtime.submitted.borrow().len(), 1);
+}
+
+#[test]
+fn owner_can_approve_a_current_card_while_the_project_has_a_director() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision};
+    let (f, at) = expired_approval_fixture("approval-owner");
+    let owner = continuation_approval_context(RoutingActor::Owner, Some("director-a"), 1);
+    f.store.with_state(|state| {
+        super::approval::sync_one(state, &f.ask, Some(&owner), at);
+        let approval = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        let request = decision_input(&approval, RoutingDecision::Approve);
+        super::approval::decide(state, &f.ask, Some(&owner), &Actor::Owner, &request, at).unwrap();
+        let ask = &state.asks[&f.ask];
+        assert!(ask.is_open());
+        assert_eq!(ask.bounded_continuation.current.as_ref().unwrap().budget_epoch, 2);
+        assert_eq!(ask.bounded_continuation.approval.as_ref().unwrap().decided_by, Some(Actor::Owner));
+    }).unwrap();
+}
+
+#[test]
+fn legacy_owner_body_approves_an_unscoped_request_and_uses_the_continuation_revision() {
+    let (f, at) = expired_approval_fixture("unscoped-legacy");
+    f.store.with_state(|state| {
+        state.update_ask(&f.ask, at, |ask| ask.project_id = None);
+    }).unwrap();
+    super::approval::tick(&f.store, at).unwrap();
+    let revision = f.store.inspect(|state| {
+        let ask = &state.asks[&f.ask];
+        let a = ask.bounded_continuation.approval.as_ref().unwrap();
+        assert!(a.director_session_id.is_none());
+        assert_eq!(a.authority_epoch, 0);
+        assert_eq!(super::approval::list(state, None, true).len(), 1);
+        let event = state.notices.iter().find(|n| n.params["resourceId"] == a.id
+            && n.params["projectId"].is_null()
+            && n.sessions == [crate::management::v2::services::HOST_EVENT_SESSION_ID]).unwrap();
+        crate::management::v2::contract_validation::validate_cutex_event_message(&json!({
+            "method":"cutex/delegation/routingApprovalChanged","params":event.params,
+        })).unwrap();
+        let detail = json!({"ask":crate::asks::view::owner_view(state, ask)});
+        crate::management::v2::schema_export::assert_valid("continuation-approvals", "unscopedAskDetail", &detail);
+        assert_eq!(detail["ask"]["continuationApproval"]["id"], a.id);
+        assert!(crate::asks::view::requester_view(state, ask).get("continuationApproval").is_none());
+        ask.bounded_continuation.current.as_ref().unwrap().revision
+    }).unwrap();
+    let legacy = |revision| serde_json::from_value(json!({
+        "actionId": "legacy-owner", "expectedRevision": revision,
+    })).unwrap();
+    f.store.with_state(|state| {
+        let err = super::approval::decide_owner(state, &f.ask, None, &legacy(revision + 1), at).unwrap_err();
+        assert_eq!(err.code, "approval_changed");
+        let result = super::approval::decide_owner(state, &f.ask, None, &legacy(revision), at).unwrap();
+        assert_eq!(result["continuationApproval"]["decision"], "approve");
+        assert_eq!(state.asks[&f.ask].bounded_continuation.current.as_ref().unwrap().budget_epoch, 2);
+    }).unwrap();
+}
+
+#[test]
+fn requester_stop_after_approval_card_prevents_a_new_segment() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision};
+    let (f, at) = expired_approval_fixture("approval-requester-stop");
+    let ctx = continuation_approval_context(RoutingActor::Owner, Some("director-a"), 1);
+    let request = f.store.with_state(|state| {
+        super::approval::sync_one(state, &f.ask, Some(&ctx), at);
+        decision_input(state.asks[&f.ask].bounded_continuation.approval.as_ref().unwrap(), RoutingDecision::Approve)
+    }).unwrap();
+    crate::asks::lineage::stop(&f.store, Some(crate::asks::store::tests::REQUESTER), &f.ask,
+        crate::asks::lineage::Cascade::None, false, "requester-stop", None, at).unwrap();
+    f.store.with_state(|state| {
+        let err = super::approval::decide(state, &f.ask, Some(&ctx), &Actor::Owner, &request, at).unwrap_err();
+        assert_eq!(err.code, "approval_not_pending");
+        assert_eq!(state.asks[&f.ask].closed, Some(model::CloseOutcome::Stopped));
+        assert!(state.asks[&f.ask].bounded_continuation.budget_resets.is_empty());
+    }).unwrap();
+    f.tick(MAX_ELAPSED_SECONDS + 120);
+    assert_eq!(f.runtime.submitted.borrow().len(), 1);
+}
+
+#[test]
+fn continuation_approval_persists_while_runtime_admission_is_held() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision, RoutingRef};
+
+    for hold in ["busy", "offline", "owner-offline", "paused", "generation"] {
+        let (f, at) = expired_approval_fixture(&format!("approval-hold-{hold}"));
+        match hold {
+            "busy" => f.runtime.set(TARGET, |s| s.active_turn_id = Some("other-turn".into())),
+            "offline" => f.runtime.set(TARGET, |s| s.online = false),
+            "owner-offline" => f.store.with_state(|s| {
+                s.owner_offline.insert(TARGET.into());
+            }).unwrap(),
+            "paused" => f.store.with_state(|s| {
+                crate::asks::agent_pause::pause(s, TARGET, "owner", None, at);
+            }).unwrap(),
+            "generation" => f.store.with_state(|s| {
+                s.presence.entry(TARGET.into()).or_default().runtime_generation = Some(2);
+            }).unwrap(),
+            _ => unreachable!(),
+        }
+        let director = "director-a";
+        let actor = Actor::Agent { session_id: director.into() };
+        let ctx = continuation_approval_context(
+            RoutingActor::Agent { reference: RoutingRef::new("local", director).unwrap(), name: None },
+            Some(director),
+            1,
+        );
+        f.store.with_state(|state| {
+            super::approval::sync_one(state, &f.ask, Some(&ctx), at);
+            let card = super::approval::action_card(&state.asks[&f.ask], Some(&ctx)).unwrap();
+            assert_eq!(card["allowedActions"], json!({"approve":true,"deny":true}), "{hold}");
+            crate::management::v2::schema_export::assert_valid("continuation-approvals", "treeApprovalCard", &card);
+            let approval = state.asks[&f.ask].bounded_continuation.approval.as_ref().unwrap();
+            let request = decision_input(approval, RoutingDecision::Approve);
+            let receipt = super::approval::decide(state, &f.ask, Some(&ctx), &actor, &request, at).unwrap();
+            assert_eq!(receipt["continuationApproval"]["decision"], "approve", "{hold}");
+            assert_eq!(state.asks[&f.ask].bounded_continuation.current.as_ref().unwrap().budget_epoch, 2);
+        }).unwrap();
+        let due = MAX_ELAPSED_SECONDS + i64::from(MIN_WAKE_SECONDS);
+        f.tick(due);
+        assert_eq!(f.runtime.submitted.borrow().len(), 1, "{hold}");
+        let wait = f.store.inspect(|state| crate::asks::view::continuation_wait(&state.asks[&f.ask])).unwrap();
+        let reason = match hold {
+            "busy" => "targetBusy",
+            "offline" | "owner-offline" => "runtimeOffline",
+            "paused" => "paused",
+            "generation" => "admission",
+            _ => unreachable!(),
+        };
+        assert_eq!(wait["blockedReason"], reason, "{hold}");
+        match hold {
+            "busy" => f.runtime.set(TARGET, |s| s.active_turn_id = None),
+            "offline" => f.runtime.set(TARGET, |s| {
+                s.online = true;
+                s.runtime_generation = 2;
+            }),
+            "owner-offline" => f.store.with_state(|s| {
+                s.owner_offline.remove(TARGET);
+            }).unwrap(),
+            "paused" => f.store.with_state(|s| {
+                crate::asks::agent_pause::resume(s, TARGET);
+            }).unwrap(),
+            "generation" => f.runtime.set(TARGET, |s| s.runtime_generation = 2),
+            _ => unreachable!(),
+        }
+        f.tick(due + 1);
+        f.tick(due + 2);
+        assert_eq!(f.runtime.submitted.borrow().len(), 2, "{hold}");
+        if matches!(hold, "offline" | "generation") {
+            let generation = f.store.inspect(|s| s.asks[&f.ask].current_attempt().unwrap().runtime_generation).unwrap();
+            assert_eq!(generation, 2, "{hold}");
+        }
+    }
+}
+
+#[test]
+fn approved_continuation_reports_a_late_runtime_refusal() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision};
+    use crate::asks::scheduler::SubmitOutcome;
+    let (f, at) = expired_approval_fixture("approval-late-refusal");
+    let ctx = continuation_approval_context(RoutingActor::Owner, None, 1);
+    f.store.with_state(|state| {
+        super::approval::sync_one(state, &f.ask, Some(&ctx), at);
+        let approval = state.asks[&f.ask].bounded_continuation.approval.as_ref().unwrap();
+        let request = decision_input(approval, RoutingDecision::Approve);
+        super::approval::decide(state, &f.ask, Some(&ctx), &Actor::Owner, &request, at).unwrap();
+    }).unwrap();
+    f.runtime.outcomes.borrow_mut().push(SubmitOutcome::Unsupported("exclusive input".into()));
+    f.tick(MAX_ELAPSED_SECONDS + i64::from(MIN_WAKE_SECONDS));
+    f.store.inspect(|state| {
+        let ask = &state.asks[&f.ask];
+        assert_eq!(ask.current_attempt().unwrap().state, AttemptState::Refused);
+        assert_eq!(crate::asks::view::continuation_wait(ask)["blockedReason"], "runtimeUnsupported");
+    }).unwrap();
+}
+
+#[test]
+fn continuation_approval_readdresses_when_the_handler_leaves_the_director_seat() {
+    use crate::asks::routing_policy::{RoutingActor, RoutingDecision, RoutingRef};
+    let (f, at) = expired_approval_fixture("approval-director-handler");
+    let agent = |id: &str| RoutingActor::Agent {
+        reference: RoutingRef::new("local", id).unwrap(),
+        name: None,
+    };
+    let actor = |id: &str| Actor::Agent { session_id: id.into() };
+    let incoming = "director-incoming";
+    let current = continuation_approval_context(agent(TARGET), Some(TARGET), 2);
+    let owner = continuation_approval_context(RoutingActor::Owner, Some(TARGET), 2);
+    let replaced = continuation_approval_context(agent(TARGET), Some(incoming), 3);
+    let next = continuation_approval_context(agent(incoming), Some(incoming), 3);
+    f.store.with_state(|state| {
+        let original = continuation_approval_context(agent(incoming), Some(incoming), 1);
+        super::approval::sync_one(state, &f.ask, Some(&original), at);
+        let old = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        assert_eq!(old.director_session_id.as_deref(), Some(incoming));
+        let old_request = decision_input(&old, RoutingDecision::Approve);
+        let err = super::approval::decide(state, &f.ask, Some(&current), &actor(TARGET), &old_request, at).unwrap_err();
+        assert_eq!(err.code, "forbidden");
+
+        super::approval::sync_one(state, &f.ask, Some(&current), at);
+        let a = state.asks[&f.ask].bounded_continuation.approval.clone().unwrap();
+        assert_eq!(a.revision, old.revision + 1);
+        assert!(a.director_session_id.is_none());
+        assert!(state.notices.iter().any(|n| n.params["resourceId"] == a.id
+            && n.params["revision"] == a.revision
+            && n.sessions == [crate::management::v2::services::HOST_EVENT_SESSION_ID]));
+        assert!(super::approval::list(state, Some(&current), true).is_empty());
+        assert_eq!(super::approval::list(state, Some(&owner), true).len(), 1);
+        let request = decision_input(&a, RoutingDecision::Approve);
+        for ctx in [&current, &replaced] {
+            let err = super::approval::decide(state, &f.ask, Some(ctx), &actor(TARGET), &request, at).unwrap_err();
+            assert_eq!(err.code, "forbidden");
+        }
+
+        super::approval::sync_one(state, &f.ask, Some(&next), at);
+        let a = state.asks[&f.ask].bounded_continuation.approval.as_ref().unwrap();
+        assert_eq!(a.director_session_id.as_deref(), Some(incoming));
+        let request = decision_input(a, RoutingDecision::Approve);
+        super::approval::decide(state, &f.ask, Some(&next), &actor(incoming), &request, at).unwrap();
+    }).unwrap();
+}
+
+#[test]
+fn archived_project_continuation_falls_back_to_owner_and_delivers_expiry() {
+    use crate::agent_management::{AgentManagementSnapshot, ProjectId};
+    use crate::asks::routing_policy::RoutingDecision;
+    let (f, at) = expired_approval_fixture("approval-archived-project");
+    let mut roster = AgentManagementSnapshot::empty();
+    roster.project_states.insert(ProjectId::new("alpha").unwrap(),
+        serde_json::from_value(json!({
+            "project_id":"alpha","lifecycle":"archived","revision":3,
+            "created_at":at,"updated_at":at,"archived_at":at,"last_director_epoch":2
+        })).unwrap());
+    f.store.with_state(|state| {
+        let dirty = super::approval::project_changes(&f.store, state, &roster, "local");
+        assert_eq!(dirty.len(), 1);
+        let (id, ctx) = dirty.into_iter().next().unwrap();
+        assert_eq!(id, f.ask);
+        super::approval::sync_one(state, &id, Some(&ctx), at);
+        let a = state.asks[&id].bounded_continuation.approval.as_ref().unwrap();
+        assert_eq!(a.authority_epoch, 2);
+        assert!(a.director_session_id.is_none());
+        assert_eq!(super::approval::list(state, Some(&ctx), true).len(), 1);
+        assert!(state.notices.iter().any(|n| n.params["resourceId"] == a.id
+            && n.sessions == [crate::management::v2::services::HOST_EVENT_SESSION_ID]));
+        assert_eq!(state.deliveries.values().filter(|d| d.ref_id.starts_with("continuationExpired@")).count(), 1);
+        let request = decision_input(a, RoutingDecision::Deny);
+        super::approval::decide(state, &id, Some(&ctx), &Actor::Owner, &request, at).unwrap();
+    }).unwrap();
 }

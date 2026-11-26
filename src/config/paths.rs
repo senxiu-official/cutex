@@ -361,6 +361,11 @@ pub fn is_foreign_runtime_tmp(path: &Path) -> bool {
     is_foreign_runtime_tmp_of(path, own.as_deref())
 }
 
+/// Includes per-launch children inherited from this instance's own shells.
+pub fn is_runtime_tmp_path(path: &Path) -> bool {
+    is_foreign_runtime_tmp_of(path, None)
+}
+
 fn is_foreign_runtime_tmp_of(path: &Path, own: Option<&Path>) -> bool {
     fn same_name(component: Option<&std::ffi::OsStr>, name: &str) -> bool {
         component.and_then(|value| value.to_str()).is_some_and(|value| {

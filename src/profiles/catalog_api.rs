@@ -119,6 +119,10 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
     let mut view = json!({
         "id": id,
         "requestModel": row.get("request_model"),
+        "resolvedModel": row.get("resolvedModel"),
+        "resolvedModelSource": row.get("resolvedModelSource"),
+        "resolvedDisplayName": row.get("resolvedDisplayName"),
+        "resolvedDisplayVersion": row.get("resolvedDisplayVersion"),
         "displayName": row.get("display_name"),
         "contextWindow": context_window,
         "maxContextWindow": max_context_window,
@@ -127,6 +131,8 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
         "effectiveContextWindowPercent": int(row, "effective_context_window_percent"),
         "inputModalities": row.get("input_modalities").cloned().unwrap_or(json!(["text", "image"])),
         "supportedReasoningEfforts": efforts,
+        "effortSupportKnown": row["effortSupportKnown"].as_bool()
+            .unwrap_or_else(|| row["supported_reasoning_levels"].is_array()),
         "defaultReasoningEffort": row.get("default_reasoning_level"),
         "isDefault": snapshot.model.as_deref() == Some(id),
         "discovered": discovered.iter().any(|model| model == id),
@@ -144,7 +150,7 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
     view["defaultValues"]=super::model_context::default_values(row,snapshot);
     // Preserve Claude reference provenance and compatibility evidence instead
     // of losing it while adapting native-shaped rows for Desktop.
-    for field in ["kind", "family", "source", "description", "accountAvailability", "minCliVersion", "cliCompatibility", "effortSupportKnown"] {
+    for field in ["kind", "family", "source", "description", "accountAvailability", "minCliVersion", "cliCompatibility", "effortSupportKnown", "effortSupportSource"] {
         if let Some(value) = row.get(field) { view[field] = value.clone(); }
     }
     view
@@ -232,6 +238,40 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
     }else{rows};
     let mut models: Vec<Value> =
         custom.iter().map(|row| model_view(row, &state.snapshot, &discovered_ids)).collect();
+    let model_efforts = super::reasoning::profile_model_efforts(account).unwrap_or_default();
+    let official_claude = account.cli_kind == CliKind::Claude && super::reasoning::uses_claude_reference(account);
+    for model in &mut models {
+        let id = model["id"].as_str().unwrap_or_default();
+        let resolved = model["resolvedModel"].as_str();
+        let old_overlay_effort = catalog_overlay.as_ref().and_then(|overlay| overlay.entries.iter().find(|entry| entry.id == id))
+            .and_then(|entry| entry.overrides.get("default_reasoning_level"))
+            .and_then(Value::as_str);
+        let explicit_model_effort = model_efforts.get(id).map(String::as_str).or(old_overlay_effort);
+        let owner = explicit_model_effort.or_else(|| resolved.and_then(|id| model_efforts.get(id).map(String::as_str)));
+        let levels: Vec<String> = model["supportedReasoningEfforts"].as_array().into_iter().flatten()
+            .filter_map(|level| level.as_str().map(str::to_owned)).collect();
+        let profile = if account.cli_kind == CliKind::Claude {
+            account.options.claude.effort.map(|level| level.as_str())
+        } else {
+            state.snapshot.model_reasoning_effort.as_deref()
+        };
+        let builtin = if account.cli_kind == CliKind::Claude {
+            super::reasoning::claude_builtin_default(resolved.unwrap_or(id))
+        } else {
+            model["defaultReasoningEffort"].as_str().map(|value| (value, super::reasoning::EffortSource::Catalog))
+        };
+        let known = !levels.is_empty() || model["effortSupportKnown"] == true;
+        let usable = if account.cli_kind == CliKind::Claude {
+            model["effortSupportSource"] == "sdkHandshake"
+                || (official_claude && model["kind"] == "pinned" && known)
+        } else {
+            known
+        };
+        model["reasoningEffort"] = json!(super::reasoning::resolve(
+            None, owner, profile, builtin, usable.then_some(levels.as_slice())
+        ).expect("no explicit effort to reject"));
+        model["modelReasoningEffort"] = json!(explicit_model_effort);
+    }
     if account.cli_kind == CliKind::Claude {
         // r290 P13: read the settings once for the complete table.
         let defaults = super::claude_compaction::view(account).0;

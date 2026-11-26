@@ -51,3 +51,37 @@ async def test_switching_profiles_with_same_default_resets_manual_choice_once(ph
     # The launch hint is consumed; repeated Start/ensure cannot overwrite a live choice.
     await ph.call('claude/thread/ensure', {'threadId': tid})
     assert ph.store.thread(tid)['model'] == 'opus'
+
+
+async def test_explicit_offline_launch_selection_replaces_retired_saved_pair(ph):
+    tid = await ph.thread()
+    await ph.engine.start_runtime(tid)
+    saved_native_id = ph.engine.session(tid)['session_id']
+    instructions = ph.store.thread(tid)['instructions']
+    cwd = ph.store.thread(tid)['cwd']
+    await ph.engine.close_runtime(tid)
+    ph.engine.save_model_effort(tid, 'retired-fixture', 'max')
+    assert ph.store.thread(tid)['model'] == 'retired-fixture'
+    assert ph.engine.thread_effort(tid) == 'max'
+
+    selection = {'threadId': tid, 'model': 'sonnet', 'instructions': instructions,
+                 'launchSelection': {'effort': 'low'}}
+    with pytest.raises(Exception, match='explicit effort or null'):
+        await ph.call('claude/thread/ensure', {**selection, 'launchSelection': {}})
+    assert ph.store.thread(tid)['model'] == 'retired-fixture'
+    for _ in range(2):  # Retry before the runtime result is committed.
+        result = await ph.call('claude/thread/ensure', selection)
+        assert result['created'] is False
+    assert ph.store.thread(tid)['cwd'] == cwd
+    assert ph.store.thread(tid)['instructions'] == instructions
+    assert ph.store.thread(tid)['model'] == 'sonnet'
+    assert ph.engine.thread_effort(tid) == 'low'
+    assert ph.engine.session(tid)['session_id'] == saved_native_id
+
+    await ph.engine.start_runtime(tid)
+    assert ph.sdk.clients[-1].options.model == 'sonnet'
+    assert ph.engine.session(tid)['session_id'] == saved_native_id
+    assert all(client.query_count == 0 for client in ph.sdk.clients)
+    with pytest.raises(Exception, match='Close the native runtime'):
+        await ph.call('claude/thread/ensure', {**selection, 'launchSelection': {'effort': None}})
+    assert ph.engine.thread_effort(tid) == 'low'

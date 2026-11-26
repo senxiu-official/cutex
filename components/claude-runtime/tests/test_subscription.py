@@ -358,7 +358,7 @@ async def test_sdk_public_driver_option_wiring_and_same_task_ownership(sh, monke
     o = client.options
     assert o.tools == {'type':'preset','preset':'claude_code'} and o.allowed_tools == ['mcp__cutex__read_file','mcp__cutex__list_directory'] and o.strict_mcp_config
     assert o.permission_mode == 'bypassPermissions'
-    assert {k:v for k,v in o.extra_args.items() if k != 'append-system-prompt-file'} == {'allow-dangerously-skip-permissions':None, 'replay-user-messages':None}
+    assert {k:v for k,v in o.extra_args.items() if k != 'append-system-prompt-file'} == {'allow-dangerously-skip-permissions':None, 'replay-user-messages':None, 'include-hook-events':None}
     assert Path(o.extra_args['append-system-prompt-file']).read_text(encoding='utf-8') == sh.engine.settings.preset_append('')
     assert o.enable_file_checkpointing is False and o.forward_subagent_text is True  # subagent_transcripts
     assert o.setting_sources == [] and o.plugins == [] and not o.continue_conversation

@@ -1023,6 +1023,15 @@
           }
         },
         "autoRetry": { "anyOf": [{ "$ref": "#/$defs/autoRetry" }, { "type": "null" }] },
+        "orderedAutomaticInput": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["busy", "nextStepAt"],
+          "properties": {
+            "busy": { "type": "boolean" },
+            "nextStepAt": { "type": ["string", "null"] }
+          }
+        },
         "nextStep": {
           "type": "array",
           "items": {
@@ -1100,6 +1109,10 @@
         },
         "fromHost": {
           "type": ["string", "null"]
+        },
+        "fromPeerInstanceId": {
+          "type": "string",
+          "pattern": "^ci-[0-9a-fA-F]{32}$"
         },
         "fromCutexSessionId": {
           "type": ["string", "null"],
@@ -1836,6 +1849,7 @@
         "lastError": { "type": ["string", "null"] },
         "waitingFor": { "type": "string" },
         "sourceWaitingFor": { "type": "string" },
+        "readNowDisabledReason": { "enum": ["orderedBatchPending", "orderedBindingReplaced"] },
         "blockedByInputId": { "type": ["string", "null"] },
         "binding": {
           "type": ["object", "null"], "additionalProperties": false,
@@ -1866,6 +1880,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "crossHost": { "$ref": "#/$defs/crossHost" },
         "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
@@ -1897,6 +1912,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "crossHost": { "$ref": "#/$defs/crossHost" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
         "wakeDowngraded": { "const": true },
@@ -1980,6 +1996,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "crossHost": { "$ref": "#/$defs/crossHost" },
         "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
@@ -2007,6 +2024,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "crossHost": { "$ref": "#/$defs/crossHost" },
         "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
@@ -2192,7 +2210,8 @@
     "peersChanged": {"type":"object","required":["peerId","reason"],"properties":{"peerId":{"type":"string"},"reason":{"type":"string"}}},
     "usersChanged": {"type":"object","required":["userId","reason"],"description":"Capability peer-owner-profile: a user's displayName / avatar changed without an owner action (reason peerProfile: pulled from paired peer peerId). Re-read GET /v2/users.","properties":{"userId":{"type":"string"},"reason":{"type":"string"},"peerId":{"type":"string"}}},
     "profilesChanged": {"type":"object","additionalProperties":false,"required":["profileId","fields","updatedAt"],"properties":{"profileId":{"$ref":"#/$defs/nonEmptyString"},"fields":{"type":"array","minItems":1,"uniqueItems":true,"items":{"enum":["avatarStyle"]}},"updatedAt":{"type":"string","format":"date-time"}}},
-    "peerAsk": {"type":"object","additionalProperties":true,"properties":{"remote":{"type":["object","null"],"additionalProperties":true,"properties":{"peerId":{"type":"string"},"label":{"type":"string"},"targetName":{"type":"string"},"syncState":{"type":"string"},"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"interruptReason":{"type":["string","null"]},"remoteState":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."}},"description":"Portable peer snapshot metadata; answer text is omitted. Unknown state strings are retained."},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."}}},"requester":{"type":"object","required":["kind"],"properties":{"kind":{"enum":["agent","owner","peer"]},"peer":{"type":"object","required":["peerId","label"],"properties":{"peerId":{"type":"string"},"label":{"type":"string"}}},"cutexSessionId":{"type":"string"},"name":{"type":["string","null"]},"peerId":{"type":"string"},"label":{"type":"string","description":"Single-line sanitized display label."},"claimedCaps":{"type":"object","additionalProperties":true,"properties":{"sandbox":{"type":["string","null"]},"networkAccess":{"type":"boolean"},"unrestrictedServices":{"type":"boolean"}},"description":"Capabilities claimed by the remote requester; display only, never approval authority."}}},"hold":{"type":["object","null"],"properties":{"reason":{"type":"string","description":"Includes peerUnreachable, peerIdentityChanged, peerVersionMismatch and peerUnknown. Unknown peer state is display-only and never drives local scheduling."},"raw":{"type":"string"}}},"hops":{"type":"integer","minimum":0},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."},"resultUndeliverable":{"type":"boolean"},"interruptReason":{"type":["string","null"]}}},
+    "crossHost": {"type":"object","additionalProperties":false,"required":["direction","peer","receipt"],"properties":{"direction":{"enum":["inbound","outbound"]},"peer":{"type":"object","additionalProperties":false,"required":["instanceId","label"],"properties":{"instanceId":{"type":"string","pattern":"^ci-[0-9a-fA-F]{32}$"},"label":{"type":"string"}}},"receipt":{"type":"object","additionalProperties":false,"required":["state","reason","confirmedAt"],"properties":{"state":{"enum":["queuedAtSource","deliveredToPeer","accepted","failed","outcomeUnknown"]},"reason":{"enum":[null,"sourceRoutingRefused","destinationRoutingRefused","peerRefusedUnspecified","peerUnreachable","peerCredentialRefused","peerIdentityChanged","peerVersionMismatch","peerRemoved","peerDisabled","peerRejectedRequest","destinationRejected","destinationFailed","cancelled","interrupted","outcomeUnknown"]},"confirmedAt":{"type":["string","null"],"format":"date-time"}}}}},
+    "peerAsk": {"type":"object","additionalProperties":true,"properties":{"crossHost":{"$ref":"#/$defs/crossHost"},"remote":{"type":["object","null"],"additionalProperties":true,"properties":{"peerId":{"type":"string"},"label":{"type":"string"},"targetName":{"type":"string"},"syncState":{"type":"string"},"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"interruptReason":{"type":["string","null"]},"remoteState":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."}},"description":"Portable peer snapshot metadata; answer text is omitted. Unknown state strings are retained."},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."}}},"requester":{"type":"object","required":["kind"],"properties":{"kind":{"enum":["agent","owner","peer"]},"peer":{"type":"object","required":["peerId","label"],"properties":{"peerId":{"type":"string"},"label":{"type":"string"}}},"cutexSessionId":{"type":"string"},"name":{"type":["string","null"]},"peerId":{"type":"string"},"label":{"type":"string","description":"Single-line sanitized display label."},"claimedCaps":{"type":"object","additionalProperties":true,"properties":{"sandbox":{"type":["string","null"]},"networkAccess":{"type":"boolean"},"unrestrictedServices":{"type":"boolean"}},"description":"Capabilities claimed by the remote requester; display only, never approval authority."}}},"hold":{"type":["object","null"],"properties":{"reason":{"type":"string","description":"Includes peerUnreachable, peerIdentityChanged, peerVersionMismatch and peerUnknown. Unknown peer state is display-only and never drives local scheduling."},"raw":{"type":"string"}}},"hops":{"type":"integer","minimum":0},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."},"resultUndeliverable":{"type":"boolean"},"interruptReason":{"type":["string","null"]}}},
     "servicesChanged": {
       "type": "object",
       "additionalProperties": false,

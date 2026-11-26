@@ -28,6 +28,9 @@ impl std::fmt::Display for Unavailable {
 impl std::error::Error for Unavailable {}
 
 pub trait Runtime {
+    fn submit_template(&mut self, _store: &Store, _run: &Run) -> anyhow::Result<String> {
+        anyhow::bail!("assistant template dispatch unavailable")
+    }
     /// Fresh eligibility check; errors with Paused hold, Unavailable refuse.
     fn check(&mut self, run: &Run) -> anyhow::Result<()>;
     /// Idempotently verify/reconnect/start; the adapter must recheck pause at spawn.
@@ -48,6 +51,9 @@ pub fn tick<T: chrono::TimeZone>(
     let count = runs.len();
     for run in runs {
         let result = (|| {
+            if run.assistant_template.is_some() {
+                return runtime.submit_template(store, &run);
+            }
             runtime.check(&run)?;
             runtime.online(&run)?;
             runtime.check(&run)?;
@@ -61,7 +67,11 @@ pub fn tick<T: chrono::TimeZone>(
             Err(error) => {
                 let outcome = if error.is::<Paused>() || error.is::<OwnerStopped>() {
                     "held"
-                } else if error.is::<Unavailable>() {
+                } else if error.is::<CancelledTemplate>() {
+                    "cancelled"
+                } else if error.is::<Unavailable>()
+                    || error.is::<crate::personal_assistants::Fault>()
+                {
                     "refused"
                 } else {
                     "retrying"
@@ -72,6 +82,14 @@ pub fn tick<T: chrono::TimeZone>(
     }
     Ok(count)
 }
+#[derive(Debug)]
+pub(crate) struct CancelledTemplate;
+impl std::fmt::Display for CancelledTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("schedule cancelled, paused, or superseded before admission")
+    }
+}
+impl std::error::Error for CancelledTemplate {}
 
 pub fn validate_target(target: &str) -> anyhow::Result<()> {
     let record = crate::session::store::shared_session_row(target)?
@@ -93,6 +111,9 @@ struct HostRuntime<F> {
     online: F,
 }
 impl<F: Fn(&str, &str) -> anyhow::Result<()>> Runtime for HostRuntime<F> {
+    fn submit_template(&mut self, store: &Store, run: &Run) -> anyhow::Result<String> {
+        crate::personal_assistants::recurring::dispatch(store, run, || self.check(run))
+    }
     fn completed_at(&self) -> Option<DateTime<Utc>> {
         Some(Utc::now())
     }
@@ -144,8 +165,44 @@ fn delivery_message(run: &Run) -> String {
         run.message
     )
 }
-/// Called in the Agent Bus process. A kernel lock excludes another scheduler
-/// across daemon restarts; all runtime and bus work happens after DB commits.
+pub(crate) fn tick_host(
+    store: &Store,
+    now: DateTime<Utc>,
+    online: impl Fn(&str, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let count = tick(store, now, &Local, &mut HostRuntime { online })?;
+    if let Err(error) = store.deliver_template_reviews(|review, session| {
+        use crate::owner_notify::store::{Level, NewNotification, OwnerNotifyStore};
+        let notices = OwnerNotifyStore::open_default()?;
+        let (settings, evaluator) = crate::notification_levels::Evaluator::current_with_owner();
+        let change = if review.reason == "director_changed" {
+            "项目 Director 席位或任期已变更"
+        } else {
+            "项目授权已变更"
+        };
+        let text = format!(
+            "{change}，请在个人助理中重新确认周期模板 {}（第 {} 版）。此次请求未入队。",
+            review.schedule_id, review.template_revision
+        );
+        let notice = NewNotification {
+            agent_id: session.to_string(),
+            agent_name: None,
+            text,
+            level: Level::Info,
+            needs_reply: false,
+            delegation: None,
+            job: None,
+            turn_id: None,
+        };
+        notices.template_review_once(review, notice, &settings, &evaluator, now)?;
+        crate::management::v2::owner_notify::publish_pending_notices(&notices);
+        Ok(())
+    }) {
+        eprintln!("Personal Assistant template notification pending: {error:#}");
+    }
+    Ok(count)
+}
+/// The Agent Bus process holds the worker lock across ticks and restart recovery.
 pub fn spawn(
     online: impl Fn(&str, &str) -> anyhow::Result<()> + Send + 'static,
 ) -> anyhow::Result<()> {
@@ -157,9 +214,36 @@ pub fn spawn(
                     let store = Store::open_default()?;
                     let _worker = store.worker_lock()?;
                     store.recover_dispatching(Utc::now())?;
-                    let mut runtime = HostRuntime { online: &online };
+                    let mut cursor = String::new();
+                    let mut maintenance = std::time::Instant::now();
                     loop {
-                        tick(&store, Utc::now(), &Local, &mut runtime)?;
+                        tick_host(&store, Utc::now(), &online)?;
+                        if std::time::Instant::now() >= maintenance {
+                            let mut assistants = None;
+                            match store.maintain_templates(
+                                &cursor,
+                                Utc::now(),
+                                |assistant, schedule| {
+                                    if assistants.is_none() {
+                                        assistants = Some(
+                                            crate::personal_assistants::Store::open_default()?,
+                                        );
+                                    }
+                                    assistants
+                                        .as_ref()
+                                        .unwrap()
+                                        .prune_closed_schedule(assistant, schedule)?;
+                                    Ok(())
+                                },
+                            ) {
+                                Ok(next) => cursor = next,
+                                Err(e) => eprintln!(
+                                    "Personal Assistant template retention pending: {e:#}"
+                                ),
+                            }
+                            maintenance =
+                                std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        }
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
                 })();
@@ -211,6 +295,7 @@ pub(crate) fn own_list(
 ) -> anyhow::Result<super::Page<super::Schedule>> {
     let mut page = store.list(Some(session), cursor, limit)?;
     for row in &mut page.data {
+        row.assistant_template = None;
         if row
             .last_run
             .as_ref()
@@ -220,6 +305,7 @@ pub(crate) fn own_list(
         }
         if let Some(run) = &mut row.last_run {
             run.lease_token = None;
+            run.assistant_template = None;
         }
     }
     Ok(page)

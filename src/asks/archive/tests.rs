@@ -43,6 +43,27 @@ fn closed_old_only_and_open_ancestry_are_protected() {
 }
 
 #[test]
+fn retired_notice_recipient_unpins_archive_but_unknown_handover_does_not() {
+    use crate::asks::{model::route,terminal_notices,tools};
+    let mut state=AskState::default();let at=stamp("2026-10-23T00:00:00Z");
+    let id=state.create_ask(new_ask("retired-archive","work"),at).unwrap().0.ask_id;
+    tools::close_in_state(&mut state,None,&id,"abandoned",false,at).unwrap();
+    // Management SSE has its own normal drain; isolate the critical outbox
+    // as the only hot retention edge, as the other historical fixtures do.
+    state.notices.clear();
+    assert!(!plan(&state,cutoff()).unwrap().contains(&("asks".into(),id.clone())));
+    route::pin(&id,route::Pin{controller:Err("handover_unknown"),history:vec![],questions:None});
+    terminal_notices::retire_unreachable(&mut state,&[&id],|_|true,at);
+    assert!(!plan(&state,cutoff()).unwrap().contains(&("asks".into(),id.clone())));
+    route::pin(&id,route::Pin{controller:Ok(Some("cutex.successor".into())),history:vec![],questions:None});
+    terminal_notices::retire_unreachable(&mut state,&[&id],|r|r!="cutex.successor",at);
+    assert!(!plan(&state,cutoff()).unwrap().contains(&("asks".into(),id.clone())));
+    terminal_notices::retire_unreachable(&mut state,&[&id],|_|true,at);
+    assert!(state.deliveries.values().all(|d|d.state==crate::asks::model::DeliveryState::Acknowledged));
+    assert!(plan(&state,cutoff()).unwrap().contains(&("asks".into(),id)));
+}
+
+#[test]
 fn malformed_cutoff_hold_and_runtime_command_do_not_archive() {
     let mut state = AskState::default();
     let invalid = closed(&mut state, "invalid");
@@ -1110,6 +1131,17 @@ fn rolling_pass_moves_only_closed_older_than_the_age_and_keeps_the_fixed_cutoff(
     store.archive_before(Some(cutoff()), cutoff()).unwrap();
     assert_eq!(cold_ask_ids(&path), BTreeSet::from([before_cutoff.clone()]));
 
+    let table_names = || {
+        let db = open(&path).unwrap();
+        let names: BTreeSet<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        names
+    };
+    let tables_before = table_names();
+    let archive_tables = BTreeSet::from(["hot_store_meta", "hot_store_rows", "asks_archive_meta", "asks_archive_rows"].map(String::from));
+    assert!(archive_tables.is_subset(&tables_before));
+
     let report = store.rolling_archive_pass(chrono::Duration::hours(48), 200, rolling_now()).unwrap();
     assert_eq!(report.moved.asks, 1, "{report:?}");
     assert_eq!(report.deferred_asks, 0);
@@ -1124,13 +1156,9 @@ fn rolling_pass_moves_only_closed_older_than_the_age_and_keeps_the_fixed_cutoff(
     // its own startup pass neither fails nor re-plans these rows.
     assert_eq!(persisted_cutoff(&path).unwrap(), Some(cutoff()));
     assert!(store.archive_before(None, rolling_now()).is_ok());
-    // Format: no new table, only rows in the existing cold table.
-    let db = open(&path).unwrap();
-    let tables: BTreeSet<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap()
-        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-    assert_eq!(tables, BTreeSet::from(["hot_store_meta", "hot_store_rows", "asks_archive_meta", "asks_archive_rows"].map(String::from)));
-    drop(db);
+    // The shared database can contain other features' tables already, but
+    // rolling archival only adds rows to the existing cold tables.
+    assert_eq!(table_names(), tables_before);
     // Idempotent: a second pass finds nothing; the outgoing restore brings
     // rolled rows back like any other cold rows.
     assert_eq!(store.rolling_archive_pass(chrono::Duration::hours(48), 200, rolling_now()).unwrap().moved.rows, 0);

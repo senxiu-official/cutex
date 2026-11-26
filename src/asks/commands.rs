@@ -64,7 +64,7 @@ pub fn run(runtime: &dyn AskRuntime, store: &AskStore, command: &RuntimeCommand,
         }
         RuntimeCommand::ResumeGate { .. } => Ok(false),
         RuntimeCommand::StopAttempt { ask_id, attempt } => stop_attempt(runtime, store, ask_id, *attempt, now),
-        RuntimeCommand::RespondQuestion { question_id } => respond_question(runtime, store, question_id, now),
+        RuntimeCommand::RespondQuestion { question_id, human_actor } => respond_question(runtime, store, question_id, human_actor.as_ref(), now),
         RuntimeCommand::CancelJobs { ask_id, cutex_session_id, jobs } => {
             super::awaits::run_cancel(runtime, store, ask_id, cutex_session_id, jobs, now)
         }
@@ -233,7 +233,14 @@ fn stop_attempt(runtime: &dyn AskRuntime, store: &AskStore, ask_id: &str, attemp
     Ok(matches!(stop_state(store, |state| finish_stop(state, ask_id, &claimed, outcome, error, now))?, Ready(())))
 }
 
-fn respond_question(runtime: &dyn AskRuntime, store: &AskStore, question_id: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
+fn respond_question(
+    runtime: &dyn AskRuntime,
+    store: &AskStore,
+    question_id: &str,
+    human_actor: Option<&crate::management::v2::interaction_history::Actor>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    use crate::management::v2::interaction_history::Actor;
     let state = store.snapshot()?;
     let Some(question) = state.questions.get(question_id).cloned() else {
         return Ok(true);
@@ -244,13 +251,20 @@ fn respond_question(runtime: &dyn AskRuntime, store: &AskStore, question_id: &st
     let Some(ask) = state.asks.get(&question.ask_id) else {
         return Ok(true);
     };
-    let result = json!({ "answers": resolution.answers });
+    let actor = human_actor.cloned().unwrap_or_else(|| {
+        if resolution.by == "owner" {
+            Actor::Owner
+        } else {
+            Actor::Agent { cutex_session_id: resolution.by.clone() }
+        }
+    });
+    let answered_at = DateTime::parse_from_rfc3339(&resolution.at).map_or(now, |at| at.with_timezone(&Utc));
     let outcome = runtime.respond_question(
         &ask.target_cutex_session_id,
         question.runtime_generation,
         &format!("ask-{question_id}"),
         &question.native.request_id,
-        &result,
+        super::scheduler::QuestionResponse { answers: &resolution.answers, actor, answered_at },
     );
     let done = !matches!(outcome, RespondOutcome::NotSent(_));
     if let RespondOutcome::AlreadyResolved | RespondOutcome::Unknown(_) = &outcome {
@@ -267,7 +281,6 @@ fn respond_question(runtime: &dyn AskRuntime, store: &AskStore, question_id: &st
                 );
             }
         })?;
-        let _ = now;
     }
     Ok(done)
 }

@@ -304,7 +304,10 @@ class Server:
                            effort=self._effort(tid), status=status)
 
     def _thread_response(self, tid: str, include_turns: bool = False) -> dict:
-        return {"thread": self._thread_wire(tid, include_turns), "model": self.store.thread(tid)["model"],
+        owner = getattr(getattr(self.engine, "driver", None), "owners", {}).get(tid)
+        diagnostics = getattr(owner, "diagnostics", None)
+        return {**({"claudeRuntimeDiagnostics": diagnostics.snapshot()} if diagnostics else {}),
+                "thread": self._thread_wire(tid, include_turns), "model": self.store.thread(tid)["model"],
                 "modelProvider": PROVIDER, "serviceTier": self._service_tier(tid), "cwd": str(self.settings.workspace),
                 "instructionSources": [], **self._permission_wire(tid),
                 "sandbox": self._sandbox_wire(tid), "reasoningEffort": self._effort(tid)}
@@ -556,14 +559,26 @@ class Server:
                 await self._emit_settings(tid)
             return result, started
         if method == "claude/thread/ensure":
-            require(set(params) <= {"threadId", "model", "cwd", "instructions"}, "unsupported ensure fields")
+            require(set(params) <= {"threadId", "model", "cwd", "instructions", "launchSelection"}, "unsupported ensure fields")
             self._validate_launch(params)
             tid = text(params.get("threadId"), "threadId", limit=256)
             instructions = params.get("instructions", "")
             if instructions != "":
                 instructions = text(instructions, "instructions")
             ensure_thread = getattr(self.engine, 'ensure_launch_thread', self.store.ensure_thread)
-            created = ensure_thread(tid, self.settings.model, str(self.settings.workspace), instructions)
+            selection = params.get("launchSelection")
+            if "launchSelection" in params:
+                require(self.settings.backend == "subscription" and
+                        hasattr(self.engine, "ensure_launch_thread"),
+                        "offline launch selection requires a Claude subscription adapter", -32601)
+                require(isinstance(selection, dict) and set(selection) == {"effort"},
+                        "launchSelection requires an explicit effort or null")
+                require(selection["effort"] in (None, "low", "medium", "high", "xhigh", "max"),
+                        "unsupported Claude effort")
+                created = ensure_thread(tid, self.settings.model, str(self.settings.workspace),
+                                        instructions, launch_selection=selection)
+            else:
+                created = ensure_thread(tid, self.settings.model, str(self.settings.workspace), instructions)
             peer.subscriptions.add(tid)
             return {"threadId": tid, "created": created}, None
         if method == "thread/resume":
@@ -618,6 +633,20 @@ class Server:
             background = live and child in bridge.background
             return {'verified':bool(foreground or background), 'parentThreadId':tid, 'childId':child,
                     'nativeSessionId':getattr(bridge, 'sid', None)}, None
+        if method == "claude/effort/applyInherited":
+            require(self.settings.backend == "subscription", "effort control requires subscription backend", -32601)
+            require(set(params) == {"threadId", "model", "connectionId", "generation", "effort"},
+                    "unsupported inherited effort fields")
+            tid = text(params["threadId"], "threadId", limit=256)
+            effort = params["effort"]
+            require(effort in (None, "low", "medium", "high", "xhigh", "max"), "invalid inherited effort")
+            generation = params["generation"]
+            require(type(generation) is int and generation > 0, "invalid native connection generation")
+            owner = getattr(self.engine.driver, "owners", {}).get(tid)
+            require(owner is not None, "runtime is offline", -32009)
+            return await owner.control("apply_inherited_effort", effort=effort,
+                model=text(params["model"], "model", limit=256),
+                connection_id=text(params["connectionId"], "connectionId", limit=256), generation=generation), None
         if method in {"claude/runtime/start", "claude/runtime/status", "claude/runtime/close"}:
             require(self.settings.backend == "subscription", "runtime control requires subscription backend", -32601)
             require(set(params) <= {"threadId"}, "unsupported runtime control fields")
@@ -824,6 +853,8 @@ class Server:
             text(source["id"], "source.id", limit=256)
             metadata = params.get("metadata", {})
             require(isinstance(metadata, dict), "metadata must be an object")
+            require(not {'automaticInputOrder', 'automaticNoteBatch', 'automaticBatchMember',
+                         'automaticNoteStartOnly'} & metadata.keys(), "automatic batch metadata is reserved")
             require(len(dump(metadata).encode()) <= 8192, "metadata too large")
             payload = {"source": source, "eventType": text(params.get("eventType", "message"), "eventType", limit=256),
                        "text": text(params.get("text"), "text"), "metadata": metadata}

@@ -21,6 +21,7 @@ pub struct GlobalConfigPatch {
     pub claude_usage_refresh_minutes: Option<u8>,
     pub profile_quota_refresh_minutes: Option<u8>,
     pub archive_delete_empty: Option<bool>,
+    pub heavy_read_concurrency: ConfigValueUpdate<usize>,
     /// r290 P10 (B4/A8): `ownerShares` (replaces the list; validated on apply).
     pub owner_shares: Option<Vec<String>>,
     pub queue_owner_may_pass_asks: Option<bool>,
@@ -73,6 +74,9 @@ pub fn apply_global_config_patch(
     config: &mut CodezConfig,
     patch: &GlobalConfigPatch,
 ) -> anyhow::Result<bool> {
+    if let ConfigValueUpdate::Set(limit) = patch.heavy_read_concurrency {
+        crate::management::v2::control_capacity::validate_heavy_read_limit(limit)?;
+    }
     if let ConfigValueUpdate::Set(port) = &patch.desktop_notify_port {
         validate_desktop_notify_port(*port)?;
     }
@@ -144,6 +148,7 @@ pub fn apply_global_config_patch(
         patch.profile_quota_refresh_minutes,
     );
     changed |= apply_value_update(&mut config.archive_delete_empty, patch.archive_delete_empty);
+    changed |= apply_optional_update(&mut config.heavy_read_concurrency, &patch.heavy_read_concurrency);
     // r290 P10 (B4/A8)
     if let Some(shares) = &patch.owner_shares {
         let shares = crate::artifacts::paths::normalize_owner_shares(shares).map_err(anyhow::Error::msg)?;

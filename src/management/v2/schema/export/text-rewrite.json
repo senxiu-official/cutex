@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:text-rewrite",
+  "title": "One-shot composer text rewrite",
+  "description": "OwnerOnly POST /v2/text-rewrite. Requires textRewriteV1. UTF-8 input is limited to 16384 bytes. With featureProfiles, explicit and fallback choices use Feature Profile IDs.",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "templateId": {
+          "const": "prompt-enhance-v1"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "route": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "const": "agent"
+                },
+                "sessionId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "fallbackProfileIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": "Legacy compatibility. Entries outside the Feature Profile namespace are ignored."
+                },
+                "fallbackFeatureProfileIds": {
+                  "type": "array",
+                  "maxItems": 3,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^fp-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+                  }
+                }
+              },
+              "required": [
+                "mode",
+                "sessionId"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "const": "profile"
+                },
+                "profileIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "minItems": 1,
+                  "description": "Deprecated alias for Feature Profile IDs on a backend advertising featureProfiles."
+                }
+              },
+              "required": [
+                "mode",
+                "profileIds"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "const": "featureProfiles"
+                },
+                "featureProfileIds": {
+                  "$ref": "#/$defs/featureProfileIds"
+                }
+              },
+              "required": [
+                "mode",
+                "featureProfileIds"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "templateId",
+        "text",
+        "route"
+      ]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "rewrittenText": {
+          "type": "string",
+          "minLength": 1
+        },
+        "missingDetails": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "type": "string"
+          }
+        },
+        "used": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "profileId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requestedModel": {
+              "type": "string",
+              "minLength": 1
+            },
+            "fallbackUsed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "profileId",
+            "provider",
+            "model",
+            "requestedModel",
+            "fallbackUsed"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion",
+        "rewrittenText",
+        "missingDetails",
+        "used"
+      ]
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "authentication",
+            "quota_exhausted",
+            "rate_limited",
+            "profile_unavailable",
+            "content_refused",
+            "invalid_output",
+            "timeout",
+            "upstream",
+            "cancelled"
+          ]
+        }
+      },
+      "required": [
+        "profileId",
+        "category"
+      ]
+    },
+    "failureDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attempt"
+          }
+        }
+      },
+      "required": [
+        "attempts"
+      ]
+    },
+    "featureProfileIds": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {
+        "type": "string",
+        "pattern": "^fp-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+      }
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    },
+    {
+      "$ref": "#/$defs/failureDetails"
+    }
+  ]
+}

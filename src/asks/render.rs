@@ -201,7 +201,11 @@ pub fn ask_text_at(
     let ask = &visible;
     let mut out = String::new();
     out.push_str(&format!("[delegation {} · attempt {attempt}] from {}", ask.ask_id, if matches!(ask.requester, Requester::Peer { .. }) { ask.requester.label() } else { requester.name.clone() }));
-    if let Requester::Peer { label, .. } = &ask.requester { let label = crate::peers::wire::sanitize_name(label); out.push_str(&format!("\nRemote host: {label}. This delegation comes from another host; paths in its text refer to that host, not this machine.")); }
+    if let Requester::Peer { label, peer_id, .. } = &ask.requester {
+        let label = crate::peers::wire::sanitize_name(label);
+        let peer_id = crate::peers::wire::sanitize_name(peer_id);
+        out.push_str(&format!("\nRemote host: {label} ({peer_id}). Paths in this delegation refer to that host."));
+    }
     if let Some(profile_model) = &requester.profile_model {
         out.push_str(&format!(" ({profile_model})"));
     }
@@ -442,6 +446,7 @@ pub enum ReturnItem {
         state: String,
         // r290 P7
         failure: Option<super::handler_failure::HandlerFailure>,
+        notice: Option<super::terminal_notices::Notice>,
     },
 }
 
@@ -488,6 +493,12 @@ pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
         )),
         super::awaits::WAITING_STATE => Some(format!(
             "{target} ended its turn to wait for jobs of this delegation (a stage, not the result); it continues by itself when they finish. To make it continue now: delegation_resume(delegation=\"{ask_id}\"); to cancel it and its jobs: delegation_stop(delegation=\"{ask_id}\", stop_jobs=true)."
+        )),
+        "continuationExpired" => Some(format!(
+            "The automatic continuation budget for {ask_id} expired. The project Director or owner can approve a new segment."
+        )),
+        "continuationApproved" => Some(format!(
+            "A new automatic continuation segment was approved for {ask_id}. Cutex will admit the next attempt under the usual runtime and routing checks."
         )),
         super::delivery::HANDED_OVER => Some(format!(
             "Control of {ask_id} (to {target}) passed to you as the project's current Director (handover); the original requester and handler stay as they were. Results and questions of it come to you from now on; what was already given to the earlier controller stays there and is not sent again. Read it with delegation_read(delegation=\"{ask_id}\")."
@@ -609,11 +620,18 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
                 "## Question from {target} on {ask_id} ({title}) · {question_id}\n{shown}\nAnswer with question_answer(question=\"{question_id}\", answers=...). Your answer is task input, never an approval."
             )
         }
-        ReturnItem::State { ask_id, title, target, state, failure } => {
+        ReturnItem::State { ask_id, title, target, state, failure,notice } => {
             let target = crate::short_ids::display(target);
             let visible_id = crate::short_ids::display(ask_id);
             let ask_id = visible_id.as_str();
             let mut piece = format!("## {ask_id} ({title}) to {target} is now {state}");
+            if let Some(notice)=notice {
+                piece.push_str(&format!("\nRecorded at {}. Actor: {}.",notice.at,serde_json::to_string(&notice.actor).unwrap()));
+                if failure.is_none() {
+                    piece.push_str(&format!("\nReason (data): {}\nRead current state with delegation_read(delegation=\"{ask_id}\").",
+                        crate::peers::model::sanitize_diagnostic(&notice.reason)));
+                }
+            }
             // r290 P7: provider text remains data, never recovery instructions.
             if let Some(failure) = failure {
                 let provider_data = crate::peers::model::sanitize_diagnostic(&failure.message);
@@ -621,7 +639,9 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
                     serde_json::to_value(failure.kind).unwrap().as_str().unwrap_or("other"), provider_data,
                     failure.last_activity.line.as_deref().unwrap_or("none recorded"),
                     failure.last_activity.last_activity_at.as_deref().unwrap_or("unknown"), failure.delegation_open));
-                if failure.auto_requeued {
+                if !failure.delegation_open {
+                    piece.push_str(&format!("\nThis delegation is already closed. Read its recorded state with delegation_read(delegation=\"{ask_id}\"); this failure notice does not resume it."));
+                } else if failure.auto_requeued {
                     piece.push_str("\nCutex will deliver this again automatically when the usage limit resets. Stop this delegation with delegation_stop before delegating the work elsewhere; otherwise both copies may run.");
                     if let Some(at) = &failure.resumes_at { piece.push_str(&format!(" Automatic recovery scheduled for {at}.")); }
                 } else {
@@ -782,6 +802,7 @@ mod tests {
             target: "Kimi".into(),
             state: crate::asks::EVENT_TOO_LARGE.into(),
             failure: None,
+            notice: None,
         }]);
         assert!(text.contains("is now event_too_large\nThe delegation message was larger than Kimi accepts"));
     }

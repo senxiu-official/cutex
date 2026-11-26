@@ -1209,7 +1209,11 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "hello").unwrap();
         std::fs::write(dir.join("a.log"), "").unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let listing = dir_resource(&root, &params(&[])).unwrap();
+        // This fixture checks Git ignore semantics, not the production timeout.
+        let listing = super::super::workspace_git::with_test_ignore_budget(
+            std::time::Duration::from_secs(5),
+            || dir_resource(&root, &params(&[])).unwrap(),
+        );
         let names: Vec<&str> = listing["entries"]
             .as_array()
             .unwrap()

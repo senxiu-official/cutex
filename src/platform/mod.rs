@@ -8,6 +8,7 @@ pub mod file_lock;
 pub mod lock_accounting;
 pub mod file_stamp;
 pub mod heap;
+pub(crate) mod memory_pressure;
 pub mod shared_assets;
 pub mod host;
 #[cfg(target_os = "macos")]

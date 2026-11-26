@@ -66,7 +66,7 @@ pub fn projection(data: &ContinuationData) -> Value {
         "deadlineAt": record.deadline_at, "maxRounds": MAX_ROUNDS,
         "maxElapsedSeconds": MAX_ELAPSED_SECONDS, "waitingFor": record.declaration.wake,
         "nextWakeAt": record.next_wake_at, "sourceAttemptId": record.declaration.source.attempt_id,
-        "revision": record.revision, "limitReason": record.limit_reason})
+        "revision": record.revision, "limitReason": record.limit_reason, "blockedReason": record.blocked_reason})
 }
 
 /// Tool/HTTP entry. Caller and guards are authenticated server values; caller
@@ -156,7 +156,7 @@ pub fn declare_current(
     )
 }
 
-fn projection_record(record: &ContinuationRecord) -> Value {
+pub(super) fn projection_record(record: &ContinuationRecord) -> Value {
     projection(&ContinuationData {
         current: Some(record.clone()),
         ..ContinuationData::default()
@@ -297,6 +297,11 @@ pub fn guards_for(
     archived: bool,
     permitted: bool,
 ) -> Guards {
+    let first_approved_wake = is_approved_wake(&ask.bounded_continuation);
+    // Generation is a dispatch fence. A newer observed binding supersedes
+    // the status sample, but the yielded attempt can predate that binding.
+    let observed_generation = state.presence.get(&ask.target_cutex_session_id)
+        .and_then(|presence| presence.runtime_generation);
     Guards {
         stopped: !ask.is_open()
             || ask.current_attempt().is_some_and(|a| a.stop_requested)
@@ -308,15 +313,85 @@ pub fn guards_for(
             || status.profile_switch_pending
             || status.blocked.is_some()
             || !status.exclusive_admission,
-        online: status.online,
+        online: status.online && !(first_approved_wake && state.owner_offline.contains(&ask.target_cutex_session_id)),
         permission_valid: permitted,
-        occurrence_valid: ask.current_attempt().is_some(),
+        occurrence_valid: ask.current_attempt().is_some_and(|attempt|
+            !first_approved_wake || (attempt.runtime_generation <= status.runtime_generation
+                && observed_generation.is_none_or(|generation| generation <= status.runtime_generation))),
         running_turn: status.active_turn_id.is_some()
             || state.leases.contains_key(&ask.target_cutex_session_id),
         submission_unknown: ask
             .current_attempt()
             .is_some_and(|a| a.state == AttemptState::Submitting),
         restarting: !status.online && status.reconnectable,
+    }
+}
+
+pub(in crate::asks) fn is_approved_wake(data: &ContinuationData) -> bool {
+    data.approval.as_ref().is_some_and(|approval| {
+        approval.decision == Some(crate::asks::routing_policy::RoutingDecision::Approve)
+            && data.current.as_ref().is_some_and(|record| {
+                approval.budget_epoch.checked_add(1) == Some(record.budget_epoch)
+                    && record.wake.as_ref().is_some_and(|wake| !wake.increments_round)
+            })
+    })
+}
+
+pub(in crate::asks) fn waiting_blocker(ask: &AskRecord) -> Option<WakeBlocker> {
+    let data = &ask.bounded_continuation;
+    let record = data.current.as_ref()?;
+    if !matches!(record.state, Phase::Waiting | Phase::Ready | Phase::Resuming) {
+        return None;
+    }
+    // AskStore may have a queue or adapter hold before the next bounded tick.
+    record.blocked_reason.or_else(|| {
+        if !is_approved_wake(data) { return None; }
+        match ask.hold.as_ref() {
+            Some(model::Hold::TargetBusy { .. }) => Some(WakeBlocker::TargetBusy),
+            Some(model::Hold::Paused { .. }) => Some(WakeBlocker::Paused),
+            Some(model::Hold::RuntimeUnsupported { .. }) => Some(WakeBlocker::RuntimeUnsupported),
+            Some(model::Hold::ProfileSwitchPending) => Some(WakeBlocker::ProfileSwitchPending),
+            Some(model::Hold::Blocked { by }) => Some(status_blocker(by)),
+            Some(model::Hold::WaitingForApproval) => Some(WakeBlocker::Routing),
+            Some(model::Hold::HeldByRuntime { .. }) => Some(WakeBlocker::Admission),
+            _ if record.reconciling => Some(WakeBlocker::Reconciling),
+            _ => None,
+        }
+    })
+}
+
+fn status_blocker(reason: &model::BlockedReason) -> WakeBlocker {
+    match reason {
+        model::BlockedReason::Login => WakeBlocker::Login,
+        model::BlockedReason::Quota => WakeBlocker::Quota,
+        model::BlockedReason::RuntimeDown => WakeBlocker::RuntimeDown,
+        model::BlockedReason::Budget => WakeBlocker::Budget,
+    }
+}
+
+fn held_reason(state: &AskState, ask: &AskRecord, status: &TargetStatus, guards: Guards) -> Option<WakeBlocker> {
+    let target = &ask.target_cutex_session_id;
+    if state.pauses.contains_key(target) || crate::asks::agent_pause::is_paused(state, target) {
+        return Some(WakeBlocker::Paused);
+    }
+    if !guards.online {
+        return Some(WakeBlocker::RuntimeOffline);
+    }
+    if let Some(reason) = status.blocked.as_ref() {
+        return Some(status_blocker(reason));
+    }
+    if status.plan_mode {
+        Some(WakeBlocker::PlanMode)
+    } else if status.profile_switch_pending {
+        Some(WakeBlocker::ProfileSwitchPending)
+    } else if !guards.permission_valid || !guards.occurrence_valid {
+        Some(WakeBlocker::Admission)
+    } else if guards.running_turn {
+        Some(WakeBlocker::TargetBusy)
+    } else if !status.exclusive_admission {
+        Some(WakeBlocker::RuntimeUnsupported)
+    } else {
+        None
     }
 }
 
@@ -336,6 +411,28 @@ fn tick_projection(
         }
     }
     let eligibility=data.evaluate(guards,now,director);
+    let approved_wake = is_approved_wake(&data);
+    if let Some(record) = data.current.as_mut() {
+        let reason = match eligibility {
+            Eligibility::Held => held_reason(state, ask, status, guards),
+            Eligibility::Waiting if approved_wake => {
+                held_reason(state, ask, status, guards)
+            },
+            Eligibility::Reconciling
+                if matches!(record.state, Phase::Ready | Phase::Resuming)
+                    || !matches!(record.declaration.wake, Some(WakeCondition::Children { .. }))
+                        && record.next_wake_at.is_some_and(|at| now >= at) =>
+            {
+                Some(if guards.restarting { WakeBlocker::Reconnecting } else { WakeBlocker::Reconciling })
+            }
+            Eligibility::Ready if record.blocked_reason == Some(WakeBlocker::Routing) => {
+                // Only the final authority-fenced routing check can clear this.
+                Some(WakeBlocker::Routing)
+            }
+            _ => None,
+        };
+        record.blocked_reason = reason;
+    }
     let mut resume=ask.resume.clone();let mut hold=ask.hold.clone();
     match eligibility {
         Eligibility::Ready if resume.is_none()=>{
@@ -431,6 +528,22 @@ pub fn admission_permission(
         })
 }
 
+pub(crate) fn record_routing_wait(state: &mut AskState, ask_id: &str, wake_id: &str, now: DateTime<Utc>) {
+    let Some(record) = state.asks.get(ask_id).and_then(|ask| ask.bounded_continuation.current.as_ref()) else {
+        return;
+    };
+    if record.state != Phase::Ready || record.blocked_reason == Some(WakeBlocker::Routing)
+        || !record.wake.as_ref().is_some_and(|wake| wake.id == wake_id) {
+        return;
+    }
+    state.update_ask(ask_id, now, |ask| {
+        if let Some(record) = ask.bounded_continuation.current.as_mut() {
+            record.blocked_reason = Some(WakeBlocker::Routing);
+        }
+    });
+    notify_continuation_changed(state, ask_id);
+}
+
 pub fn bounded_wake(ask: &AskRecord) -> Option<String> {
     let current = ask.bounded_continuation.current.as_ref()?;
     (current.state == Phase::Ready)
@@ -492,6 +605,17 @@ pub fn unknown(ask: &mut AskRecord) {
     }
 }
 
+fn notify_continuation_changed(state: &mut AskState, ask_id: &str) {
+    let Some(ask) = state.asks.get(ask_id) else { return };
+    let mut recipients = AskState::ask_sessions(ask);
+    recipients.push(crate::management::v2::services::HOST_EVENT_SESSION_ID.into());
+    state.notice(
+        "cutex/delegation/continuationChanged",
+        recipients,
+        json!({"projectId": ask.project_id, "resourceId": ask_id, "revision": ask.revision}),
+    );
+}
+
 pub fn changed_and_notice(
     state: &mut AskState,
     ask_id: &str,
@@ -505,15 +629,8 @@ pub fn changed_and_notice(
         })
         .flatten();
     super::super::stop_settlement::close_cancelled_continuation(state, ask_id, now);
-    let Some(ask) = state.asks.get(ask_id).cloned() else {
-        return;
-    };
-    state.notice(
-        "cutex/delegation/continuationChanged",
-        AskState::ask_sessions(&ask),
-        json!({"projectId": ask.project_id, "resourceId": ask_id, "revision": ask.revision}),
-    );
-    if let Some(notice) = notice {
+    notify_continuation_changed(state, ask_id);
+    if let Some((notice, ask)) = notice.zip(state.asks.get(ask_id)) {
         let mut sessions = vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.to_string()];
         if let Some(director) = &notice.director_session_id {
             if !sessions.contains(director) {

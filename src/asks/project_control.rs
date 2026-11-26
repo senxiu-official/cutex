@@ -291,6 +291,42 @@ fn occurrence(state:&AskState,session:&str)->Option<(u64,String)> {
 mod tests{
     use super::*;
     use crate::asks::routing_policy::RoutingActor;
+    #[test]
+    fn owner_all_pause_covers_live_and_later_members_and_resume_keeps_agent_pause() {
+        use crate::agent_management::{AgentManagementSnapshot, CurrentProjectMembership, ProjectId};
+        use crate::role_revision::{CutexSessionId, Rfc3339};
+        fn add(roster:&mut AgentManagementSnapshot,id:&str,archived:bool) {
+            let id=CutexSessionId::new(id).unwrap();
+            roster.current_project_memberships.insert(id.clone(),CurrentProjectMembership{
+                cutex_session_id:id.clone(),project_id:Some(ProjectId::new("p").unwrap()),revision:1,
+                updated_at:Rfc3339::new("2026-11-25T00:00:00Z").unwrap(),
+            });
+            roster.reversible_archive_projection.insert(id,archived);
+        }
+        let now="2026-11-25T00:00:00Z".parse().unwrap();
+        let mut roster=AgentManagementSnapshot::empty();
+        for id in ["cutex.director","cutex.operator","cutex.worker"] { add(&mut roster,id,false); }
+        add(&mut roster,"cutex.archived",true);
+        let mut membership=crate::management::v2::delegations::membership(&roster,"p");
+        assert!(!membership.members.contains("cutex.archived"));
+        membership.excluded=["cutex.director".into(),"cutex.operator".into()].into();
+        let ctx=RoutingContext{project_id:"p".into(),authority_epoch:0,current_director:None,actor:RoutingActor::Owner,operator_may_route:false};
+        let mut state=AskState::default();
+        state.presence.insert("cutex.worker".into(),super::super::store::Presence{online:true,busy:true,..Default::default()});
+        let result=pause(&mut state,&ctx,&PauseRequest{action_id:"pause-all".into(),expected_epoch:0,mode:Mode::AfterTurn,scope:Scope::All},&membership,"host",now).unwrap();
+        for id in ["cutex.director","cutex.operator","cutex.worker"] { assert!(is_paused(&state,id)); }
+        assert!(state.presence["cutex.worker"].busy,"afterTurn leaves the current turn running");
+        assert!(result["memberOutcomes"].as_array().unwrap().iter().any(|v|v["sessionId"]=="cutex.worker"&&v["phase"]=="pendingTurnEnd"));
+        add(&mut roster,"cutex.late",false);
+        assert!(is_paused_with_roster(&state,"cutex.late",&roster),"fresh admission must hold a new member before reconciliation");
+        let membership=crate::management::v2::delegations::membership(&roster,"p");
+        reconcile(&mut state,"p",&membership);
+        super::super::agent_pause::pause(&mut state,"cutex.late","owner",None,now);
+        resume(&mut state,&ctx,&ResumeRequest{action_id:"resume-all".into(),pause_id:result["runControl"]["pauseId"].as_str().unwrap().into(),expected_epoch:1},"host",now).unwrap();
+        assert!(!is_paused_with_roster(&state,"cutex.late",&roster));
+        assert!(super::super::agent_pause::is_paused(&state,"cutex.late"));
+        assert!(!state.presence["cutex.director"].online,"resume must not bring offline agents online");
+    }
     fn assert_outcome_contract(value:&Value,host:&str,now:DateTime<Utc>,changed:bool) {
         let expected:BTreeSet<_>=["sessionId","hostId","phase","reasonCode","lastActivityAt","observedAt","changed","retryable"].into();
         assert_eq!(value.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(),expected);

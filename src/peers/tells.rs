@@ -17,6 +17,7 @@
 //! `inbound.tellWakesPerHour` it delivers a note (`wakeDowngraded`,
 //! `rate_limited`). No hop or cooldown control.
 use super::{store::Peer, store::Store, Error, Result};
+use super::receipt::{CrossHost, DeliveryState, Direction};
 use crate::asks::{store::AskError, tools::ToolContext};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -491,6 +492,14 @@ pub fn send(
                     } else {
                         e
                     }
+                })
+                .map_err(|mut error| {
+                    let (state, reason) = super::receipt::tell_failure(&error);
+                    super::receipt::insert(&mut error.details, CrossHost::new(
+                        Direction::Outbound, &peer.peer_id, &peer.label, state,
+                        Some(reason), None,
+                    ));
+                    error
                 })?;
                 let name = super::wire::sanitize_name(
                     response["target"]["name"]
@@ -540,14 +549,18 @@ pub fn send(
                     value["wakeDowngraded"] = json!(true);
                     value["reason"] = json!(reason);
                 }
+                super::receipt::insert(&mut value, CrossHost::new(
+                    Direction::Outbound, &peer.peer_id, &peer.label,
+                    DeliveryState::DeliveredToPeer, None, Some(&super::now()),
+                ));
                 Ok(value)
             })();
             result.map_err(|error| {
             if error.code == "remote_unsupported" && error.status == 404 {
-                return unsupported(UNSUPPORTED_DETAIL);
+                return unsupported(UNSUPPORTED_DETAIL).with(error.details);
             }
             if error.code == "wake_unsupported" {
-                return unsupported(WAKE_UNSUPPORTED_DETAIL);
+                return unsupported(WAKE_UNSUPPORTED_DETAIL).with(error.details);
             }
             if error.code == "wake_not_allowed" {
                 let reason = match error.details["reason"].as_str() {
@@ -555,15 +568,17 @@ pub fn send(
                     Some("agent_disabled") => "that agent does not take agent input",
                     _ => "that host does not let your host wake its agents",
                 };
+                let mut details = error.details;
+                details["reason"] = json!(details["reason"].as_str().unwrap_or("policy"));
                 return AskError::new(
                     "wake_not_allowed",
                     format!("You may not wake {to}: {reason}. Nothing was sent. A note (wake=false) is still possible; for work you need done, use agent_delegate."),
                 )
-                .with(json!({"reason": error.details["reason"].as_str().unwrap_or("policy")}));
+                .with(details);
             }
-            let transport = error.is_transport();
+            let uncertain = super::receipt::tell_failure(&error).0 == DeliveryState::OutcomeUnknown;
             let mut e = super::asks::ask_error(error);
-            if transport {
+            if uncertain {
                 // The note may have arrived; the same action_id retries safely.
                 e.detail = "the other host did not answer; it may or may not have the note. Retrying with the same action_id is safe (it is never delivered twice)".into();
                 if !e.extra.is_object() {

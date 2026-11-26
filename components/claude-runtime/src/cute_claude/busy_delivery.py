@@ -133,6 +133,11 @@ class BusyDelivery:
             thread = self.store.thread(tid)
             if not active or thread['halted'] or thread['archived'] or tid in self.store.history_mutations:
                 return ''
+            past_answer = self.store.db.execute("""SELECT 1 FROM items WHERE turn_id=?
+                AND json_extract(payload,'$.type')='agentMessage'
+                AND json_extract(payload,'$.phase')='final_answer' LIMIT 1""", (turn_id,)).fetchone() is not None
+            if not past_answer:
+                taken.extend(self.store._take_notes(tid, turn_id, automatic_only=True))
             rows = self.store.db.execute('''SELECT i.* FROM inputs i JOIN busy_inputs b
                 ON b.thread_id=i.thread_id AND b.message_id=i.message_id
                 WHERE i.thread_id=? AND i.state='queued' ORDER BY i.seq''', (tid,)).fetchall()
@@ -152,11 +157,21 @@ class BusyDelivery:
                     continue
                 # External provenance and ask metadata remain unchanged.
                 item = self.store.external_item(row['message_id'], payload)
-                self.store.put_item(turn_id, item)
+                frame = self.store.project_input(payload)[0]['text']
+                order = payload.get('metadata', {}).get('automaticInputOrder')
+                if order:
+                    if past_answer:
+                        continue
+                    companions = self.store.take_owner_carries(tid, row['message_id'], turn_id, publish=False)
+                    parts = self.store.order_automatic_batch(order, (item, frame), companions)
+                else:
+                    parts = [(item, frame)]
+                for entry, _ in parts:
+                    self.store.put_item(turn_id, entry)
                 self.store.db.execute("UPDATE inputs SET state='injecting' WHERE seq=?", (row['seq'],))
                 self.store.db.execute('UPDATE busy_inputs SET context_turn_id=? WHERE thread_id=? AND message_id=?',
                                       (turn_id, tid, row['message_id']))
-                taken.append((item, self.store.project_input(payload)[0]['text']))
+                taken.extend(parts)
         # No await after the claim: the hook records offered and returns in the
         # same event-loop step. Every claimed item is published at once:
         # scheduled here, never awaited, so it runs right after the hook has
@@ -223,6 +238,7 @@ class BusyDelivery:
                   AND b.offered=1 AND b.persisted=0
                   AND json_extract(i.payload,'$.source.kind')='agent'
                   AND json_extract(i.payload,'$.eventType')='agent_message'
+                  AND json_extract(i.payload,'$.metadata.automaticInputOrder') IS NULL
                 ORDER BY i.seq LIMIT ?''', (tid, self.server.settings.max_pending)).fetchall()
             for row in rows:
                 payload = json.loads(row['payload'])
@@ -254,16 +270,18 @@ class BusyDelivery:
             await self.items_published(tid)
         note_selected = '' if message_ids is None else ' AND message_id IN (' + ','.join('?' for _ in message_ids) + ')'
         notes = [] if message_ids is None else self.store.db.execute('''SELECT message_id FROM notes WHERE thread_id=? AND turn_id=?
-            AND state='injected' AND json_extract(payload,'$.metadata.ownerCarrier') IS NOT NULL
+            AND state='injected' AND (json_extract(payload,'$.metadata.ownerCarrier') IS NOT NULL
+                OR json_extract(payload,'$.metadata.automaticNoteBatch') IS NOT NULL)
             AND NOT EXISTS(SELECT 1 FROM external_inputs e WHERE e.thread_id=notes.thread_id
                 AND e.message_id=notes.message_id AND e.receipt IS NOT NULL)'''
             + note_selected, (tid, turn_id, *(message_ids or ()))).fetchall()
         if notes:
             await self.items_published(tid)
-        for row in [*rows, *notes]:
+        known = {row['message_id']: None for row in [*rows, *notes]}
+        mids = known if message_ids is None else dict.fromkeys(mid for mid in message_ids if mid in known)
+        for mid in mids:
             await self.server.engine.emit(tid, 'claude/input/contextPersisted',
-                {'threadId': tid, 'turnId': turn_id, 'messageId': row['message_id'],
-                 'clientId': self.client_id(tid, row['message_id'])})
+                {'threadId': tid, 'turnId': turn_id, 'messageId': mid, 'clientId': self.client_id(tid, mid)})
 
     def offered(self, tid, turn_id, *, call_id=None, context=None, bridge=None, hook_name=None):
         # Synchronous final step of the authenticated hook: no await between

@@ -2,7 +2,7 @@
 //! inserting between neighbours never renumbers an ask.
 
 use crate::asks::{
-    model::{DeliveryKind, DeliveryState, ExecutionState, Hold},
+    model::{AskRecord, DeliveryKind, DeliveryState, ExecutionState, Hold},
     store::AskState,
 };
 use serde::{Deserialize, Serialize};
@@ -11,8 +11,33 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdmissionRef {
-    pub kind: String,
+    kind: AdmissionRefKind,
     pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AdmissionRefKind {
+    Owner,
+    Ask,
+}
+
+impl AdmissionRef {
+    pub fn owner(id: String) -> Self {
+        Self { kind: AdmissionRefKind::Owner, id }
+    }
+
+    pub fn ask(id: String) -> Self {
+        Self { kind: AdmissionRefKind::Ask, id }
+    }
+
+    fn matches(&self, item: &AdmissionItem) -> bool {
+        let kind = match self.kind {
+            AdmissionRefKind::Owner => "owner",
+            AdmissionRefKind::Ask => "ask",
+        };
+        item.kind == kind && item.id == self.id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,12 +59,6 @@ pub struct AdmissionItem {
 }
 
 impl AdmissionItem {
-    pub fn reference(&self) -> AdmissionRef {
-        AdmissionRef {
-            kind: self.kind.clone(),
-            id: self.id.clone(),
-        }
-    }
     pub(crate) fn key_id(&self) -> String {
         format!("{}:{}", self.kind, self.id)
     }
@@ -48,6 +67,9 @@ impl AdmissionItem {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionSnapshot {
+    /// Negotiated capability and frozen busy deadline for the Pending Notes panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordered_automatic_input: Option<OrderedAutomaticTiming>,
     #[serde(default)]
     pub auto_retry: Option<super::model_overload_retry::AutoRetry>,
     #[serde(default)]
@@ -67,6 +89,14 @@ pub struct AdmissionSnapshot {
     /// otherwise. In memory only: a daemon restart drops it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_yielded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderedAutomaticTiming {
+    #[serde(default)]
+    pub busy: bool,
+    pub next_step_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +133,9 @@ pub struct AdmissionNextStep {
     /// `name@host`); omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_host: Option<String>,
+    /// Authenticated peer instance for a remote sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_peer_instance_id: Option<String>,
     /// The sender's cutex session id when it is an agent on this host (a
     /// local delegate, a same-host tell), for its avatar; never another
     /// host's session; omitted otherwise.
@@ -303,7 +336,7 @@ impl StoredAdmission {
         may_pass: bool,
     ) -> anyhow::Result<bool> {
         use super::user_input::QueueMoveError;
-        let original: Vec<_> = self.snapshot.items.iter().map(AdmissionItem::reference).collect();
+        let original: Vec<_> = self.snapshot.items.iter().map(|item| (item.kind.clone(), item.id.clone())).collect();
         let items = &mut self.snapshot.items;
         let from = items
             .iter()
@@ -312,7 +345,7 @@ impl StoredAdmission {
         let before = match before {
             Some(reference) => items
                 .iter()
-                .position(|item| item.reference() == *reference)
+                .position(|item| reference.matches(item))
                 .ok_or_else(|| QueueMoveError::AdmissionNotFound(reference.id.clone()))?,
             None => items.len(),
         };
@@ -348,7 +381,7 @@ impl StoredAdmission {
         for (index, item) in items.iter_mut().enumerate() {
             item.position = index as u64 + 1;
         }
-        if !items.iter().map(AdmissionItem::reference).eq(original) {
+        if !items.iter().map(|item| (&item.kind, &item.id)).eq(original.iter().map(|(kind, id)| (kind, id))) {
             self.snapshot.order_revision = super::user_input::next_revision(self.snapshot.order_revision)?;
         }
         self.snapshot.revision = super::user_input::next_revision(self.snapshot.revision)?;
@@ -356,17 +389,16 @@ impl StoredAdmission {
     }
 }
 
+pub(crate) fn is_numbered_ask(ask: &AskRecord) -> bool {
+    ask.remote.is_none() && (ask.execution == ExecutionState::Queued || ask.resume_pending())
+}
+
 pub(crate) fn ask_items(state: &AskState, session: &str) -> Vec<AdmissionItem> {
     let paused = state.pauses.contains_key(session)
         || crate::asks::agent_pause::is_paused(state, session);
     let mut items = Vec::new();
     let mut ordered: Vec<_> = state.asks.values().filter(|ask| {
-        ask.remote.is_none()
-            && ask.target_cutex_session_id == session
-            && (matches!(
-                ask.execution,
-                ExecutionState::Queued
-            ) || ask.resume_pending())
+        ask.target_cutex_session_id == session && is_numbered_ask(ask)
     }).collect();
     ordered.sort_by_key(|ask| ask.seq);
     for ask in ordered {
@@ -461,6 +493,7 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
         // A local delegation's delegate (a remote one is another host's).
         let from_cutex_session_id = ask.filter(|ask| ask.remote.is_none())
             .map(|ask| ask.target_cutex_session_id.trim()).filter(|id| !id.is_empty()).map(str::to_string);
+        let peer = ask.and_then(|ask| ask.remote.as_ref());
         let preview = match delivery.kind {
             DeliveryKind::Answer => state.answers.get(&delivery.ref_id)
                 .and_then(|answer| answer.preview.as_deref()).and_then(ridealong_preview),
@@ -474,7 +507,9 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
             held: if crate::asks::returns::native_held(delivery).is_some() { Some(crate::asks::control::HELD_OWNER_STOP.into()) }
                 else if crate::asks::returns::delivery_admissible(state,session,delivery) { None } else { held.clone() },
             wait_reason: (delivery.state == DeliveryState::QueuedAsEvent).then(|| "nativeReceipt".into()),
-            ask_id: Some(delivery.ask_id.clone()), from, from_host: None, from_cutex_session_id, preview,
+            ask_id: Some(delivery.ask_id.clone()), from, from_cutex_session_id, preview,
+            from_host: peer.map(|peer| crate::peers::wire::sanitize_name(&peer.label)),
+            from_peer_instance_id: peer.filter(|peer| crate::peers::valid_id(&peer.peer_id)).map(|peer| peer.peer_id.clone()),
             settlement: None,
             eligible: crate::asks::returns::delivery_admissible(state, session, delivery)
                 && crate::asks::delivery::actionable(state, delivery),
@@ -538,6 +573,20 @@ fn delivery_may_start_first(queue: &super::user_input::UserInputRepository, sess
         }
         Ok(admission.next_step.iter().any(|item| item.id == id && item.eligible))
     }
+}
+
+/// Owner precedence used by an idle automatic batch's triggering member.
+pub fn owner_defers_delivery(session: &str, admission: &AdmissionSnapshot) -> bool {
+    let waiting = || admission.items.iter().filter(|item| item.state == "waiting");
+    if owner_priority(session) {
+        if waiting().any(|item| item.kind == "owner") {
+            return true;
+        }
+        owner_started(session);
+    } else if owner_first(session) {
+        return waiting().next().is_some_and(|item| item.kind == "owner");
+    }
+    false
 }
 
 // Notifications are coalesced per session and consumed outside source-store

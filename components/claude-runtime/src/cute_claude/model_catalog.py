@@ -131,6 +131,7 @@ def reference_catalog() -> dict:
         window = row.get("contextWindow")
         if (not label(row["id"], 200) or any(ch.isspace() for ch in row["id"])
                 or not label(row["displayName"], 200)
+                or (row.get("displayVersion") is not None and not label(row["displayVersion"], 32))
                 or not isinstance(row["description"], str) or len(row["description"].encode("utf-8")) > 4000
                 or any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in row["description"])
                 or (row["family"] is not None and not label(row["family"], 100))
@@ -163,9 +164,16 @@ def _metadata_text(value) -> bool:
             and not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in value))
 
 
+def resolved_display(rows: dict, target: str) -> dict:
+    row = rows.get(target)
+    if not row or row["kind"] != "pinned":
+        return {}
+    return {"resolvedDisplayName": row["displayName"], "resolvedDisplayVersion": row.get("displayVersion")}
+
+
 def merge_catalog(reference: dict, *, cli_version: str | None, selected_model: str,
                   retained_models=(), sdk_names: dict | None = None,
-                  sdk_efforts: dict | None = None) -> dict:
+                  sdk_efforts: dict | None = None, sdk_resolved: dict | None = None) -> dict:
     """Keep reference IDs even if the SDK only advertises dynamic aliases."""
     sdk_names = {key: label for key, label in (sdk_names or {}).items()
                  if _metadata_text(key) and _metadata_text(label)}
@@ -189,6 +197,9 @@ def merge_catalog(reference: dict, *, cli_version: str | None, selected_model: s
             sources.append("sdkHandshake")
         if model in retained:
             sources.append("savedSelection")
+        resolved = (sdk_resolved or {}).get(model)
+        if resolved:
+            entry.update(resolvedModel=resolved, resolvedModelSource="sdkHandshake", **resolved_display(rows, resolved))
         levels = sdk_efforts.get(model)
         if isinstance(levels, list):
             entry["supportedEffortLevels"] = list(dict.fromkeys(
@@ -227,14 +238,21 @@ class ModelCatalog:
         retained = [row[0] for row in server.store.db.execute("SELECT DISTINCT model FROM threads")]
         retained.append(server.model_config.model())
         driver = getattr(server.engine, "driver", None)
-        names, efforts = {}, {}
+        names, efforts, resolved = {}, {}, {}
         # Read cached handshakes only; catalog reads must not start an owner.
-        for owner in getattr(driver, "owners", {}).values():
+        owners = getattr(driver, "owners", {})
+        sources = [owners[tid]] if tid in owners else list(owners.values()) if not tid else []
+        for owner in sources:
+            if owner.task.done():
+                continue
             names.update(getattr(owner, "model_catalog", {}))
             efforts.update(getattr(owner, "model_efforts", {}))
+            for alias, target in getattr(owner, "resolved_models", {}).items():
+                resolved.setdefault(alias, set()).add(target)
         version = await self.probe.read(getattr(driver, "cli", None))
         return merge_catalog(self.reference, cli_version=version, selected_model=selected,
-                             retained_models=retained, sdk_names=names, sdk_efforts=efforts)
+                             retained_models=retained, sdk_names=names, sdk_efforts=efforts,
+                             sdk_resolved={key: next(iter(values)) for key, values in resolved.items() if len(values) == 1})
 
 
 # Codex service tier id the desktop's Fast toggle selects (`fastTierOf`).
@@ -265,6 +283,9 @@ def native_models(entries: list[dict], *, default_model: str, configured_effort:
         data.append({"id": model, "model": model, "upgrade": None, "upgradeInfo": None,
             "availabilityNux": None, "displayName": "Mock " + model if mock else entry["displayName"],
             "description": entry["description"], "modelSpecialty": None, "hidden": entry.get("hidden", False),
+            "resolvedModel": entry.get("resolvedModel"), "resolvedModelSource": entry.get("resolvedModelSource"),
+            "resolvedDisplayName": entry.get("resolvedDisplayName"),
+            "resolvedDisplayVersion": entry.get("resolvedDisplayVersion"),
             "supportedReasoningEfforts": efforts,
             "defaultReasoningEffort": configured_effort if configured_effort in (levels or []) else "none",
             "inputModalities": ["text", "image"] if subscription else ["text"], "supportsPersonality": False,

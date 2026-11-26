@@ -1,12 +1,14 @@
 {
   "version": 1,
-  "release": "claude-r55",
+  "release": "claude-r59",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
+    "personalAssistantTools": true,
     "nativeSubagentScope": 1,
     "systemAppendFile": true,
     "turnStart": true,
     "launchModelUpdate": true,
+    "offlineLaunchSelection": true,
     "turnSteer": true,
     "queueWhileBusy": true,
     "turnInterrupt": true,
@@ -32,6 +34,7 @@
     "modelList": true,
     "versionedModelCatalog": true,
     "modelObservation": true,
+    "resolvedReasoningEffort": true,
     "effort": true,
     "fastMode": true,
     "tokenUsage": true,

@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.5 — Beautiful World** 改进中断与恢复过程中的用户输入顺序、有界便条接收和 Linux 运行时监管，提供 Native 0.169.0-r65 与 Claude claude-r55（适配器 0.8.17、Agent SDK 0.2.180、内置 CLI 2.1.321）。已有智能体保留运行时选择。手动退回 0.2.4 前，须先用 0.2.5 停止并核验全部新增 Linux 运行时 scope；详见[运行时监管](docs/agent-management-provider.md)。既有单向迁移和 worker 记录限制仍然有效。另见[更新日志](CHANGELOG.md)和[已知问题](docs/KNOWN-ISSUES.md)。
+**0.2.6 — Beautiful World** 新增个人助理与定期任务、项目控制和投递恢复改进，提供 Native 0.172.0-r70 与 Claude claude-r59（适配器 0.8.18、Agent SDK 0.2.187、内置 CLI 2.1.330），复用原始 Job Service 0.1.3。已有智能体保留运行时选择。**0.2.6 启动后，不支持退回 0.2.5。** 请保留升级前完整且一致的离线备份和升级程序备份；旧版 0.2.5 的内建备份不包含个人助理与任务日程存储，新增数据须另留这两份存储的一致快照。详见[更新日志](CHANGELOG.md)和[已知问题](docs/KNOWN-ISSUES.md)。
 
 > **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。

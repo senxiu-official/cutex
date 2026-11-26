@@ -143,6 +143,8 @@ pub struct Schedule {
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub last_run: Option<Run>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_template: Option<crate::personal_assistants::recurring::Template>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +164,14 @@ pub struct Run {
     pub last_error: Option<String>,
     pub message_id: Option<String>,
     pub lease_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_template: Option<crate::personal_assistants::recurring::Template>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesced_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_local: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

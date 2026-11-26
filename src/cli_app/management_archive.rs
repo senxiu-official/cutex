@@ -62,6 +62,7 @@ fn mutate_retire(
     // The transaction released the session store lock: settle the retired
     // session's delegations as target (asks store lock only).
     cutex::asks::lifecycle::settle_retired_target_default(&transition.cutex_session_id);
+    cutex::management::v2::archive_jobs::after_archive(&transition.cutex_session_id, transition.revision);
     Ok(archive_receipt(&transition))
 }
 
@@ -224,6 +225,8 @@ impl CutexSessionArchiveTransaction for ManagementArchiveTransaction {
                     holder: holder.cutex_session_id.clone(),
                 });
             }
+            cutex::management::v2::archive_records::restore(&current)
+                .map_err(|error| CutexSessionArchiveError::RestoreDataUnavailable { detail: format!("{error:#}") })?;
             let transition = commit_restore_record(
                 store
                     .sessions
@@ -566,6 +569,14 @@ fn archive_error(error: CutexSessionArchiveError) -> UserInputExecutionError {
             runtime_stop_failed("runtime remained online after safe stop confirmation")
         }
         CutexSessionArchiveError::RuntimeStopFailed { detail } => runtime_stop_failed(detail),
+        CutexSessionArchiveError::RestoreDataUnavailable { detail } => UserInputExecutionError {
+            stage: "storage".into(),
+            code: "archive_restore_data_unavailable".into(),
+            message: detail,
+            retryable: true,
+            details: serde_json::json!({"lifecycleCommitted": false}),
+            outcome_unknown: false,
+        },
         CutexSessionArchiveError::PersistenceUncertain { detail } => persistence_uncertain(detail),
         CutexSessionArchiveError::AgentNameTaken { name, holder } => UserInputExecutionError {
             stage: "route".to_string(),
@@ -635,7 +646,7 @@ impl cutex::agent_management::AgentArchiveRuntime for StoppingArchiveRuntime {
 }
 
 impl cutex::agent_management::AgentArchiveRuntime for OfflineArchiveRuntime {
-    fn prepare(&mut self, record: &CutexSessionRecord, _restoring: bool) -> anyhow::Result<()> {
+    fn prepare(&mut self, record: &CutexSessionRecord, restoring: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             cutex::runtime::lifecycle::cutex_session_host_is_local(
                 &record.host_id,
@@ -644,6 +655,9 @@ impl cutex::agent_management::AgentArchiveRuntime for OfflineArchiveRuntime {
             "archive must run on the agent's host ({})",
             record.host_id
         );
+        if restoring {
+            cutex::management::v2::archive_records::restore(record)?;
+        }
         Ok(())
     }
 

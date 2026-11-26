@@ -165,6 +165,17 @@ fn fire(session: &str) {
     // exact pending value is checked again under the final reservation.
     let skip=skip_reason(session,&expected);
     let asks=match cutex::asks::store::AskStore::open_default(){Ok(store)=>store,Err(_)=>return};
+    let workflow_asks = match asks.peek() {
+        Ok(state) => open_workflow_asks(state.as_ref(), session, &expected),
+        Err(_) => return,
+    };
+    // Keep the quota hold until unmatched workflow deliveries are closed.
+    // Estimated probes and old runtime generations cannot admit them.
+    for (ask_id, must_stop) in &workflow_asks {
+        if *must_stop && cutex::asks::tools::close_ask_with(&asks, None, ask_id, "stop", false, now).is_err() {
+            return;
+        }
+    }
     let pending = match claim_due(&store,&asks,session,&expected,now) {
         Ok(Some(pending)) => pending,
         Ok(None) => return,
@@ -173,23 +184,53 @@ fn fire(session: &str) {
             return;
         }
     };
-    let (result, reason): (&str, String) = match skip {
+    let (result, reason) = deliver_due(
+        skip, !workflow_asks.is_empty(), || asks_requeued(session),
+        || cutex::asks::control::quota_reset_reopen_default(session),
+        || qc::send(super::management_context::management_request_context(), session, pending.reset_at),
+    );
+    eprintln!("quota auto-continue: {session}: {result} ({reason})");
+    record(&store, session, result, &reason, pending.reset_at);
+}
+
+fn open_workflow_asks(
+    state: Option<&cutex::asks::store::AskState>, session: &str, expected: &qc::Pending,
+) -> Vec<(String, bool)> {
+    use cutex::asks::model::ExecutionState;
+    use cutex::workflows::asks_bridge::{is_workflow_step, quota_reset_matches};
+
+    state.into_iter().flat_map(|state| state.asks.values())
+        .filter(|ask| ask.is_open() && ask.target_cutex_session_id == session && is_workflow_step(ask))
+        .map(|ask| {
+            let must_stop = ask.quota_requeues > 0
+                && (ask.execution == ExecutionState::Queued || ask.resume_pending())
+                && !quota_reset_matches(ask, expected);
+            (ask.ask_id.clone(), must_stop)
+        })
+        .collect()
+}
+
+fn deliver_due(
+    skip: Option<&str>, workflow_owns_continuation: bool,
+    requeued: impl FnOnce() -> bool, reopen: impl FnOnce(),
+    send: impl FnOnce() -> anyhow::Result<String>,
+) -> (&'static str, String) {
+    match skip {
         Some(reason) => ("skipped", reason.to_string()),
         // Delegations that failed on the limit were put back in the queue
         // and are redelivered now that the hold ended: that is the work.
         // The failed turn closed the native gate; reopen it, or the
         // redelivery waits for the owner (host-a 2026-10-21).
-        None if asks_requeued(session) => {
-            cutex::asks::control::quota_reset_reopen_default(session);
+        None if requeued() => {
+            reopen();
             ("skipped", "asksRedelivered".to_string())
         }
-        None => match qc::send(super::management_context::management_request_context(), session, pending.reset_at) {
+        None if workflow_owns_continuation => ("skipped", "workflowOwnsContinuation".to_string()),
+        None => match send() {
             Ok(disposition) => ("fired", disposition),
             Err(error) => ("failed", format!("{error:#}")),
         },
-    };
-    eprintln!("quota auto-continue: {session}: {result} ({reason})");
-    record(&store, session, result, &reason, pending.reset_at);
+    }
 }
 
 /// The stored usage snapshot of the account of `session`'s due estimated
@@ -213,7 +254,8 @@ fn asks_requeued(session: &str) -> bool {
         .flatten()
         .is_some_and(|state| {
             state.asks.values().any(|ask| {
-                ask.remote.is_none()
+                ask.is_open()
+                    && ask.remote.is_none()
                     && ask.target_cutex_session_id == session
                     && ask.quota_requeues > 0
                     && (ask.execution == cutex::asks::model::ExecutionState::Queued || ask.resume_pending())
@@ -254,6 +296,64 @@ pub(super) fn spawn_worker() -> anyhow::Result<()> {
 #[cfg(test)]
 mod pause_tests {
     use super::*;
+    use cutex::asks::{
+        model::{AskBody, AskOptions, CloseOutcome, ExecutionState, Requester},
+        store::{AskState, NewAsk},
+    };
+
+    #[test]
+    fn closed_workflow_ask_does_not_suppress_an_ordinary_due_continuation() {
+        let mut asks = AskState::default();
+        let now = Utc::now();
+        let session = "cutex.quota";
+        let (ask, _) = asks.create_ask(NewAsk {
+            ask_id: None,
+            action_id: "wr-0123456789abcdef:fedcba9876543210#1".into(),
+            requester: Requester::Owner,
+            target_cutex_session_id: session.into(),
+            target_name: None,
+            project_id: None,
+            body: AskBody {
+                text: "Validate".into(),
+                text_artifact: None,
+                text_bytes: "Validate".len(),
+                text_sha256: cutex::asks::sha256_hex(b"Validate"),
+                attachments: vec![],
+            },
+            title: None,
+            options: AskOptions::default(),
+            follow_up_of: None,
+            parent_ask: None,
+            gate: None,
+        }, now).unwrap();
+        let expected = qc::Pending {
+            at: now.to_rfc3339(), reset_at: now.timestamp(), account_id: None,
+            turn_id: Some("failed-turn".into()), runtime_generation: 7,
+            scheduled_at: now.to_rfc3339(), estimated: true,
+        };
+        let open = open_workflow_asks(Some(&asks), session, &expected);
+        assert_eq!(open, vec![(ask.ask_id.clone(), false)]);
+        assert_eq!(deliver_due(None, !open.is_empty(), || false,
+            || panic!("no requeued ask"), || panic!("workflow owns continuation")),
+            ("skipped", "workflowOwnsContinuation".into()));
+        assert_eq!(deliver_due(None, !open.is_empty(), || true,
+            || {}, || panic!("requeued ask owns continuation")),
+            ("skipped", "asksRedelivered".into()));
+        asks.update_ask(&ask.ask_id, now, |ask| {
+            ask.closed = Some(CloseOutcome::Completed);
+            ask.execution = ExecutionState::Answered;
+            ask.closed_at = Some(now.to_rfc3339());
+        });
+        let open = open_workflow_asks(Some(&asks), session, &expected);
+        let sent = std::cell::Cell::new(false);
+        let outcome = deliver_due(None, !open.is_empty(), || false, || panic!("no requeued ask"), || {
+            sent.set(true);
+            Ok("ordinaryContinuation".into())
+        });
+        assert!(sent.get());
+        assert_eq!(outcome, ("fired", "ordinaryContinuation".into()));
+    }
+
     #[test]
     fn due_quota_claim_defers_without_consuming_pending_reset_or_probe_budget() {
         let root=std::env::temp_dir().join(format!("quota-pause-{}",uuid::Uuid::new_v4()));

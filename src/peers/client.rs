@@ -160,8 +160,17 @@ fn request_resolved(
 // A remote schema rejection describes this mutation, not the peer's negotiated
 // protocol. Locally detected response/DTO errors remain peer-level failures.
 fn request_error(method: &str, path: &str, mut error: Error) -> Error {
+    use super::receipt::{RoutingRefusal, UNSPECIFIED_CREATE_REFUSAL};
+    let create = method == "PUT"
+        && path.strip_prefix("/peer/v1/asks/").is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    if error.code == RoutingRefusal::Destination.code() && !(create && error.status == 403) {
+        error.code = "peer_request_failed".into();
+    }
+    if create && error.status == 400 && error.code == "peer_unavailable" {
+        error.code = UNSPECIFIED_CREATE_REFUSAL.into();
+    }
     let mutation = match (method, path.strip_prefix("/peer/v1/asks/")) {
-        ("PUT", Some(id)) => !id.is_empty() && !id.contains('/'),
+        ("PUT", _) => create,
         ("POST", Some(tail)) => tail
             .strip_suffix("/ops")
             .is_some_and(|id| !id.is_empty() && !id.contains('/')),
@@ -486,6 +495,25 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn project_refusal_from_peer_is_scoped_to_create_and_keeps_transport_separate() {
+        use crate::peers::receipt::{RoutingRefusal, UNSPECIFIED_CREATE_REFUSAL};
+        let path = "/peer/v1/asks/ask-new";
+        let code = RoutingRefusal::Destination.code();
+        let reply = |status, code| decode_response(&http_response(
+            status, &serde_json::json!({"code":code}).to_string(),
+        )).unwrap_err();
+        let refusal = request_error("PUT", path, reply(403, code));
+        assert_eq!(refusal.request_failure_code(), code);
+        assert!(!refusal.is_transport() && !refusal.retryable);
+        assert_eq!(request_error("GET", path, reply(403, code)).code, "peer_request_failed");
+        assert_eq!(request_error("PUT", path, reply(403, RoutingRefusal::Source.code())).code, "peer_request_failed");
+        assert_eq!(request_error("PUT", path, reply(400, "peer_unavailable")).code, UNSPECIFIED_CREATE_REFUSAL);
+        assert_eq!(request_error("PUT", path, reply(400, "peer_request_failed")).code, "peer_request_failed");
+        assert_eq!(request_error("PUT", path, reply(409, "peer_unavailable")).code, "peer_unavailable");
+        assert_eq!(request_error("PUT", path, reply(503, code)).code, "peer_unreachable");
     }
 
     #[test]

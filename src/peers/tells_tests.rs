@@ -396,6 +396,9 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     assert_eq!(sent["peerId"], p.peer_id);
     assert_eq!(sent["deliveryKind"], "note");
     assert_eq!(sent["recipientState"], "busy");
+    assert_eq!(sent["crossHost"]["direction"], "outbound");
+    assert_eq!(sent["crossHost"]["peer"]["instanceId"], p.peer_id);
+    assert_eq!(sent["crossHost"]["receipt"]["state"], "deliveredToPeer");
     assert!(sent.get("messageId").is_none(), "the receiver's bus ID is not a local messageSent ID: {sent}");
     assert!(sent["detail"]
         .as_str()
@@ -423,6 +426,7 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
         &local,
     );
     assert_eq!(replay["tellId"], sent["tellId"]);
+    assert_eq!(replay["crossHost"], sent["crossHost"]);
     assert!(replay.get("messageId").is_none());
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert_eq!(*local.borrow(), 0, "never the local bus");

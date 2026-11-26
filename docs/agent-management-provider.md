@@ -1,5 +1,10 @@
 # Agent Management v1 native provider boundary
 
+> **0.2.6 upgrade boundary:** after 0.2.6 starts, rollback to 0.2.5 is unsupported. Keep a complete, consistent offline backup from before upgrading and the upgrade-run backup. The old 0.2.5 managed backup excludes personal-assistant and schedule stores; preserve consistent snapshots separately for data created by 0.2.6. Older rollback instructions below describe earlier release boundaries.
+>
+> **0.2.6 升级边界：**0.2.6 启动后，不支持退回 0.2.5。请保留升级前完整且一致的离线备份和升级程序备份；旧版备份不含个人助理与任务日程存储，0.2.6 新增数据须另留这两份存储的一致快照。下文旧版回退步骤仅描述更早的版本边界。
+
+
 Agent Management project authority comes only from the authenticated runtime's
 current durable Cutex session and the Agent Management provider store. Agent Bus
 groups are collaboration and discovery labels. Neither `CUTEX_AGENT_GROUPS` nor

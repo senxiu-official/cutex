@@ -21,6 +21,16 @@ const CLIENT_ID: &str = "cutex-agent-bus-wake";
 /// Private retry-payload metadata, never forwarded as user/native input.
 pub const READ_NOTES_FIELD: &str = "_cutexReadNotes";
 
+fn check_ordered_reservations(explicit: Option<&Value>, available: &[String], reserved: &[String]) -> Result<(), UserInputExecutionError> {
+    let blocked = explicit.and_then(Value::as_array).map_or(available.is_empty() && !reserved.is_empty(), |values|
+        values.iter().filter_map(Value::as_str).any(|id| reserved.iter().any(|item| item == id)));
+    if blocked {
+        return Err(super::input_ledger::route_error("ordered_batch_pending",
+            "The selected note has an unconfirmed ordered batch receipt. Dismiss is still available.".into(), false));
+    }
+    Ok(())
+}
+
 fn note_ids(value: &Value) -> anyhow::Result<Vec<String>> {
     let ids: Vec<String> = serde_json::from_value(value.clone())?;
     anyhow::ensure!(ids.len() < super::input_ledger::MAX_BATCH_ITEMS
@@ -74,8 +84,7 @@ pub(super) fn dispatch(
     let selected = std::cell::RefCell::new(Vec::new());
     let pending = || {
         super::agent_bus_state::agent_bus_message_repository()
-            .and_then(|repository| repository.pending_note_ids(cutex_session_id))
-            .map(|ids| { let count = ids.len(); *selected.borrow_mut() = ids; count })
+            .and_then(|repository| repository.read_now_notes(cutex_session_id))
             .map_err(|error| UserInputExecutionError {
                 stage: "route".into(),
                 code: "event_persistence_unavailable".into(),
@@ -83,6 +92,11 @@ pub(super) fn dispatch(
                 retryable: true,
                 details: json!({}),
                 outcome_unknown: false,
+            }).and_then(|(ids, reserved)| {
+                check_ordered_reservations(request.params.get("inputIds"), &ids, &reserved)?;
+                let count = ids.len();
+                *selected.borrow_mut() = ids;
+                Ok(count)
             })
     };
     dispatch_with(owner.is_some(), session, request, pending, |submit| {
@@ -223,5 +237,18 @@ mod tests {
         }
         super::super::contract_validation::validate_cutex_request(&json!({"requestId":"wake",
             "method":METHOD,"params":{"inputIds":["note-a"]}})).unwrap();
+    }
+
+    #[test]
+    fn read_now_reports_an_ordered_reservation_before_submitting() {
+        let reserved = ["reserved".into()];
+        let available = ["available".into()];
+        let selection = request(json!({"inputIds":["available","reserved"]}));
+        let error = dispatch_with(true, &session(None), &selection,
+            || check_ordered_reservations(selection.params.get("inputIds"), &available, &reserved).map(|()| 2),
+            |_| unreachable!()).unwrap_err();
+        assert_eq!(error.code, "ordered_batch_pending");
+        assert!(check_ordered_reservations(None, &[], &reserved).is_err());
+        assert!(check_ordered_reservations(None, &available, &reserved).is_ok());
     }
 }

@@ -1978,6 +1978,7 @@ impl GlobalSettingsDraft {
             claude_usage_refresh_minutes: self.claude_usage_refresh_minutes,
             profile_quota_refresh_minutes: None,
             archive_delete_empty: None,
+            heavy_read_concurrency: ConfigValueUpdate::Unchanged,
             // r290 P10 (B4/A8): Management /v2/settings only.
             owner_shares: None,
             documents: None,

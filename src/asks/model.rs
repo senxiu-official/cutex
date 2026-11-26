@@ -401,6 +401,10 @@ pub struct AttemptRecord {
     pub submitted_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    /// `started_at` was first filled by exact-input history catchup. The
+    /// timestamp is when the start was proved, not the lost notification time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub started_at_inferred: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,6 +753,7 @@ impl AttemptRecord {
             stop_unconfirmed: false,
             submitted_at,
             started_at: None,
+            started_at_inferred: false,
             ended_at: None,
             last_error: None,
             view: None,
@@ -844,6 +849,12 @@ pub struct AskRecord {
     pub follow_up_ended: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<String>,
+    /// Initiator captured before asynchronous stop settlement; never authority.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub terminal_cause: Option<super::terminal_notices::Cause>,
+    /// Immutable closure snapshots referenced by existing State deliveries.
+    #[serde(default,skip_serializing_if="Vec::is_empty")]
+    pub terminal_notices: Vec<super::terminal_notices::Notice>,
     pub created_at: String,
     pub updated_at: String,
     /// Record revision; bumped by every change (optimistic reads by clients).
@@ -1222,6 +1233,11 @@ pub enum DeliveryState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryRecord {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub notice_ref: Option<String>,
+    /// Frozen payload survives the bounded per-ask notice history.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub terminal_notice: Option<super::terminal_notices::Notice>,
     pub delivery_id: String,
     pub kind: DeliveryKind,
     pub ask_id: String,
@@ -1312,6 +1328,8 @@ pub struct AdmissionLease {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventOutboxRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_batch_id: Option<String>,
     /// A held Stop-answer may be observed after manual resume, only on this
     /// original generation. This is bookkeeping outside the frozen envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]

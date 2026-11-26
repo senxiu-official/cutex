@@ -67,6 +67,8 @@ pub fn build_command(record: &ServiceRecord, default_cwd: &Path) -> anyhow::Resu
     for (key, value) in &record.env {
         builder.env(key, substitute_arg(value));
     }
+    builder.env_remove(super::notifications::TOKEN_ENV)
+        .env_remove(super::notifications::PATH_ENV);
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -343,6 +345,7 @@ mod tests {
 
     fn record(command: ServiceCommand) -> ServiceRecord {
         ServiceRecord {
+            remote_access: false,
             proxy_host_header: "preserve".into(),
             slug: "t".into(),
             display_name: "t".into(),
@@ -371,6 +374,7 @@ mod tests {
             cwd: None,
             env: [("GREETING".to_string(), "hi-{port}".to_string())].into(),
             login_link_command: None,
+            notification_instance: None,
             stopped: false,
             idle_stop_preset: Default::default(),
             stopped_idle_at: None,

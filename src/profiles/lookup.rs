@@ -9,6 +9,7 @@ pub fn find_account<'a>(
     store: &'a AccountsStore,
     target: &str,
 ) -> anyhow::Result<Option<&'a StoredAccount>> {
+    crate::management::v2::feature_profiles::require_agent_id(target)?;
     Ok(store
         .accounts
         .iter()
@@ -38,6 +39,7 @@ pub fn ensure_unique_name(
     name: &str,
     ignore_account_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    crate::management::v2::feature_profiles::require_agent_id(name)?;
     // A profile that already has a reserved name (design 041) may keep it.
     let keeps_own_name = ignore_account_id
         .is_some_and(|id| store.accounts.iter().any(|account| account.id == id && account.name == name));

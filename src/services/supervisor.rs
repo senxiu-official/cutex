@@ -301,7 +301,7 @@ impl Entry {
 
 fn wants_running(record: &ServiceRecord) -> bool {
     match record.runtime {
-        ServiceRuntime::External | ServiceRuntime::Static => false,
+        ServiceRuntime::External | ServiceRuntime::Static | ServiceRuntime::Integration => false,
         ServiceRuntime::Managed | ServiceRuntime::Worker => !record.stopped && !record.archived && record.stopped_idle_at.is_none(),
     }
 }
@@ -696,8 +696,13 @@ impl Supervisor {
         if entry.logs.state.lock().expect("log ring").file.is_none() {
             entry.logs.open_file(self.store.log_path(&record.slug));
         }
-        let spawned = super::process::build_command(record, &self.default_cwd)
-            .and_then(super::process::spawn);
+        let spawned = super::process::build_command(record, &self.default_cwd).and_then(|mut command| {
+            if let Ok(Some(token)) = super::notifications::Store::supervised_token(self.store.dir(), record) {
+                command.env(super::notifications::TOKEN_ENV, token)
+                    .env(super::notifications::PATH_ENV, format!("/v2/services/{}/notifications", record.slug));
+            }
+            super::process::spawn(command)
+        });
         let (mut child, tree) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -849,7 +854,7 @@ impl Supervisor {
                 .records
                 .values()
                 .filter(|record| {
-                    record.runtime != ServiceRuntime::Worker && (!record.runtime.supervised()
+                    record.runtime.has_view() && (!record.runtime.supervised()
                         || inner
                             .entries
                             .get(&record.slug)
@@ -976,6 +981,25 @@ impl Supervisor {
             Ok(()) => inner.state_dirty = false,
             Err(error) => eprintln!("services: could not save state: {error:#}"),
         }
+    }
+
+    /// A tile can reuse the supervisor's committed registration after the
+    /// registry stamp is checked. Missing or changed records go to the store
+    /// so tombstones and writes from the other process are visible immediately.
+    pub(crate) fn tile_record(&self, slug: &str) -> Option<(ServiceRecord, Option<RuntimeSnapshot>)> {
+        let stamp = crate::platform::file_stamp::FileStamp::of(&self.store.registry_path())?;
+        let inner = self.inner.lock().expect("services supervisor");
+        if inner.registry_stamp.as_ref() != Some(&stamp) {
+            return None;
+        }
+        let record = inner.records.get(slug)?.clone();
+        let snapshot = inner.entries.get(slug).map(|entry| entry.snapshot.clone());
+        Some((record, snapshot))
+    }
+
+    pub(crate) fn snapshot(&self, slug: &str) -> Option<RuntimeSnapshot> {
+        let inner = self.inner.lock().expect("services supervisor");
+        inner.entries.get(slug).map(|entry| entry.snapshot.clone())
     }
 
     /// Current runtime facts (fresher than `state.json`).
@@ -1695,6 +1719,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tile_record_reuses_current_registration_and_falls_back_on_a_write() {
+        let store = temp_store().with_port_probe(|_| true);
+        store.register(
+            RegisterRequest {
+                slug: "perf-tile".into(),
+                port: Some(48257),
+                ..Default::default()
+            },
+            &Caller::Owner,
+        ).unwrap();
+        let (supervisor, _) = recording_supervisor(store.clone());
+        let reload = || {
+            let mut inner = supervisor.inner.lock().unwrap();
+            supervisor.reload_locked(&mut inner, &mut Vec::new(), false);
+        };
+        reload();
+        super::super::store::REGISTRY_READS.with(|reads| reads.set(0));
+
+        let (record, state) = supervisor.tile_record("perf-tile").unwrap();
+        assert_eq!(record.slug, "perf-tile");
+        assert!(state.is_some());
+        assert!(supervisor.snapshot("perf-tile").is_some());
+        assert!(supervisor.tile_record("unknown").is_none());
+        super::super::store::REGISTRY_READS.with(|reads| assert_eq!(reads.get(), 0));
+
+        store.mutate(|registry| {
+            registry.services.get_mut("perf-tile").unwrap().archived = true;
+            Ok(())
+        }).unwrap();
+        assert!(supervisor.tile_record("perf-tile").is_none());
+        assert!(store.get("perf-tile").unwrap().archived);
+        reload();
+        assert!(supervisor.tile_record("perf-tile").unwrap().0.archived);
+
+        store.mutate(|registry| {
+            registry.services.remove("perf-tile").unwrap();
+            Ok(())
+        }).unwrap();
+        assert!(supervisor.tile_record("perf-tile").is_none());
+        assert_eq!(store.get("perf-tile").unwrap_err().status, 404);
+        reload();
+        assert!(supervisor.snapshot("perf-tile").is_none());
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
     fn temp_store() -> ServiceStore {
         let dir = std::env::temp_dir().join(format!(
             "cutex-services-sup-{}",
@@ -2121,6 +2191,24 @@ mod tests {
         let state = ring.state.lock().unwrap();
         assert_eq!(state.bytes.len(), LOG_RING_BYTES);
         assert_eq!(state.end_offset, 500 * 1024);
+    }
+
+    #[test]
+    fn remote_access_patch_emits_existing_updated_event() {
+        let store = temp_store().with_port_probe(|_| true);
+        store.register(RegisterRequest { slug:"remote".into(), ..Default::default() }, &Caller::Owner).unwrap();
+        let (supervisor, _) = recording_supervisor(store.clone());
+        let mut inner = supervisor.inner.lock().unwrap();
+        supervisor.reload_locked(&mut inner, &mut Vec::new(), true);
+        store.update("remote", super::super::store::UpdateRequest { remote_access:Some(true), ..Default::default() }, &Caller::Owner).unwrap();
+        let mut pending = Vec::new();
+        supervisor.reload_locked(&mut inner, &mut pending, false);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].reason, "updated");
+        assert_eq!(pending[0].slug.as_deref(), Some("remote"));
+        assert_eq!(pending[0].service.as_ref().unwrap()["remoteAccess"], true);
+        drop(inner);
+        std::fs::remove_dir_all(store.dir()).unwrap();
     }
 
     #[test]

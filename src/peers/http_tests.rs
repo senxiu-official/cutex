@@ -65,7 +65,9 @@ fn context() -> ManagementRequestContext {
         execute_agent_archive: |_, _| panic!("unexpected archive"),
         durable_agent_candidates: |_| panic!("unexpected agent candidates"),
         import_durable_agent: |_, _| panic!("unexpected agent import"),
-        load_registry: || panic!("unexpected registry load"),
+        // The v2 dispatcher can materialize an event stream recovery reset
+        // before routing a request. This fixture has no registered sessions.
+        load_registry: || Ok(Default::default()),
         load_runtime_status: |_| panic!("unexpected runtime status"),
         forward_native_request: |_, _| panic!("unexpected native request"),
         respond_native_server_request: |_, _, _| panic!("unexpected native response"),

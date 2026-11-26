@@ -9,6 +9,7 @@ fn find_profile<'a>(
     profile: &str,
 ) -> anyhow::Result<&'a crate::profiles::model::StoredAccount> {
     let profile = profile.trim();
+    crate::management::v2::feature_profiles::require_agent_id(profile)?;
     accounts
         .accounts
         .iter()
@@ -24,6 +25,7 @@ fn find_profile<'a>(
 
 /// Canonical profile name for a profile selected by name or id.
 pub fn resolve_profile_name(profile: &str) -> anyhow::Result<String> {
+    crate::management::v2::feature_profiles::require_agent_id(profile)?;
     let accounts: AccountsStore =
         serde_json::from_slice(&std::fs::read(super::paths::accounts_path()?)?)?;
     Ok(find_profile(&accounts, profile)?.name.clone())

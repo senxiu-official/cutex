@@ -387,20 +387,32 @@ fn select<'a>(
 
 impl AgentBusMessageRepository {
     pub fn bounded_bootstrap(&self, session: &str, window: &Window) -> anyhow::Result<Value> {
-        self.read(|store| {
-            let (received, received_more) = select(store, session, Direction::Received, window);
-            let (sent, sent_more) = select(store, session, Direction::Sent, window);
-            Ok(json!({
-                "agentBusMessages": received.into_iter().map(|row| row_value(row, Direction::Received)).collect::<anyhow::Result<Vec<_>>>()?,
-                "agentBusSentMessages": sent.into_iter().map(|row| row_value(row, Direction::Sent)).collect::<anyhow::Result<Vec<_>>>()?,
-                "busMessagesPage": {"received": {"hasMore": received_more}, "sent": {"hasMore": sent_more}},
-            }))
-        })
+        self.read_matching(
+            |db| super::super::hot_store::bus_history_rows(db, Some(session), Some(session)),
+            |store| bounded(store, session, window),
+        )
     }
 
     pub fn history_page(&self, session: &str, query: &Query) -> anyhow::Result<Value> {
-        self.read(|store| page(store, session, query))
+        let directions = match query.direction {
+            Direction::Received => (Some(session), None),
+            Direction::Sent => (None, Some(session)),
+        };
+        self.read_matching(
+            |db| super::super::hot_store::bus_history_rows(db, directions.0, directions.1),
+            |store| page(store, session, query),
+        )
     }
+}
+
+fn bounded(store: &AgentBusMessageStore, session: &str, window: &Window) -> anyhow::Result<Value> {
+    let (received, received_more) = select(store, session, Direction::Received, window);
+    let (sent, sent_more) = select(store, session, Direction::Sent, window);
+    Ok(json!({
+        "agentBusMessages": received.into_iter().map(|row| row_value(row, Direction::Received)).collect::<anyhow::Result<Vec<_>>>()?,
+        "agentBusSentMessages": sent.into_iter().map(|row| row_value(row, Direction::Sent)).collect::<anyhow::Result<Vec<_>>>()?,
+        "busMessagesPage": {"received": {"hasMore": received_more}, "sent": {"hasMore": sent_more}},
+    }))
 }
 
 fn page(store: &AgentBusMessageStore, session: &str, query: &Query) -> anyhow::Result<Value> {

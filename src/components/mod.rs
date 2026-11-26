@@ -1551,6 +1551,10 @@ pub fn select_for_release(
     let manifest = release_manifest(layout, keys);
     let mut notes = Vec::new();
     for (name, entry) in state {
+        if name == job_service::NAME && handler(&name).is_ok_and(|job| job.external(layout)) {
+            notes.push("Job Service preserved; hosting handoff requires owner approval".into());
+            continue;
+        }
         let target = match &manifest {
             Ok(Some(m))
                 if entry.origin == ORIGIN_SIGNED
@@ -1649,15 +1653,24 @@ pub fn restore_after_rollback(layout: &Layout, exec: &dyn Exec, snapshot: &Path)
             previous: now_state.get(&name).cloned(),
             dry_run: false,
         };
+        if name == job_service::NAME && handler.external(layout) {
+            notes.push("Job Service preserved; externally hosted during rollback".into());
+            continue;
+        }
         match handler.prepare(&ctx).and_then(|_| handler.select(&ctx)) {
-            Ok(_) => {
+            Ok(result) => {
                 let _ = update_entry(layout, &name, |e| {
                     *e = Some(Entry {
                         last_error: None,
                         ..old.clone()
                     })
                 });
-                notes.push(format!("{name} back on {}", old.selected));
+                let note = if result["restartPending"] == true {
+                    format!("{name} rollback to {} is waiting for its restart gate", old.selected)
+                } else {
+                    format!("{name} back on {}", old.selected)
+                };
+                notes.push(note);
             }
             Err(error) => notes.push(format!(
                 "{name} not restored to {}: {error:#}",

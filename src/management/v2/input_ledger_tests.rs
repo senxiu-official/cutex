@@ -76,6 +76,42 @@ fn note(kind: InputKind, timing: Timing) -> NewInput {
 // --- state machine -----------------------------------------------------------
 
 #[test]
+fn legacy_timeline_retry_restriction_has_current_scope_diagnostics() {
+    let f = Fixture::new();
+    f.go("legacy-audit", Next::sending().create(note(InputKind::AgentMessage, Timing::Passive))).unwrap();
+    let base = f.go("legacy-audit", Next::uncertain("receiptTimeout")).unwrap().record;
+    for state in [InputState::Uncertain, InputState::Failed] {
+        let mut legacy = base.clone();
+        legacy.state = state;
+        legacy.turn_id = Some("retained-turn".into());
+        legacy.timeline_item_id = Some("original-native".into());
+        legacy.details = json!({"deliveryDiagnostics":{"stage":"inbox","since":null,"waitingFor":"contextReceipt","lastError":"original error"}});
+        let projected = decode_record(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(projected.state, state);
+        assert_eq!(projected.actions, vec![Action::Dismiss]);
+        assert_eq!(projected.details["deliveryDiagnostics"]["retryBlocked"], true);
+        assert_eq!(projected.details["deliveryDiagnostics"]["lastError"], "original error");
+        assert!(projected.evidence.is_none());
+        let mut boundary = legacy.clone();
+        boundary.details["deliveryDiagnostics"]["waitingFor"] = json!("nextInputBoundary");
+        let boundary = decode_record(&serde_json::to_string(&boundary).unwrap()).unwrap();
+        assert_eq!(boundary.details["deliveryDiagnostics"]["waitingFor"], "contextReceipt");
+        assert_eq!(boundary.details["deliveryDiagnostics"]["sourceWaitingFor"], "nextInputBoundary");
+        let mut disconnected = legacy.clone();
+        disconnected.details["deliveryDiagnostics"]["waitingFor"] = json!("runtimeConnection");
+        let disconnected = decode_record(&serde_json::to_string(&disconnected).unwrap()).unwrap();
+        assert_eq!(disconnected.details["deliveryDiagnostics"]["waitingFor"], "runtimeConnection");
+        // A stale marker without its native identity cannot remove Retry or
+        // leave an explanation of a restriction that no longer exists.
+        let mut stale = projected;
+        stale.timeline_item_id = None;
+        let unblocked = decode_record(&serde_json::to_string(&stale).unwrap()).unwrap();
+        assert!(unblocked.actions.contains(&Action::Retry));
+        assert!(unblocked.details["deliveryDiagnostics"].get("retryBlocked").is_none());
+    }
+}
+
+#[test]
 fn uncertain_task_notice_explains_notification_only_retry() {
     let f = Fixture::new();
     let mut input = note(InputKind::SystemNotice, Timing::AfterTurn);

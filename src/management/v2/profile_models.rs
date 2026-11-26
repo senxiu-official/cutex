@@ -232,6 +232,21 @@ pub(super) fn handle(
             }
         }
         ("PATCH", ModelsRoute::Model(model)) => {
+            if let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(&request.body) {
+                if body.contains_key("reasoningEffort") {
+                    if body.len() != 1 {
+                        return error(stream, 400, "invalid_request", "reasoningEffort must be edited separately");
+                    }
+                    let update = match tri_state(&body, "reasoningEffort", visible_string(32)) {
+                        Ok(update) => update,
+                        Err(message) => return error(stream, 400, "invalid_request", &message),
+                    };
+                    return match crate::profiles::reasoning::update_profile_model_effort(&account, &model, &update) {
+                        Ok(()) => respond(stream, json!({"changedModel": model, "created": false})),
+                        Err(e) => error(stream, 400, "invalid_request", &format!("{e:#}")),
+                    };
+                }
+            }
             let patch = match parse_model_patch(&request.body) {
                 Ok(patch) => patch,
                 Err(message) => return error(stream, 400, "invalid_request", &message),

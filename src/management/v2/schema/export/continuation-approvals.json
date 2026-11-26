@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:continuation-approvals",
+  "description": "Project continuation approvals share the routing approvals list and invalidation event.",
+  "$defs": {
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actionId",
+        "expectedRevision",
+        "expectedDigest",
+        "expectedEpoch",
+        "decision"
+      ],
+      "properties": {
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expectedDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "expectedEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decision": {
+          "enum": [
+            "approve",
+            "deny"
+          ]
+        },
+        "decisionNote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "deny"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "decisionNote"
+            ],
+            "properties": {
+              "decisionNote": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "approval": {
+      "type": "object",
+      "required": [
+        "id",
+        "delegationId",
+        "budgetEpoch",
+        "authorityEpoch",
+        "directorSessionId",
+        "revision",
+        "digest",
+        "reason",
+        "requestedAt",
+        "briefPreview",
+        "progressPreview",
+        "decision",
+        "decisionNote",
+        "decidedBy",
+        "decidedAt",
+        "allowedActions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "delegationId": {
+          "type": "string"
+        },
+        "budgetEpoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "authorityEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "directorSessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reason": {
+          "enum": [
+            "elapsed",
+            "rounds"
+          ]
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "briefPreview": {
+          "type": "string",
+          "maxLength": 280
+        },
+        "progressPreview": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 480
+        },
+        "decision": {
+          "enum": [
+            "approve",
+            "deny",
+            null
+          ]
+        },
+        "decisionNote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "decidedBy": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "decidedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "allowedActions": {
+          "type": "object",
+          "required": [
+            "approve",
+            "deny"
+          ],
+          "properties": {
+            "approve": {
+              "type": "boolean"
+            },
+            "deny": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "list": {
+      "type": "object",
+      "required": [
+        "routingApprovals",
+        "continuationApprovals"
+      ],
+      "properties": {
+        "routingApprovals": {
+          "type": "array"
+        },
+        "continuationApprovals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/approval"
+          }
+        }
+      }
+    },
+    "legacyOwnerApprove": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actionId",
+        "expectedRevision"
+      ],
+      "properties": {
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "ownerDecision": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/decision"
+        },
+        {
+          "$ref": "#/$defs/legacyOwnerApprove"
+        }
+      ]
+    },
+    "treeApprovalCard": {
+      "type": "object",
+      "required": ["id", "revision", "digest", "authorityEpoch", "allowedActions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/approval/properties/id" },
+        "revision": { "$ref": "#/$defs/approval/properties/revision" },
+        "digest": { "$ref": "#/$defs/approval/properties/digest" },
+        "authorityEpoch": { "$ref": "#/$defs/approval/properties/authorityEpoch" },
+        "allowedActions": { "$ref": "#/$defs/approval/properties/allowedActions" }
+      }
+    },
+    "unscopedAskDetail": {
+      "type": "object",
+      "required": ["ask"],
+      "properties": {
+        "ask": {
+          "type": "object",
+          "properties": {
+            "projectId": { "type": "null" },
+            "continuationApproval": { "$ref": "#/$defs/treeApprovalCard" }
+          }
+        }
+      }
+    },
+    "treeContinuation": {
+      "type": "object",
+      "properties": {
+        "approval": {
+          "description": "A view with decision authority can receive a pending approval while resumeContinuation is false.",
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/treeApprovalCard" }
+          ]
+        },
+        "blockedReason": {
+          "description": "The current scheduler hold for a continuation after approval, when available.",
+          "enum": [null, "quota", "login", "runtimeDown", "budget", "runtimeOffline",
+            "reconnecting", "paused", "planMode", "profileSwitchPending", "targetBusy",
+            "admission", "routing", "runtimeUnsupported", "reconciling"]
+        }
+      }
+    },
+    "treeAllowedActions": {
+      "type": "object",
+      "required": [
+        "resumeContinuation",
+        "resumeContinuationBlockedReason"
+      ],
+      "properties": {
+        "resumeContinuation": {
+          "type": "boolean",
+          "description": "The pending continuation can currently run. The approval card can still permit a decision when this is false."
+        },
+        "resumeContinuationBlockedReason": {
+          "enum": [
+            null,
+            "notPending",
+            "handlerUnavailable",
+            "generationMismatch",
+            "handlerOffline",
+            "handlerBusy",
+            "leaseHeld",
+            "projectPaused",
+            "admissionBlocked",
+            "noApprovalAuthority"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "resumeContinuation": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "resumeContinuationBlockedReason": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "resumeContinuationBlockedReason": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

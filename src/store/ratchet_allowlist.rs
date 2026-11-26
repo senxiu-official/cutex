@@ -53,6 +53,7 @@ pub(super) const SQL_USERS: &[(&str, &str)] = &[];
 /// Whole-state sites per (file, pattern) at S0, labelled with the owning store
 /// ("caller" = calls another store's whole-state API). Only shrinks.
 pub(super) const ALLOWED: &[(&str, &str, usize, &str)] = &[
+    ("src/cli_app/claude_ordered_input.rs", "load_all", 1, "allow: load_cutex_session_store_shared returns the shared Arc session cache for the start boundary; no owned whole-store copy"),
     // r290 integration: register existing probes and explicit test-only copy validators.
     ("src/agent_bus/claude_occurrence.rs", "load_all", 1, "allow: shared Arc session cache for occurrence reconciliation; no owned whole-store copy"),
     ("src/cli_app/asks_claude/owner_note_evidence.rs", "unbounded_select", 1, "allow: read-only external adapter evidence query is keyed by thread/message; WHERE follows JOIN lines"),
@@ -202,10 +203,9 @@ pub(super) const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("src/management/v2/downgrade_drill.rs", "full_file_parse", 2, "allow: kit downgrade drill (offline)"),
     ("src/management/v2/downgrade_drill.rs", "load_all", 1, "allow: kit downgrade drill (offline)"),
     ("src/management/v2/fork_preview.rs", "load_all", 1, "caller: profiles settings small config"),
-    ("src/management/v2/health.rs", "load_all", 4, "caller"),
+    ("src/management/v2/health.rs", "load_all", 2, "allow: host-wide health scan and package repair review; runtime fixes use a targeted row"),
     ("src/management/v2/hot_store.rs", "unbounded_select", 2, "allow: multi-line SQL, WHERE on a following line (B6 indexed bus/presentation reads)"),
     ("src/management/v2/hot_store.rs", "verified_rows", 1, "caller"),
-    ("src/management/v2/human_jobs.rs", "load_all", 1, "caller"),
     ("src/management/v2/input_ledger.rs", "unbounded_select", 3, "allow: multi-line SQL, WHERE on a following line"),
     ("src/management/v2/input_ledger_owner.rs", "load_all", 1, "caller: session store runtime generation (S3)"),
     ("src/management/v2/input_ledger_revert.rs", "load_all", 1, "caller: session store, once at startup for revert receipts (S3)"),
@@ -245,6 +245,7 @@ pub(super) const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("src/management/v2/storage_cleanup_homes.rs", "full_file_parse", 2, "allow: owner-triggered cleanup scan of runtime homes"),
     ("src/management/v2/storage_cleanup_homes.rs", "load_all", 2, "caller: session-store whole load (S3)"),
     ("src/management/v2/summary.rs", "load_all", 2, "caller: session-store whole load (S3)"),
+    ("src/management/v2/text_rewrite.rs", "load_all", 1, "caller: profile config enumeration for duplicate-ID rejection and unique Claude account routing; profiles remains JSON"),
     ("src/management/v2/usage/index.rs", "unbounded_select", 3, "allow: multi-line SQL, WHERE on the next line (warnings, entries); the duplicates side table holds only cross-file repeats of an entry id"),
     // r290 P8 manifest decision: account grouping reads only existing SmallConfig.
     ("src/management/v2/usage/quota_attribution.rs", "load_all", 1, "allow: design052 per-account grouping reads the SmallConfig profile document; session/activity/ledger state uses keyed or paged SQLite reads, never whole-store snapshots"),

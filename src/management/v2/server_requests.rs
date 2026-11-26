@@ -77,7 +77,7 @@ enum NativeServerResponseClaimState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerResponseClaimDecision {
-    Submit,
+    Submit(Value),
     InProgress,
     Deduplicated,
     IdempotencyConflict,
@@ -239,7 +239,7 @@ fn claim_response_in_store(
         body_sha256,
         state: NativeServerResponseClaimState::Writing,
     });
-    Ok(ServerResponseClaimDecision::Submit)
+    Ok(ServerResponseClaimDecision::Submit(request.native.clone()))
 }
 
 pub fn release_definitely_failed_response(
@@ -266,7 +266,19 @@ pub fn mark_response_submitted(
     cutex_session_id: &str,
     runtime_generation: u64,
     response_id: &str,
+    native: Value,
+    reply: &Value,
+    actor: super::interaction_history::Actor,
+    answered_at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    // The pending store may be cleared by disconnect as soon as the write
+    // completes. The snapshot came from the winning claim under its lock.
+    // A history I/O failure must never cause a response to be written again.
+    if let Err(error) = super::interaction_history::record_submitted(
+        cutex_session_id, runtime_generation, native, reply, actor, answered_at,
+    ) {
+        eprintln!("interaction history: could not save reply for {cutex_session_id}: {error:#}");
+    }
     update_response_claim(
         cutex_session_id,
         runtime_generation,
@@ -306,8 +318,13 @@ fn update_response_claim(
                         .as_ref()
                         .is_some_and(|claim| claim.response_id == response_id)
             })
-            .and_then(|request| request.response_claim.as_mut())
-            .context("native server response claim no longer exists")?;
+            .and_then(|request| request.response_claim.as_mut());
+        let Some(claim) = claim else {
+            if state == NativeServerResponseClaimState::Submitted {
+                return Ok(()); // A concurrent disconnect discarded the pending generation.
+            }
+            anyhow::bail!("native server response claim no longer exists");
+        };
         if claim.state != NativeServerResponseClaimState::Writing {
             anyhow::bail!("native server response claim is no longer writable");
         }
@@ -363,25 +380,6 @@ pub fn resolve_turn_requests(
             resolved += 1;
         }
         Ok(resolved)
-    })
-}
-
-/// The recorded native request (claimed or not) with this id, if still kept.
-pub fn request_native(
-    cutex_session_id: &str,
-    runtime_generation: u64,
-    native_request_id: &Value,
-) -> anyhow::Result<Option<Value>> {
-    read_store(|store| {
-        Ok(store
-            .requests
-            .iter()
-            .find(|request| {
-                request.cutex_session_id == cutex_session_id
-                    && request.runtime_generation == runtime_generation
-                    && request_id(&request.native) == Some(native_request_id)
-            })
-            .map(|request| request.native.clone()))
     })
 }
 
@@ -692,7 +690,7 @@ mod tests {
             "validation must preserve rich metadata"
         );
         let valid = json!({"id":"question-1","result":{"answers":{"q0":{"answers":["Linux","Windows","Other OS"]}}}});
-        assert_eq!(
+        assert!(matches!(
             claim_validated_response_in_store(
                 &mut store,
                 "cutex-question",
@@ -702,8 +700,8 @@ mod tests {
                 &valid
             )
             .unwrap(),
-            ServerResponseClaimDecision::Submit
-        );
+            ServerResponseClaimDecision::Submit(_)
+        ));
         assert_eq!(
             claim_validated_response_in_store(
                 &mut store,
@@ -821,7 +819,7 @@ mod tests {
             }],
         };
 
-        assert_eq!(
+        assert!(matches!(
             claim_response_in_store(
                 &mut store,
                 "cutex-1",
@@ -831,8 +829,8 @@ mod tests {
                 &json!("approval-1"),
             )
             .expect("first claim"),
-            ServerResponseClaimDecision::Submit
-        );
+            ServerResponseClaimDecision::Submit(_)
+        ));
         assert_eq!(
             claim_response_in_store(
                 &mut store,

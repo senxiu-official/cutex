@@ -69,7 +69,7 @@ fn cascade_fences_children_and_reopening_root_does_not_revive_them(){
     record.parent=ParentFact::Verified(ParentOccurrence{reference:root_ref.clone(),attempt_id:format!("{}#1",root.ask_id),owner_session_id:root.target_cutex_session_id.clone(),runtime_generation:1,turn_id:"parent-turn".into(),source_event_id:"parent-event".into()});
     record.root=Some(root_ref.clone());
     let scope=ReadScope{caller:"owner".into(),project:None,permission_revision:1,
-        resources:[root_ref.clone(),child_ref.clone()].into_iter().map(|r|(r,NodeAccess{visible:true,read_attempts:true,available:true,stop:true,stop_jobs:true,resume_continuation:false})).collect()};
+        resources:[root_ref.clone(),child_ref.clone()].into_iter().map(|r|(r,NodeAccess{visible:true,read_attempts:true,available:true,stop:true,stop_jobs:true,resume_continuation:false,resume_continuation_blocker:None,continuation_approval:None})).collect()};
     let plan=prepare_stop(&state,&state.lineage,&host,&scope,&root_ref,Cascade::default(),false,"cascade",now).unwrap();
     let result=apply_stop(&mut state,plan,1,now).unwrap();
     assert_eq!(result["coverage"],"complete");

@@ -406,11 +406,14 @@ class Store:
             # (ExternalInputService.settle_notes) and a later one would stick.
             if not self.db.execute("SELECT 1 FROM turns WHERE id=? AND thread_id=? AND state='inProgress'", (turn_id, tid)).fetchone():
                 return []
-            return self._take_notes(tid, turn_id)
+            return self._take_notes(tid, turn_id, automatic_only=False)
 
-    def _take_notes(self, tid: str, turn_id: str) -> list[tuple[dict, str]]:
+    def _take_notes(self, tid: str, turn_id: str, *, automatic_only: bool | None = None) -> list[tuple[dict, str]]:
         taken = []
-        rows = self.db.execute("SELECT * FROM notes WHERE thread_id=? AND state='pending' ORDER BY seq", (tid,)).fetchall()
+        rows = self.db.execute("""SELECT * FROM notes WHERE thread_id=? AND state='pending' AND
+            (? IS NULL OR (json_extract(payload,'$.metadata.automaticNoteBatch') IS NOT NULL)=?)
+            AND (? IS NOT 1 OR json_extract(payload,'$.metadata.automaticNoteStartOnly') IS NULL)
+            ORDER BY seq""", (tid, automatic_only, automatic_only, automatic_only)).fetchall()
         for row in rows:
             payload = json.loads(row["payload"])
             item = self.external_item(row["message_id"], payload)
@@ -419,7 +422,7 @@ class Store:
             taken.append((item, self.project_input(payload)[0]["text"]))
         return taken
 
-    def take_owner_carries(self, tid: str, carrier: str, turn_id: str) -> list[tuple[dict, str]]:
+    def take_owner_carries(self, tid: str, carrier: str, turn_id: str, *, publish: bool = True) -> list[tuple[dict, str]]:
         """Only the carrier's own claim may consume reserved identities."""
         taken = []
         rows = self.db.execute("""SELECT * FROM notes WHERE thread_id=? AND state='reserved'
@@ -427,10 +430,18 @@ class Store:
         for row in rows:
             payload = json.loads(row['payload'])
             item = self.external_item(row['message_id'], payload)
-            self.put_item(turn_id, item)
+            if publish:
+                self.put_item(turn_id, item)
             self.db.execute("UPDATE notes SET state='injected',turn_id=? WHERE seq=?", (turn_id, row['seq']))
             taken.append((item, self.project_input(payload)[0]['text']))
         return taken
+
+    @staticmethod
+    def order_automatic_batch(order: list[str], trigger: tuple[dict, str],
+                              companions: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+        by_id = {item['id']: (item, frame) for item, frame in [trigger, *companions]}
+        require(len(order) == len(by_id) and set(order) == by_id.keys(), 'incomplete automatic input batch', -32009)
+        return [by_id[mid] for mid in order]
 
     @staticmethod
     def external_item(mid: str, payload: dict) -> dict:
@@ -536,6 +547,7 @@ class Store:
                 return None
             payload = json.loads(row["payload"])
             content = self.project_input(payload)
+            automatic_order = payload.get('metadata', {}).get('automaticInputOrder')
             now = time.time()
             existing = self.db.execute("SELECT state FROM turns WHERE id=?", (row['turn_id'],)).fetchone()
             if existing:
@@ -545,9 +557,14 @@ class Store:
                 self.db.execute("UPDATE inputs SET state='processing' WHERE seq=?", (row['seq'],))
                 prompt = content[0]['text']
                 if payload['source']['kind'] != 'user':
-                    frames = self.turn_note_frames(row['turn_id'])
-                    if frames:
-                        prompt = '\n\n'.join([*frames, prompt])
+                    frames = self._turn_notes(row['turn_id'])
+                    if automatic_order:
+                        frame_by_id = dict(frames)
+                        frame_by_id[row['message_id']] = prompt
+                        prompt = '\n\n'.join([*(frame for mid, frame in frames if mid not in automatic_order),
+                                              *(frame_by_id[mid] for mid in automatic_order)])
+                    elif frames:
+                        prompt = '\n\n'.join([*(frame for _, frame in frames), prompt])
                 retry = json.loads(self.db.execute('SELECT value FROM meta WHERE key=?', ('claudeQueueRetry:' + row['turn_id'],)).fetchone()[0])
                 return {**dict(row), 'state': 'processing', 'prompt': prompt, 'queue_retry': True, 'retry_continuation': bool(retry.get('continuation')), 'retry_receipt': retry.get('receipt'), 'retry_authorized': self.db.execute('SELECT 1 FROM meta WHERE key=?', ('claudeQueueRecovery:' + tid,)).fetchone() is None}
             self.db.execute("INSERT INTO turns(id,thread_id,state,started) VALUES(?,?,'inProgress',?)", (row["turn_id"], tid, now))
@@ -573,13 +590,22 @@ class Store:
             # owner turn as separate text blocks before the owner's text
             # (`turn_note_frames`), so only the owner's own text expands @path
             # mentions. `/compact` reads none: they wait for the next turn.
-            notes = [] if compact else self.take_owner_carries(tid, row["message_id"], row["turn_id"]) + self._take_notes(tid, row["turn_id"])
-            model_content = content
-            if notes:
-                model_content = [{"type": "text", "text": "\n\n".join([frame for _, frame in notes] + [content[0]["text"]])}]
+            if automatic_order:
+                notes = self._take_notes(tid, row["turn_id"])
+                companions = self.take_owner_carries(tid, row["message_id"], row["turn_id"], publish=False)
+                trigger = self.external_item(row['message_id'], payload), content[0]['text']
+                batch = self.order_automatic_batch(automatic_order, trigger, companions)
+                for entry, _ in batch:
+                    self.put_item(row['turn_id'], entry)
+                model_content = [{"type": "text", "text": "\n\n".join(frame for _, frame in [*notes, *batch])}]
+            else:
+                notes = [] if compact else self.take_owner_carries(tid, row["message_id"], row["turn_id"]) + self._take_notes(tid, row["turn_id"])
+                model_content = content
+                if notes:
+                    model_content = [{"type": "text", "text": "\n\n".join([frame for _, frame in notes] + [content[0]["text"]])}]
             if not self.db.execute("SELECT 1 FROM meta WHERE key='backend' AND value='subscription'").fetchone():
                 self.db.execute("INSERT INTO history(thread_id,turn_id,role,content) VALUES(?,?,'user',?)", (tid, row["turn_id"], dump(model_content)))
-            if not owner and (isinstance(payload.get("view"), dict) or payload.get('metadata', {}).get('nativeExternalInput') is True):
+            if not owner and not automatic_order and (isinstance(payload.get("view"), dict) or payload.get('metadata', {}).get('nativeExternalInput') is True):
                 # cutex r208 inputs with a view (agent wakes, 委托 events) show as
                 # `external_event` items, keyed by their message id.
                 self.put_item(row["turn_id"], self.external_item(row["message_id"], payload))
@@ -594,8 +620,11 @@ class Store:
     def turn_note_frames(self, turn_id: str) -> list[str]:
         """Model frames of the notes read in at the start of `turn_id`, oldest
         first. Called before the turn's first request (no PostToolUse yet)."""
-        rows = self.db.execute("SELECT payload FROM notes WHERE turn_id=? AND state='injected' ORDER BY seq", (turn_id,)).fetchall()
-        return [self.project_input(json.loads(row[0]))[0]["text"] for row in rows]
+        return [frame for _, frame in self._turn_notes(turn_id)]
+
+    def _turn_notes(self, turn_id: str) -> list[tuple[str, str]]:
+        rows = self.db.execute("SELECT message_id,payload FROM notes WHERE turn_id=? AND state='injected' ORDER BY seq", (turn_id,)).fetchall()
+        return [(row['message_id'], self.project_input(json.loads(row['payload']))[0]["text"]) for row in rows]
 
     def turn_source(self, turn_id: str) -> dict | None:
         """Who started a turn: {kind, id, name} of its input; None if unknown."""

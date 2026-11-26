@@ -50,6 +50,7 @@ pub mod native_models;
 pub mod model_check;
 pub mod reviewer_catalog;
 pub mod reasoning;
+pub mod pinned_selection;
 pub mod claude_models;
 pub mod claude_tool_defaults;
 pub mod model_variants;

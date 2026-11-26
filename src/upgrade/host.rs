@@ -299,10 +299,10 @@ impl Host for RealHost {
         super::older_stores::prepare(&self.home, displaced, target)
     }
 
-    fn rollback_prep(&self, migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
-        // Refuse incompatible workers before the runner stops services or backs up.
+    fn rollback_prep(&self, target: &str, migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
+        // Refuse incompatible state before the runner stops services or backs up.
         // prepare_older_stores repeats the check after writers have stopped.
-        super::older_stores::preflight_worker_services(&self.home)?;
+        super::older_stores::preflight_rollback(&self.home, target)?;
         // No release so far ships a rollback-preparation step; a one-way
         // migration is the only known hazard.
         Ok(migrations
@@ -400,6 +400,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn r295_boundary_refuses_integration_before_the_runner_stops_services() {
+        use super::super::manifest::{MigrationClass, Mode};
+        use super::super::runner::{self, fake::FakeHost, Plan};
+        use super::super::state::{PackageRun, Phase, RunKind};
+        for target in ["r295", "0.2.5"] {
+            let root = std::env::temp_dir().join(format!("integration-rollback-{}", uuid::Uuid::new_v4()));
+            let home = root.join("home");
+            let store = crate::services::store::ServiceStore::new(home.join("services"), "fixture");
+            let request = serde_json::from_value(json!({
+                "slug":"owner-feed", "runtime":"integration", "lifetime":"persistent"
+            })).unwrap();
+            store.register(request, &crate::services::store::Caller::Owner).unwrap();
+            let before = std::fs::read(store.registry_path()).unwrap();
+            let real = RealHost { layout: Layout::at(root.join("base")), home,
+                base_url: "http://127.0.0.1:1".into(), token: String::new(), service_manager: "unused".into(),
+                names: ServiceNames::default(), unit_dir: None, cancel_marker: root.join("cancel") };
+            let mut host = FakeHost::new("r296");
+            host.rollback_guard = Some(Box::new(move |target| real.rollback_prep(target, &[]).map(|_| ())));
+            let plan = Plan { to_release: target.into(), to_commit: None, mode: Mode::Full,
+                class: MigrationClass::RollbackSafe, migrations: Vec::new(),
+                capabilities_added: Vec::new(), capabilities_removed: Vec::new(),
+                package_run: PackageRun::After, max_wait: Duration::from_secs(1), ready_timeout: Duration::from_secs(1),
+                run_dir: root.join("run"), selection_backup: None };
+            let mut run = runner::new_run(RunKind::Rollback, "r296", &plan);
+            runner::rollback(&mut run, &plan, &host);
+            assert_eq!(run.phase, Phase::Failed);
+            let error = run.error.unwrap();
+            assert_eq!(error.code, "rollback_hazard");
+            assert!(error.message.contains("owner-feed") && error.message.contains("integration"), "{error:?}");
+            let steps = host.steps();
+            assert!(steps.iter().any(|step| step == "rollback_prep"));
+            assert!(steps.iter().all(|step| !matches!(step.as_str(), "stop" | "backup" | "activate_old")));
+            assert_eq!(std::fs::read(store.registry_path()).unwrap(), before);
+            assert!(!root.join("base").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn worker_rollback_is_refused_by_production_pre_stop_check() {
         let root = std::env::temp_dir().join(format!("worker-rollback-pre-stop-{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
@@ -413,7 +452,7 @@ mod tests {
         let real = RealHost { layout: Layout::at(root.join("base")), home,
             base_url: "http://127.0.0.1:1".into(), token: String::new(), service_manager: "unused".into(),
             names: ServiceNames::default(), unit_dir: None, cancel_marker: root.join("cancel") };
-        let error = real.rollback_prep(&[]).unwrap_err();
+        let error = real.rollback_prep("0.2.0", &[]).unwrap_err();
         assert!(error.to_string().contains("worker services"), "{error:#}");
         assert_eq!(std::fs::read(store.registry_path()).unwrap(), before);
         assert!(!root.join("base").exists(), "preflight must not create a run backup");

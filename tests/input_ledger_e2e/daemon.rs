@@ -380,8 +380,10 @@ pub struct SeededAgentSpec {
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
-    /// Exact previous debug build for private compatibility probes only.
+    /// Exact previous build for private compatibility probes only.
     pub executable: Option<PathBuf>,
+    /// Matching previous MCP facade when that build is the tool caller.
+    pub mcp_executable: Option<PathBuf>,
     pub ledger_enabled: bool,
     /// Also run the Agent Bus (`cutex agent serve`) for wakes, notes, alarms.
     pub bus: bool,
@@ -402,7 +404,7 @@ pub struct DaemonOptions {
 
 impl Default for DaemonOptions {
     fn default() -> Self {
-        Self { executable: None, ledger_enabled: true, bus: false, fake_external_input: false, wake_busy_wait_secs: None, peers: false, turn_stall_secs: None }
+        Self { executable: None, mcp_executable: None, ledger_enabled: true, bus: false, fake_external_input: false, wake_busy_wait_secs: None, peers: false, turn_stall_secs: None }
     }
 }
 
@@ -615,6 +617,7 @@ impl Daemon {
         let program = option_env!("CARGO_BIN_EXE_cutex-mcp").map(PathBuf::from).unwrap_or_else(|| {
             Path::new(env!("CARGO_BIN_EXE_cutex")).with_file_name(if cfg!(windows) { "cutex-mcp.exe" } else { "cutex-mcp" })
         });
+        let program = self.options.mcp_executable.as_deref().unwrap_or(&program);
         let mut command = self.command_for(program.to_str().unwrap(), &[]);
         command
             .env("CUTEX_AGENT_ID", runtime_agent_id)
@@ -776,10 +779,16 @@ fn request_head(port: u16, token: &str, method: &str, path: &str, extra: &[(&str
 }
 
 pub fn http_request(port: u16, token: &str, method: &str, path: &str, body: Option<&Value>) -> std::io::Result<(u16, Value)> {
+    http_request_with_headers(port, token, method, path, &[], body)
+}
+
+pub fn http_request_with_headers(
+    port: u16, token: &str, method: &str, path: &str, extra: &[(&str, String)], body: Option<&Value>,
+) -> std::io::Result<(u16, Value)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let body = body.map(|b| b.to_string());
-    let mut head = request_head(port, token, method, path, &[], body.as_ref().map(String::len));
+    let mut head = request_head(port, token, method, path, extra, body.as_ref().map(String::len));
     head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     if let Some(body) = &body {

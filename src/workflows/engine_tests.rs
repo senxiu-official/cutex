@@ -15,6 +15,7 @@ struct FakeAsk {
 #[derive(Default)]
 struct FakeState {
     asks: HashMap<String, FakeAsk>,
+    starts_by_action: HashMap<String, StepHandle>,
     starts: Vec<StepStart>,
     notices: Vec<(String, String)>,
     stopped: Vec<String>,
@@ -61,7 +62,12 @@ impl StepBackend for Fake {
         state.asks.insert(ask.clone(), FakeAsk { settled: None, session: session.clone(), text: step.brief.clone(), nth: 1, polls: 0, stopped: false });
         let live = Self::live(&state);
         state.max_live = state.max_live.max(live);
-        Ok(StepHandle { session_id: session, ask_id: ask })
+        let handle = StepHandle { session_id: session, ask_id: ask };
+        state.starts_by_action.insert(step.action_id.clone(), handle.clone());
+        Ok(handle)
+    }
+    fn find_started_step(&self, action_id: &str) -> Result<Option<StepHandle>, RunError> {
+        Ok(self.state.lock().unwrap().starts_by_action.get(action_id).cloned())
     }
     fn follow_up(&self, session_id: &str, _action_id: &str, _title: &str, text: &str) -> Result<String, RunError> {
         let mut state = self.state.lock().unwrap();
@@ -103,7 +109,7 @@ impl StepBackend for Fake {
                     out.insert(id.clone(), settled);
                 }
                 None => {
-                    out.insert(id.clone(), AskPoll::Pending { activity: Some("working".into()), tokens: 1, blocked: false });
+                    out.insert(id.clone(), AskPoll::Pending { activity: Some("working".into()), tokens: 1, blocked: false, quota_reset_known: false });
                 }
             }
         }
@@ -441,7 +447,7 @@ fn resume_reuses_finished_steps_and_needs_no_new_approval() {
 }
 
 #[test]
-fn restart_recovery_continues_runs_whose_steps_are_alive() {
+fn restart_recovery_reattaches_a_step_waiting_for_a_known_quota_reset() {
     let fake = Fake::with(|p, _| Some(format!("r:{p}")), 10, 0);
     let h = harness(fake.clone());
     // First execution: both steps answered; capture the journal shape.
@@ -469,14 +475,27 @@ fn restart_recovery_continues_runs_whose_steps_are_alive() {
     two.run_id = run.run_id.clone();
     two.state = StepState::Running;
     two.result = None;
+    two.tokens = 0;
+    two.ended_at = None;
     two.session_id = Some(handle.session_id);
     two.ask_id = Some(handle.ask_id.clone());
-    two.ask_ids = vec![handle.ask_id];
+    two.ask_ids = vec![handle.ask_id.clone()];
     h.service.store().save_step(&two).unwrap();
+    fake.state.lock().unwrap().asks.get_mut(&handle.ask_id).unwrap().settled = Some(AskPoll::Pending {
+        activity: None, tokens: 5, blocked: true, quota_reset_known: true,
+    });
     let starts = fake.starts();
     let second = new_service(&h.dir, fake.clone(), None, Arc::new(Mutex::new(Vec::new())));
     second.recover();
     let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if second.store().step(&run.run_id, &two.step_key).unwrap().unwrap().tokens == 5 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the recovered driver did not poll the held step");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fake.state.lock().unwrap().asks.get_mut(&handle.ask_id).unwrap().settled = None;
     let recovered = loop {
         let current = second.store().run(&run.run_id).unwrap().unwrap();
         if current.state.is_terminal() {
@@ -524,8 +543,130 @@ fn restart_with_a_lost_step_stops_the_run_as_interrupted() {
     let run = second.store().run(&run.run_id).unwrap().unwrap();
     assert_eq!(run.state, RunState::Stopped);
     assert_eq!(run.stop_reason, Some(StopReason::Interrupted));
+    assert_eq!(run.error.as_ref().map(|error| error.code.as_str()), Some(STEP_OUTCOME_UNKNOWN));
+    assert_eq!(second.store().steps(&run.run_id).unwrap()[0].error.as_ref().unwrap().code, STEP_OUTCOME_UNKNOWN);
     assert_eq!(fake.starts(), starts, "recovery must not start another step for the lost ask");
     assert!(fake.state.lock().unwrap().notices.iter().any(|(_, t)| t.contains("resume_from_run_id")));
+}
+
+#[test]
+fn restart_recovers_the_ask_created_before_starting_step_was_linked() {
+    for answered in [true, false] {
+        let fake = Fake::new(|_, _| Some("done".into()));
+        let mut h = harness(fake.clone());
+        let body = "return await agent('one')";
+        let started = h.service.submit(owner_request(body)).unwrap().run;
+        let mut run = finished(&h, &started.run_id);
+        let mut step = h.service.store().steps(&run.run_id).unwrap().remove(0);
+        let ask_id = step.ask_id.take().unwrap();
+        let session_id = step.session_id.take().unwrap();
+        step.ask_ids.clear();
+        step.state = StepState::Starting;
+        step.result = None;
+        step.ended_at = None;
+        h.service.store().save_step(&step).unwrap();
+        run.state = RunState::Running;
+        run.result = None;
+        run.ended_at = None;
+        h.service.store().save_run(&mut run).unwrap();
+
+        if !answered {
+            fake.state.lock().unwrap().asks.get_mut(&ask_id).unwrap().settled = Some(AskPoll::Pending {
+                activity: None, tokens: 1, blocked: false, quota_reset_known: false,
+            });
+        }
+        h.service = new_service(&h.dir, fake.clone(), Some(ApprovalStore::at(&h.approvals_path)), h.events.clone());
+        h.service.recover();
+        let old = h.service.store().step(&run.run_id, &step.step_key).unwrap().unwrap();
+        assert_eq!(old.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(old.ask_id.as_deref(), Some(ask_id.as_str()));
+        assert_eq!(old.ask_ids, vec![ask_id.clone()]);
+        assert_eq!(fake.starts(), 1);
+
+        let resumed = h.service.resume(&run.run_id, true).unwrap().run;
+        if answered {
+            assert_eq!(old.state, StepState::Done);
+            let resumed = finished(&h, &resumed.run_id);
+            assert_eq!(resumed.result, Some(json!("done")));
+            assert_eq!(resumed.counts.cached, 1);
+            assert_eq!(fake.starts(), 1);
+        } else {
+            assert_eq!(old.error.unwrap().code, STEP_OUTCOME_UNKNOWN);
+            assert!(fake.state.lock().unwrap().stopped.contains(&ask_id));
+            assert_eq!(resumed.state, RunState::PendingApproval);
+            assert_eq!(fake.starts(), 1);
+        }
+    }
+}
+
+#[test]
+fn quota_retry_after_restart_reuses_completed_steps_and_requires_owner_for_unknown_outcome() {
+    let blocked = Arc::new(AtomicBool::new(true));
+    let flag = blocked.clone();
+    let fake = Fake::new(move |prompt, _| {
+        if prompt == "write" && flag.load(Ordering::SeqCst) {
+            None
+        } else {
+            Some(format!("result:{prompt}"))
+        }
+    });
+    let mut h = harness(fake.clone());
+    let body = "const a = await agent('inspect'); const b = await agent('write'); return [a, b]";
+    let run = h.service.submit(agent_request(body)).unwrap().run;
+    approve(&h, &run);
+    wait_for(&h, &run.run_id, |current| current.state == RunState::Running);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let ask_id = loop {
+        if let Some(step) = h.service.store().steps(&run.run_id).unwrap()
+            .into_iter().find(|step| step.prompt == "write" && step.state == StepState::Running)
+        {
+            break step.ask_id.unwrap();
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    fake.state.lock().unwrap().asks.get_mut(&ask_id).unwrap().settled = Some(AskPoll::Pending {
+        activity: None, tokens: 5, blocked: true, quota_reset_known: true,
+    });
+    // A quota hold with a known reset survives a poll. Losing the receipt
+    // instead of receiving the answer routes the retry to the owner.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(h.service.store().run(&run.run_id).unwrap().unwrap().state, RunState::Running);
+    fake.state.lock().unwrap().asks.remove(&ask_id);
+    let stopped = finished(&h, &run.run_id);
+    assert_eq!(stopped.error.as_ref().unwrap().code, STEP_OUTCOME_UNKNOWN);
+    assert_eq!(stopped.counts.done, 1);
+
+    let service = new_service(&h.dir, fake.clone(), Some(ApprovalStore::at(&h.approvals_path)), h.events.clone());
+    service.recover();
+    let mut request = agent_request(body);
+    request.resume_from_run_id = Some(run.run_id);
+    let retry = service.submit(request).unwrap();
+    assert_eq!(retry.run.state, RunState::PendingApproval);
+    assert_eq!(retry.approval.unwrap().details["unconfirmedSteps"], true);
+    assert_eq!(fake.starts(), 2);
+
+    // If the owner declines this retry, a new retry of the declined run
+    // still needs confirmation and inherits the original completed step.
+    ApprovalStore::at(&h.approvals_path).decide(retry.run.approval_id.as_ref().unwrap(), false, None, chrono::Utc::now()).unwrap();
+    service.tick();
+    assert_eq!(service.store().run(&retry.run.run_id).unwrap().unwrap().state, RunState::Rejected);
+    let mut request = agent_request(body);
+    request.resume_from_run_id = Some(retry.run.run_id);
+    let retry = service.submit(request).unwrap().run;
+    assert_eq!(retry.state, RunState::PendingApproval);
+    assert_eq!(fake.starts(), 2);
+
+    blocked.store(false, Ordering::SeqCst);
+    h.service = service;
+    approve(&h, &retry);
+    let result = finished(&h, &retry.run_id);
+    assert_eq!(result.result, Some(json!(["result:inspect", "result:write"])));
+    assert_eq!(result.counts.cached, 1);
+    assert_eq!(result.counts.done, 1);
+    assert_eq!(fake.starts(), 3);
+    let state = fake.state.lock().unwrap();
+    assert_eq!(state.starts.iter().filter(|step| task_of(&step.brief) == "inspect").count(), 1);
 }
 
 #[test]

@@ -295,6 +295,60 @@ revisions and remote job cancellation remain `remote_unsupported`. `alarm_set`
 to `name@host` is refused (`remote_unsupported`, "alarms are local to a host");
 other tools except `agent_delegate` and `agent_tell` refuse `@` targets too.
 
+## Management and tool delivery receipts
+
+Management advertises `peer-delivery-receipts-v1` (`peerDeliveryReceiptsV1`).
+Peer delegation views, result items and peer message views can include
+`crossHost: {direction, peer:{instanceId,label}, receipt:{state,reason,confirmedAt}}`.
+The direction is from the recording daemon's perspective. The peer ID comes
+from the authenticated pair or its persisted provenance. The sanitized label
+is the recording daemon's label for that peer. Clients match connections by
+instance ID and can show the label on historical records.
+
+| Receipt state | Evidence |
+| --- | --- |
+| `queuedAtSource` | Origin has a durable delegation, with peer persistence unconfirmed. |
+| `deliveredToPeer` | A peer snapshot proves destination persistence, or a tell response confirms the destination bus enqueue. Review and runtime acceptance are separate. |
+| `accepted` | The destination delegation scheduler admitted the work, or the runtime or answer proves admission. |
+| `failed` | The request or delivery ended with a known refusal or terminal state. |
+| `outcomeUnknown` | A send/reply or remote execution has not been established. The same action ID or original ask remains the recovery key. |
+
+`reason` is a bounded display enum. `confirmedAt` is the recording daemon's
+latest confirmed timestamp, or null when there is no proof. Free-form snapshot
+diagnostics never serve as routing refusal evidence. Existing fields and
+already frozen runtime views retain their contracts. The receipt uses existing
+peer wire snapshots and tell acknowledgements, including compatible older peers.
+Closing a queued delegation settles its local receipt, even if the create
+was never confirmed or the destination reports a late confirmation.
+
+Project routing failures use two fixed codes. Source policy or authority
+refuses locally as `delegation_cross_host_source_routing_refused`. Destination
+project routing refuses a create with HTTP 403
+`delegation_cross_host_destination_routing_refused`; the origin retains that
+reason in the ask result. These are policy refusals. They leave the peer
+connection usable for unrelated work. Ordinary peer-owner admission review
+remains a separate check. A legacy-shaped HTTP 400 `peer_unavailable` from a
+create is `peer_create_refused_unspecified` on the new origin, since the old
+response does not prove the routing cause. Current hosts use
+`peer_request_failed` for unrecognized internal failures. An unavailable or
+disabled peer keeps its own code and status. Name-resolution and transport
+errors retain their own classification.
+
+For private recovery acceptance, use the marked-home input-ledger E2E
+harness and the repository's platform build gate. The fixture uses two
+loopback daemons with synthetic agents and credentials.
+
+```text
+cargo test --locked --test input_ledger_e2e -- crosshost_phase1 --test-threads=1
+```
+
+To exercise both directions with an older real binary, set
+`CUTEX_CROSSHOST_OLDER_DAEMON` to the absolute path of a verified pre-feature
+daemon with its matching `cutex-mcp` beside it, and add `--include-ignored` to
+the test arguments. Each daemon runs in its own marked home. The scenarios
+check both policy refusals, reconnect and same-action replay, and replacement
+of credentials by removing and re-pairing the peer.
+
 ## Cross-host tells
 
 `agent_tell` with `to: "name@host"` leaves an FYI note for an agent the other

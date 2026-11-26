@@ -234,27 +234,78 @@ use StoreClass::{AppendLog, Blob, Cache, MutableState, SmallConfig};
 const SMALL: usize = 256 * 1024;
 
 pub static MANIFEST: &[StoreSpec] = &[
+    StoreSpec {
+        max_row_bytes: 512 * 1024,
+        page: PageBudget { max_rows: 50, max_bytes: 2 * 1024 * 1024 },
+        ..base("interaction-history", &["src/management/v2/interaction_history.rs"],
+            Sqlite { file: "runtime/management-v2/interaction-history/history.sqlite3", tables: &["interactions"] },
+            AppendLog, &domain::INTERACTION_HISTORY)
+            .key("session_id,seq / session_id,runtime_generation,request_id", &[K::Host, K::Session])
+            .indexes(&["interactions_turn", "PRIMARY KEY(session_id,seq)", "UNIQUE(session_id,runtime_generation,request_id)"])
+            .grows(0, 0, "at most 256 retained replies per session; each reply at most 512 KiB")
+    },
+    base("archive-migration-jobs", &["src/management/v2/archive_jobs.rs", "src/management/v2/archive_records.rs"],
+        JsonDir { path: "runtime/archive-migration/jobs" }, SmallConfig, &domain::OWN_FILE).config(4 * 1024 * 1024),
+    base("archive-migration-auto-revisions", &["src/management/v2/archive_records.rs"],
+        JsonDir { path: "runtime/archive-migration/auto-revisions" }, SmallConfig, &domain::OWN_FILE).config(32),
+    base("archive-migration-queue", &["src/management/v2/archive_jobs.rs", "src/management/v2/archive_records.rs"],
+        JsonDir { path: "runtime/archive-migration/queue" }, SmallConfig, &domain::OWN_FILE).config(256),
+    base("archive-history-locations", &["src/management/v2/archive_records.rs"],
+        JsonDir { path: "runtime/archive-migration/locations" }, SmallConfig, &domain::OWN_FILE).config(64 * 1024),
+    base("archive-location", &["src/management/v2/archive_location.rs", "src/management/v2/archive_inventory.rs"],
+        Json { path: "archive-location-v1.json" }, SmallConfig, &domain::OWN_FILE).config(64 * 1024),
+    base("personal-assistants", &["src/personal_assistants/store.rs", "src/personal_assistants/inbox.rs", "src/personal_assistants/owner_views.rs"],
+        Sqlite { file: "runtime/personal-assistants/assistants-v1.sqlite3", tables: &["pa_assistants","pa_actions","pa_audit","pa_requests","pa_memory","pa_notices","pa_reminder_cancellations","pa_calendar_sources","pa_calendar_events"] },
+        MutableState, &domain::PERSONAL_ASSISTANTS)
+        .key("id", &[K::Host,K::Session]).indexes(&["pa_audit_by_assistant","pa_requests_by_source","pa_requests_by_director","pa_requests_due","pa_calendar_agenda","pa_requests_source_state","pa_requests_project_history","pa_requests_project_state","pa_requests_director_history","pa_requests_director_state","pa_requests_seat_history","pa_closed_schedule"]),
     // r290 P12: standalone SQLite user_version=2, migrates v1 outbox metadata.
     base("profile-quota-notes", &["src/profile_quota_agents/alerts.rs"],
         Sqlite { file: "runtime/profile-quota-notes/quota-notes-v1.sqlite3", tables: &["quota_notes", "quota_note_windows"] }, MutableState, &domain::PROFILE_QUOTA_NOTES)
         .key("id", &[K::Host, K::Recipient]).indexes(&["quota_notes_pending", "quota_notes_cycle", "quota_notes_expiry", "quota_note_windows_cycle"]),
     // r290 P5 schedules: standalone versioned SQLite, keyed and bounded.
     base("schedules", &["src/schedules/store.rs"],
-        Sqlite { file: "runtime/schedules/schedules-v1.sqlite3", tables: &["schedules", "schedule_runs", "schedule_actions"] },
+        Sqlite { file: "runtime/schedules/schedules-v1.sqlite3", tables: &["schedules", "schedule_runs", "schedule_actions","schedule_template_events","schedule_template_reviews"] },
         MutableState, &domain::SCHEDULES)
         .key("schedule_id / occurrence_id / action_id", &[K::Host, K::Session])
-        .indexes(&["schedules_due", "schedules_active", "schedules_target", "schedule_runs_history", "schedule_runs_due", "schedule_one_open_run"]), // standalone user_version=1
+        .indexes(&["schedules_due", "schedules_active", "schedules_target", "schedule_runs_history", "schedule_runs_due", "schedule_one_open_run","schedules_by_assistant","schedule_template_history","schedule_reviews_pending","schedule_template_maintenance","schedule_retention_summary"]), // v2 on first confirmed assistant template
     // --- management-state.sqlite3 (hot_store) ---------------------------------
-    base("asks", &["src/asks/store.rs", "src/asks/store_diagnostics.rs", "src/asks/receipt_uncertainty/read_context/observer.rs"],
+    base("asks", &["src/asks/store.rs", "src/asks/store_diagnostics.rs", "src/asks/receipt_uncertainty/read_context/observer.rs", "src/asks/short_id_lookup.rs"],
         HotStore { logical: "asks" }, MutableState, &domain::MANAGEMENT_STATE)
         .key("ask_id", &[K::Host, K::Recipient, K::Session])
-        .indexes(&["requester", "target", "deadline"])
+        .indexes(&["requester", "target", "deadline", "asks_short_id_hot_prefix", "asks_short_id_hot_suffix"])
         .grows(13_650_000, 0, "asks incl. closed history")
         .fixture("asks").whole("S6"),
-    base("asks-archive", &["src/asks/archive.rs"],
+    base("asks-archive", &["src/asks/archive.rs", "src/asks/short_id_lookup.rs"],
         Sqlite { file: "runtime/management-v2/management-state.sqlite3", tables: &["asks_archive_meta", "asks_archive_rows"] },
         AppendLog, &domain::MANAGEMENT_STATE)
-        .key("ask_id", &[K::Host]).grows(0, 0, "closed asks moved to cold archive").slice("S6"),
+        .key("ask_id", &[K::Host]).indexes(&["asks_short_id_cold_prefix", "asks_short_id_cold_suffix"])
+        .grows(0, 0, "closed asks moved to cold archive").slice("S6"),
+    // Arrival ordinals commit atomically with hot_store source rows; windows
+    // and immutable publication plans share the same SQLite snapshot domain.
+    base("automatic-input-order", &["src/management/v2/automatic_input_order.rs"],
+        Sqlite { file: "runtime/management-v2/management-state.sqlite3", tables: &["automatic_input_order"] },
+        MutableState, &domain::MANAGEMENT_STATE)
+        .key("store,collection,row_key / ordinal", &[K::Host])
+        .indexes(&["PRIMARY KEY(ordinal)", "UNIQUE(store,collection,row_key)"])
+        .grows(0, 0, "one immutable arrival ordinal per source row, deleted with that source row"),
+    base("automatic-input-windows", &["src/management/v2/automatic_input_order.rs"],
+        Sqlite { file: "runtime/management-v2/management-state.sqlite3", tables: &["automatic_input_windows"] },
+        MutableState, &domain::MANAGEMENT_STATE)
+        .key("session / id", &[K::Host, K::Session])
+        .indexes(&["UNIQUE(session)"])
+        .grows(0, 0, "one active delivery window per session; retired after prefix promotion or reconciliation"),
+    base("automatic-input-window-anchors", &["src/management/v2/automatic_input_order.rs"],
+        Sqlite { file: "runtime/management-v2/management-state.sqlite3", tables: &["automatic_input_window_anchors"] },
+        MutableState, &domain::MANAGEMENT_STATE)
+        .key("window_id", &[K::Host, K::Session])
+        .indexes(&["PRIMARY KEY(window_id)"])
+        .grows(0, 0, "one source anchor per window, cascade-deleted with its window"),
+    base("automatic-input-publications", &["src/management/v2/automatic_input_order.rs", "src/management/v2/automatic_input/manifest.rs"],
+        Sqlite { file: "runtime/management-v2/management-state.sqlite3", tables: &["automatic_input_publications"] },
+        MutableState, &domain::MANAGEMENT_STATE)
+        .key("batch / session,thread,generation", &[K::Host, K::Session])
+        .indexes(&["PRIMARY KEY(batch)", "automatic_input_active_publication", "automatic_input_reconciliation"])
+        .grows(0, 0, "one active publication per session plus pending replaced-generation reconciliation"),
     base("bus-messages", &["src/management/v2/agent_bus_state.rs", "src/management/v2/agent_bus_stuck.rs", "src/cli_app/agent_bus_runtime.rs", "src/management/v2/bus_changes.rs"],
         HotStore { logical: "agent_bus" }, MutableState, &domain::MANAGEMENT_STATE)
         .key("message_id", &[K::Host, K::Recipient])
@@ -410,9 +461,10 @@ pub static MANIFEST: &[StoreSpec] = &[
         Sqlite { file: "notifications/outbound.sqlite3", tables: &["delivery", "meta"] },
         AppendLog, &domain::NOTIFY_OUTBOUND)
         .key("delivery_id", &[K::Host]),
-    base("storage-cache", &["src/management/v2/storage.rs", "src/management/v2/storage_cleanup_state.rs", "src/management/v2/storage_cleanup_catalog.rs", "src/management/v2/storage_cleanup_homes.rs", "src/management/v2/storage_cleanup_vacuum.rs", "src/management/v2/storage_cleanup.rs"],
-        Sqlite { file: "runtime/storage/storage.sqlite3", tables: &["walk", "walk_items", "cleanup_previews", "cleanups", "cleanup_items", "cleanup_audit"] },
-        Cache, &domain::STORAGE)
+    // The same database also holds cleanup and Native launch ownership receipts.
+    base("storage-cache", &["src/management/v2/storage.rs", "src/management/v2/stock_temp.rs", "src/management/v2/storage_cleanup_state.rs", "src/management/v2/storage_cleanup_catalog.rs", "src/management/v2/storage_cleanup_homes.rs", "src/management/v2/storage_cleanup_vacuum.rs", "src/management/v2/storage_cleanup.rs"],
+        Sqlite { file: "runtime/storage/storage.sqlite3", tables: &["walk", "walk_items", "stock_temp_owners", "cleanup_previews", "cleanups", "cleanup_items", "cleanup_audit"] },
+        MutableState, &domain::STORAGE)
         .key("walk,item", &[K::Host]),
     // --- management JSON / JSONL ---------------------------------------------
     base("events", &["src/management/v2/repository.rs"],
@@ -446,8 +498,8 @@ pub static MANIFEST: &[StoreSpec] = &[
         Jsonl { path: "runtime/management-v2/usage-ledger-external" }, AppendLog, &domain::OWN_FILE)
         .key("entry_id", &[K::Host]).grows(99_861_683, 0, "external usage samples").fixture("usage").append().slice("S1"),
     // S1: derived read model of the two ledgers above (JSONL stays canonical; R0: the previous build ignores it).
-    base("usage-index", &["src/management/v2/usage/index.rs"],
-        Sqlite { file: "runtime/management-v2/usage-index.sqlite3", tables: &["usage_index_meta", "usage_index_files", "usage_index_entries", "usage_index_duplicates", "usage_index_warnings", "usage_index_native_threads"] },
+    base("usage-index", &["src/management/v2/usage/index.rs", "src/management/v2/usage/index_archive.rs"],
+        Sqlite { file: "runtime/management-v2/usage-index.sqlite3", tables: &["usage_index_meta", "usage_index_files", "usage_index_entries", "usage_index_duplicates", "usage_index_warnings", "usage_index_native_threads", "usage_index_archive_samples", "usage_index_archive_ready"] },
         Cache, &domain::USAGE)
         .key("entry_id", &[K::Host]).indexes(&["observed_ms", "profile_id,observed_ms", "file_id"])
         .grows(0, 0, "one row per ledger entry; rebuilt from the ledger when missing").slice("S1").layer(1),
@@ -548,7 +600,7 @@ pub static MANIFEST: &[StoreSpec] = &[
         Json { path: "runtime/director-address/management-v1.json" }, MutableState, &domain::OWN_FILE)
         .key("project", &[K::Project]).whole("S12").rollback(Rollback::R1, Some("S12 exporter")),
     base("owner-notify", &["src/owner_notify/store.rs", "src/owner_notify/sql.rs"],
-        Sqlite { file: "runtime/owner-notify/owner-notify.sqlite3", tables: &["notifications", "notification_actions", "notification_meta", "notification_count", "notification_outbox_count", "store_outbox"] }, MutableState, &domain::OWNER_NOTIFY)
+        Sqlite { file: "runtime/owner-notify/owner-notify.sqlite3", tables: &["notifications", "notification_actions", "notification_meta", "notification_count", "notification_outbox_count", "notification_template_reviews", "store_outbox"] }, MutableState, &domain::OWNER_NOTIFY)
         .key("notification_id", &[K::Host]).grows(75_671, 0, "owner notifications")
         .fixture("owner_notify").layer(1).slice("S10").indexes(&["pending/time", "agent/time", "state/agent", "safety", "action_id"]).rollback(Rollback::R1, Some("storage notification-store --rollback --daemon-stopped")),
     base("approvals", &["src/approvals.rs", "src/approvals_sql.rs", "src/approval_rules.rs"],
@@ -570,7 +622,15 @@ pub static MANIFEST: &[StoreSpec] = &[
         Json { path: "services/registry.json" }, MutableState, &domain::OWN_FILE)
         .key("slug", &[K::Host, K::Project]).grows(47_400, 0, "registered services")
         .whole("S11").rollback(Rollback::R1, Some("S11 exporter")),
+    base("service-notifications", &["src/services/notifications.rs"],
+        Sqlite { file: "services/notifications/service-notifications.sqlite3", tables: &["metadata", "configuration", "notices"] },
+        MutableState, &domain::SERVICE_NOTIFICATIONS)
+        .key("metadata name; configuration slug; notice sequence and (instance, dedup)", &[K::Host])
+        .indexes(&["notices_slug_seq", "notices_slug_at", "notices_at"])
+        .grows(0, 0, "one configuration per service and up to 2,000 retained notice rows per host"),
     // --- users / profiles / small config ----------------------------------------
+    base("feature-profiles", &["src/management/v2/feature_profiles.rs"],
+        JsonDir { path: "feature-profiles" }, SmallConfig, &domain::OWN_FILE).config(16 * 1024),
     base("users", &["src/management/users.rs", "src/management/persons.rs", "src/management/user_home.rs"],
         Json { path: "runtime/users/users-v1.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     // 056 user layout: one JSON document per user/device key under the users dir (r275 merge).
@@ -603,7 +663,7 @@ pub static MANIFEST: &[StoreSpec] = &[
         Json { path: "im-sessions.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("profile-avatars", &["src/profiles/avatar.rs"],
         Json { path: "runtime/profile-avatars/avatars-v1.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
-    base("profiles", &["src/profiles/store.rs", "src/profiles/identity.rs", "src/profiles/lifecycle.rs", "src/profiles/settings_api.rs", "src/profiles/catalog_api.rs", "src/profiles/catalog_overlay.rs", "src/profiles/generic_switches.rs", "src/profiles/claude_compaction.rs", "src/profiles/claude_tool_defaults.rs", "src/profiles/reviewer_catalog.rs", "src/profiles/account_link.rs", "src/profiles/transfer.rs", "src/profiles/stored_keys.rs", "src/profiles/cc_switch.rs", "src/profiles/materialize.rs", "src/profiles/kimi_launch.rs", "src/profiles/kimi_accounts.rs"],
+    base("profiles", &["src/profiles/store.rs", "src/profiles/identity.rs", "src/profiles/lifecycle.rs", "src/profiles/settings_api.rs", "src/profiles/catalog_api.rs", "src/profiles/catalog_overlay.rs", "src/profiles/reasoning.rs", "src/profiles/generic_switches.rs", "src/profiles/claude_compaction.rs", "src/profiles/claude_tool_defaults.rs", "src/profiles/reviewer_catalog.rs", "src/profiles/account_link.rs", "src/profiles/transfer.rs", "src/profiles/stored_keys.rs", "src/profiles/cc_switch.rs", "src/profiles/materialize.rs", "src/profiles/kimi_launch.rs", "src/profiles/kimi_accounts.rs"],
         JsonDir { path: "profiles" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("config", &["src/config/store.rs", "src/config/paths.rs", "src/config/text.rs", "src/config/fresh_agent_permissions.rs", "src/config/notification_levels.rs", "src/cli_app/profile.rs"],
         Json { path: "config.json, accounts.json, state.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
@@ -738,6 +798,33 @@ pub fn validate(repo_root: Option<&std::path::Path>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_notifications_owns_the_sqlite_store_in_the_services_backup_root() {
+        let entry = spec("service-notifications");
+        assert_eq!(entry.owner, &["src/services/notifications.rs"]);
+        assert_eq!(entry.domain.kind, domain::DomainKind::Sqlite);
+        assert_eq!(domain::domain(entry.domain.id).unwrap().path, entry.domain.path);
+        assert!(matches!(entry.canonical, Canonical::Sqlite { file, tables }
+            if file == entry.domain.path && tables == ["metadata", "configuration", "notices"]));
+        assert_eq!(entry.access, Access::Keyed);
+        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|root|
+            entry.domain.path.starts_with(&format!("{root}/"))));
+    }
+
+    #[test]
+    fn submitted_interactions_are_registered_with_their_own_transaction_domain() {
+        let entry = spec("interaction-history");
+        assert_eq!(entry.owner, &["src/management/v2/interaction_history.rs"]);
+        assert!(matches!(entry.canonical, Canonical::Sqlite { file: "runtime/management-v2/interaction-history/history.sqlite3", tables } if tables == ["interactions"]));
+        assert_eq!(entry.domain.kind, domain::DomainKind::Sqlite);
+        assert_eq!(domain::domain(entry.domain.id).unwrap().path, entry.domain.path);
+        assert_eq!(entry.access, Access::Keyed);
+        assert_eq!(entry.class, StoreClass::AppendLog);
+        assert_eq!((entry.max_row_bytes, entry.page.max_rows, entry.page.max_bytes), (512 * 1024, 50, 2 * 1024 * 1024));
+        assert!(entry.growth.with.contains("256"));
+        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|root| entry.domain.path.starts_with(&format!("{root}/"))));
+    }
 
     #[test]
     fn submitted_input_index_is_registered_as_a_rebuildable_repository_cache() {

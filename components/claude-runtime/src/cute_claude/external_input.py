@@ -18,8 +18,11 @@ from . import asks
 from .errors import RpcError, require, text
 from .store import dump
 
-METHODS = frozenset('thread/externalInput/' + action for action in ('submit', 'status', 'retry', 'resume', 'interrupt', 'returnCarries'))
+METHODS = frozenset('thread/externalInput/' + action for action in ('submit', 'submitBatch', 'batchCapacity', 'status', 'retry', 'resume', 'interrupt', 'returnCarries'))
 BINDING_FIELDS = {'version', 'ownerId', 'threadId', 'runtimeGeneration'}
+MAX_BATCH_MEMBERS = 100
+MAX_BATCH_BYTES = 1024 * 1024
+MAX_PASSIVE_MEMBERS = MAX_BATCH_MEMBERS - 1
 
 
 def _hash(domain: bytes, fields: list[str]):
@@ -186,7 +189,8 @@ class ExternalInputService:
         return {'externalInputVersion': 1, 'externalInputVersions': [1, 2],
                 'externalInputDeliveries': ['after_turn', 'passive'] + (['soon'] if self.settings.backend == 'subscription' else []),
                 'externalInputControlVersion': 1,
-                **({'ownerInputCarries': 1, 'ownerCarryReturn': 1, 'ownerInputBatch': 1} if self.settings.backend == 'subscription' else {})}
+                **({'ownerInputCarries': 1, 'ownerCarryReturn': 1, 'ownerInputBatch': 1,
+                    'externalInputOrderedBatch': 1} if self.settings.backend == 'subscription' else {})}
 
     def _binding(self, params: dict, *, submit=False) -> str:
         require(self.enabled, 'native external input requires a trusted host owner/runtime binding', -32011)
@@ -227,6 +231,10 @@ class ExternalInputService:
                 owner = self.store.db.execute('SELECT state FROM inputs WHERE thread_id=? AND message_id=?', (tid, carrier)).fetchone()
                 if owner and owner[0] in {'interrupted', 'failed', 'uncertain', 'completed'}:
                     return {**dict(note), 'state': owner[0]}
+            elif note['state'] == 'injected' and json.loads(note['payload']).get('metadata', {}).get('automaticNoteBatch'):
+                turn = self.store.db.execute('SELECT state FROM turns WHERE id=?', (note['turn_id'],)).fetchone()
+                if turn and turn[0] != 'inProgress':
+                    return {**dict(note), 'state': turn[0]}
         return note
 
     def _status(self, tid: str, mid: str, digest: str, *, recover: bool = False) -> dict:
@@ -258,10 +266,21 @@ class ExternalInputService:
         if inbox['passive']:
             if not row['receipt'] and inbox['state'] in {'failed', 'interrupted', 'uncertain', 'completed'}:
                 result['processing'] = {'state':'held', 'attemptId':row['attempt_id'], 'reason':'request_uncertain'}
-            if not row['receipt'] and json.loads(inbox['payload']).get('metadata', {}).get('ownerCarrier'):
+            metadata = json.loads(inbox['payload']).get('metadata', {})
+            if not row['receipt'] and (metadata.get('ownerCarrier') or metadata.get('automaticNoteBatch')):
                 state = inbox['state']
-                result['processing'] = {'state': 'pending' if state == 'reserved' else ('claimed' if state == 'injected' else 'held'),
-                                        'attemptId': row['attempt_id'], 'reason': None if state in {'reserved', 'injected'} else ('interrupted' if state == 'interrupted' else 'request_uncertain')}
+                pending = state in {'pending', 'reserved'}
+                attempt = row['attempt_id']
+                if not pending and (metadata.get('automaticNoteBatch') or metadata.get('automaticBatchMember')):
+                    turn_id = inbox['turn_id']
+                    if turn_id is None and metadata.get('ownerCarrier'):
+                        carrier = self.store.db.execute('SELECT turn_id FROM inputs WHERE thread_id=? AND message_id=?',
+                                                        (tid, metadata['ownerCarrier'])).fetchone()
+                        turn_id = carrier[0] if carrier else None
+                    if turn_id:
+                        attempt = str(uuid.uuid5(uuid.NAMESPACE_URL, f"cute-claude:external:{tid}:{turn_id}"))
+                result['processing'] = {'state': 'pending' if pending else ('claimed' if state == 'injected' else 'held'),
+                                        'attemptId': attempt, 'reason': None if pending or state == 'injected' else ('interrupted' if state == 'interrupted' else 'request_uncertain')}
             return result
         attempt = row['attempt_id']
         state = inbox['state']
@@ -461,7 +480,8 @@ class ExternalInputService:
         rows = self.store.db.execute('''SELECT n.seq,n.message_id FROM notes n
             JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
             WHERE n.thread_id=? AND n.turn_id=? AND n.state='injected' AND e.receipt IS NULL
-              AND json_extract(n.payload,'$.metadata.ownerCarrier') IS NULL ORDER BY n.seq''',
+              AND json_extract(n.payload,'$.metadata.ownerCarrier') IS NULL
+              AND json_extract(n.payload,'$.metadata.automaticNoteBatch') IS NULL ORDER BY n.seq''',
             (tid, turn_id)).fetchall()
         if not rows:
             return [], []
@@ -534,15 +554,22 @@ class ExternalInputService:
     async def dispatch(self, peer, method: str, params: dict):
         require(method in METHODS, 'unsupported native external input method')
         action = method.rsplit('/', 1)[-1]
-        extra = {'submit': {'message', 'view', 'semanticSha256', 'admission'}, 'status': {'messages'}, 'returnCarries': {'messages'},
+        extra = {'submit': {'message', 'view', 'semanticSha256', 'admission'}, 'submitBatch': {'messages', 'triggerId', 'notesAtStart'},
+                 'status': {'messages'}, 'returnCarries': {'messages'}, 'batchCapacity': set(),
                  'retry': {'messageId', 'semanticSha256', 'expectedAttemptId', 'retryId'},
                  'resume': set(), 'interrupt': {'turnId'}}[action]
         require(not set(params) - BINDING_FIELDS - extra, 'unsupported external input fields')
-        tid = self._binding(params, submit=action == 'submit')
-        if action != 'status':
+        tid = self._binding(params, submit=action in {'submit', 'submitBatch'})
+        if action not in {'status', 'batchCapacity'}:
             require(tid not in self.store.history_mutations, 'session history mutation is in progress', -32009)
         if action == 'submit':
             return await self._submit(peer, tid, params)
+        if action == 'submitBatch':
+            return self._submit_batch(peer, tid, params)
+        if action == 'batchCapacity':
+            require(self.settings.backend == 'subscription', 'ordered capacity requires bound subscription runtime', -32011)
+            members, size = self._batch_capacity(tid)
+            return {**self._response(tid), 'availableMembers': members, 'availableBytes': size}, None
         if action == 'status':
             keys = params.get('messages')
             require(isinstance(keys, list) and 1 <= len(keys) <= 100, 'status requires 1..100 message keys')
@@ -615,13 +642,33 @@ class ExternalInputService:
 
     def owner_carries(self, tid: str, values) -> list[dict]:
         require(self.settings.backend == 'subscription' and self.enabled, 'owner carries require bound subscription runtime', -32011)
-        require(isinstance(values, list) and len(values) <= 100, 'ownerCarries must be an array of at most 100 envelopes')
+        require(isinstance(values, list) and len(values) <= MAX_BATCH_MEMBERS, 'ownerCarries must be an array of at most 100 envelopes')
         result = [self.validate_envelope(tid, value) for value in values]
         require(len({e['message']['id'] for e in result}) == len(result), 'duplicate carried identity')
-        require(sum(len(dump(e).encode('utf-8')) for e in result) <= 1024 * 1024, 'ownerCarries exceeds 1 MiB')
+        require(sum(len(dump(e).encode('utf-8')) for e in result) <= MAX_BATCH_BYTES, 'ownerCarries exceeds 1 MiB')
         return result
 
-    def reserve_owner_carries(self, tid: str, carrier: str, values) -> None:
+    def _batch_capacity(self, tid: str) -> tuple[int, int]:
+        # Only ordinary passive inputs still eligible to join a future claim.
+        # Claimed, uncertain or terminal inputs retain their exact receipts.
+        used, size = self.store.db.execute('''SELECT COUNT(*),
+            COALESCE(SUM(length(CAST(e.envelope AS BLOB))), 0)
+            FROM notes n JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
+            WHERE n.thread_id=? AND e.receipt IS NULL AND (
+                (n.state='pending' AND json_extract(n.payload,'$.metadata.automaticNoteBatch') IS NOT NULL)
+                OR (n.state='reserved' AND json_extract(n.payload,'$.metadata.automaticBatchMember')=1
+                    AND EXISTS (SELECT 1 FROM inputs i WHERE i.thread_id=n.thread_id AND i.state='queued'
+                        AND i.message_id=json_extract(n.payload,'$.metadata.ownerCarrier'))))''', (tid,)).fetchone()
+        return max(0, MAX_PASSIVE_MEMBERS - used), max(0, MAX_BATCH_BYTES - size)
+
+    def _check_batch_capacity(self, tid: str, companions: list[dict]) -> None:
+        if not companions:
+            return  # An eligible trigger always has its own slot.
+        count, size = self._batch_capacity(tid)
+        if len(companions) > count or sum(len(dump(e).encode('utf-8')) for e in companions) > size:
+            raise asks.refuse_busy('automatic_passive_capacity')
+
+    def reserve_owner_carries(self, tid: str, carrier: str, values, *, automatic: bool = False) -> None:
         # Caller encloses owner enqueue and reservations in one SQLite transaction.
         for envelope in values:
             mid = envelope['message']['id']
@@ -635,10 +682,101 @@ class ExternalInputService:
                 continue  # Retrying never rearms a claimed/terminal carrier.
             payload = self.payload(envelope)
             payload['metadata']['ownerCarrier'] = carrier
+            if automatic:
+                payload['metadata']['automaticBatchMember'] = True
             self.store.enqueue_note(tid, mid, payload, self.settings.max_pending)
             self.store.db.execute("UPDATE notes SET state='reserved' WHERE thread_id=? AND message_id=?", (tid, mid))
             self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)', (tid, mid, dump(envelope)))
             self.store.db.execute('DELETE FROM returned_carries WHERE thread_id=? AND message_id=?', (tid, mid))
+
+    def _submit_batch(self, peer, tid: str, params: dict):
+        """Publish an ordered batch in one inbox write. A notes-only batch never wakes."""
+        envelopes = self.owner_carries(tid, params.get('messages'))
+        require(envelopes, 'an automatic batch requires at least one input')
+        notes_at_start = params.get('notesAtStart', False)
+        require(type(notes_at_start) is bool, 'notesAtStart must be a boolean')
+        if params.get('triggerId') is None:
+            return self._submit_note_batch(peer, tid, envelopes, notes_at_start)
+        require(not notes_at_start, 'notesAtStart is for notes-only batches')
+        trigger_id = text(params.get('triggerId'), 'triggerId', limit=256)
+        trigger = next((e for e in envelopes if e['message']['id'] == trigger_id), None)
+        require(trigger is not None and trigger['message']['delivery'] in {'soon', 'after_turn'},
+                'batch requires an active trigger')
+        companions = [e for e in envelopes if e is not trigger]
+        require(all(e['message']['delivery'] == 'passive' for e in companions),
+                'batch companions require passive envelopes')
+        members = [e['message']['id'] for e in envelopes]
+        payload = self.payload(trigger)
+        payload['metadata']['automaticInputOrder'] = members
+        with self.store.transaction():
+            known = self._row(tid, trigger_id)
+            if known is None:
+                require(all(self._row(tid, mid) is None and self._inbox(tid, mid) is None for mid in members),
+                        'batch contains a previously submitted identity', -32010)
+                reason = asks.busy_reason(self.server, tid)
+                if reason and (reason != 'active_turn' or trigger['message']['delivery'] != 'soon'):
+                    raise asks.refuse_busy(reason)
+                if self.server.approvals.planning(tid) or self.server.engine.closing:
+                    raise asks.refuse_busy('plan_mode' if self.server.approvals.planning(tid) else 'server_draining')
+                self._check_batch_capacity(tid, companions)
+                receipt = self.store.enqueue(tid, trigger_id, payload, self.settings.max_pending)
+                self.reserve_owner_carries(tid, trigger_id, companions, automatic=True)
+                self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)',
+                                      (tid, trigger_id, dump(trigger)))
+                if trigger['message']['delivery'] == 'soon':
+                    self.server.busy_delivery.register(tid, trigger_id, receipt)
+            else:
+                inbox = self._inbox(tid, trigger_id)
+                require(inbox is not None and json.loads(inbox['payload']) == payload,
+                        'batch order or trigger content changed', -32010)
+                for envelope in envelopes:
+                    mid = envelope['message']['id']
+                    saved = self._row(tid, mid)
+                    require(saved is not None and json.loads(saved['envelope'])['semanticSha256'] == envelope['semanticSha256'],
+                            'batch member content changed', -32010)
+            statuses = [self._status(tid, mid, e['semanticSha256']) for mid, e in zip(members, envelopes)]
+        peer.subscriptions.add(tid)
+
+        async def after():
+            self.server.engine.wake(tid)
+            for mid in members:
+                await self._changed(tid, mid)
+
+        return {**self._response(tid), 'statuses': statuses}, after
+
+    def _submit_note_batch(self, peer, tid: str, envelopes, notes_at_start: bool):
+        require(all(e['message']['delivery'] == 'passive' for e in envelopes),
+                'notes-only batches require passive envelopes')
+        keys = [(e['message']['id'], e['semanticSha256']) for e in envelopes]
+        batch = _hash(b'cutex:ordered-automatic-notes:v1\0', [
+            'start' if notes_at_start else 'gap', *(value for key in keys for value in key)]).hexdigest()
+        with self.store.transaction():
+            existing = [(self._row(tid, mid), self._inbox(tid, mid)) for mid, _ in keys]
+            if any(saved is not None or inbox is not None for saved, inbox in existing):
+                for (_, digest), (saved, inbox) in zip(keys, existing):
+                    require(saved is not None and inbox is not None
+                            and json.loads(saved['envelope'])['semanticSha256'] == digest
+                            and json.loads(inbox['payload']).get('metadata', {}).get('automaticNoteBatch') == batch,
+                            'batch contains a previously submitted identity', -32010)
+            else:
+                self._check_batch_capacity(tid, envelopes)
+                for envelope, (mid, _) in zip(envelopes, keys):
+                    payload = self.payload(envelope)
+                    payload['metadata']['automaticNoteBatch'] = batch
+                    if notes_at_start:
+                        payload['metadata']['automaticNoteStartOnly'] = True
+                    self.store.enqueue_note(tid, mid, payload, self.settings.max_pending)
+                    self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)',
+                                          (tid, mid, dump(envelope)))
+                    self.store.db.execute('DELETE FROM returned_carries WHERE thread_id=? AND message_id=?', (tid, mid))
+            statuses = [self._status(tid, mid, digest) for mid, digest in keys]
+        peer.subscriptions.add(tid)
+
+        async def after():
+            for mid, _ in keys:
+                await self._changed(tid, mid)
+
+        return {**self._response(tid), 'statuses': statuses}, after
 
     async def _submit(self, peer, tid: str, params: dict):
         envelope = self.validate_envelope(tid, {k: v for k, v in params.items() if k != 'admission'})

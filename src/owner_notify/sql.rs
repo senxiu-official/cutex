@@ -9,6 +9,7 @@ use std::sync::Arc;
 const ID: &str = "owner-notify";
 const TOPIC: &str = "owner-notify.notice";
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS notification_template_reviews(schedule_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS notifications (
  id TEXT PRIMARY KEY, agent TEXT NOT NULL, origin TEXT NOT NULL, created TEXT NOT NULL, created_ms INTEGER,
  pending INTEGER NOT NULL, alerting INTEGER NOT NULL, state TEXT NOT NULL,
@@ -587,6 +588,42 @@ impl OwnerNotifyStore {
     ) -> anyhow::Result<OwnerNotification> {
         self.edit_selected_inner("0", &[], None, Some(now), |state| {
             state.create_decided(new, Origin::System, kind, settings, evaluator, None, now)
+        })
+    }
+
+    /// Commit the owner's record and one monotonic receipt per schedule together. The
+    /// receipt survives dismissal, deletion and notification-history expiry.
+    pub(crate) fn template_review_once(
+        &self,
+        review: &TemplateReview,
+        new: NewNotification,
+        settings: &crate::config::owner_notify::OwnerNotifySettings,
+        evaluator: &crate::notification_levels::Evaluator,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        self.database()?.write(|tx| {
+            let changed = tx.sql().execute(
+                "INSERT INTO notification_template_reviews(schedule_id,revision) VALUES(?1,?2)
+                 ON CONFLICT(schedule_id) DO UPDATE SET revision=excluded.revision WHERE revision<excluded.revision",
+                params![review.schedule_id, review.template_revision],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let mut state = OwnerNotifyState::default();
+            state.selected_rows = true;
+            let mut record = state.create_decided(new, Origin::System, Some("assistantTemplateNeedsReview"), settings, evaluator, None, now);
+            record.template_review = Some(review.clone());
+            state.notices.clear();
+            state.notice(super::CREATED_EVENT, &record);
+            put(tx, &record)?;
+            for notice in &state.notices {
+                enqueue(tx, notice)?;
+            }
+            trim_notices(tx)?;
+            prune(tx, now)?;
+            tx.sql().execute("UPDATE notification_meta SET revision=revision+1 WHERE id=1", [])?;
+            Ok(true)
         })
     }
 

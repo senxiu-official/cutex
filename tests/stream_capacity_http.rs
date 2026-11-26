@@ -85,6 +85,7 @@ fn context() -> ManagementRequestContext {
             Ok(fixtures().get(id).filter(|f| f.online).map(|_| {
                 cutex::app_server::manager::AppServerManagedRuntimeStatus {
                     background_work: Default::default(),
+                    claude_diagnostics: None,
                     cutex_session_id: id.into(),
                     thread_id: thread_id(id),
                     runtime_generation: 1,

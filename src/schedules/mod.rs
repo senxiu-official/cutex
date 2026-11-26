@@ -7,6 +7,8 @@ pub use store::Store;
 
 pub const CAPABILITY: &str = "recurring-schedules-v1";
 pub const SYSTEM_OWNER: &str = "cutex.schedules";
+pub(crate) const TEMPLATE_HISTORY_KEEP: i64 = 128;
+pub(crate) const PRUNE_BATCH: i64 = 32;
 
 #[derive(Debug)]
 pub enum Error {

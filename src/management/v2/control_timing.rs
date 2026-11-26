@@ -234,8 +234,20 @@ impl Histogram {
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
     fn snapshot(&self) -> Value {
+        let buckets = self.buckets.each_ref().map(|bucket| bucket.load(Ordering::Relaxed));
+        let samples = buckets.iter().sum::<u64>();
+        let p95_upper_ns = if samples == 0 {
+            None
+        } else {
+            let rank = samples - samples / 20;
+            let mut cumulative = 0;
+            buckets.iter().zip(UPPER_NS).find_map(|(count, upper)| {
+                cumulative += count;
+                (cumulative >= rank).then_some(upper)
+            })
+        };
         json!({"count":self.count.load(Ordering::Relaxed),"sumNs":self.sum_ns.load(Ordering::Relaxed),"maxNs":self.max_ns.load(Ordering::Relaxed),
-            "buckets":self.buckets.each_ref().map(|bucket| bucket.load(Ordering::Relaxed))})
+            "buckets":buckets,"p95UpperNs":p95_upper_ns})
     }
 }
 struct Counters {
@@ -506,6 +518,18 @@ mod tests {
         assert_eq!(path["stages"]["validation"]["inFlight"], 0);
         assert_eq!(path["stages"]["store_read"]["count"], 1);
         assert_eq!(path["statusClasses"][2], 1);
+    }
+    #[test]
+    fn control_timing_p95_reports_bucket_upper_bound_or_null() {
+        let histogram = Histogram::new();
+        assert!(histogram.snapshot()["p95UpperNs"].is_null());
+        for _ in 0..19 {
+            histogram.record(6_000_000);
+        }
+        histogram.record(6_000_000_000);
+        assert_eq!(histogram.snapshot()["p95UpperNs"], 10_000_000);
+        histogram.record(6_000_000_000);
+        assert!(histogram.snapshot()["p95UpperNs"].is_null());
     }
     #[test]
     fn histogram_boundaries_and_slow_log_rate_limit_are_exact() {

@@ -261,6 +261,17 @@ fn head(connection: &Connection) -> anyhow::Result<(String, StoreHead)> {
     )?)
 }
 
+pub(crate) fn reference_cursor_at(path: &Path) -> anyhow::Result<Option<ChangeCursor>> {
+    let Some(db) = ensure_ready(path, false, false)? else {
+        return Ok(None);
+    };
+    with_connection(&db, |connection| {
+        let (instance, head) = head(connection)?;
+        let spec = crate::store::manifest::spec(STORE);
+        Ok(Some(ChangeCursor::new(&instance, spec, head.epoch, &Scope::Host, head.seq)))
+    })
+}
+
 pub fn has_prepared_launch_at(path: &Path, session: &str) -> anyhow::Result<bool> {
     let Some(db) = ensure_ready(path, false, false)? else {
         return Ok(false);
@@ -385,6 +396,19 @@ fn decode(
         }
     }
     Ok(value)
+}
+
+/// Check the same key and durable ID as get_at across every lifecycle. A
+/// missing catalog returns None, distinct from a successful negative lookup.
+pub(crate) fn session_exists_in_catalog_at(path: &Path, id: &str) -> anyhow::Result<Option<bool>> {
+    let Some(db) = ensure_ready(path, false, false)? else { return Ok(None); };
+    with_connection(&db, |connection| {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE key=?1 OR cutex_session_id=?1)", [id], |r| r.get(0),
+        )?;
+        note(STORE, OpCounts { sql_statements: 1, rows_visited: u64::from(exists), ..Default::default() });
+        Ok(Some(exists))
+    })
 }
 
 pub fn get_at(path: &Path, id: &str) -> anyhow::Result<Option<Arc<CutexSessionRecord>>> {
@@ -566,6 +590,32 @@ pub(crate) fn archive_receipt_at(path: &Path, key: &str) -> anyhow::Result<Optio
             ..Default::default()
         });
         json.map(|value| serde_json::from_str(&value).context("decode retirement receipt")).transpose()
+    })
+}
+
+/// Read the session and its latest Native stop in the same SQLite snapshot.
+pub(crate) fn stock_temp_stop_at(
+    path: &Path,
+    key: &str,
+) -> anyhow::Result<Option<(CutexSessionRecord, Option<crate::session::model::NativeStopReceipt>)>> {
+    let Some(db) = ensure_ready(path, false, false)? else { return Ok(None) };
+    with_connection(&db, |connection| {
+        let row: Option<(String, Option<String>)> = connection.query_row(
+            "SELECT s.record_json, r.json FROM sessions s LEFT JOIN receipts r ON r.map='native_stop' AND r.key=s.key WHERE s.key=?1",
+            [key], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        note(STORE, OpCounts {
+            sql_statements: 1,
+            rows_visited: u64::from(row.is_some()),
+            rows_materialized: u64::from(row.is_some()),
+            ..Default::default()
+        });
+        row.map(|(session, stop)| {
+            Ok((
+                serde_json::from_str(&session)?,
+                stop.as_deref().map(serde_json::from_str).transpose()?,
+            ))
+        }).transpose()
     })
 }
 

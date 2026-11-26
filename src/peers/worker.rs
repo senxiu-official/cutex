@@ -32,7 +32,7 @@ pub fn spawn() -> anyhow::Result<()> {
     if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
-    std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .name("cutex-peers".into())
         .spawn(|| {
             let running = Arc::new(Mutex::new(BTreeSet::<String>::new()));
@@ -99,7 +99,11 @@ pub fn spawn() -> anyhow::Result<()> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *guard = false;
             }
-        })?;
+        });
+    if result.is_err() {
+        STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    result?;
     Ok(())
 }
 fn due(at: &Option<String>) -> bool {
@@ -143,6 +147,7 @@ fn fail_in_state(s: &mut AskState, id: &str, code: &str, unknown: bool) {
     }) {
         return;
     }
+    crate::asks::terminal_notices::set_cause(s,id,crate::asks::terminal_notices::Actor::System{component:"peerDelivery".into()},code);
     s.update_ask(id, Utc::now(), |a| {
         a.execution = if unknown {
             ExecutionState::Interrupted
@@ -590,15 +595,16 @@ fn maintain_inner(store: &Store, asks: &AskStore, before_commit: impl FnOnce()) 
                         if now - crate::asks::parse_time(received).unwrap_or(now) <= ttl {
                             continue;
                         }
-                        unknown = create_may_have_run(&r.sync)
-                            || peers.peers.get(&r.peer_id).is_some_and(|p| {
-                                matches!(p.status.as_str(), "identityChanged" | "versionMismatch")
-                            });
-                        code = if unknown {
-                            "outcomeUnknown"
+                        if super::receipt::source_routing_held(&r.sync) {
+                            unknown = false;
+                            code = super::receipt::RoutingRefusal::Source.code();
                         } else {
-                            "peer_unreachable"
-                        };
+                            unknown = create_may_have_run(&r.sync)
+                                || peers.peers.get(&r.peer_id).is_some_and(|p| {
+                                    matches!(p.status.as_str(), "identityChanged" | "versionMismatch")
+                                });
+                            code = if unknown { "outcomeUnknown" } else { "peer_unreachable" };
+                        }
                     }
                     fail_in_state(s, &id, code, unknown);
                 }

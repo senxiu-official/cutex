@@ -253,9 +253,14 @@ impl JobService {
     /// `dry_run`: a version not downloaded yet is planned at its future path.
     fn plan_for(&self, layout: &Layout, dir: &Path, dry_run: bool) -> anyhow::Result<Plan> {
         ensure_linux()?;
-        let record = layout
-            .read_install()
-            .map_err(|_| upgrade_error(409, "unmanaged_install", "not a managed cutex install (no install.json)"))?;
+        let services = if layout.install_record_path().try_exists()? {
+            ServiceNames::of(&layout.read_install()?)
+        } else if super::kit_layout::managed(layout, &crate::upgrade::keys::trusted_keys()) {
+            // Component-only adoption must not create a backend install.json.
+            ServiceNames::for_install()?
+        } else {
+            return Err(upgrade_error(409, "unmanaged_install", "Job Service requires a managed install or a trusted component kit"));
+        };
         let binary = if dry_run && !dir.join(super::RECEIPT_FILE).exists() {
             dir.join(JOB_EXE)
         } else {
@@ -287,7 +292,7 @@ impl JobService {
         );
         let (unit_dir, start) = self.unit_dir()?;
         let argv = argv(&binary, &launcher.path, &allowed, &paths, &bus_url);
-        let unit_text = unit_text(&argv, &paths.root, &ServiceNames::of(&record).bus_unit);
+        let unit_text = unit_text(&argv, &paths.root, &services.bus_unit);
         Ok(Plan {
             binary,
             launcher,
@@ -478,6 +483,54 @@ fn busy_error(count: usize, what: &str) -> anyhow::Error {
         format!("{count} local job(s) are running; {what} would interrupt them. Try again when they have finished"),
         json!({ "name": NAME, "activeJobs": count }),
     )
+}
+
+/// Held across the process swap. The Job Service takes a shared lock on the
+/// same file before accepting a local launch or an NCI prepare/register.
+#[cfg(target_os = "linux")]
+fn maintenance_fence(paths: &Paths) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+        .truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW)
+        .open(paths.root.join("maintenance.lock"))
+        .map_err(|_| "cannot open the Job maintenance fence".to_owned())?;
+    let metadata = file.metadata().map_err(|_| "cannot verify the Job maintenance fence".to_owned())?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("invalid Job maintenance fence".into());
+    }
+    FileExt::try_lock_exclusive(&file).map_err(|_| "Job submission is in progress".to_owned())?;
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maintenance_fence(_: &Paths) -> Result<std::fs::File, String> {
+    Err("Job maintenance is available on Linux only".into())
+}
+
+fn can_read_archived_store(version: &str) -> bool {
+    let mut parts = version.split('-').next().unwrap_or_default().split('.');
+    let get = |part: Option<&str>| part.and_then(|p| p.parse::<u64>().ok());
+    match (get(parts.next()), get(parts.next()), get(parts.next()), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => (major, minor, patch) >= (0, 1, 5),
+        _ => false,
+    }
+}
+
+fn check_store_reader(paths: &Paths, version: &str) -> anyhow::Result<()> {
+    let bytes = match std::fs::read(&paths.state) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let state: Value = serde_json::from_slice(&bytes).context("Job state unreadable")?;
+    ensure!(
+        state["version"].as_u64().is_some_and(|n| (1..=3).contains(&n) || (n == 4 && can_read_archived_store(version))),
+        "Job {version} cannot read this store; restore the compatible Job component or rehydrate an offline copy"
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -807,22 +860,40 @@ impl Handler for JobService {
             return Ok(json!({ "restartPending": false, "restarted": false, "started": false, "unitPath": unit_path }));
         }
         let running = probe_socket(&plan.paths);
+        if self.external(layout) {
+            return Err(upgrade_error(409, "component_external", "Job Service is externally hosted; complete the owner-approved handoff first"));
+        }
+        check_store_reader(&plan.paths, &ctx.version)?;
         let running_current = running.as_ref().is_some_and(|r| r.executable.as_deref() == Some(plan.binary.as_path()));
         let restart = unit_changed || !running_current;
-        if restart && running.is_some() {
-            if let Err(reason) = self.restart_gate(layout) {
-                let mut notes = Vec::new();
-                if !ctx.dry_run {
-                    std::fs::create_dir_all(pending_path(layout).parent().context("pending parent")?)?;
-                    crate::config::atomic::write_bytes_atomic(
-                        &pending_path(layout),
-                        serde_json::to_vec_pretty(&json!({ "version": ctx.version, "reason": reason, "since": super::now() }))?.as_slice(),
-                    )?;
-                    notes.extend(self.keep_running_selected(layout, &plan, running.as_ref().expect("checked")));
+        let _admission_fence = if let Some(running) = running.as_ref().filter(|_| restart) {
+            let gate = (|| -> Result<std::fs::File, String> {
+                if running.capabilities["maintenanceFence"] != true {
+                    return Err("running Job version needs a quiet, owner-approved update window".into());
                 }
-                return Ok(json!({ "restartPending": true, "restarted": false, "reason": reason, "notes": notes }));
+                let fence = maintenance_fence(&plan.paths)?;
+                self.restart_gate(layout)?;
+                // A submission may have archived its first batch between the
+                // initial store check and acquiring the fence.
+                check_store_reader(&plan.paths, &ctx.version).map_err(|error| format!("{error:#}"))?;
+                Ok(fence)
+            })();
+            match gate {
+                Ok(fence) => Some(fence),
+                Err(reason) => {
+                    let mut notes = Vec::new();
+                    if !ctx.dry_run {
+                        std::fs::create_dir_all(pending_path(layout).parent().context("pending parent")?)?;
+                        crate::config::atomic::write_bytes_atomic(
+                            &pending_path(layout),
+                            serde_json::to_vec_pretty(&json!({ "version": ctx.version, "reason": reason, "since": super::now() }))?.as_slice(),
+                        )?;
+                        notes.extend(self.keep_running_selected(layout, &plan, running));
+                    }
+                    return Ok(json!({ "restartPending": true, "restarted": false, "reason": reason, "notes": notes }));
+                }
             }
-        }
+        } else { None };
         let mut actions = Vec::new();
         if unit_changed {
             actions.push(format!("write {}", unit_path.display()));
@@ -939,10 +1010,18 @@ impl Handler for JobService {
             states::DEGRADED
         } else if pending.is_some() || running.as_ref().and_then(|r| r.executable.clone()) != binary {
             states::RESTART_PENDING
-        } else if entry.last_error.is_some() || selected.is_none() {
+        } else if entry.last_error.is_some() || !selected.as_ref().is_some_and(|d| {
+            Some(&d.adapter.path) == binary.as_ref() && Some(&d.endpoint) == paths.socket.canonicalize().ok().as_ref()
+        }) {
             states::DEGRADED
         } else {
             states::READY
+        };
+        let maintenance = match state {
+            states::READY => "verified",
+            states::RESTART_PENDING if caps.is_some_and(|c| c["maintenanceFence"] == true) => "waiting",
+            states::RESTART_PENDING => "handoffRequired",
+            _ => "needsAttention",
         };
         json!({
             "state": state,
@@ -953,6 +1032,7 @@ impl Handler for JobService {
             "nciMailConfigured": paths.notify_file.is_file(),
             "descriptorSelected": selected.is_some(),
             "activeJobs": active_jobs(&paths).map(|v| v.len()).unwrap_or(0),
+            "maintenance": {"state":maintenance,"selectedVersion":entry.selected,"runningVersion":running_version},
         })
     }
 

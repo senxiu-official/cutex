@@ -256,11 +256,13 @@ fn view(
         }
         json!({"id":target.id,"name":target.name,"cliKind":target.cli_kind.to_string(),"providerFamily":target_facts.family.as_deref().unwrap_or("unknown"),"eligible":refusal.is_none(),"reason":refusal})
     }).collect();
-    if query.profile.is_some() && selected_profile.is_none() {
-        selected_reason = Some(reason(
-            "profile_not_found",
-            "the requested fork profile does not exist",
-        ));
+    if let Some(requested) = query.profile.as_deref().filter(|_| selected_profile.is_none()) {
+        use super::feature_profiles::{require_agent_id, AGENT_REFUSAL_CODE, AGENT_REFUSAL_MESSAGE};
+        selected_reason = Some(if require_agent_id(requested).is_err() {
+            reason(AGENT_REFUSAL_CODE, AGENT_REFUSAL_MESSAGE)
+        } else {
+            reason("profile_not_found", "the requested fork profile does not exist")
+        });
         cold_cache = None;
     }
     if query.profile.is_none() {

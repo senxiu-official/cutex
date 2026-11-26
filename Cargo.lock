@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "cutex"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -584,6 +584,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "iana-time-zone",
  "image",
  "imbl",
  "jsonschema",

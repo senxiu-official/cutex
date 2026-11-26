@@ -77,6 +77,7 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/sessions", Class::Scoped(SessionList)),
         ("GET", "/v2/sessions/s1", Class::Scoped(SessionRead)),
         ("GET", "/v2/sessions/s1/bootstrap", Class::Scoped(SessionBootstrap)),
+        ("GET", "/v2/sessions/search", Class::Scoped(SessionSearch)),
         ("GET", "/v2/sessions/s1/history", Class::Scoped(SessionHistory)),
         ("GET", "/v2/sessions/s1/history/turns/t1", Class::Scoped(SessionHistoryTurn)),
         ("POST", "/v2/sessions/s1/app-server/requests", Class::Scoped(NativeRequest)),

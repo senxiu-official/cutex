@@ -38,6 +38,21 @@ use crate::profiles::import::{id_token_claims, parse_auth_metadata};
 use crate::profiles::materialize::materialized_account_files;
 use crate::profiles::model::{CliKind, StoredAccount};
 
+/// An explicitly stored label that can be sent to another Management host.
+pub(super) fn sync_value(account: &StoredAccount) -> Option<Option<String>> {
+    account.plan_label.as_deref().map(normalize_manual_plan_label).transpose().ok()
+}
+
+/// Advance the same durable clock as other fields in linked Profile sync.
+pub fn record_change(account: &mut StoredAccount, before: Option<&str>) {
+    if account.plan_label.as_deref() != before {
+        let clocks = &mut account.options.appearance_updated_at;
+        let field = "planLabel";
+        let timestamp = super::appearance::next_revision_timestamp(clocks.get(field).map(String::as_str));
+        clocks.insert(field.into(), timestamp);
+    }
+}
+
 /// Longest manual plan label accepted from Management clients (characters).
 pub const MAX_PLAN_LABEL_CHARS: usize = 40;
 

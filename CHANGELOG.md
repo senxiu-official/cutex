@@ -1,3 +1,13 @@
+## 0.2.6 "Beautiful World"
+
+Adds personal assistants and recurring tasks, project controls and delivery recovery. Includes Native 0.172.0-r70 and Claude claude-r59. Job Service 0.1.3 is reused without changing its signed bytes. Existing agents retain their selected runtime.
+
+**One-way upgrade from 0.2.5:** after 0.2.6 has started, rollback to 0.2.5 is unsupported. Keep a complete, consistent offline backup from before the upgrade and the upgrade-run backup. The old 0.2.5 managed backup does not contain personal-assistant or schedule stores. Preserve consistent snapshots of those stores separately when keeping data created by 0.2.6.
+
+新增个人助理与定期任务、项目控制和投递恢复改进。提供 Native 0.172.0-r70 与 Claude claude-r59；Job Service 0.1.3 复用原始签名文件。已有智能体保留所选运行时。
+
+**从 0.2.5 开始的单向升级：**0.2.6 启动后，不支持退回 0.2.5。请保留升级前完整且一致的离线备份，以及升级程序生成的备份。旧版 0.2.5 的内建备份不包含个人助理和任务日程存储；保留 0.2.6 新增数据时，还须单独保留这两份存储的一致快照。
+
 # Changelog
 
 ## 0.2.5 "Beautiful World" (2026-11-23)

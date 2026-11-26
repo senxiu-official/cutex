@@ -35,6 +35,7 @@ use super::turn_index::Key;
 
 /// Bound on all cached shaped turns (serialized bytes).
 const MAX_BYTES: usize = 64 * 1024 * 1024;
+const PRESSURE_BYTES: usize = 8 * 1024 * 1024;
 /// A larger shaped turn is not cached.
 const MAX_TURN_BYTES: usize = 8 * 1024 * 1024;
 /// How long a live thread's newest turn must be listed final, unchanged,
@@ -200,7 +201,7 @@ impl<'a> TurnShaper<'a> {
         if let (Some(meta), Some(scope), Some(id), 0) = (meta, &self.scope, id, replacer.failed) {
             let bytes = serde_json::to_vec(&turn).map_or(usize::MAX, |bytes| bytes.len());
             if bytes <= MAX_TURN_BYTES {
-                put(
+                cache().put(
                     self.session,
                     scope,
                     self.compact,
@@ -284,24 +285,45 @@ fn next_clock() -> u64 {
     CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-fn put(session: &str, scope: &Scope, compact: bool, id: String, turn: CachedTurn) {
-    let mut cache = cache();
-    if !current_fence(&cache, session, &scope.fence) {
-        return;
-    }
-    cache.bytes += turn.bytes;
-    let slot = Slot { session: session.to_string(), turn: Arc::new(turn), used: next_clock() };
-    if let Some(old) = cache.turns.insert((scope.key.clone(), compact, id), slot) {
-        cache.bytes -= old.turn.bytes;
-    }
-    while cache.bytes > MAX_BYTES {
-        let Some(oldest) = cache.turns.iter().min_by_key(|(_, slot)| slot.used).map(|(key, _)| key.clone()) else {
-            break;
+impl Cache {
+    fn put(&mut self, session: &str, scope: &Scope, compact: bool, id: String, turn: CachedTurn) {
+        if !current_fence(self, session, &scope.fence) {
+            return;
+        }
+        let limit = if super::memory_pressure::active() {
+            self.clear_pressure_backlog();
+            PRESSURE_BYTES
+        } else {
+            MAX_BYTES
         };
-        if let Some(old) = cache.turns.remove(&oldest) {
-            cache.bytes -= old.turn.bytes;
+        self.bytes += turn.bytes;
+        let slot = Slot { session: session.to_string(), turn: Arc::new(turn), used: next_clock() };
+        if let Some(old) = self.turns.insert((scope.key.clone(), compact, id), slot) {
+            self.bytes -= old.turn.bytes;
+        }
+        while self.bytes > limit {
+            let Some(oldest) = self.turns.iter().min_by_key(|(_, slot)| slot.used).map(|(key, _)| key.clone()) else {
+                break;
+            };
+            if let Some(old) = self.turns.remove(&oldest) {
+                self.bytes -= old.turn.bytes;
+            }
         }
     }
+
+    fn clear_pressure_backlog(&mut self) -> bool {
+        if self.bytes <= PRESSURE_BYTES { return false; }
+        // Avoid one scan of the full cache per LRU eviction when the budget
+        // falls. Preserve the per-session validity fences and settling state.
+        self.turns = HashMap::new();
+        self.bytes = 0;
+        true
+    }
+}
+
+pub(super) fn trim_under_pressure() -> bool {
+    CACHE.get().and_then(|cache| cache.try_lock().ok())
+        .is_some_and(|mut cache| cache.clear_pressure_backlog())
 }
 
 /// Drop a session's shaped turns (history revert, fork) and fence the

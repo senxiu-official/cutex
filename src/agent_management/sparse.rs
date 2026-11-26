@@ -1028,6 +1028,8 @@ fn live_profile_facts(requested: &str) -> Result<ProfileFacts, SparseRefusal> {
 /// (a DSH profile, or `dsh` on a DeepSeek API-key profile) launches on DSH;
 /// a variant whose runtime is not available here is refused by name.
 fn live_profile_facts_variant(requested: &str, variant: Option<&str>) -> Result<ProfileFacts, SparseRefusal> {
+    use crate::management::v2::feature_profiles::{require_agent_id, AGENT_REFUSAL_CODE};
+    require_agent_id(requested).map_err(|error| refuse(AGENT_REFUSAL_CODE, error.to_string()))?;
     let store = crate::profiles::settings_api::load_store().map_err(|_| unavailable())?;
     let account = crate::profiles::settings_api::find(&store, requested.trim()).ok_or_else(|| {
         refuse(
@@ -1567,6 +1569,7 @@ mod tests {
                 account_sha256: sha("d"),
                 model: "Zephyr-model".into(),
                 reasoning: None,
+            reasoning_resolution: None,
                 model_provider: "openai".into(),
                 provider: crate::launch::stock::DummyProvider {
                     name: "n".into(),

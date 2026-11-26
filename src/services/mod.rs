@@ -31,5 +31,6 @@ pub use store::ServicesSettings;
 pub use store::UpdateRequest;
 
 pub mod lifecycle;
+pub mod notifications;
 pub mod reveal;
 pub mod static_files;

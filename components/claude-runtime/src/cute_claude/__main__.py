@@ -40,6 +40,7 @@ def parser() -> argparse.ArgumentParser:
                    help="subscription: opt into native file snapshots for rewind (default disabled); "
                         "disabling stops new snapshots and preserves existing native history")
     p.add_argument("--workspace", type=Path, required=True)
+    p.add_argument("--personal-assistant", action="store_true", help="use only the assistant tools in the cutex descriptor")
     p.add_argument("--managed-skills-root", type=Path, action="append", default=[],
                    help="host-selected skill root for this workspace/account; repeatable, no user settings discovery")
     p.add_argument("--setting-sources", default="",
@@ -104,7 +105,7 @@ async def run(args) -> None:
     settings = Settings(workspace, state, model=model, mock=args.mock, backend=args.backend,
             api_base=args.api_base, max_tokens=args.max_tokens if args.max_tokens is not None else 4096, max_steps=args.max_steps,
             effort=args.effort, thinking=args.thinking, thinking_display=args.thinking_display, allow_write=args.allow_write, allow_exec=args.allow_exec,
-            file_checkpointing=args.file_checkpointing == "enabled",
+            file_checkpointing=args.file_checkpointing == "enabled", personal_assistant=args.personal_assistant,
             api_timeout=args.api_timeout, tool_timeout=args.tool_timeout, system=system, system_append=system_append,
             agent_turn_questions=args.agent_turn_questions,
             managed_skills_roots=tuple(root.expanduser().resolve() for root in args.managed_skills_root),
@@ -113,6 +114,8 @@ async def run(args) -> None:
             mcp_servers=mcp_servers, mcp_tool_filters=mcp_tool_filters,
             claude_ai_connectors=args.claude_ai_connectors == "enabled")
     settings.validate()
+    if args.personal_assistant and (args.plugin or args.http_tools or not args.cutex_mcp_config):
+        raise ValueError("Personal Assistants require one cutex tool descriptor")
     driver = None
     if args.backend == "subscription":
         from .subscription_auth import check_subscription_environment, load_api_account, official_cli, resolve_config_dir

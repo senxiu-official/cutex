@@ -6,7 +6,7 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.2.5 — Beautiful World** preserves ordered owner inputs through interruption and recovery, adds bounded note admission and improves Linux runtime supervision. It includes Native 0.169.0-r65 and Claude claude-r55 (adapter 0.8.17, Agent SDK 0.2.180, bundled CLI 2.1.321). Existing agents keep their runtime selections. Before manually returning to 0.2.4, stop and verify all new Linux runtime scopes using 0.2.5; see [runtime supervision](docs/agent-management-provider.md). Historical one-way migrations and worker-record restrictions remain in effect. See [CHANGELOG.md](CHANGELOG.md) and [Known issues](docs/KNOWN-ISSUES.md).
+**0.2.6 — Beautiful World** adds personal assistants and recurring tasks, project controls and delivery recovery. It includes Native 0.172.0-r70 and Claude claude-r59 (adapter 0.8.18, Agent SDK 0.2.187, bundled CLI 2.1.330), and reuses the original Job Service 0.1.3. Existing agents retain their runtime selections. **After 0.2.6 starts, rollback to 0.2.5 is unsupported.** Keep a complete, consistent pre-upgrade offline backup and the upgrade-run backup; the old 0.2.5 managed backup does not include personal-assistant or schedule stores. Retain consistent snapshots of those stores separately for new data. See [CHANGELOG.md](CHANGELOG.md) and [Known issues](docs/KNOWN-ISSUES.md).
 
 > **Current limitations:**
 > - **Phone push / pairing a phone**: there is no public phone app yet.

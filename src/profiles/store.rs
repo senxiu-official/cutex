@@ -60,6 +60,7 @@ pub fn backup_legacy_accounts_file(accounts_file_path: &Path) -> anyhow::Result<
 // the first matching row. The existing writer still loads its authoritative
 // store under the lifecycle lock before committing any changes.
 pub fn account_by_key(profile: &str) -> anyhow::Result<Option<StoredAccount>> {
+    crate::management::v2::feature_profiles::require_agent_id(profile)?;
     use serde::de::DeserializeSeed;
     let path = accounts_path()?;
     let file = match fs::File::open(&path) {

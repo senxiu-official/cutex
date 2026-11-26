@@ -6,6 +6,7 @@ use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
 /// its root was open, then the root answered while the receiver was held.
 fn queued_child(state: &mut AskState, now: DateTime<Utc>, closed_root: bool) -> (String, String) {
     let mut root_request = new_ask("root", "parent");
+    root_request.options.notify=Notify::Passive; // Historical root result is independent of child admission.
     root_request.requester = Requester::Agent { cutex_session_id: TARGET.into(), name: None };
     root_request.target_cutex_session_id = REQUESTER.into();
     let root = state.create_ask(root_request, now).unwrap().0.ask_id;

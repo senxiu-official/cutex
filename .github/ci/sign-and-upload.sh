@@ -361,6 +361,17 @@ for c in json.load(open(sys.argv[1])).get("components", {}).values():
       [ -n "$path" ] || { echo "$cname is in the manifest but not in the artifacts" >&2; exit 1; }
       cp "$path" "$dir/components/"
       rc=0; release_assets "$ctag" > "$dir/published/$ctag.assets" || rc=$?
+      case "$path" in
+        "$dir/artifacts/retained-components/"*)
+          # These were not built in this run. Require the original release and
+          # its detached signature, and never generate a replacement signature.
+          if [ "$rc" != 0 ] || ! grep -qxF "$cname" "$dir/published/$ctag.assets" \
+            || ! grep -qxF "$cname.minisig" "$dir/published/$ctag.assets"; then
+            echo "Missing original published archive or signature for $ctag/$cname" >&2
+            exit 1
+          fi
+          ;;
+      esac
       if [ "$rc" = 0 ] && grep -qxF "$cname" "$dir/published/$ctag.assets"; then
         mkdir -p "$dir/published/$ctag"
         gh release download "$ctag" -R "$repo" -p "$cname" -D "$dir/published/$ctag" --clobber
@@ -375,6 +386,9 @@ for c in json.load(open(sys.argv[1])).get("components", {}).values():
           gh release download "$ctag" -R "$repo" -p "$cname.minisig" -D "$dir/published/$ctag" --clobber
           minisign -V -q -P "$(sed -n 2p "$pubkey_file")" -m "$dir/published/$ctag/$cname" \
             || { echo "the published $ctag/$cname.minisig does not verify with $pubkey_file" >&2; exit 1; }
+          case "$path" in
+            "$dir/artifacts/retained-components/"*) cmp "$path.minisig" "$dir/published/$ctag/$cname.minisig" ;;
+          esac
           # Preserve the published detached signature after both its payload hash and signature verify.
           # A fresh randomized signature would fail immutable release-asset verification on upload.
           mkdir -p "$dir/signatures"

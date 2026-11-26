@@ -16,6 +16,7 @@ mod names_tests;
 pub mod pair;
 pub mod policy;
 pub mod profiles;
+pub(crate) mod receipt;
 pub mod routes;
 pub mod store;
 pub mod strip;
@@ -77,12 +78,16 @@ impl Error {
             "persistence_unavailable" => "persistence_unavailable",
             "peer_store_corrupt" => "peer_store_corrupt",
             "peer_event_expired" => "peer_event_expired",
+            receipt::UNSPECIFIED_CREATE_REFUSAL => receipt::UNSPECIFIED_CREATE_REFUSAL,
             code => Self::remote_failure_code(code),
         }
     }
     /// The peer can report a known refusal, but cannot impersonate a failure of
     /// our own address validation, response reader, transport or storage.
     pub(super) fn remote_failure_code(code: &str) -> &'static str {
+        if code == receipt::RoutingRefusal::Destination.code() {
+            return receipt::RoutingRefusal::Destination.code();
+        }
         match code {
             "invalid_request" => "invalid_request",
             "request_too_large" => "request_too_large",

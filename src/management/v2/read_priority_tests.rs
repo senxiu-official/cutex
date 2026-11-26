@@ -151,16 +151,16 @@ fn marker_is_additive_and_only_schedules_heavy_reads() {
         SimpleHttpRequest {method:method.into(),path:path.into(),headers,body:vec![]}
     };
     let bg = admit_request(&request(Some("background"), "GET", "/v2/sessions"), None).unwrap();
-    assert_eq!(HEAVY.state.lock().unwrap().active_background, 1);
+    assert_eq!(heavy_pool().state.lock().unwrap().active_background, 1);
     for value in [None, Some("foreground"), Some("unknown")] {
         let foreground = admit_request(&request(value, "GET", "/v2/sessions"), None).unwrap();
-        assert_eq!(HEAVY.counts().0, 2);
+        assert_eq!(heavy_pool().counts().0, 2);
         drop(foreground);
     }
     let control = admit_request(&request(Some("background"), "POST", "/v2/human/agents"), None).unwrap();
-    assert_eq!(HEAVY.counts(), (1, 0));
+    assert_eq!(heavy_pool().counts(), (1, 0));
     drop((control, bg));
-    assert_eq!(HEAVY.counts(), (0, 0));
+    assert_eq!(heavy_pool().counts(), (0, 0));
 }
 
 #[test]
@@ -183,5 +183,21 @@ fn both_free_slots_are_used_without_waiting_for_another_completion() {
     assert_eq!(pool.counts().0, 2);
     release.send(()).unwrap(); release.send(()).unwrap();
     for worker in workers {worker.join().unwrap();}
+    assert_eq!(pool.counts(), (0, 0));
+}
+
+#[test]
+fn heavy_read_background_stays_at_one_slot_with_an_override() {
+    let pool = Box::leak(Box::new(HeavyPool::new(8, 64)));
+    let background = pool.acquire_priority(Duration::ZERO, true).unwrap();
+    assert_eq!(
+        pool.acquire_priority(Duration::ZERO, true).err().unwrap().reason,
+        RefusalReason::HeavyReadWaitTimeout
+    );
+    let foreground: Vec<_> = (0..7)
+        .map(|_| pool.acquire_priority(Duration::ZERO, false).unwrap())
+        .collect();
+    assert_eq!(pool.counts(), (8, 0));
+    drop((background, foreground));
     assert_eq!(pool.counts(), (0, 0));
 }

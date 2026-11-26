@@ -20,8 +20,9 @@
 //!   `cutex/session/deliveryChanged` only when it changed.
 //! - §2.14 `cutex/input/retry`.
 //!
-//! Everything runs on one thread (`cutex-input-settle`) in the management
-//! process and only while `management.inputLedger.enabled` is on. It learns
+//! Settlement runs in the management process while the ledger is enabled.
+//! Due rechecks run in a bounded pool apart from the event and maintenance
+//! loop. The event loop learns
 //! about turns and runtimes from the durable event stream (an in-process
 //! subscriber, like the SSE streams), never by reading native history on a
 //! tick. Locks: the thread holds nothing while it does native IO; the ledger
@@ -39,6 +40,9 @@ use super::input_ledger::{
     Surface, Transition,
 };
 use super::user_input::UserInputExecutionError;
+
+#[path = "input_ledger_deadlines.rs"]
+mod deadlines;
 
 /// Records per restart-reconcile / drift / rebuild batch (§2.12).
 pub const BATCH: usize = 200;
@@ -839,9 +843,10 @@ pub fn deadline_decision(
         },
         InputState::Accepted => {
             let (result, item, carrying_turn) = check_full(runtime, record, None);
-            if is_bus(record.kind) && record.turn_id.is_none() && result == Check::Queued {
+            if is_bus(record.kind) && result == Check::Queued {
                 // A pending native queue is positive evidence of waiting.
-                // Retire this one-shot check instead of polling an expired deadline.
+                // Retire this one-shot check even if an earlier turn was
+                // bound: a later native event can provide the receipt.
                 return Some(Next::accepted().deadline(None));
             }
             // Still held by an interrupt (turn_ended re-checks once).
@@ -976,6 +981,14 @@ struct Hooks {
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 
+pub type DeadlineForward = fn(&str, Value, Instant) -> Result<Value, String>;
+static DEADLINE_FORWARD: OnceLock<DeadlineForward> = OnceLock::new();
+
+/// Install the bounded internal recheck route before serving Management.
+pub fn install_deadline_forward(forward: DeadlineForward) {
+    let _ = DEADLINE_FORWARD.set(forward);
+}
+
 struct Signal {
     dirty: BTreeSet<String>,
 }
@@ -1009,12 +1022,51 @@ pub fn ensure_started(status: StatusLoader, forward: NativeForward) {
     if HOOKS.set(Hooks { status, forward }).is_err() {
         return;
     }
+    if let Err(error) = deadlines::start(LiveRuntime(Hooks { status, forward })) {
+        eprintln!("cutex input ledger (settle): deadline scheduler not started: {error}");
+    }
     if let Err(error) = std::thread::Builder::new().name("cutex-input-settle".into()).spawn(run) {
         eprintln!("cutex input ledger (settle): thread not started: {error}");
     }
 }
 
+#[derive(Clone, Copy)]
 struct LiveRuntime(Hooks);
+
+struct DeadlineRuntime {
+    runtime: LiveRuntime,
+    until: Instant,
+}
+
+impl Runtime for DeadlineRuntime {
+    fn view(&self, session: &str) -> RuntimeView {
+        self.runtime.view(session)
+    }
+
+    fn request(&self, session: &str, method: &str, params: Value) -> Result<Value, String> {
+        let Some(forward) = DEADLINE_FORWARD.get() else {
+            return Err("deadline settlement transport unavailable".into());
+        };
+        let response = forward(session, settlement_request(method, params), self.until)?;
+        settlement_response(method, response)
+    }
+
+    fn bus_external_key(&self, message_id: &str) -> Option<(String, String, Value)> {
+        self.runtime.bus_external_key(message_id)
+    }
+}
+
+fn settlement_request(method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": format!("cutex-settle-{}", uuid::Uuid::new_v4().simple()),
+        "method": method, "params": params})
+}
+
+fn settlement_response(method: &str, response: Value) -> Result<Value, String> {
+    match response.get("error") {
+        Some(error) => Err(format!("{method}: {error}")),
+        None => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
+    }
+}
 
 fn session_record(session: &str) -> Option<(u64, String)> {
     let store = crate::session::store::load_cutex_session_store_shared().ok()?;
@@ -1055,15 +1107,9 @@ impl Runtime for LiveRuntime {
     }
 
     fn request(&self, session: &str, method: &str, params: Value) -> Result<Value, String> {
-        let message = json!({"jsonrpc": "2.0", "id": format!("cutex-settle-{}", uuid::Uuid::new_v4().simple()),
-            "method": method, "params": params});
-        match (self.0.forward)(session, message) {
-            Ok(response) => match response.get("error") {
-                Some(error) => Err(format!("{method}: {error}")),
-                None => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
-            },
-            Err(error) => Err(format!("{method}: {error:?}")),
-        }
+        let response = (self.0.forward)(session, settlement_request(method, params))
+            .map_err(|error| format!("{method}: {error:?}"))?;
+        settlement_response(method, response)
     }
 
     fn bus_external_key(&self, message_id: &str) -> Option<(String, String, Value)> {
@@ -1234,11 +1280,8 @@ impl Engine {
             std::thread::sleep(Duration::from_secs(1));
             return;
         };
-        // Wait for events (or a dirty mark / the next deadline).
-        let wait = match il::next_deadline(ledger) {
-            Ok(Some(at)) => (at - Utc::now()).to_std().unwrap_or(Duration::ZERO).min(Duration::from_millis(250)),
-            _ => Duration::from_millis(250),
-        };
+        // Receipt deadlines run independently of this event/maintenance loop.
+        let wait = Duration::from_millis(250);
         let mut events = Vec::new();
         match &self.subscription {
             Some(subscription) => {
@@ -1289,25 +1332,6 @@ impl Engine {
         }
         if !self.passive_notices.done() {
             self.passive_notices.step(ledger);
-        }
-        if let Err(error) = il::run_deadline_pass(
-            ledger,
-            Utc::now(),
-            BATCH,
-            |due| {
-                let record = ledger.get(&due.cutex_session_id, std::slice::from_ref(&due.input_id)).ok()?.records.pop()?;
-                if record.rev != due.rev {
-                    return None;
-                }
-                deadline_decision(&record, &self.runtime, &LiveOwnerStores, Utc::now())
-            },
-            |transition| {
-                if let Err(error) = il::publish(transition) {
-                    eprintln!("cutex input ledger (settle): publish: {error:#}");
-                }
-            },
-        ) {
-            eprintln!("cutex input ledger (settle): deadlines: {error}");
         }
         if self.last_drift.elapsed() >= DRIFT_EVERY {
             self.last_drift = Instant::now();
@@ -1683,13 +1707,7 @@ pub fn bus_drift(
     }
     let target = target_of(facts);
     if let Some(source) = &facts.delivery_diagnostics {
-        let mut current = record.details.get("deliveryDiagnostics").cloned();
-        if let Some(diagnostic) = current.as_mut() {
-            if let Some(waiting) = diagnostic.as_object_mut().and_then(|o|o.remove("sourceWaitingFor")) {
-                diagnostic["waitingFor"] = waiting;
-            }
-        }
-        if current.as_ref() != Some(source) { return Some(target); }
+        if !super::input_ledger_bus::same_delivery_diagnostics(record.details.get("deliveryDiagnostics"), Some(source)) { return Some(target); }
     }
     if record.state == InputState::Waiting && record.reason.as_deref() == Some("staleHeld") {
         if let super::input_ledger_bus::Target::Waiting { reason:"staleHeld", details:Some(details) } = &target {
@@ -2074,7 +2092,7 @@ pub fn parse_retry(session: &str, params: &Value) -> Result<(String, u64), UserI
 /// r274.2 §9.4: also an owner record a lost runtime left stuck
 /// (`il::owner_stuck`), never resent by cutex itself.
 pub fn retryable(record: &InputRecord) -> bool {
-    if il::owner_batch_retry_blocked(record) { return false; }
+    if il::owner_batch_retry_blocked(record) || il::bus_timeline_retry_blocked(record) { return false; }
     matches!(record.state, InputState::Failed | InputState::Uncertain) || il::owner_stuck(record) || il::owner_batch_blocked(record)
         || (record.kind==InputKind::DelegationResult && record.state==InputState::Waiting && record.reason.as_deref()==Some("nativeHeld"))
 }

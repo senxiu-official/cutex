@@ -111,15 +111,23 @@ fn write_invalid(stream: &mut TcpStream, message: &str) -> anyhow::Result<()> {
 
 /// `POST /v2/job-service/management-query`: bounded Job list (`humanList`).
 pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
-    let Ok(params) = serde_json::from_slice::<Value>(&request.body) else {
+    let Ok(mut params) = serde_json::from_slice::<Value>(&request.body) else {
         return write_invalid(stream, "Invalid Job query");
     };
     if !valid_list_params(&params) {
         return write_invalid(stream, "Expected query, cursor and limit for Jobs");
     }
+    let include_waiters = params.as_object_mut().expect("validated list parameters")
+        .remove("includeWaiters").and_then(|value| value.as_bool()).unwrap_or(false);
+    if params["activeOnly"] == false {
+        params.as_object_mut().expect("validated list parameters").remove("activeOnly");
+    }
     match call("humanList", params) {
         Ok(mut result) => {
             add_agent_names(&mut result);
+            if include_waiters {
+                add_waiting_delegations(&mut result);
+            }
             write_json_response(stream, 200, "OK", &result)
         }
         // Kept as before: every list failure is a retryable 503.
@@ -394,9 +402,18 @@ pub(super) fn handle_output(
     let Some(params) = output_params(&request.body) else {
         return write_invalid(
             stream,
-            "Expected {jobId: string (<= 160), stream: \"stdout\"|\"stderr\", offset?: integer, maxBytes?: integer}",
+            "Expected jobId, stream, optional maxBytes and either offset or tail",
         );
     };
+    if params.get("tail").and_then(Value::as_bool) == Some(true) {
+        match call("capabilities", json!({})) {
+            Ok(caps) if caps["humanOperations"].as_array().is_some_and(|ops| ops.iter().any(|op| op == "readOutputTail")) => {}
+            Ok(_) => return write_call_error(stream, &CallError::Service {
+                code: "invalid".into(), message: "unknown method".into(),
+            }),
+            Err(error) => return write_call_error(stream, &error),
+        }
+    }
     match call("humanReadOutput", params) {
         Ok(result) => write_json_response(stream, 200, "OK", &result),
         Err(error) => write_call_error(stream, &error),
@@ -417,6 +434,7 @@ fn valid_list_params(params: &Value) -> bool {
                     })
             }
             "limit" => v.is_null() || v.as_u64().is_some(),
+            "activeOnly" | "includeWaiters" => v.is_boolean(),
             _ => false,
         })
     })
@@ -476,9 +494,9 @@ fn mark_external_params(body: &[u8]) -> Option<Value> {
     Some(params)
 }
 
-/// Strict `{jobId, stream, offset?, maxBytes?}`; maxBytes clamps to 1..=8192.
+/// A tail request and a numeric offset are mutually exclusive.
 fn output_params(body: &[u8]) -> Option<Value> {
-    let object = body_object(body, &["jobId", "stream", "offset", "maxBytes"])?;
+    let object = body_object(body, &["jobId", "stream", "offset", "maxBytes", "tail"])?;
     let job_id = valid_job_id(object.get("jobId"))?;
     let stream = object.get("stream")?.as_str()?;
     if stream != "stdout" && stream != "stderr" {
@@ -490,11 +508,22 @@ fn output_params(body: &[u8]) -> Option<Value> {
             Some(value) => value.as_u64().map(Some),
         }
     };
-    let offset = optional_u64("offset")?.unwrap_or(0);
+    let offset = optional_u64("offset")?;
+    let tail = match object.get("tail") {
+        Some(value) => value.as_bool()?,
+        None => false,
+    };
+    if tail && offset.is_some() {
+        return None;
+    }
     let max_bytes = optional_u64("maxBytes")?
         .unwrap_or(OUTPUT_MAX_BYTES)
         .clamp(1, OUTPUT_MAX_BYTES);
-    Some(json!({"jobId": job_id, "stream": stream, "offset": offset, "maxBytes": max_bytes}))
+    Some(if tail {
+        json!({"jobId": job_id, "stream": stream, "tail": true, "maxBytes": max_bytes})
+    } else {
+        json!({"jobId": job_id, "stream": stream, "offset": offset.unwrap_or(0), "maxBytes": max_bytes})
+    })
 }
 
 /// Names are presentation only; ownership remains the service's session ID.
@@ -502,15 +531,44 @@ fn add_agent_names(result: &mut Value) {
     let Some(rows) = result["data"].as_array_mut() else {
         return;
     };
-    let Ok(store) = crate::session::store::load_cutex_session_store() else {
-        return;
-    };
+    let mut names = std::collections::HashMap::new();
     for row in rows {
         if let Some(id) = row["sessionId"].as_str() {
-            if let Some(record) = store.sessions.values().find(|r| r.cutex_session_id == id) {
-                row["agentName"] = json!(crate::session::metadata::cutex_session_display_name(record));
+            let name = names.entry(id.to_owned()).or_insert_with(|| {
+                crate::session::store::shared_session_row(id).ok().flatten()
+                    .map(|record| crate::session::metadata::cutex_session_display_name(&record))
+            });
+            if let Some(name) = name {
+                row["agentName"] = json!(name);
             }
         }
+    }
+}
+
+fn add_waiting_delegations(result: &mut Value) {
+    use crate::asks::{model::Hold, store::AskStore};
+    let snapshot = AskStore::open_default().and_then(|store| store.peek_shared());
+    let Ok(snapshot) = snapshot else {
+        result["waitersAvailable"] = json!(false);
+        return;
+    };
+    result["waitersAvailable"] = json!(true);
+    let Some(rows) = result["data"].as_array_mut() else { return };
+    let mut waiting = std::collections::BTreeMap::<(&str, &str), Vec<&str>>::new();
+    if let Some(snapshot) = &snapshot {
+        for ask in snapshot.asks.values().filter(|a| a.is_open() && a.remote.is_none()) {
+            let Some(Hold::WaitingForEvent { jobs, .. }) = ask.hold.as_ref() else { continue };
+            for id in jobs {
+                if ask.job(id).is_some_and(|binding| binding.terminal.is_none()) {
+                    waiting.entry((&ask.target_cutex_session_id, id)).or_default().push(&ask.ask_id);
+                }
+            }
+        }
+    }
+    for row in rows {
+        let ids = row["sessionId"].as_str().zip(row["jobId"].as_str())
+            .and_then(|key| waiting.get(&key)).map(Vec::as_slice).unwrap_or_default();
+        row["waitingDelegationIds"] = json!(ids);
     }
 }
 
@@ -883,6 +941,12 @@ mod tests {
 
     #[test]
     fn output_body_is_strict_and_clamps_page_size() {
+        assert_eq!(
+            output_params(br#"{"jobId":"job_1","stream":"stderr","tail":true,"maxBytes":100000}"#),
+            Some(json!({"jobId":"job_1","stream":"stderr","tail":true,"maxBytes":8192}))
+        );
+        assert!(output_params(br#"{"jobId":"job_1","stream":"stderr","tail":true,"offset":0}"#).is_none());
+        assert!(output_params(br#"{"jobId":"job_1","stream":"stderr","tail":"true"}"#).is_none());
         assert_eq!(
             output_params(br#"{"jobId":"job_1","stream":"stderr"}"#),
             Some(json!({"jobId":"job_1","stream":"stderr","offset":0,"maxBytes":8192}))

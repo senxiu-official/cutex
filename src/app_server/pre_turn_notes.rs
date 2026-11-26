@@ -154,13 +154,30 @@ pub fn synchronize_budget(
         repository.freeze_external_input(owner,id,|_|Ok(envelope)))
 }
 
+/// An explicit cutoff selected by the caller under the recipient lane.
+pub fn synchronize_budget_for_ids(
+    repository: &AgentBusMessageRepository, binding: &ExternalInputBinding, budget: Budget,
+    ids: Vec<String>, submit: impl FnMut(&Envelope) -> anyhow::Result<Status>,
+) -> Report {
+    synchronize_ids_with_freeze(repository, binding, budget, ids, submit, |repository, owner, id, envelope|
+        repository.freeze_external_input(owner, id, |_| Ok(envelope)))
+}
+
 fn synchronize_with_freeze(
     repository:&AgentBusMessageRepository, binding:&ExternalInputBinding, budget:Budget,
-    mut submit:impl FnMut(&Envelope)->anyhow::Result<Status>,
-    mut freeze:impl FnMut(&AgentBusMessageRepository,&str,&str,Envelope)->anyhow::Result<Envelope>,
+    submit:impl FnMut(&Envelope)->anyhow::Result<Status>,
+    freeze:impl FnMut(&AgentBusMessageRepository,&str,&str,Envelope)->anyhow::Result<Envelope>,
 ) -> Report {
     // This is the cutoff. Newly queued notes wait for the next input boundary.
     let ids = match repository.unsubmitted_note_ids(&binding.owner_id) {Ok(ids)=>ids,Err(e)=>return Report {errors:vec![format!("{e:#}")],..Default::default()}};
+    synchronize_ids_with_freeze(repository, binding, budget, ids, submit, freeze)
+}
+
+fn synchronize_ids_with_freeze(
+    repository: &AgentBusMessageRepository, binding: &ExternalInputBinding, budget: Budget,
+    ids: Vec<String>, mut submit: impl FnMut(&Envelope) -> anyhow::Result<Status>,
+    mut freeze: impl FnMut(&AgentBusMessageRepository, &str, &str, Envelope) -> anyhow::Result<Envelope>,
+) -> Report {
     let mut report=Report::default();let mut count=0usize;let mut bytes=0usize;let mut fence=ProjectionOrderFence::default();
     for id in ids {
         if count>=budget.notes.min(MAX_NOTES) || bytes>=budget.bytes.min(MAX_TRANSPORT_BYTES) {

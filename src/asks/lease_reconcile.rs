@@ -61,6 +61,8 @@ pub struct Reconcile {
     pub last_result: Option<String>,
     pub offline_since: Option<DateTime<Utc>>,
     identity: Identity,
+    start_check_after: Option<DateTime<Utc>>,
+    start_check_failures: u32,
 }
 
 /// What makes a lease the same lease: a replaced or rebound lease starts over.
@@ -112,7 +114,21 @@ fn fresh(identity: Identity) -> Reconcile {
         last_result: None,
         offline_since: None,
         identity,
+        start_check_after: None,
+        start_check_failures: 0,
     }
+}
+
+/// A missed start needs a bounded history read even while the turn is active.
+/// Keep its backoff separate from terminal reconciliation: an unreadable start
+/// is not evidence that an active lease is stale.
+pub(crate) fn start_check_due(dir: &Path, lease: &AdmissionLease, now: DateTime<Utc>) -> bool {
+    with_entry(dir, lease, |entry| {
+        if entry.start_check_after.is_some_and(|at| now < at) { return false; }
+        entry.start_check_failures = entry.start_check_failures.saturating_add(1);
+        entry.start_check_after = Some(now + backoff(entry.start_check_failures));
+        true
+    })
 }
 
 /// Wait after `failures` unproven checks.

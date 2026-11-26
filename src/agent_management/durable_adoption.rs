@@ -10,6 +10,8 @@ pub struct HumanCreationDefaults {
     pub profile: String,
     pub model: String,
     pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_resolution: Option<crate::profiles::reasoning::SessionEffort>,
     /// Sandbox / approval / workspace options chosen at creation. Absent on
     /// older receipts: adoption then keeps the historical full-access default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +39,24 @@ pub struct HumanAdoptReceipt {
     pub request: HumanAdoptRequest,
     pub record: crate::session::model::CutexSessionRecord,
     pub import_request: Option<DurableImportRequest>,
+    // The exact previous builds reject unknown fields in creation_defaults.
+    // Keep the extra replay input on the extensible receipt envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_reasoning_resolution: Option<crate::profiles::reasoning::SessionEffort>,
+}
+
+impl HumanAdoptReceipt {
+    fn matches_request(&self, request: &HumanAdoptRequest) -> bool {
+        let mut request = request.clone();
+        let resolution = take_creation_reasoning_resolution(&mut request);
+        request == self.request && resolution == self.creation_reasoning_resolution
+    }
+}
+
+fn take_creation_reasoning_resolution(
+    request: &mut HumanAdoptRequest,
+) -> Option<crate::profiles::reasoning::SessionEffort> {
+    request.creation_defaults.as_mut()?.reasoning_resolution.take()
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HumanAdoptResult {
@@ -152,7 +172,7 @@ impl AgentManagementProvider {
                     .get(request.action_id.as_str())
                 {
                     anyhow::ensure!(
-                        &receipt.request == request,
+                        receipt.matches_request(request),
                         "adoption_action_payload_conflict"
                     );
                     return Ok(receipt.clone());
@@ -227,10 +247,14 @@ impl AgentManagementProvider {
                     candidate.bump_durable_revision()?;
                     sessions.sessions.insert(candidate.cutex_session_id.clone(), candidate.clone());
                 }
+                let mut receipt_request = request.clone();
+                let creation_reasoning_resolution =
+                    take_creation_reasoning_resolution(&mut receipt_request);
                 let receipt = HumanAdoptReceipt {
-                    request: request.clone(),
+                    request: receipt_request,
                     record: candidate,
                     import_request: None,
+                    creation_reasoning_resolution,
                 };
                 sessions
                     .human_adoption_receipts
@@ -271,7 +295,7 @@ impl AgentManagementProvider {
                         .get_mut(request.action_id.as_str())
                         .ok_or_else(|| anyhow::anyhow!("adoption receipt missing"))?;
                     anyhow::ensure!(
-                        receipt.request == *request,
+                        receipt.matches_request(request),
                         "adoption_action_payload_conflict"
                     );
                     if receipt.import_request.is_none() {
@@ -305,7 +329,11 @@ fn apply_creation_defaults(
     anyhow::ensure!(!defaults.profile.trim().is_empty() && !defaults.model.trim().is_empty(), "Creation profile and model required");
     record.profile = Some(defaults.profile.clone());
     record.model_defaults = Some(defaults.model.clone());
-    record.reasoning_defaults = defaults.reasoning.clone();
+    record.reasoning_defaults = match &defaults.reasoning_resolution {
+        Some(resolution) => resolution.resolution.configured.clone(),
+        None => defaults.reasoning.clone(),
+    };
+    record.reasoning_resolution = defaults.reasoning_resolution.clone();
     if let Some(permissions) = &defaults.permissions {
         permissions.validate_shape()?;
         permissions.apply_to_record(record);
@@ -316,6 +344,68 @@ fn apply_creation_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_effort_receipt_preserves_previous_request_shape_and_replay() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PreviousCreationDefaults {
+            profile: String,
+            model: String,
+            reasoning: Option<String>,
+            permissions: Option<crate::config::new_thread::LaunchPermissions>,
+        }
+
+        use crate::profiles::reasoning::{SessionEffort, resolve};
+        let effort = SessionEffort {
+            requested_model: "gpt-test".into(),
+            resolved_model: Some("gpt-test".into()),
+            resolution: resolve(Some("high"), None, None, None, None).unwrap(),
+        };
+        let request = HumanAdoptRequest {
+            session_only: false,
+            owner_created_native: true,
+            creation_defaults: Some(HumanCreationDefaults {
+                profile: "private".into(),
+                model: "gpt-test".into(),
+                reasoning: Some("high".into()),
+                reasoning_resolution: Some(effort.clone()),
+                permissions: None,
+            }),
+            action_id: AgentActionId::new("creation-effort-replay").unwrap(),
+            native_id: "00000000-0000-7000-8000-000000000001".into(),
+            cwd: ".".into(),
+            formal_name: "Creation effort".into(),
+        };
+        let mut receipt_request = request.clone();
+        let creation_reasoning_resolution =
+            take_creation_reasoning_resolution(&mut receipt_request);
+        let mut record = crate::session::model::CutexSessionRecord::new(
+            "cutex.00000000-0000-7000-8000-000000000002".into(),
+            Some(request.native_id.clone()), "test".into(), request.cwd.clone(), None,
+        ).unwrap();
+        apply_creation_defaults(&mut record, request.creation_defaults.as_ref().unwrap()).unwrap();
+        let receipt = HumanAdoptReceipt {
+            request: receipt_request,
+            record,
+            import_request: None,
+            creation_reasoning_resolution,
+        };
+        let wire = serde_json::to_value(receipt).unwrap();
+        let previous: PreviousCreationDefaults =
+            serde_json::from_value(wire["request"]["creation_defaults"].clone()).unwrap();
+        assert_eq!(previous.profile, "private");
+        assert_eq!(previous.model, "gpt-test");
+        assert_eq!(previous.reasoning.as_deref(), Some("high"));
+        assert!(previous.permissions.is_none());
+        let decoded: HumanAdoptReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.record.reasoning_resolution, Some(effort));
+        assert!(decoded.matches_request(&request));
+        let mut conflict = request;
+        conflict.creation_defaults.as_mut().unwrap().reasoning_resolution = None;
+        assert!(!decoded.matches_request(&conflict));
+    }
+
     fn assert_adoption_creation_provenance(
         owner_created_native: bool,
         supplied_creator: Option<crate::session::model::SessionCreatedBy>,
@@ -403,7 +493,7 @@ mod tests {
         let request = HumanAdoptRequest {
             owner_created_native: false,
             session_only: false,
-            creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()),
+            creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()), reasoning_resolution: None,
                 permissions: Some(crate::config::new_thread::LaunchPermissions {
                     sandbox: "workspace-write".into(), approval: "on-request".into(), approvals_reviewer: None,
                     network_access: true, writable_roots: vec![root.to_string_lossy().into_owned()],
@@ -738,6 +828,7 @@ mod tests {
                 profile: "B".into(),
                 model: "gpt-test".into(),
                 reasoning: None,
+                reasoning_resolution: None,
                 permissions: None,
             }),
             action_id: AgentActionId::new(format!("c019-{label}")).unwrap(),

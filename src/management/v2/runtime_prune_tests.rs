@@ -343,6 +343,20 @@ fn post_rechecks_a_selection_changed_after_preview() {
 }
 
 #[test]
+fn reviewed_id_refuses_a_replacement_at_the_same_path() {
+    let _processes = super::super::runtime_prune_processes::test_inspection(Ok(vec![]));
+    let f = Fixture::new();
+    let _scope = ConfigScope::at(f.home.parent().unwrap(), &f.layout.base);
+    let version = f.versions(&CutexSessionStore::default(), vec![]).remove(0);
+    assert!(version.can_prune);
+    std::fs::rename(&f.target, f.target.with_file_name("original-fixture")).unwrap();
+    std::fs::write(&f.target, b"replacement").unwrap();
+    let result = execute(&[version.id]).unwrap();
+    assert_eq!(result["results"][0]["reason"], "not_found", "{result}");
+    assert_eq!(std::fs::read(&f.target).unwrap(), b"replacement");
+}
+
+#[test]
 fn owner_action_deletes_and_a_repeated_id_is_not_found() {
     let _processes = super::super::runtime_prune_processes::test_inspection(Ok(vec![]));
     let f = Fixture::new();

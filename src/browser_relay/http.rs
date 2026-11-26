@@ -459,6 +459,7 @@ mod tests {
             "schema_version":"test","schema_sha256":"a".repeat(64),"started_at":"2026-10-24T00:00:00Z"})).unwrap());
         let mut context=unused_context();
         context.load_runtime_status=|session|Ok(Some(crate::app_server::manager::AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id:session.into(),thread_id:"018e0000-0000-7000-8000-0000b0009ae6".into(),runtime_generation:7,connected:true,
             active_turn_id:None,active_turn_observed_at:None,thread_status:None,thread_status_observed_at:None,

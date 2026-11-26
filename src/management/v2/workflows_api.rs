@@ -136,6 +136,21 @@ impl StepBackend for ManagementSteps {
         Ok(ask)
     }
 
+    fn find_started_step(&self, action_id: &str) -> Result<Option<StepHandle>, RunError> {
+        let lookup = || -> anyhow::Result<_> {
+            use crate::asks::model::Requester;
+            let store = crate::asks::store::AskStore::open_default()?;
+            if let Some(state) = store.peek()? {
+                if let Some(ask) = state.find_by_action(&Requester::Owner, action_id) {
+                    return Ok(Some(StepHandle { session_id: ask.target_cutex_session_id.clone(), ask_id: ask.ask_id.clone() }));
+                }
+            }
+            Ok(store.archived_by_action(&Requester::Owner, action_id)?.map(|ask|
+                StepHandle { session_id: ask.target_cutex_session_id, ask_id: ask.ask_id }))
+        };
+        lookup().map_err(|error| RunError { code: "asks_unavailable".into(), message: format!("{error:#}") })
+    }
+
     fn poll(&self, ask_ids: &[String]) -> HashMap<String, AskPoll> {
         match crate::asks::store::AskStore::open_default() {
             Ok(store) => asks_bridge::poll(&store, ask_ids),

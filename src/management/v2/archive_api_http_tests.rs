@@ -44,7 +44,7 @@ fn r264_owner_review_execute_http_rejects_nonowner_and_requires_bound_token() {
         let (status,_,bytes)=exchange_with(ctx,"POST",path,bearer,body.to_string().into_bytes(),"application/json","");
         (status,serde_json::from_slice::<Value>(&bytes).unwrap())
     };
-    for path in [REVIEW,EXECUTE] {
+    for path in [REVIEW,EXECUTE,crate::management::v2::archive::batch::PATH] {
         assert_eq!(call(path,None,json!({})).0,401);
         assert_eq!(call(path,Some(&token.token),json!({"confirmed_name":"可粘贴的完整名字 🦅"})).0,403);
     }

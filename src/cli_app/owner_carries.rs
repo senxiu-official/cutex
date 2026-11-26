@@ -189,6 +189,12 @@ impl OwnerCarries {
         thread: &str,
         generation: u64,
     ) -> Result<Self> {
+        Self::prepare_for_boundary(session, owner, thread, generation, false)
+    }
+
+    pub(crate) fn prepare_for_boundary(
+        session: &str, owner: &str, thread: &str, generation: u64, ordered_start: bool,
+    ) -> Result<Self> {
         // No IO in THIS attempt does not prove a prior attempt was unsent.
         // C-010 normally deduplicates the owner first; never turn an explicit
         // retry or a restarted process into permission to release old carries.
@@ -230,7 +236,7 @@ impl OwnerCarries {
                 return Ok(());
             }
             let store = AskStore::open_default()?;
-            if let Some(results) = cutex::asks::owner_carries::reserve_owner_results(
+            if let Some(results) = cutex::asks::owner_carries::reserve_owner_results_filtered(
                 &store,
                 session,
                 owner,
@@ -238,6 +244,7 @@ impl OwnerCarries {
                 ReceiverLimit::from_policy(&binding.canonical_byte_limit),
                 cutex::config::documents::current(),
                 Utc::now(),
+                ordered_start,
             )? {
                 bundle.had_results = true;
                 anyhow::ensure!(
@@ -265,8 +272,9 @@ impl OwnerCarries {
                 .filter(|candidate| {
                     candidate.eligible || candidate.held.as_deref() == Some("ownerStop")
                 })
-                .take(available)
             {
+                if metadata.len() == available { break; }
+                if ordered_start && bus.is_ordinary_automatic_input(session, &candidate.id)? { continue; }
                 metadata.insert(candidate.id.clone(), bus.message_meta(&candidate.id)?);
             }
             let mut bytes = bundle

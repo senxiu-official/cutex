@@ -4,6 +4,9 @@
 //! the behavior-preserving extraction targets for the staged modularization
 //! plan in `agent-log/260629-cutex-modularization-blueprint.md`.
 
+#[macro_use]
+mod diagnostic_stderr;
+
 pub mod agent_bus;
 pub mod agent_management;
 pub mod agent_names;
@@ -48,6 +51,7 @@ pub mod role_revision;
 pub mod runtime;
 // r290 P5 owner-created recurring schedules.
 pub mod schedules;
+pub mod personal_assistants;
 pub mod services;
 pub mod session;
 pub mod short_ids;

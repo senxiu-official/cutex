@@ -2,16 +2,43 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cutex:management-v2:asks",
   "title": "AskList",
-  "description": "GET /v2/asks summaries. Owner cleanup pagination (asks-updated-before-cursor-v1) adds updatedBefore RFC3339 and opaque cursor, orders by updatedAt then askId ascending, and returns nextCursor. Keep filters and cutoff unchanged between pages. Without these parameters legacy order is unchanged. GET /v2/asks/{id} returns {ask} with owner detail.",
+  "description": "GET /v2/asks summaries. Owner cleanup pagination (asks-updated-before-cursor-v1) adds updatedBefore RFC3339 and opaque cursor, orders by updatedAt then askId ascending, and returns nextCursor. Keep filters and cutoff unchanged between pages. Without these parameters legacy order is unchanged. Short-ID lookup (asks-short-id-lookup-v1) adds idPrefix and returns lightweight hits. GET /v2/asks/{id} returns {ask} with owner detail.",
   "anyOf": [
     {
       "$ref": "#/$defs/askList"
     },
     {
       "$ref": "#/$defs/askDetail"
+    },
+    {
+      "$ref": "#/$defs/askShortIdLookup"
     }
   ],
   "$defs": {
+    "crossHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction", "peer", "receipt"],
+      "properties": {
+        "direction": {"enum": ["inbound", "outbound"]},
+        "peer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["instanceId", "label"],
+          "properties": {"instanceId": {"type": "string", "pattern": "^ci-[0-9a-fA-F]{32}$"}, "label": {"type": "string"}}
+        },
+        "receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "reason", "confirmedAt"],
+          "properties": {
+            "state": {"enum": ["queuedAtSource", "deliveredToPeer", "accepted", "failed", "outcomeUnknown"]},
+            "reason": {"enum": [null, "sourceRoutingRefused", "destinationRoutingRefused", "peerRefusedUnspecified", "peerUnreachable", "peerCredentialRefused", "peerIdentityChanged", "peerVersionMismatch", "peerRemoved", "peerDisabled", "peerRejectedRequest", "destinationRejected", "destinationFailed", "cancelled", "interrupted", "outcomeUnknown"]},
+            "confirmedAt": {"type": ["string", "null"], "format": "date-time"}
+          }
+        }
+      }
+    },
     "reviewReference": {
       "type": "object",
       "required": ["kind", "approvalId", "projectId"],
@@ -106,6 +133,7 @@
         "requester": {
           "$ref": "#/$defs/requester"
         },
+        "crossHost": {"$ref": "#/$defs/crossHost"},
         "controller": {
           "type": ["string", "null"],
           "description": "Current scoped controller after handover; null while review or reconciliation prevents control. Omitted for ordinary r253 ownership."
@@ -157,7 +185,11 @@
             "state": {"type": "string", "enum": ["waiting", "ready", "limited"]},
             "kind": {"type": "string", "enum": ["after", "children", "jobs"]},
             "since": {"type": ["string", "null"]},
-            "nextWakeAt": {"type": ["string", "null"]}
+            "nextWakeAt": {"type": ["string", "null"]},
+            "blockedReason": {
+              "type": "string",
+              "enum": ["quota", "login", "runtimeDown", "budget", "runtimeOffline", "reconnecting", "paused", "planMode", "profileSwitchPending", "targetBusy", "admission", "routing", "runtimeUnsupported", "reconciling"]
+            }
           }
         },
         "hold": {
@@ -197,6 +229,28 @@
           "description": "Independent routing and capability reviews; deciding one never bypasses the other."
         },
         "reviewDenialReason": {"type": ["string", "null"]},
+        "activityLink": {
+          "type": "object",
+          "description": "Current delegation blocker and navigation references. These links confer no action authority.",
+          "properties": {
+            "delegation": {
+              "type": "object",
+              "required": ["kind", "askId"],
+              "properties": {"kind": {"const": "delegation"}, "askId": {"type": "string"}}
+            },
+            "approval": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/reviewReference"}]},
+            "result": {
+              "type": ["object", "null"],
+              "required": ["kind", "askId", "answerId"],
+              "properties": {
+                "kind": {"const": "delegationResult"}, "askId": {"type": "string"}, "answerId": {"type": "string"}
+              }
+            },
+            "blocker": {"type": ["string", "null"]},
+            "next": {"type": "string"}
+          },
+          "required": ["delegation", "approval", "result", "blocker", "next"]
+        },
         "closed": {
           "type": [
             "string",
@@ -209,7 +263,8 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "description": "Management asks list and detail report the one-based position in the target's numbered admission queue, including owner inputs, or null if the delegation has no numbered row. Internal ask summaries and delegation tools use creation order among local queued delegations for the same target. The owner close receipt returns null."
         },
         "attempts": {
           "type": "integer"
@@ -228,7 +283,7 @@
             "object",
             "null"
           ],
-          "properties": {"stopDeadline": {"type": ["string", "null"]}, "stopUnconfirmed": {"type": "boolean"}, "steps": {"type": ["object", "null"], "properties": {"done": {"type": "integer", "minimum": 0}, "total": {"type": "integer", "minimum": 0}, "currentStep": {"type": ["string", "null"]}}}, "lastProgressAt": {"type": ["string", "null"]}}
+          "properties": {"startedAtInferred": {"const": true, "description": "Optional. startedAt is the time exact native input history proved the start, not the original start notification time. Absent on old or unmarked records; absence does not prove exact timing."}, "stopDeadline": {"type": ["string", "null"]}, "stopUnconfirmed": {"type": "boolean"}, "steps": {"type": ["object", "null"], "properties": {"done": {"type": "integer", "minimum": 0}, "total": {"type": "integer", "minimum": 0}, "currentStep": {"type": ["string", "null"]}}}, "lastProgressAt": {"type": ["string", "null"]}}
         },
         "closedAt": {
           "type": [
@@ -435,6 +490,33 @@
         }
       }
     },
+    "askShortIdLookup": {
+      "type": "object",
+      "required": ["hostId", "asks", "hasMore"],
+      "properties": {
+        "hostId": {"type": "string"},
+        "asks": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {"$ref": "#/$defs/askShortIdHit"}
+        },
+        "hasMore": {"type": "boolean"}
+      }
+    },
+    "askShortIdHit": {
+      "type": "object",
+      "required": ["askId", "title", "target", "targetName", "projectId", "execution", "closed", "updatedAt"],
+      "properties": {
+        "askId": {"type": "string", "pattern": "^ask-[0-9a-fA-F]{32}$"},
+        "title": {"type": "string"},
+        "target": {"type": "string"},
+        "targetName": {"type": ["string", "null"]},
+        "projectId": {"type": ["string", "null"]},
+        "execution": {"type": "string"},
+        "closed": {"type": ["string", "null"]},
+        "updatedAt": {"type": "string"}
+      }
+    },
     "askDetail": {
       "type": "object",
       "required": [
@@ -445,6 +527,7 @@
           "type": "object",
           "properties": {
             "admissionFailure": { "type": "string", "minLength": 1, "description": "Exact permanent pre-dispatch refusal code; no attempt is invented." },
+            "crossHost": {"$ref": "#/$defs/crossHost"},
             "controller": { "type": ["string", "null"] },
             "originallyRequestedBy": { "type": ["string", "null"] },
             "controlError": { "type": "string" },

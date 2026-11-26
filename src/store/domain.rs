@@ -70,6 +70,8 @@ sqlite_domain!(PAN, "pan", "pan/pan.sqlite", "Pan download tasks and audit entri
 sqlite_domain!(PROFILE_QUOTA_NOTES, "profile-quota-notes", "runtime/profile-quota-notes/quota-notes-v1.sqlite3", "passive quota note outbox and per-window dedupe"); // r290 P12.
 // r290 P5: schedule cursor, occurrence audit and owner receipts are atomic.
 sqlite_domain!(SCHEDULES, "schedules", "runtime/schedules/schedules-v1.sqlite3", "owner recurring schedules, occurrence audit and idempotent writes");
+sqlite_domain!(INTERACTION_HISTORY, "interaction-history", "runtime/management-v2/interaction-history/history.sqlite3", "submitted question and approval replies; keyed retention within each session");
+sqlite_domain!(PERSONAL_ASSISTANTS, "personal-assistants", "runtime/personal-assistants/assistants-v1.sqlite3", "assistant bindings, Director requests, confirmations and audit");
 sqlite_domain!(NAME_TARGET_PINS, "name-target-pins", "runtime/name-target-pins.sqlite3", "immutable action recipient bindings");
 sqlite_domain!(
     INTEGRATION_DEDUPE,
@@ -124,6 +126,12 @@ sqlite_domain!(
     "outbound notification deliveries"
 );
 sqlite_domain!(
+    SERVICE_NOTIFICATIONS,
+    "service-notifications",
+    "services/notifications/service-notifications.sqlite3",
+    "service notification settings, credential digests, stream metadata and bounded history"
+);
+sqlite_domain!(
     STORAGE,
     "storage",
     "runtime/storage/storage.sqlite3",
@@ -174,7 +182,9 @@ pub static EXTERNAL: TxDomain = TxDomain {
 };
 
 pub static DOMAINS: &[&TxDomain] = &[
+    &INTERACTION_HISTORY,
     &SCHEDULES, // r290 P5 schedules.
+    &PERSONAL_ASSISTANTS,
     &OWNER_NOTIFY,
     &APPROVALS,
     &MANAGEMENT_STATE,
@@ -198,6 +208,7 @@ pub static DOMAINS: &[&TxDomain] = &[
     &OWNER_PINS,
     &NOTIFY_STATES,
     &NOTIFY_OUTBOUND,
+    &SERVICE_NOTIFICATIONS,
     &STORAGE,
     &USAGE,
     &USAGE_COLLECTORS,

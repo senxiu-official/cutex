@@ -151,6 +151,9 @@ impl ClaudeQuotaSnapshot {
             "consecutiveFailures": self.consecutive_failures,
             "credentialsExpired": self.credentials_expired_at.is_some(),
             "credentialsExpiredAt": self.credentials_expired_at,
+            "loginDiagnostic": self.credentials_expired_at.map(|at| {
+                if at <= now { "loginExpired" } else { "loginExpiring" }
+            }),
         })
     }
 
@@ -596,6 +599,8 @@ mod tests {
         let meta = stale.meta(1200, 300);
         assert_eq!(meta["credentialsExpired"], true);
         assert_eq!(meta["credentialsExpiredAt"], 1050);
+        assert_eq!(meta["loginDiagnostic"], "loginExpired");
+        assert_eq!(stale.meta(1049, 300)["loginDiagnostic"], "loginExpiring");
         assert_eq!(meta["lastError"], Value::Null);
         assert!(!stale.gauges(1200, 300)[0].stale);
 
@@ -608,6 +613,7 @@ mod tests {
         assert!(changed);
         assert_eq!(fresh.credentials_expired_at, None);
         assert_eq!(fresh.meta(1800, 300)["credentialsExpired"], false);
+        assert_eq!(fresh.meta(1800, 300)["loginDiagnostic"], Value::Null);
         // A snapshot without the field (before r224) still loads.
         let old: ClaudeQuotaSnapshot = serde_json::from_value(json!({"version": 1, "fetchedAt": 5})).unwrap();
         assert_eq!(old.credentials_expired_at, None);

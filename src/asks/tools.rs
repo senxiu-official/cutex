@@ -182,7 +182,7 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
         ARRIVAL_NO_WAIT
     };
     let mut tools = vec![
-        json!({"name": AGENT_LIST, "description": format!("List online persistent cutex agents in your own project and explicitly linked projects (idle/busy/paused), own project first, excluding yourself. Rows outside your project carry project. Offline agents are counted per project in projects; include_offline:true lists them. Outside a project, list reachable standalone agents in your creator family or linked families. Projects visible only through external-agent grants or host-wide access are counts only in other_projects; project selects a visible project by id. name looks up one agent with full fields, including offline agents, using the same name/ID matching as agent_delegate; name@host or host+name looks up a peer agent. List rows contain name/id/profile/model/status/queue, project for another project, and Director/pause facts when set. Never lists native subagents from {native}. Includes your open delegations, delegations to you, open questions, unclaimed results and pending Director reviews. Finalized Director changes are omitted. limit defaults to 50; next_cursor continues with the same filters. otherHosts is a per-host count; host selects a compact page on that host. These are output filters, not changes to communication permissions. {guidance}"),
+        json!({"name": AGENT_LIST, "description": format!("List online persistent cutex agents in your own project and explicitly linked projects (idle/busy/paused), own project first, excluding yourself. Rows outside your project carry project. Offline agents are counted per project in projects; include_offline:true lists them. Outside a project, list reachable standalone agents in your creator family or linked families. Projects visible only through external-agent grants or host-wide access are counts only in other_projects; project selects a visible project by id. name looks up one agent with full fields, including offline agents, using the same name/ID matching as agent_delegate; name@host or host+name looks up a peer agent. List rows contain name/id/profile/model/status/queue, project for another project, and Director/pause facts when set. Never lists native subagents from {native}. Includes open delegations, closed delegations with unclaimed failure/terminal notices, delegations to you, open questions, unclaimed results and pending Director reviews. Finalized Director changes are omitted. limit defaults to 50; next_cursor continues with the same filters. otherHosts is a per-host count; host selects a compact page on that host. These are output filters, not changes to communication permissions. {guidance}"),
             "inputSchema": {"type":"object","properties":{
                 "name":{"type":"string","description":"One concrete agent name or ID (offline included); name@host also works. Returns full fields."},
                 "project":{"type":"string","description":"A visible local project id from projects or other_projects. Narrows the list to that project; omit for your project plus explicit links."},
@@ -278,7 +278,7 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
                 "closed":{"type":"boolean"}, "before":{"type":"string","format":"date-time"},
                 "all":{"type":"boolean"}, "action_id":action_schema()
             }, "additionalProperties":false}}),
-        json!({"name": DELEGATION_READ, "description": "Read the result of a delegation you made or handle, one page at a time, or an artifact attached to it (art- id, such as a long brief). Use it when a delegation result, brief or previous answer arrives as an [overlength …] notice or is cut short: call it exactly as the notice shows. Not for files (use your file tools) and not for overlength messages (doc- ids: use read_overlength_content).",
+        json!({"name": DELEGATION_READ, "description": "Read the result of a delegation you made or handle, one page at a time, or an artifact attached to it (art- id, such as a long brief). Use it when a delegation result, brief or previous answer arrives as an [overlength …] notice or is cut short: call it exactly as the notice shows. If an answer is absent after failure or closure, returns recorded state, reason and actor. Not for files (use your file tools) and not for overlength messages (doc- ids: use read_overlength_content).",
             "inputSchema": {"type": "object", "properties": {
                 "delegation": delegation_schema("The delegation id (delegation-…)."),
                 "cursor": {"type": "integer", "minimum": 0, "description": "Byte offset to start reading at. Omit it for the first page; to continue, pass next_cursor from the previous result (null means you have reached the end)."},
@@ -988,11 +988,14 @@ fn agent_list_with_reads(ctx: &ToolContext<'_>, args: Value,
     let agents = if let Some(row) = remote_lookup { vec![row] } else if args.host.is_some() { Vec::new() } else {page.rows};
     let empty_detail = (agents_total == 0 && args.host.is_none() && ctx.world.manages_project(ctx.caller))
         .then_some("No other cutex agents in your project yet; create one with agent_create.");
+    let terminal_pending:std::collections::HashSet<&str>=state.deliveries.values()
+        .filter(|d|super::terminal_notices::is_critical(d)&&super::delivery::discoverable(&state,d))
+        .map(|d|d.ask_id.as_str()).collect();
     let controlled_asks: Vec<(&AskRecord, String)> = state
         .asks
         .values()
         .map(|ask| &**ask)
-        .filter(|ask| ask.is_open())
+        .filter(|ask| ask.is_open() || terminal_pending.contains(ask.ask_id.as_str()))
         .filter_map(|ask| {
             let controller = ownership.as_ref()?.controller(ask).ok().flatten()?;
             if controller != ctx.caller { return None; }
@@ -1018,20 +1021,22 @@ fn agent_list_with_reads(ctx: &ToolContext<'_>, args: Value,
         .values()
         .filter(|ask| (ask.remote.is_none() && ask.target_cutex_session_id == ctx.caller) && ask.is_open() && !ask.execution.is_terminal())
         .map(|ask| {
-            json!({
+            let mut row = json!({
                 "ask_id": ask.ask_id,
                 "from": ask.requester.label(),
                 "title": ask.title,
                 "state": ask.execution,
                 "queue_position": super::store::queue_position(&state, ask),
-            })
+            });
+            crate::peers::receipt::insert(&mut row, crate::peers::receipt::delegation(ask));
+            row
         })
         .collect();
     // Resolve visibility before projecting any pending notice or its title.
     let pending: Vec<_> = state
         .deliveries
         .values()
-        .filter(|delivery| super::delivery::actionable(&state, delivery))
+        .filter(|delivery| super::delivery::discoverable(&state, delivery))
         .filter(|delivery| {
             let Some(ownership) = ownership.as_ref() else { return false; };
             let Some(ask) = state.asks.get(&delivery.ask_id) else { return false; };
@@ -1881,11 +1886,18 @@ pub(crate) fn close_in_state(
             }
             if ask.remote.is_some() && outcome != "followUpEnded" {
                 if stop_jobs { return Err(AskError::new("remote_unsupported", "remote job cancellation is unavailable in P0")); }
+                if matches!(outcome,"stop"|"accepted"|"abandoned") {super::terminal_notices::control_cause(state,ask_id,requester,outcome);}
                 let result = crate::peers::asks::queue_op(state,ask_id,outcome,now)?;
                 if let Some(requester) = requester { super::delivery::settle_for_ask(state, requester, ask_id, None, "closed", now); }
                 return Ok(result);
             }
             let mut stopping = false;
+            if !matches!(outcome,"followUpEnded"|"accepted"|"stop"|"abandoned") {return Err(invalid("unknown close outcome"));}
+            if outcome=="accepted" && ask.review!=Some(ReviewState::AwaitingAcceptance) {
+                return Err(AskError::new("ask_not_awaiting_acceptance","only a delegation whose result waits for review can be accepted"));
+            }
+            if outcome=="followUpEnded" && stop_jobs {return Err(invalid("followUpEnded sends no runtime or job commands"));}
+            super::terminal_notices::control_cause(state,ask_id,requester,outcome);
             match outcome {
                 "followUpEnded" => {
                     if stop_jobs { return Err(invalid("followUpEnded sends no runtime or job commands")); }
@@ -1900,7 +1912,7 @@ pub(crate) fn close_in_state(
                     for question in state.questions.values_mut().filter(|q|q.ask_id==ask_id && q.state==QuestionState::Open) {
                         question.state=QuestionState::Stale;
                     }
-                    for delivery in state.deliveries.values_mut().filter(|d|d.ask_id==ask_id && d.state==DeliveryState::Pending) {
+                    for delivery in state.deliveries.values_mut().filter(|d|d.ask_id==ask_id && d.state==DeliveryState::Pending && !super::terminal_notices::is_critical(d)) {
                         delivery.state=DeliveryState::Acknowledged;
                         delivery.settled_by=Some("followUpEnded".into());
                         delivery.updated_at=now_rfc3339(now);
@@ -2177,14 +2189,26 @@ fn delegation_read_with_receipt(ctx: &ToolContext<'_>, args: Value, settle_recei
         let found = if belongs { ctx.store.read_artifact(&artifact, None).map_err(store_error)? } else { None };
         let (_, bytes) = found.ok_or_else(|| AskError::new("artifact_not_found", "no such artifact on this delegation"))?;
         let (text, cursor, next, total) = page_of(bytes);
-        return Ok(json!({"ok": true, "ask_id": ask.ask_id, "artifact": artifact, "cursor": cursor, "next_cursor": next, "bytes": total, "text": text}));
+        let mut value = json!({"ok": true, "ask_id": ask.ask_id, "artifact": artifact, "cursor": cursor, "next_cursor": next, "bytes": total, "text": text});
+        crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
+        return Ok(value);
     }
     let answer = state
         .answers
         .values()
         .filter(|answer| answer.ask_id == ask.ask_id && args.revision.is_none_or(|revision| answer.revision == revision))
-        .max_by_key(|answer| answer.revision)
-        .ok_or_else(|| AskError::new("answer_not_found", "the delegation has no result yet; it is delivered according to the delegation's notify setting"))?;
+        .max_by_key(|answer| answer.revision);
+    let Some(answer)=answer else {
+        if args.revision.is_none() && super::terminal_notices::readable(ask) {
+            let mut value=super::terminal_notices::read_state(ask);
+            crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
+            if settle_receipt && crate::director_address::is_controller(ask,ctx.caller) {
+                ctx.store.with_records(&[&ask.ask_id],|s|super::delivery::settle_for_ask(s,ctx.caller,&ask.ask_id,None,"read",ctx.now)).map_err(store_error)?;
+            }
+            return Ok(value);
+        }
+        return Err(AskError::new("answer_not_found","the delegation has no result yet; it is delivered according to the delegation's notify setting"));
+    };
     let bytes = match answer.artifact_id.as_deref() {
         Some(artifact) => ctx.store.read_artifact(artifact, None).map_err(store_error)?.map(|(_, bytes)| bytes).unwrap_or_default(),
         None => Vec::new(),
@@ -2198,7 +2222,7 @@ fn delegation_read_with_receipt(ctx: &ToolContext<'_>, args: Value, settle_recei
             .with_state(|state| super::delivery::settle_for_ask(state, ctx.caller, &ask_id, Some(revision), "read", ctx.now))
             .map_err(store_error)?;
     }
-    Ok(json!({
+    let mut value = json!({
         "ok": true,
         "ask_id": ask.ask_id,
         "answer_id": answer.answer_id,
@@ -2209,7 +2233,10 @@ fn delegation_read_with_receipt(ctx: &ToolContext<'_>, args: Value, settle_recei
         "bytes": total,
         "text": if answer.artifact_id.is_some() { json!(text) } else { Value::Null },
         "metadata": answer.metadata,
-    }))
+        "delegation_state":super::terminal_notices::readable(ask).then(||super::terminal_notices::read_state(ask)),
+    });
+    crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
+    Ok(value)
 }
 
 /// One page of a document a message pointed the caller to (input overflow).
@@ -3011,47 +3038,69 @@ mod director_tool_tests {
     }
 
     #[test]
-    fn director_continuation_reset_sees_fresh_project_pause_before_cached_membership() {
-        use crate::asks::{continuation as bounded,project_control as control,routing_policy::{integration as routing,RoutingActor}};
-        let f=Fixture::new();
-        let created=f.call(&f.director,3,AGENT_DELEGATE,json!({"target":f.next,"text":"bounded work"}),"reset-fresh-pause");
-        assert_eq!(created["ok"],true,"{created}");
-        let id=f.ask_id("reset-fresh-pause");
-        let now=Utc::now();
-        let attempt=bounded::AttemptIdentity{delegation_id:id.clone(),attempt_id:format!("{id}#1"),
-            owner_session_id:f.next.clone(),runtime_generation:1,parent_turn_id:"reset-fixture-turn".into()};
-        f.store.with_state(|state| {
-            let data=&mut state.asks.get_mut(&id).unwrap().bounded_continuation;
-            data.declare(&bounded::Actor::Agent{session_id:f.next.clone()},&attempt,&bounded::DeclareRequest{
-                action_id:"reset-fixture-declaration".into(),expected_attempt_id:attempt.attempt_id.clone(),expected_revision:None,
-                note:"continue bounded work".into(),wake:None},false,bounded::Guards{
-                    online:true,permission_valid:true,occurrence_valid:true,running_turn:true,..Default::default()},
-                bounded::ConditionSupport::default(),now).unwrap();
-            let record=data.current.as_mut().unwrap();record.state=bounded::Phase::Limited;record.running_attempt=None;
-            state.presence.insert(f.next.clone(),super::super::store::Presence{online:true,runtime_generation:Some(1),..Default::default()});
+    fn director_continuation_approval_persists_while_project_pause_is_fresh() {
+        use crate::asks::{
+            continuation as bounded, pause_admission, project_control as control,
+            routing_policy::{integration as routing, RoutingActor},
+        };
+        let f = Fixture::new();
+        let created = f.call(&f.director, 3, AGENT_DELEGATE,
+            json!({"target":f.next,"text":"bounded work"}), "reset-fresh-pause");
+        assert_eq!(created["ok"], true, "{created}");
+        let id = f.ask_id("reset-fresh-pause");
+        let now = Utc::now();
+        let declared_at = now - chrono::Duration::seconds(bounded::MAX_ELAPSED_SECONDS);
+        let host = routing::local_host_id();
+        let args = routing::with_authority(|snapshot| {
+            let ctx = routing::trusted_context(snapshot, &f.project, RoutingActor::Owner, &host)?;
+            f.store.with_state(|state| {
+                let ask = state.asks.get_mut(&id).unwrap();
+                let mut attempt = AttemptRecord::submitting(1, "reset-message".into(), 1, now_rfc3339(declared_at));
+                attempt.state = AttemptState::Yielded;
+                attempt.turn_id = Some("reset-fixture-turn".into());
+                attempt.ended_at = Some(now_rfc3339(now));
+                ask.attempts.push(attempt);
+                let source = bounded::AttemptIdentity {
+                    delegation_id: id.clone(), attempt_id: format!("{id}#1"),
+                    owner_session_id: f.next.clone(), runtime_generation: 1,
+                    parent_turn_id: "reset-fixture-turn".into(),
+                };
+                let data = &mut ask.bounded_continuation;
+                data.declare(&bounded::Actor::Agent { session_id: f.next.clone() }, &source,
+                    &bounded::DeclareRequest {
+                        action_id: "reset-fixture-declaration".into(), expected_attempt_id: source.attempt_id.clone(),
+                        expected_revision: None, note: "continue bounded work".into(), wake: None,
+                    }, false, bounded::Guards {
+                        online: true, permission_valid: true, occurrence_valid: true, running_turn: true,
+                        ..Default::default()
+                    }, bounded::ConditionSupport::default(), declared_at).unwrap();
+                data.current.as_mut().unwrap().running_attempt = None;
+                assert!(data.enforce_limits(now, Some(&f.director)));
+                data.enqueue_limit_notice().unwrap();
+                bounded::approval::sync_one(state, &id, Some(&ctx), now);
+                let card = state.asks[&id].bounded_continuation.approval.as_ref().unwrap();
+                let args = json!({"operation":"resume_continuation","project_id":f.project,
+                    "delegation_ref":{"hostId":host,"id":id},"expected_revision":card.revision,
+                    "expected_digest":card.digest,"expected_epoch":card.authority_epoch,"decision":"approve"});
+                control::pause(state, &ctx, &control::PauseRequest {
+                    action_id: "reset-project-pause".into(), expected_epoch: 0,
+                    mode: control::Mode::AfterTurn, scope: control::Scope::Members,
+                }, &control::Membership {
+                    revision: 0, members: Default::default(), excluded: Default::default(),
+                }, &host, now)?;
+                assert!(!control::is_paused(state, &f.next));
+                assert!(pause_admission::is_paused_in(state, snapshot, &f.next));
+                Ok(args)
+            }).unwrap()
         }).unwrap();
-        let host=routing::local_host_id();
-        let pause=routing::with_authority(|snapshot| {
-            let ctx=routing::trusted_context(snapshot,&f.project,RoutingActor::Owner,&host)?;
-            f.store.with_state(|state|control::pause(state,&ctx,&control::PauseRequest{action_id:"reset-project-pause".into(),
-                expected_epoch:0,mode:control::Mode::AfterTurn,scope:control::Scope::Members},&control::Membership{
-                    revision:0,members:Default::default(),excluded:Default::default()},&host,now)).unwrap()
-        }).unwrap();
-        let before=f.store.snapshot().unwrap().asks[&id].bounded_continuation.clone();
-        assert!(!control::is_paused(&f.store.snapshot().unwrap(),&f.next),"cached membership has not seen the target");
-        let args=json!({"operation":"resume_continuation","project_id":f.project,"delegation_ref":{"hostId":host,"id":id},
-            "expected_revision":before.current.as_ref().unwrap().revision});
-        let refused=f.call(&f.director,3,DELEGATION_ROUTING,args.clone(),"reset-while-project-paused");
-        assert_eq!(refused["code"],"continuation_guarded","{refused}");
-        assert_eq!(f.store.snapshot().unwrap().asks[&id].bounded_continuation,before);
+        let result = f.call(&f.director, 3, DELEGATION_ROUTING, args, "reset-while-project-paused");
+        assert_eq!(result["ok"], true, "{result}");
         routing::with_authority(|snapshot| {
-            let ctx=routing::trusted_context(snapshot,&f.project,RoutingActor::Owner,&host)?;
-            f.store.with_state(|state|control::resume(state,&ctx,&control::ResumeRequest{action_id:"reset-project-resume".into(),
-                pause_id:pause["runControl"]["pauseId"].as_str().unwrap().into(),expected_epoch:1},&host,now)).unwrap()
+            let state = f.store.snapshot().unwrap();
+            assert_eq!(state.asks[&id].bounded_continuation.current.as_ref().unwrap().budget_epoch, 2);
+            assert!(pause_admission::is_paused_in(&state, snapshot, &f.next));
+            Ok(())
         }).unwrap();
-        let resumed=f.call(&f.director,3,DELEGATION_ROUTING,args,"reset-after-project-resume");
-        assert_eq!(resumed["ok"],true,"{resumed}");
-        assert_eq!(f.store.snapshot().unwrap().asks[&id].bounded_continuation.current.as_ref().unwrap().budget_epoch,2);
     }
 
     #[test]
@@ -3111,16 +3160,8 @@ mod director_tool_tests {
         assert_eq!(forged["code"],"invalid_arguments","{forged}");
         assert_eq!(f.store.snapshot().unwrap(),before_lookup,"receipt lookups do not mutate or retry work");
         let host=route::local_host_id();
-        let without_grant=route::with_authority(|snapshot| {
-            let controllers=route::ControllerView::load(snapshot)?;
-            f.store.with_state(|s|route::check_admission(s,snapshot,&id,&host,false,Utc::now(),&controllers)).unwrap()
-        });
-        assert_eq!(without_grant.unwrap_err().code,"delegation_reviewer_grant_required");
-        let grant=f.call(&f.director,3,DELEGATION_ROUTING,json!({"operation":"create_grant","project_id":f.project,
-            "requester_ref":{"hostId":host,"id":f.caller},"target_refs":[{"hostId":host,"id":f.next}],
-            "root_delegation_ref":{"hostId":host,"id":id}}),"routing-grant");
-        assert_eq!(grant["ok"],true,"{grant}");
-        let grant_id=grant["grant"]["id"].as_str().unwrap();
+        let grant_id=f.store.snapshot().unwrap().asks[&id].routing_grant_id.clone().expect("approval completes the one-use grant");
+        assert_eq!(f.store.snapshot().unwrap().routing.grants[&grant_id].used_count,0);
         for _ in 0..2 {
             let verdict=route::with_authority(|snapshot| {
                 let controllers=route::ControllerView::load(snapshot)?;
@@ -3129,8 +3170,8 @@ mod director_tool_tests {
             assert!(matches!(verdict,routing::RouteVerdict::Pass(routing::RouteBasis::ApprovedGrant{..})));
         }
         let restarted=AskStore::at(f.roots[1].clone()).snapshot().unwrap();
-        assert_eq!(restarted.routing.grants[grant_id].used_count,1);
-        assert_eq!(restarted.asks[&id].routing_grant_id.as_deref(),Some(grant_id));
+        assert_eq!(restarted.routing.grants[&grant_id].used_count,1);
+        assert_eq!(restarted.asks[&id].routing_grant_id.as_deref(),Some(grant_id.as_str()));
         assert_eq!(f.call(&f.caller,3,"agent_ask",args,"routing-alias")["delegation"],first["delegation"]);
         assert_eq!(f.store.snapshot().unwrap().asks.len(),1);
         f.store.with_state(|state| {
@@ -3145,6 +3186,152 @@ mod director_tool_tests {
         assert_eq!(rotated["status"],"found","{rotated}");
         assert_eq!(rotated["result"]["receipt"],approved["receipt"]);
         assert_eq!(f.store.snapshot().unwrap(),before_lookup,"former Director can inspect own outcomes without retrying work");
+    }
+
+    #[test]
+    fn routing_approval_repair_does_not_restore_a_revoked_grant() {
+        use crate::asks::routing_policy::integration as route;
+        let f=Fixture::new();
+        assert_eq!(f.call(&f.caller,3,AGENT_DELEGATE,json!({"target":f.next,"text":"review"}),"revoked-routing")["ok"],true);
+        let id=f.ask_id("revoked-routing");
+        let before=f.store.snapshot().unwrap();
+        let approval=&before.routing.approvals[before.asks[&id].routing_approval_id.as_ref().unwrap()];
+        assert_eq!(f.call(&f.director,3,DELEGATION_ROUTING,json!({"operation":"decide_approval","project_id":f.project,
+            "approval_id":approval.id,"expected_revision":approval.revision,"expected_digest":approval.request_digest,
+            "decision":"approve"}),"approve-revoked-routing")["ok"],true);
+        let approved=f.store.snapshot().unwrap();let grant_id=approved.asks[&id].routing_grant_id.as_ref().unwrap();
+        assert_eq!(f.call(&f.director,3,DELEGATION_ROUTING,json!({"operation":"revoke_grant","project_id":f.project,
+            "grant_id":grant_id,"expected_revision":approved.routing.grants[grant_id].revision}),"revoke-routing")["ok"],true);
+        // Even a missing old binding must not manufacture a replacement for
+        // the same approved occurrence after its grant was explicitly revoked.
+        f.store.with_state(|s|s.asks.get_mut(&id).unwrap().routing_grant_id=None).unwrap();
+        let result=route::with_authority(|snapshot| {
+            let controllers=route::ControllerView::load(snapshot)?;
+            f.store.with_state(|s|route::check_admission(s,snapshot,&id,&route::local_host_id(),false,Utc::now(),&controllers)).unwrap()
+        });
+        assert!(result.is_err());
+        let after=f.store.snapshot().unwrap();assert_eq!(after.routing.grants.len(),1);
+        assert!(after.routing.grants[grant_id].revoked_at.is_some());assert!(after.asks[&id].attempts.is_empty());
+    }
+
+    #[test]
+    fn routing_repair_defers_when_approving_director_retired_after_seat_clear() {
+        cleared_director_repair(true);
+    }
+
+    #[test]
+    fn routing_repair_defers_when_approving_director_moved_after_seat_clear() {
+        cleared_director_repair(false);
+    }
+
+    fn cleared_director_repair(retired:bool) {
+        use crate::asks::routing_policy::{self as routing,integration as route};
+        let f=Fixture::new();
+        assert_eq!(f.call(&f.caller,3,AGENT_DELEGATE,json!({"target":f.next,"text":"review"}),"cleared-review")["ok"],true);
+        let id=f.ask_id("cleared-review");let before=f.store.snapshot().unwrap();
+        let approval=&before.routing.approvals[before.asks[&id].routing_approval_id.as_ref().unwrap()];
+        assert_eq!(f.call(&f.director,3,DELEGATION_ROUTING,json!({"operation":"decide_approval","project_id":f.project,
+            "approval_id":approval.id,"expected_revision":approval.revision,"expected_digest":approval.request_digest,
+            "decision":"approve"}),"approve-cleared-review")["ok"],true);
+        // Reproduce a historical valid approval for which no grant was bound.
+        f.store.with_state(|s| {s.routing.grants.clear();s.asks.get_mut(&id).unwrap().routing_grant_id=None;}).unwrap();
+        let roster=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        {
+            let _fence=roster.lock_mutations().unwrap();
+            roster.with_state(true,|mut state| {
+                let project=crate::agent_management::ProjectId::new(f.project.clone()).unwrap();
+                let old=state.projects.remove(&project).unwrap();
+                state.project_states.insert(project,serde_json::from_value(json!({"project_id":f.project,
+                    "lifecycle":"active","revision":1,"created_at":"2026-10-24T00:00:00Z",
+                    "updated_at":"2026-10-24T00:00:00Z","last_director_epoch":old.authority_epoch})).unwrap());
+                let director=crate::role_revision::CutexSessionId::new(f.director.clone()).unwrap();
+                if retired {
+                    state.agents.get_mut(&director).unwrap().retired_at=Some(serde_json::from_value(json!(now_rfc3339(Utc::now()))).unwrap());
+                } else {
+                    let destination=crate::agent_management::ProjectId::new("other-project").unwrap();
+                    state.project_states.insert(destination.clone(),serde_json::from_value(json!({"project_id":"other-project",
+                        "lifecycle":"active","revision":1,"created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"})).unwrap());
+                    state.current_project_memberships.get_mut(&director).unwrap().project_id=
+                        Some(destination);
+                }
+                Ok((state,(),true))
+            }).unwrap();
+        }
+        let check=|consume|route::with_authority(|snapshot| {
+            let controllers=route::ControllerView::load(snapshot)?;
+            f.store.with_state(|s|route::check_admission(s,snapshot,&id,&route::local_host_id(),consume,Utc::now(),&controllers)).unwrap()
+        });
+        assert_eq!(check(false).unwrap_err().code,"delegation_reviewer_grant_required");
+        assert!(f.store.snapshot().unwrap().asks[&id].is_open());
+        route::with_authority(|snapshot| {
+            let host=route::local_host_id();let controllers=route::ControllerView::load(snapshot)?;
+            let owner=route::trusted_context(snapshot,&f.project,routing::RoutingActor::Owner,&host)?;
+            f.store.with_state(|s| {
+                let ask=s.asks[&id].clone();let (request,root)=route::request_and_root(s,&ask,&host,&controllers)?;
+                s.routing.create_grant("owner-after-seat-clear",&owner,&routing::CreateGrantRequest{
+                    action_id:"owner-after-seat-clear".into(),requester_ref:request.requester_ref.unwrap(),
+                    target_refs:vec![request.target_ref],root_delegation_ref:request.root.unwrap(),
+                    purpose:routing::GrantPurpose::Review,max_uses:1,expires_at:None},&root,Utc::now()).map_err(route::error)?;
+                Ok(())
+            }).unwrap()
+        }).unwrap();
+        for _ in 0..2 {assert!(matches!(check(true).unwrap(),routing::RouteVerdict::Pass(routing::RouteBasis::ApprovedGrant{..})));}
+        let final_state=f.store.snapshot().unwrap();assert!(final_state.asks[&id].is_open());
+        assert_eq!(final_state.routing.grants.len(),1);assert_eq!(final_state.routing.grants["owner-after-seat-clear"].used_count,1);
+    }
+
+    #[test]
+    fn director_routing_notice_tracks_current_digest_and_director() {
+        use crate::asks::routing_policy::{integration as route,notifications};
+        let f=Fixture::new();
+        struct RestoreMarker(Option<std::ffi::OsString>);
+        impl Drop for RestoreMarker { fn drop(&mut self) { unsafe {
+            match self.0.take(){Some(old)=>std::env::set_var("CUTEX_TEST_PRIVATE_HOME",old),
+                None=>std::env::remove_var("CUTEX_TEST_PRIVATE_HOME")}
+        } } }
+        let _marker=RestoreMarker(std::env::var_os("CUTEX_TEST_PRIVATE_HOME"));
+        std::fs::write(f._home.root().join(".cutex-test-private-home"),b"").unwrap();
+        unsafe {std::env::set_var("CUTEX_TEST_PRIVATE_HOME",f._home.root());}
+        assert_eq!(f.call(&f.caller,3,AGENT_DELEGATE,json!({"target":f.next,"text":"review"}),"director-notice")["ok"],true);
+        let id=f.ask_id("director-notice");
+        let drafts=||route::with_authority(|snapshot| {
+            let controllers=route::ControllerView::load(snapshot)?;
+            f.store.inspect(|s|notifications::pending(s,snapshot,&route::local_host_id(),&controllers))
+                .map_err(|e|AskError::new("read",e.to_string()))
+        }).unwrap();
+        let first=drafts();assert_eq!(first.len(),1);assert_eq!(first[0].to,f.director);
+        route::with_authority(|snapshot| {
+            let mut no_membership=snapshot.clone();
+            let target=crate::role_revision::CutexSessionId::new(f.next.clone()).unwrap();
+            no_membership.agents.remove(&target);no_membership.current_project_memberships.remove(&target);
+            let controllers=route::ControllerView::load(&no_membership)?;
+            assert!(f.store.inspect(|s|notifications::pending(s,&no_membership,&route::local_host_id(),&controllers)).unwrap().is_empty(),
+                "a visible nonmember is not a Director-first project review");
+            Ok(())
+        }).unwrap();
+        let state=f.store.snapshot().unwrap();let approval=&state.routing.approvals[state.asks[&id].routing_approval_id.as_ref().unwrap()];
+        assert!(first[0].text.contains(&approval.id));assert!(first[0].text.contains(&approval.request_digest));
+        assert_eq!(first[0].key,drafts()[0].key,"stable durable notice identity");
+        notifications::publish(f.store.dir(),first.clone());
+        notifications::publish(f.store.dir(),first.clone());
+        let alarms=crate::agent_bus::alarms::read_all_at(&crate::agent_bus::alarms::store_path().unwrap()).unwrap();
+        assert_eq!(alarms.len(),1,"repeated scheduler passes enqueue only one durable review");
+        assert_eq!(alarms[0].to,f.director);assert_eq!(alarms[0].message,first[0].text);
+        assert!(alarms[0].message_id.starts_with(crate::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX));
+        f.store.with_state(|s|s.asks.get_mut(&id).unwrap().body.text.push_str(" revised")).unwrap();
+        route::with_authority(|snapshot| {
+            let controllers=route::ControllerView::load(snapshot)?;
+            f.store.with_state(|s|route::check_admission(s,snapshot,&id,&route::local_host_id(),false,Utc::now(),&controllers)).unwrap()
+        }).unwrap();
+        let renewed=drafts();assert_eq!(renewed.len(),1);assert_ne!(first[0].key,renewed[0].key);
+        assert_eq!(renewed[0].to,f.director,"stale re-request still goes to Director");
+        let successor=format!("cutex.{}",uuid::Uuid::new_v4());f.set_director(&successor);
+        route::with_authority(|snapshot| {
+            let controllers=route::ControllerView::load(snapshot)?;
+            f.store.with_state(|s|route::check_admission(s,snapshot,&id,&route::local_host_id(),false,Utc::now(),&controllers)).unwrap()
+        }).unwrap();
+        let rotated=drafts();assert_eq!(rotated.len(),1);
+        assert_eq!(rotated[0].to,successor);assert_ne!(rotated[0].key,renewed[0].key);
     }
 
     #[test]
@@ -3173,7 +3360,7 @@ mod director_tool_tests {
             assert!(response.starts_with("HTTP/1.1 200"),"{response}");
             serde_json::from_str::<Value>(response.split_once("\r\n\r\n").unwrap().1).unwrap()
         };
-        for (decision,capability_review) in [("approve",false),("deny",false),("deny",true)] {
+        for (decision,capability_review) in [("approve",false),("approve",true),("deny",false),("deny",true)] {
             let mut f=Fixture::new();
             // Fixture holds the shared HOME mutex. The scheduler also opens
             // Agent Bus state, whose test guard requires this exact marker.
@@ -3207,33 +3394,44 @@ mod director_tool_tests {
             assert_eq!(pending["routingApprovals"].as_array().unwrap().len(),1);
             assert_eq!(pending["routingApprovals"][0]["id"],approval.id);
             assert_eq!(pending["routingApprovals"][0]["allowedActions"]["approve"],true);
-            if decision=="approve" {
-                // Existing approvalRequired policy also requires its scoped
-                // one-use reviewer grant; owner approval does not weaken it.
-                let host=crate::asks::routing_policy::integration::local_host_id();
-                owner_call("POST",&format!("/v2/projects/{}/delegation-grants",f.project),json!({
-                    "actionId":"owner-grant","requesterRef":{"hostId":host,"id":f.caller},
-                    "targetRefs":[{"hostId":host,"id":f.next}],"rootDelegationRef":{"hostId":host,"id":id},
-                    "purpose":"review","maxUses":1
-                }));
-            }
             let decided=owner_call("POST",&format!("/v2/delegation-approvals/{}/decision",approval.id),json!({
                 "actionId":format!("owner-{decision}"),"decision":decision,"expectedDigest":approval.request_digest,
                 "expectedRevision":approval.revision,"decisionNote":"owner reviewed this route"
             }));
             assert_eq!(decided["routingApproval"]["decisionAuthority"],"owner");
+            if decision=="approve" {
+                let approved=f.store.snapshot().unwrap();
+                assert_eq!(approved.routing.grants.len(),1,"approve atomically completes the exact review grant");
+                // Reproduce an older backend's durable approved/missing-grant
+                // record. The normal scheduler must repair and admit it.
+                f.store.with_state(|s| {s.routing.grants.clear();s.asks.get_mut(&id).unwrap().routing_grant_id=None;}).unwrap();
+                use crate::asks::routing_policy::integration as route;
+                route::with_authority(|snapshot| {
+                    let mut no_membership=snapshot.clone();
+                    let target=crate::role_revision::CutexSessionId::new(f.next.clone()).unwrap();
+                    no_membership.agents.remove(&target);no_membership.current_project_memberships.remove(&target);
+                    let controllers=route::ControllerView::load(&no_membership)?;
+                    f.store.with_state(|s|route::complete_approved_review(s,&no_membership,&id,&route::local_host_id(),Utc::now(),&controllers)).unwrap()?;
+                    assert!(f.store.snapshot().unwrap().routing.grants.is_empty(),"membership is required to repair an old approval");
+                    Ok(())
+                }).unwrap();
+            }
             assert!(owner_call("GET",&list_path,json!({}))["routingApprovals"].as_array().unwrap().is_empty());
             let runtime=crate::asks::scheduler::tests::FakeRuntime::idle(&[&f.next,&f.caller]);
             crate::asks::scheduler::tick(&f.world,&runtime,&f.store,Utc::now()).unwrap();
-            if decision=="approve" {
+            if decision=="approve" && !capability_review {
                 let admitted=f.store.snapshot().unwrap();
                 let turn=admitted.asks[&id].current_attempt().unwrap().turn_id.clone().unwrap();
                 crate::asks::observe::observe(&f.store,&f.next,"turn/started",&json!({"turn":{"id":turn}}),Utc::now()).unwrap();
             }
             let after=f.store.snapshot().unwrap();let ask=&after.asks[&id];
-            if decision=="approve" {
+            if decision=="approve" && !capability_review {
                 assert_eq!(runtime.submitted.borrow().len(),1);
                 assert_eq!(ask.execution,ExecutionState::Running);
+            } else if decision=="approve" {
+                assert!(runtime.submitted.borrow().iter().all(|(target,_)|target!=&f.next));
+                assert_eq!(ask.execution,ExecutionState::PendingReview,"routing approval cannot decide the owner capability gate");
+                assert!(ask.attempts.is_empty());
             } else {
                 // A rejection may wake the requester with its result; it
                 // must never submit the denied work to the target.
@@ -3975,6 +4173,26 @@ pub(crate) mod tests {
     use crate::asks::store::tests::{temp_store, REQUESTER, TARGET};
     use std::cell::RefCell;
 
+    #[test]
+    fn terminal_read_and_unclaimed_notice_do_not_require_an_answer() {
+        let (world,dir)=world("terminal-tool-read");
+        let (store,store_dir)=temp_store("terminal-tool-read");let now=Utc::now();
+        let id=store.with_state(|s|s.create_ask(crate::asks::store::tests::new_ask("terminal-tool-read","work"),now).unwrap().0.ask_id).unwrap();
+        close_ask(&store,None,&id,"stop",now).unwrap();
+        store.with_state(|s| {for d in s.deliveries.values_mut(){d.owner_hold=true;}}).unwrap();
+        let listed=call(&world,&store,REQUESTER,AGENT_LIST,json!({}),"terminal-list");
+        assert_eq!(listed["unclaimed_results"],1,"{listed}");
+        assert_eq!(listed["my_delegations"].as_array().unwrap().len(),1);
+        assert_eq!(listed["pending_notices"]["entries"][0]["notice"]["actor"]["kind"],"owner");
+        let read=call(&world,&store,REQUESTER,DELEGATION_READ,json!({"delegation":id}),"terminal-read");
+        assert_eq!(read["ok"],true,"{read}");assert_eq!(read["kind"],"state");assert_eq!(read["closed"],"stopped");
+        assert_eq!(read["actor"]["kind"],"owner");assert_eq!(read["reason"],"stop");
+        assert!(store.snapshot().unwrap().answers.is_empty());
+        assert_eq!(call(&world,&store,REQUESTER,AGENT_LIST,json!({}),"terminal-list-after")["unclaimed_results"],0);
+        assert_eq!(call(&world,&store,"cutex.unrelated",DELEGATION_READ,json!({"delegation":id}),"terminal-foreign")["code"],"id_not_found");
+        let _=std::fs::remove_dir_all(dir);std::fs::remove_dir_all(store_dir).unwrap();
+    }
+
     pub fn call(world: &FakeWorld, store: &AskStore, caller: &str, tool: &str, args: Value, action_id: &str) -> Value {
         call_as(world, store, caller, tool, args, action_id, true)
     }
@@ -4312,9 +4530,13 @@ pub(crate) mod tests {
         assert!(listed["hint"].as_str().unwrap().contains("until the owner resumes"), "{listed}");
         let accepted = call(&world, &store, REQUESTER, DELEGATION_CLOSE, json!({"delegation": review, "outcome": "accepted"}), "c1");
         assert_eq!(accepted["closed"], "accepted", "{accepted}");
-        assert_eq!(call(&world, &store, REQUESTER, AGENT_LIST, json!({}), "l2")["unclaimed_results"], 0);
+        assert_eq!(call(&world, &store, REQUESTER, AGENT_LIST, json!({}), "l2")["unclaimed_results"], 0,
+            "the requester's own acceptance is recorded without notifying itself");
         let state = store.snapshot().unwrap();
-        assert!(state.deliveries.values().all(|d| d.state == DeliveryState::Acknowledged && d.settled_by.as_deref() == Some("closed")));
+        assert!(state.deliveries.values().filter(|d|!crate::asks::terminal_notices::is_critical(d))
+            .all(|d| d.state == DeliveryState::Acknowledged && d.settled_by.as_deref() == Some("closed")));
+        assert_eq!(call(&world,&store,REQUESTER,DELEGATION_READ,json!({"delegation":review}),"read-accepted-state")["delegation_state"]["closed"],"accepted");
+        assert_eq!(call(&world,&store,REQUESTER,AGENT_LIST,json!({}),"list-accepted-read")["unclaimed_results"],0);
         store.with_state(|state| crate::asks::control::owner_resume(state, REQUESTER, "resumed", now)).unwrap();
         assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap().events.is_empty(), "nothing left to send");
 
@@ -4437,7 +4659,8 @@ pub(crate) mod tests {
         let stopped = call(&world, &store, REQUESTER, "ask_close", json!({"ask": id, "outcome": "stop"}), "o3");
         assert_eq!(stopped["nodeOutcomes"][0]["phase"], "stopped", "{stopped}");
         let read = call(&world, &store, REQUESTER, "ask_read", json!({"ask": id}), "o4");
-        assert_eq!(read["code"], "answer_not_found", "{read}");
+        assert_eq!(read["kind"], "state", "{read}");
+        assert_eq!(read["closed"], "stopped", "{read}");
         let other = call(&world, &store, REQUESTER, "agent_ask", json!({"target": TARGET, "text": "again"}), "o5");
         let abandoned = call(&world, &store, REQUESTER, "ask_close", json!({"ask": other["delegation"], "outcome": "abandoned"}), "o6");
         assert_eq!(abandoned["closed"], "abandoned", "{abandoned}");

@@ -41,10 +41,15 @@ pub(super) fn check_reasoning(
 
 /// Codex create on the installed native: check an explicit reasoning against
 /// the selected model's catalog (the launch review of that exact effort),
-/// and resolve `default` / empty to the profile's effort so the agent record
-/// never stores `default`.
+/// and resolve inherited defaults during launch review. Preserve the caller's
+/// intent in the spec so adoption can save the effective value separately.
 pub(super) fn resolve_local_reasoning(spec: &mut ManagedAgentSpec) -> Result<(), LifecycleFailure> {
-    resolve_local_reasoning_with(spec, local_resolution)
+    let configured = spec.reasoning.clone();
+    resolve_local_reasoning_with(spec, local_resolution)?;
+    if reasoning::is_default(&configured) {
+        spec.reasoning = configured;
+    }
+    Ok(())
 }
 
 /// What the installed native's launch review resolves for a spec.

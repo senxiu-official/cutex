@@ -28,6 +28,8 @@ fn push(state: &mut AskState, ask: &AskRecord, kind: DeliveryKind, ref_id: Strin
     state.deliveries.insert(
         delivery_id.clone(),
         DeliveryRecord {
+            notice_ref: None,
+            terminal_notice: None,
             delivery_id: delivery_id.clone(),
             kind,
             ask_id: ask.ask_id.clone(),
@@ -96,6 +98,15 @@ pub fn record_answer_delivery(state: &mut AskState, ask: &AskRecord, answer_id: 
     push(state, ask, DeliveryKind::Answer, answer_id.to_string(), ask.options.notify == Notify::Passive, now)
 }
 
+pub(super) fn record_terminal_notice(state:&mut AskState,ask:&AskRecord,reference:String,now:DateTime<Utc>)->Option<String> {
+    let id=push(state,ask,DeliveryKind::State,reference.clone(),ask.options.notify==Notify::Passive,now)?;
+    state.deliveries.get_mut(&id).unwrap().notice_ref=Some(reference);
+    if let Some(notice)=state.asks.get(&ask.ask_id).and_then(|a|a.terminal_notices.last()).cloned() {
+        super::terminal_notices::attach(state,&id,notice,now);
+    }
+    Some(id)
+}
+
 /// A question routed to the requester. Always actionable (never passive).
 pub fn record_question_delivery(state: &mut AskState, ask: &AskRecord, question_id: &str, now: DateTime<Utc>) -> Option<String> {
     push(state, ask, DeliveryKind::Question, question_id.to_string(), false, now)
@@ -103,14 +114,27 @@ pub fn record_question_delivery(state: &mut AskState, ask: &AskRecord, question_
 
 // r290 P7: failures are actionable even though the delegation remains open.
 pub(super) fn record_handler_failure(state: &mut AskState, ask: &AskRecord, attempt: u32, now: DateTime<Utc>) -> Option<String> {
-    push(state, ask, DeliveryKind::State, format!("{}{attempt}", super::handler_failure::PREFIX),
-        ask.options.notify == Notify::Passive, now)
+    let id=push(state, ask, DeliveryKind::State, format!("{}{attempt}", super::handler_failure::PREFIX),
+        ask.options.notify == Notify::Passive, now)?;
+    super::terminal_notices::capture_failure(state,ask,attempt,&id,now);
+    Some(id)
 }
 
 /// A state change that wakes waits (§5.8): paused, blocked, held,
 /// rejected, interrupted, failed. Final outcomes are delivered like answers;
 /// holds are passive (shown by the next `agent_wait` / `agent_list`).
 pub fn record_state_delivery(state: &mut AskState, ask: &AskRecord, reason: &str, now: DateTime<Utc>) -> Option<String> {
+    if let Some(notice)=state.asks.get(&ask.ask_id).and_then(|a|a.terminal_notices.last())
+        .filter(|n|n.revision==ask.revision && n.ref_id.starts_with(super::terminal_notices::PREFIX)) {
+        if let Some(id)=state.deliveries.values().find(|d|d.ask_id==ask.ask_id&&d.notice_ref.as_deref()==Some(notice.ref_id.as_str()))
+            .map(|d|d.delivery_id.clone()) {
+            let existing=state.deliveries.get_mut(&id).unwrap();
+            if existing.state==DeliveryState::Pending && existing.unsubmitted && existing.event_id.is_none() {
+                existing.ref_id=format!("{reason}@{}",ask.revision);
+            }
+            return Some(id);
+        }
+    }
     if let Some(inbound) = state.asks.get_mut(&ask.ask_id).and_then(|a|a.peer_inbound.as_mut()) { inbound.last_error = Some(reason.to_string()); }
     if matches!(reason, "held" | "paused") && gate_hold(ask) {
         if let Some(pause) = state.pauses.get(&ask.target_cutex_session_id)
@@ -122,7 +146,9 @@ pub fn record_state_delivery(state: &mut AskState, ask: &AskRecord, reason: &str
     let final_outcome = ask.execution.is_terminal();
     let passive = !final_outcome || ask.options.notify == Notify::Passive;
     let ref_id = format!("{reason}@{}", ask.revision);
-    push(state, ask, DeliveryKind::State, ref_id, passive, now)
+    let id=push(state, ask, DeliveryKind::State, ref_id, passive, now)?;
+    if ask.execution.is_terminal() {super::terminal_notices::capture_delivery(state,ask,&id,reason,now);}
+    Some(id)
 }
 
 fn gate_hold(ask: &AskRecord) -> bool {
@@ -219,7 +245,9 @@ pub fn record_owner_action_delivery_with(state: &mut AskState, ask: &AskRecord, 
 pub fn record_owner_stopped_delivery(state: &mut AskState, ask: &AskRecord, now: DateTime<Utc>) -> Option<String> {
     let attempt = ask.current_attempt().map(|attempt| attempt.n).unwrap_or(0);
     let ref_id = format!("{}@attempt{attempt}", super::render::OWNER_STOPPED_STATE);
-    push(state, ask, DeliveryKind::State, ref_id, false, now)
+    let id=push(state, ask, DeliveryKind::State, ref_id, false, now)?;
+    super::terminal_notices::capture_delivery(state,ask,&id,super::render::OWNER_STOPPED_STATE,now);
+    Some(id)
 }
 
 /// Result notifications ended by an explicit settlement, not ordinary completion.
@@ -231,14 +259,19 @@ pub(super) fn settled_for_requester(ask: &AskRecord) -> bool {
 /// items remain available to explicit wait/read calls): not of an
 /// ask the requester already settled (accepted, abandoned or cancelled).
 /// Its source records can remain available for explicit reads.
-pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
+pub fn discoverable(state: &AskState, delivery: &DeliveryRecord) -> bool {
     delivery.state == DeliveryState::Pending
         && !stale_gate_notice(state, delivery)
         && !stale_passive_state(state, delivery)
+        && !(state.asks.get(&delivery.ask_id).is_some_and(|ask| settled_for_requester(ask))
+            && !super::terminal_notices::is_critical(delivery))
+        && !duplicate_answer(state, delivery)
+}
+
+pub fn actionable(state:&AskState,delivery:&DeliveryRecord)->bool {
+    discoverable(state,delivery)
         && !delivery.owner_hold
         && !super::lineage::stopped_parent(state,&super::routing_policy::integration::local_host_id(),&delivery.ask_id)
-        && !state.asks.get(&delivery.ask_id).is_some_and(|ask| settled_for_requester(ask))
-        && !duplicate_answer(state, delivery)
 }
 
 /// Passive intermediate notices cease to matter after their delegation ends.
@@ -294,7 +327,7 @@ pub fn settle_for_ask(
                 (Some(max), Some(revision)) => *revision <= max,
                 (Some(_), None) => false,
             },
-            DeliveryKind::State => true,
+            DeliveryKind::State => !super::terminal_notices::is_critical(delivery) || !matches!(by,"closed"|"reopened"),
             DeliveryKind::Question => false,
         };
         if covered {
@@ -410,6 +443,7 @@ pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, nativ
     state.events.insert(
         event_id.clone(),
         EventOutboxRecord {
+            automatic_batch_id: None,
             held_runtime_generation: None,
             event_id: event_id.clone(),
             cutex_session_id: requester.to_string(),

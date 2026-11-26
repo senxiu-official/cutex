@@ -110,6 +110,15 @@
           }
         },
         "autoRetry": { "anyOf": [{ "$ref": "#/$defs/autoRetry" }, { "type": "null" }] },
+        "orderedAutomaticInput": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["busy", "nextStepAt"],
+          "properties": {
+            "busy": { "type": "boolean" },
+            "nextStepAt": { "type": ["string", "null"] }
+          }
+        },
         "nextStep": {
           "type": "array",
           "items": {
@@ -241,6 +250,10 @@
         },
         "fromHost": {
           "type": ["string", "null"]
+        },
+        "fromPeerInstanceId": {
+          "type": "string",
+          "pattern": "^ci-[0-9a-fA-F]{32}$"
         },
         "fromCutexSessionId": {
           "type": ["string", "null"],

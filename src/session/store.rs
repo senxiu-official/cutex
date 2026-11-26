@@ -29,8 +29,10 @@ pub use rows::update_session_row;
 pub use rows::with_locked_session_rows;
 pub use rows::SessionRowConflict;
 pub use rows::SessionRows;
+pub(crate) use sqlite::indexed::reference_cursor_at;
 pub(crate) use sqlite::indexed::pending_quick_chat_promotions_at;
-pub(crate) use sqlite::indexed::archive_receipt_at;
+pub(crate) use sqlite::indexed::{archive_receipt_at, stock_temp_stop_at};
+pub(crate) use sqlite::indexed::session_exists_in_catalog_at;
 pub(crate) use sqlite::indexed::{runtime_references_at, runtime_references_from_store, RuntimeReferenceSnapshot};
 // Every receipt map, for row-level writers (not all have one yet).
 #[allow(unused_imports)]

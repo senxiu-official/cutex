@@ -29,6 +29,7 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
     // r274 cutex/input/interruptSend: the runtime half.
     cutex::management::v2::input_interrupt_send::install(super::app_server_user_input::interrupt_send_v2);
     cutex::management::v2::input_interrupt_send::install_many(super::app_server_user_input::interrupt_send_many_v2);
+    cutex::management::v2::input_ledger_settle::install_deadline_forward(forward_deadline_recheck);
     ManagementRequestContext {
         explicit_launch_action,
         adopt_saved_native,
@@ -239,6 +240,29 @@ fn explicit_launch_action(
     principal: &cutex::management::control_plane::HumanManagementPrincipal,
     request: &cutex::agent_management::ExplicitLaunchRequest,
 ) -> Result<serde_json::Value, cutex::agent_management::AgentManagementError> {
+    explicit_launch_operation(principal, request).map_err(|e| {
+        if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&e) {
+            return cutex::agent_management::AgentManagementError::CreatorPathsChanged(id.to_string());
+        }
+        if let Some(cutex::agent_management::AgentManagementError::HostBusy(message)) =
+            e.downcast_ref::<cutex::agent_management::AgentManagementError>()
+        {
+            // Fence-first entry: the subject's lane stayed busy for the budget.
+            return cutex::agent_management::AgentManagementError::HostBusy(message.clone());
+        }
+        if cutex::asks::pause_admission::is_deferred(&e) {
+            // Before any runtime IO; never a start over an uncleared claim.
+            return cutex::agent_management::AgentManagementError::HostBusy(format!("{e:#}"));
+        }
+        cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
+    })
+}
+
+/// The session owner-online request projects typed refusals to its own wire error.
+fn explicit_launch_operation(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::ExplicitLaunchRequest,
+) -> anyhow::Result<serde_json::Value> {
     // Direct explicit-launch routes do not pass through cutex/requests.
     // Coordinate an existing subject before journal/store/native operations.
     use cutex::agent_management::ExplicitLaunchRequest as Launch;
@@ -367,28 +391,12 @@ fn explicit_launch_action(
             request,
         )
     };
-    let result = match fence_first_subject {
+    match fence_first_subject {
         // The owner online route already opted in (with its mutation lane).
         Some(subject) if !cutex::agent_management::fence_first_active() =>
             cutex::agent_management::with_fence_first(subject, None, operation),
         _ => operation(),
-    };
-    result.map_err(|e| {
-        if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&e) {
-            return cutex::agent_management::AgentManagementError::CreatorPathsChanged(id.to_string());
-        }
-        if let Some(cutex::agent_management::AgentManagementError::HostBusy(message)) =
-            e.downcast_ref::<cutex::agent_management::AgentManagementError>()
-        {
-            // Fence-first entry: the subject's lane stayed busy for the budget.
-            return cutex::agent_management::AgentManagementError::HostBusy(message.clone());
-        }
-        if cutex::asks::pause_admission::is_deferred(&e) {
-            // Before any runtime IO; never a start over an uncleared claim.
-            return cutex::agent_management::AgentManagementError::HostBusy(format!("{e:#}"));
-        }
-        cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
-    })
+    }
 }
 
 fn fork_management_session(
@@ -679,6 +687,15 @@ fn human_agent_error(
     }
 }
 
+fn create_profile_error(error: anyhow::Error) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refused) = error.downcast_ref::<cutex::management::v2::feature_profiles::AgentRefusal>() {
+        let mut error = refused.user_input_error();
+        error.stage = "validation".into();
+        return error;
+    }
+    human_agent_validation("unsupported_profile", format!("{error:#}"))
+}
+
 fn human_agent_validation(
     code: &str,
     message: impl Into<String>,
@@ -714,6 +731,9 @@ fn claude_launch_defaults(
         }
     }
     let mut defaults = account.options.claude.clone();
+    // The Claude runtime resolves inherited effort using the selected model.
+    // This value carries only the session's explicit override.
+    defaults.effort = None;
     if let Some(model) = config.new_session_defaults.get(&account.name).and_then(|d| d.model.clone()) {
         defaults.model = model;
     }
@@ -862,6 +882,18 @@ fn apply_dsh_launch_overrides(
 const CLAUDE_CODEX_ONLY_LAUNCH_OPTIONS: &str = "Claude profiles use their own write/exec permissions; sandbox, approvalPolicy, networkAccess and writableRoots are Codex-only";
 
 /// `launch.claudePermissionMode` on a Codex profile.
+fn refresh_stock_reasoning(
+    record: &mut CutexSessionRecord,
+) -> Result<(), cutex::management::v2::user_input::UserInputExecutionError> {
+    if record.runtime_backend == cutex::session::model::CutexSessionRuntimeBackend::Host
+        && record.reasoning_resolution.is_some()
+    {
+        record.reasoning_resolution = cutex::launch::stock::fresh_effort_resolution(record)
+            .map_err(session_mutation_invalid_error)?;
+    }
+    Ok(())
+}
+
 fn refuse_claude_mode_for_codex(
     launch: Option<&cutex::config::new_thread::LaunchOverrides>,
 ) -> Result<(), cutex::management::v2::user_input::UserInputExecutionError> {
@@ -940,7 +972,7 @@ fn create_human_agent_bound(
         .or(request.profile.as_deref())
         .map(cutex::config::new_session::resolve_profile_name)
         .transpose()
-        .map_err(|error| human_agent_validation("unsupported_profile", format!("{error:#}")))?;
+        .map_err(create_profile_error)?;
     // 1. Resolve the Project (if any) and the cwd. No side effects yet.
     let project = match &request.project_id {
         Some(project_id) => {
@@ -999,7 +1031,7 @@ fn create_human_agent_bound(
             .as_deref()
             .map(cutex::config::new_session::resolve_profile_name)
             .transpose()
-            .map_err(|error| human_agent_validation("unsupported_profile", format!("{error:#}")))?,
+            .map_err(create_profile_error)?,
     };
     let plan = variant_plan_for_launch(effective_profile.as_deref(), request.variant_id.as_deref(), request.launch.as_ref())?;
     let dsh = plan.as_ref().filter(|plan| is_acp_plan(plan)).map(|plan| plan.account.clone());
@@ -1246,7 +1278,7 @@ fn create_human_session(
     })?;
     // Selected by name or id; defaults and the record use the name.
     let profile = cutex::config::new_session::resolve_profile_name(&profile)
-        .map_err(|error| human_agent_validation("unsupported_profile", format!("{error:#}")))?;
+        .map_err(create_profile_error)?;
     if let Some(cwd) = &request.cwd {
         if !std::path::Path::new(cwd).is_dir() {
             return Err(human_agent_validation(
@@ -1936,6 +1968,7 @@ fn apply_management_v2_session_mutation(
             record.claude_session.as_mut().expect("Claude session").model = model.clone();
             record.model_defaults = Some(model);
         }
+        refresh_stock_reasoning(store.sessions.get_mut(&key).expect("profile-updated session"))?;
         match persist(&store, &key) {
             Ok(()) => {}
             Err(error) if is_store_revision_conflict(&error) => {
@@ -1989,8 +2022,23 @@ fn apply_management_v2_session_mutation(
                 patch.contains_key("sandboxMode"),
             )
             .map_err(session_mutation_invalid_error)?;
-            apply_optional_string(patch, "model", &mut record.model_defaults)?;
-            apply_optional_string(patch, "reasoningEffort", &mut record.reasoning_defaults)?;
+            if record.claude_session.is_some() && (patch.contains_key("model") || patch.contains_key("reasoningEffort")) {
+                let mut chosen_model = None;
+                let mut chosen_effort = None;
+                apply_optional_string(patch, "model", &mut chosen_model)?;
+                apply_optional_string(patch, "reasoningEffort", &mut chosen_effort)?;
+                if patch.contains_key("model") && chosen_model.is_none() {
+                    return Err(session_mutation_invalid("choose an explicit Claude model"));
+                }
+                cutex::runtime::claude::apply_offline_launch_selection(
+                    record,
+                    chosen_model.as_deref(),
+                    patch.contains_key("reasoningEffort").then_some(chosen_effort.as_deref()),
+                ).map_err(session_mutation_invalid_error)?;
+            } else {
+                apply_optional_string(patch, "model", &mut record.model_defaults)?;
+                apply_optional_string(patch, "reasoningEffort", &mut record.reasoning_defaults)?;
+            }
             if record.explicit_launch.is_some()
                 && (patch.contains_key("model") || patch.contains_key("reasoningEffort"))
             {
@@ -1998,6 +2046,9 @@ fn apply_management_v2_session_mutation(
                 // failed edit must not persist an unlaunchable model/effort.
                 cutex::launch::stock::current_configuration(record)
                     .map_err(session_mutation_invalid_error)?;
+            }
+            if patch.contains_key("model") || patch.contains_key("reasoningEffort") {
+                refresh_stock_reasoning(record)?;
             }
             // session-fast-mode: stored for the next start / resume; clients
             // change a running thread with native thread/settings/update.
@@ -2583,6 +2634,9 @@ fn online_management_v2_session_inner(
     id: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
+    if let Some(profile) = params.get("launchProfile").and_then(serde_json::Value::as_str) {
+        cutex::management::v2::feature_profiles::require_agent_id(profile).map_err(runtime_mutation_error)?;
+    }
     let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     use cutex::agent_management::{ExplicitLaunchRequest, StockRuntimeReview};
     let store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
@@ -2602,7 +2656,7 @@ fn online_management_v2_session_inner(
         return reconnect_live_explicit_runtime(&key);
     };
     start_explicit_runtime(&key, &params, |key| {
-        let review: StockRuntimeReview = serde_json::from_value(explicit_launch_action(
+        let review: StockRuntimeReview = serde_json::from_value(explicit_launch_operation(
             owner,
             &ExplicitLaunchRequest::ReviewRuntime {
                 cutex_session_id: cutex::role_revision::CutexSessionId::new(key.to_string())
@@ -2616,7 +2670,7 @@ fn online_management_v2_session_inner(
             "api-runtime-{}",
             uuid::Uuid::new_v4()
         ))?;
-        serde_json::from_value(explicit_launch_action(
+        serde_json::from_value(explicit_launch_operation(
             owner,
             &ExplicitLaunchRequest::Run { action_id, review },
         )?)
@@ -3187,7 +3241,7 @@ fn mutate_management_v2_runtime(
                             &entry,
                             launch_profile.as_ref(),
                         )
-                        .map_err(runtime_mutation_error)?;
+                        .map_err(runtime_launch_error)?;
                     profile_application.runtime |= outcome.runtime_launched;
                     profile_application.tui |= outcome.tui_launched;
                 }
@@ -3204,7 +3258,7 @@ fn mutate_management_v2_runtime(
                         &entry,
                         launch_profile.as_ref(),
                     )
-                    .map_err(runtime_mutation_error)?;
+                    .map_err(runtime_launch_error)?;
                 profile_application.runtime |= outcome.runtime_launched;
                 profile_application.tui |= outcome.tui_launched;
             }
@@ -3369,6 +3423,9 @@ fn launch_profile_unavailable(
     requested: &str,
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refusal) = error.downcast_ref::<cutex::management::v2::feature_profiles::AgentRefusal>() {
+        return refusal.user_input_error();
+    }
     cutex::management::v2::user_input::UserInputExecutionError {
         stage: "runtime".to_string(),
         code: "launch_profile_unavailable".to_string(),
@@ -3402,9 +3459,54 @@ fn launch_profile_not_applied(
     }
 }
 
+fn runtime_launch_error(error: anyhow::Error) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refusal) = pinned_selection_error(&error) {
+        return refusal;
+    }
+    use cutex::app_server::client::AppServerClientError;
+    if error.chain().any(|cause| matches!(cause.downcast_ref::<AppServerClientError>(),
+        Some(AppServerClientError::Connect(_)))) {
+        return cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(), code: "runtime_unreachable".into(),
+            message: "Could not reach the runtime.".into(), retryable: true,
+            details: serde_json::json!({"diagnosticCode":"unreachable"}), outcome_unknown: false,
+        };
+    }
+    runtime_mutation_error(error)
+}
+
+fn pinned_selection_error(error: &anyhow::Error) -> Option<cutex::management::v2::user_input::UserInputExecutionError> {
+    use cutex::profiles::pinned_selection::{CODE, UPGRADE_CODE, Unavailable, UpgradeRequired};
+    if let Some(error) = error.downcast_ref::<UpgradeRequired>() {
+        return Some(cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(),
+            code: UPGRADE_CODE.into(),
+            message: error.to_string(),
+            retryable: false,
+            details: serde_json::json!({"requiredCapability":"offlineLaunchSelection"}),
+            outcome_unknown: false,
+        });
+    }
+    let unavailable = error.downcast_ref::<Unavailable>()?;
+    Some(cutex::management::v2::user_input::UserInputExecutionError {
+        stage: "runtime".into(),
+        code: CODE.into(),
+        message: unavailable.to_string(),
+        retryable: false,
+        details: unavailable.details(),
+        outcome_unknown: false,
+    })
+}
+
 fn runtime_mutation_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refusal) = error.downcast_ref::<cutex::management::v2::feature_profiles::AgentRefusal>() {
+        return refusal.user_input_error();
+    }
+    if let Some(refusal) = pinned_selection_error(&error) {
+        return refusal;
+    }
     if cutex::runtime::claude::is_schema_start_refusal(&error) {
         return cutex::management::v2::user_input::UserInputExecutionError {
             stage: "runtime".into(), code: cutex::runtime::claude::SCHEMA_START_REFUSAL_CODE.into(),
@@ -3594,6 +3696,12 @@ fn session_mutation_invalid(
 fn session_mutation_invalid_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refusal) = error.downcast_ref::<cutex::management::v2::feature_profiles::AgentRefusal>() {
+        return refusal.user_input_error();
+    }
+    if let Some(refusal) = pinned_selection_error(&error) {
+        return refusal;
+    }
     if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&error) {
         return cutex::management::v2::user_input::UserInputExecutionError {
             stage: "runtime".into(), code: "creator_paths_changed".into(), message: format!("{error:#}"),
@@ -3627,6 +3735,9 @@ pub(super) fn session_revision_conflict(
 fn session_mutation_persistence_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(refusal) = error.downcast_ref::<cutex::management::v2::feature_profiles::AgentRefusal>() {
+        return refusal.user_input_error();
+    }
     cutex::management::v2::user_input::UserInputExecutionError {
         stage: "route".to_string(),
         code: "event_persistence_unavailable".to_string(),
@@ -3730,6 +3841,143 @@ fn dsh_unsupported_native_request(message: &serde_json::Value) -> Option<serde_j
     }))
 }
 
+struct NativeEffortSelection {
+    generation: u64,
+    thread: String,
+    model: Option<String>,
+    effort: String,
+}
+
+impl NativeEffortSelection {
+    fn from_request(record: &CutexSessionRecord, message: &serde_json::Value) -> Option<Self> {
+        use cutex::profiles::reasoning::NATIVE_EFFORTS;
+        use cutex::session::model::CutexSessionRuntimeBackend;
+        let params = &message["params"];
+        let thread = record.app_server_thread_id()?;
+        let effort = params["effort"].as_str()?;
+        record.reasoning_resolution.as_ref()?;
+        (record.runtime_backend == CutexSessionRuntimeBackend::Host
+            && message["method"] == cutex::app_server::commands::THREAD_SETTINGS_UPDATE_METHOD
+            && params["threadId"] == thread && NATIVE_EFFORTS.contains(&effort))
+            .then(|| Self {
+                generation: record.runtime_generation,
+                thread: thread.to_owned(),
+                model: params["model"].as_str().map(str::to_owned),
+                effort: effort.to_owned(),
+            })
+    }
+
+    fn apply_ack(&self, record: &mut CutexSessionRecord, response: &serde_json::Value) -> anyhow::Result<()> {
+        use cutex::profiles::reasoning::{self, SessionEffort};
+        if response.get("result").is_none() || response.get("error").is_some()
+            || record.runtime_backend != cutex::session::model::CutexSessionRuntimeBackend::Host
+            || record.runtime_generation != self.generation
+            || record.app_server_thread_id() != Some(self.thread.as_str())
+            || record.is_retired()
+        {
+            return Ok(());
+        }
+        let Some(saved) = record.reasoning_resolution.as_ref() else { return Ok(()); };
+        let requested_model = self.model.as_ref().map(|requested| {
+            response.pointer("/result/threadSettings/model").and_then(serde_json::Value::as_str)
+                .unwrap_or(requested).to_owned()
+        });
+        if record.reasoning_defaults.as_ref() == Some(&self.effort)
+            && saved.resolution.configured.as_ref() == Some(&self.effort)
+            && requested_model.as_ref().is_none_or(|model| record.model_defaults.as_ref() == Some(model))
+        {
+            return Ok(());
+        }
+        let model = requested_model.as_ref().or(record.model_defaults.as_ref())
+            .unwrap_or(&saved.requested_model).clone();
+        let model_changed = model != saved.requested_model;
+        let skipped = if model_changed { Vec::new() } else { saved.resolution.skipped.clone() };
+        if let Some(requested_model) = requested_model {
+            record.model_defaults = Some(requested_model);
+        }
+        record.reasoning_defaults = Some(self.effort.clone());
+        let refreshed = if model_changed {
+            // The runtime already accepted the explicit choice. A profile or
+            // catalog read failure must not discard it.
+            match cutex::launch::stock::fresh_effort_resolution(record) {
+                Ok(resolution) => resolution,
+                Err(error) => {
+                    eprintln!("Could not refresh reasoning defaults for {}: {error:#}", record.cutex_session_id);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        record.reasoning_resolution = if refreshed.is_some() {
+            refreshed
+        } else {
+            let mut resolution = reasoning::resolve(Some(&self.effort), None, None, None, None)
+                .map_err(anyhow::Error::msg)?;
+            resolution.skipped = skipped;
+            Some(SessionEffort { requested_model: model, resolved_model: None, resolution })
+        };
+        record.bump_durable_revision()?;
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(())
+    }
+}
+
+/// Only ledger receipt probes use this bounded internal dispatch. External
+/// status may recover and write a receipt, so it reserves the mutation lane
+/// just like the ordinary Native route.
+fn forward_deadline_recheck(
+    session: &str,
+    message: serde_json::Value,
+    until: std::time::Instant,
+) -> Result<serde_json::Value, String> {
+    use cutex::management::v2::session_coordination::ReservationError;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let method = message["method"].as_str().unwrap_or_default();
+    let status_probe = matches!(method, "thread/externalInput/status" | "claude/input/status");
+    if !status_probe && method != "thread/items/list" {
+        return Err("unsupported ledger receipt probe".into());
+    }
+    let lane = status_probe.then(|| cutex::management::v2::user_input::session_input_lock(session))
+        .transpose().map_err(|error| error.to_string())?;
+    let _reservation = if let Some(lane) = &lane {
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                eprintln!("cutex input ledger (settle): receipt lane timeout lane_ms={}", started.elapsed().as_millis());
+                return Err("receipt probe lane budget elapsed".into());
+            }
+            match lane.try_lock() {
+                Ok(reservation) => break Some(reservation),
+                Err(ReservationError::WouldBlock) => std::thread::sleep(remaining.min(Duration::from_millis(25))),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    } else {
+        None
+    };
+    let lane_ms = started.elapsed().as_millis();
+    if Instant::now() >= until { return Err("receipt probe budget elapsed".into()); }
+    if status_probe {
+        super::management_archive::api::ensure_input_allowed(session).map_err(|error| error.to_string())?;
+    }
+    let manager = selected_native_manager(session).map_err(|error| error.to_string())?;
+    let handle = match message["params"]["runtimeGeneration"].as_u64() {
+        Some(generation) => manager.handle_for_generation(session, generation)
+            .map_err(|error| error.to_string())?,
+        None => manager.handle(session).map_err(|error| error.to_string())?,
+    };
+    let rpc = Instant::now();
+    let result = handle.request_raw_message_until(message, until).map_err(|error| error.to_string());
+    let total = started.elapsed().as_millis();
+    if total >= 500 {
+        eprintln!("cutex input ledger (settle): receipt lane_ms={lane_ms} rpc_ms={} total_ms={total}", rpc.elapsed().as_millis());
+    }
+    result
+}
+
 fn forward_management_native_request(
     cutex_session_id: &str,
     message: serde_json::Value,
@@ -3768,7 +4016,9 @@ fn forward_management_native_request(
             }
         }
         let mut passive_notes=cutex::app_server::pre_turn_notes::Report::default();
+        let mut effort_selection = None;
         if let Some(record) = super::asks_runtime::record(cutex_session_id) {
+            effort_selection = NativeEffortSelection::from_request(&record, &message);
             if let Some(thread) = record.app_server_thread_id() {
                 if cutex::memory::idle_note::transport::triggers_turn(&message, thread) ||
                     message["method"] == "review/start" && message["params"]["threadId"] == thread {
@@ -3777,13 +4027,15 @@ fn forward_management_native_request(
                 }
             }
         }
-        let handle = selected_native_manager(cutex_session_id)
-            .map_err(|error| ManagementNativeForwardError::BeforeForward(format!("{error:#}")))?
-            .handle(cutex_session_id)
+        let manager = selected_native_manager(cutex_session_id)
             .map_err(|error| ManagementNativeForwardError::BeforeForward(format!("{error:#}")))?;
-        handle
+        let handle = match &effort_selection {
+            Some(selection) => manager.handle_for_generation(cutex_session_id, selection.generation)
+                .map_err(|error| format!("{error:#}")),
+            None => manager.handle(cutex_session_id).map_err(|error| format!("{error:#}")),
+        }.map_err(ManagementNativeForwardError::BeforeForward)?;
+        let mut response = handle
             .request_raw_message(message)
-            .map(|mut response| {if !passive_notes.is_empty() {response["passiveNotes"]=serde_json::json!(passive_notes);} response})
             .map_err(|error| match error {
                 AppServerClientError::RequestIdInUse(message) => {
                     ManagementNativeForwardError::NativeRequestIdInUse(message)
@@ -3817,7 +4069,20 @@ fn forward_management_native_request(
                         error.code, error.message
                     ))
                 }
-            })
+            })?;
+        if let Some(selection) = effort_selection.filter(|_| response.get("result").is_some()) {
+            let save = cutex::session::store::cutex_sessions_path().and_then(|path|
+                cutex::session::store::update_session_row(&path, cutex_session_id, |record| {
+                    selection.apply_ack(record, &response)
+                }));
+            save.map_err(|error| ManagementNativeForwardError::OutcomeUnknown(format!(
+                "Native accepted effort selection but its session defaults could not be saved: {error:#}"
+            )))?;
+        }
+        if !passive_notes.is_empty() {
+            response["passiveNotes"] = serde_json::json!(passive_notes);
+        }
+        Ok(response)
     })
 }
 
@@ -3883,6 +4148,10 @@ pub(crate) fn load_app_server_runtime_status(
     }
     super::app_server_runtime::runtime_manager().status(cutex_session_id)
 }
+
+#[cfg(test)]
+#[path = "pinned_selection_http_tests.rs"]
+mod pinned_selection_http_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4007,6 +4276,44 @@ mod tests {
     }
 
     #[test]
+    fn native_ack_saves_an_explicit_selection_equal_to_the_inherited_effort() {
+        use cutex::profiles::reasoning::{self, EffortSource, SessionEffort};
+        use serde_json::json;
+        let mut record = CutexSessionRecord::new(
+            format!("cutex.{}", uuid::Uuid::new_v4()), Some("thread-fixture".into()),
+            "host".into(), "/workspace".into(), None,
+        ).unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::Host;
+        record.model_defaults = Some("model-fixture".into());
+        record.reasoning_resolution = Some(SessionEffort {
+            requested_model: "model-fixture".into(),
+            resolved_model: None,
+            resolution: reasoning::resolve(None, None, Some("high"), None, None).unwrap(),
+        });
+        let request = json!({"method":"thread/settings/update",
+            "params":{"threadId":"thread-fixture","effort":"high"}});
+        let selection = NativeEffortSelection::from_request(&record, &request).unwrap();
+        let before = record.durable_revision();
+        selection.apply_ack(&mut record, &json!({"error":{"code":-32602}})).unwrap();
+        assert_eq!(record.durable_revision(), before);
+        assert!(record.reasoning_defaults.is_none());
+
+        let success = json!({"result":{}});
+        let mut replaced = record.clone();
+        replaced.runtime_generation += 1;
+        selection.apply_ack(&mut replaced, &success).unwrap();
+        assert!(replaced.reasoning_defaults.is_none());
+        selection.apply_ack(&mut record, &success).unwrap();
+        assert_eq!(record.reasoning_defaults.as_deref(), Some("high"));
+        let saved = &record.reasoning_resolution.as_ref().unwrap().resolution;
+        assert_eq!(saved.configured.as_deref(), Some("high"));
+        assert_eq!(saved.source, EffortSource::Session);
+        assert_eq!(record.durable_revision(), before + 1);
+        selection.apply_ack(&mut record, &success).unwrap();
+        assert_eq!(record.durable_revision(), before + 1);
+    }
+
+    #[test]
     fn offline_native_defaults_validate_merged_model_effort_before_persistence() {
         use cutex::config::global_settings::ConfigValueUpdate::Set;
         use cutex::profiles::{lifecycle, settings_api};
@@ -4047,6 +4354,14 @@ mod tests {
             "bundle_manifest":home.root().join("unused-bundle.json"),"bundle_sha256":"0".repeat(64)
         })).unwrap());
         cutex::launch::stock::current_configuration(&record).unwrap();
+        let mut obsolete = record.clone();
+        obsolete.model_defaults = Some("retired-fixture-model".into());
+        let error = cutex::launch::stock::current_configuration(&obsolete).unwrap_err();
+        let refusal = runtime_mutation_error(error);
+        assert_eq!(refusal.code, cutex::profiles::pinned_selection::CODE);
+        assert_eq!(refusal.details["reason"], "modelUnavailable");
+        assert_eq!(refusal.details["model"], "retired-fixture-model");
+        assert_eq!(obsolete.model_defaults.as_deref(), Some("retired-fixture-model"));
         let mut store=load_cutex_session_store().unwrap();
         store.sessions.insert(id.clone(),record.clone());
         cutex::session::store::save_cutex_session_store(&store).unwrap();
@@ -4054,6 +4369,8 @@ mod tests {
         for patch in [serde_json::json!({"reasoningEffort":"xhigh"}),serde_json::json!({"model":"other-model"})] {
             let error=mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":record.revision,"patch":patch})).unwrap_err();
             assert!(error.message.contains("not offered by model"),"{}",error.message);
+            assert_eq!(error.code, cutex::profiles::pinned_selection::CODE);
+            assert_eq!(error.details["reason"], "effortUnavailable");
             assert_eq!(serde_json::to_value(cutex::session::store::shared_session_row(&id).unwrap().unwrap().as_ref()).unwrap(),before);
         }
         let local_before=serde_json::to_value(&store).unwrap();
@@ -4093,6 +4410,29 @@ mod tests {
         assert_eq!(saved.model_defaults.as_deref(),Some("other-model"));
         assert_eq!(saved.reasoning_defaults.as_deref(),Some("low"));
         assert_eq!(saved.runtime_generation,record.runtime_generation,"offline edit never starts the agent");
+
+        let mut tracked = saved.as_ref().clone();
+        tracked.reasoning_resolution = Some(cutex::profiles::reasoning::SessionEffort {
+            requested_model: "other-model".into(),
+            resolved_model: None,
+            resolution: cutex::profiles::reasoning::resolve(Some("low"), None, None, None, None).unwrap(),
+        });
+        tracked.model_defaults = Some("gemini-4-argon".into());
+        tracked.reasoning_defaults = None;
+        refresh_stock_reasoning(&mut tracked).unwrap();
+        let first = cutex::management::v2::session::runtime_defaults_resource(&tracked);
+        assert_eq!(first["reasoningResolution"]["value"], "high");
+        assert_eq!(first["reasoningResolution"]["source"], "profile");
+
+        tracked.model_defaults = Some("other-model".into());
+        refresh_stock_reasoning(&mut tracked).unwrap();
+        let second = cutex::management::v2::session::runtime_defaults_resource(&tracked);
+        assert_eq!(second["reasoningResolution"]["requestedModel"], "other-model");
+        assert_eq!(second["reasoningResolution"]["value"], "low");
+        assert_eq!(second["reasoningResolution"]["source"], "catalog");
+        assert_eq!(second["reasoningResolution"]["skipped"], serde_json::json!([
+            {"source":"profile","value":"high","reason":"unsupportedByModel"}
+        ]));
     }
 
 

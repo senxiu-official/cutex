@@ -282,6 +282,9 @@ pub fn run_management_server_on(
     }
     // Create the persisted instance id before the first client asks for it.
     let _ = crate::management::instance::instance_id();
+    if crate::management::v2::text_rewrite::sweep_startup().is_err() {
+        eprintln!("text rewrite: startup scratch recovery incomplete");
+    }
     crate::management::v2::host_files::prime_secret_path_cache();
     crate::management::v2::runtimes_api::start_inventory();
     // P1 users: run the one-time migration (every existing client / device
@@ -300,6 +303,12 @@ pub fn run_management_server_on(
     }
     if let Err(error) = crate::management::v2::storage_cleanup::resume_default() {
         eprintln!("storage cleanup recovery unavailable: {error:#}");
+    }
+    if let Err(error) = crate::management::v2::archive_records::sweep_reader_homes() {
+        eprintln!("archive reader startup cleanup unavailable: {error:#}");
+    }
+    if let Err(error) = crate::management::v2::archive_jobs::resume_default() {
+        eprintln!("archive migration recovery unavailable: {error:#}");
     }
     // Loopback listeners first so a slow Tailscale never delays them.
     let mut ordered: Vec<ListenSpec> = specs.iter().filter(|s| s.is_loopback()).cloned().collect();

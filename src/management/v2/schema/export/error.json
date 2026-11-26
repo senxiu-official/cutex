@@ -20,8 +20,49 @@
             "retryable": { "type": "boolean" },
             "diagnosticId": { "type": "string" },
             "details": {}
-          }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "code": { "const": "pinned_model_selection_unavailable" } } },
+              "then": {
+                "required": ["details"],
+                "properties": {
+                  "retryable": { "const": false },
+                  "details": { "$ref": "#/$defs/pinnedModelSelectionUnavailable" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "code": { "const": "pinned_model_selection_upgrade_required" } } },
+              "then": {
+                "required": ["details"],
+                "properties": {
+                  "retryable": { "const": false },
+                  "details": { "$ref": "#/$defs/pinnedModelSelectionUpgradeRequired" }
+                }
+              }
+            }
+          ]
         }
+      }
+    },
+    "pinnedModelSelectionUnavailable": {
+      "description": "HTTP 409 when model or effort evidence explicitly rejects the saved or requested selection.",
+      "type": "object",
+      "required": ["model", "reasoningEffort", "reason", "offeredReasoningEfforts"],
+      "properties": {
+        "model": { "type": "string" },
+        "reasoningEffort": { "type": ["string", "null"] },
+        "reason": { "enum": ["modelUnavailable", "effortUnavailable"] },
+        "offeredReasoningEfforts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "pinnedModelSelectionUpgradeRequired": {
+      "description": "HTTP 409 when the pinned Claude runtime lacks the capability required to save or apply an offline launch selection.",
+      "type": "object",
+      "required": ["requiredCapability"],
+      "properties": {
+        "requiredCapability": { "const": "offlineLaunchSelection" }
       }
     }
   }

@@ -278,7 +278,7 @@ fn not_found(path: &str) -> FetchError {
 /// Whether the daemon may contact the service now: a managed service only
 /// while its process runs (a tile never starts a stopped service).
 pub fn fetchable(record: &ServiceRecord, snapshot: Option<&RuntimeSnapshot>) -> bool {
-    record.runtime != ServiceRuntime::Worker && (record.runtime != ServiceRuntime::Managed
+    record.runtime.has_view() && (record.runtime != ServiceRuntime::Managed
         || (!record.stopped
             && snapshot.is_some_and(|state| state.pid.is_some() && state.next_restart_at.is_none())))
 }
@@ -291,7 +291,7 @@ pub fn fetch(
     timeout: Duration,
     accept: &str,
 ) -> Result<Vec<u8>, FetchError> {
-    if record.runtime == ServiceRuntime::Worker {
+    if !record.runtime.has_view() {
         return Err(FetchError::new("service_has_no_view", "This worker has no web view."));
     }
     if record.runtime == ServiceRuntime::Static {
@@ -607,7 +607,7 @@ impl TileCache {
         if let (Some(tile), None) = (&record.tile, &record.tile_path) {
             return answer(Some(tile), &record.updated_at, None, "static");
         }
-        if record.runtime == ServiceRuntime::Worker {
+        if !record.runtime.has_view() {
             return answer(None, &record.updated_at, None, "static");
         }
         let slot = format!("{scope}\u{0}{}", record.slug);

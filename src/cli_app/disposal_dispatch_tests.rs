@@ -245,6 +245,7 @@ fn disposed_result_delivery_never_reaches_real_submit_or_steer_dispatch() {
             state.events.insert(
                 message.clone(),
                 EventOutboxRecord {
+                    automatic_batch_id: None,
                     held_runtime_generation: None,
                     event_id: message.clone(),
                     cutex_session_id: session.clone(),

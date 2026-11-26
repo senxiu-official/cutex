@@ -248,6 +248,7 @@ impl ExternalInputBinding {
                 && m.len() <= 4096,
             "invalid ingress binding file"
         );
+        fs2::FileExt::try_lock_shared(&file).context("ingress binding is being reclaimed")?;
         let mut bytes = Vec::new();
         file.take(4097).read_to_end(&mut bytes)?;
         ensure!(
@@ -801,6 +802,10 @@ pub struct StockConfiguration {
     pub account_sha256: Sha256,
     pub model: String,
     pub reasoning: Option<String>,
+    /// A projection for new-session persistence. Never changes the historical
+    /// StockConfiguration wire shape or its launch approval digest.
+    #[serde(skip)]
+    pub reasoning_resolution: Option<crate::profiles::reasoning::SessionEffort>,
     pub model_provider: String,
     pub provider: DummyProvider,
     pub sandbox: String,
@@ -866,6 +871,7 @@ impl StockConfiguration {
             self.reasoning.as_ref(),
             None,
             true,
+            false,
             false,
         )?;
         Ok(())
@@ -1019,13 +1025,22 @@ impl ProviderMode {
 }
 
 pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<StockConfiguration> {
-    configuration_for_record(
-        record,
-        record
-            .explicit_launch
-            .as_ref()
-            .is_some_and(|c| c.version == 4 || (c.version == 3 && c.migration_action_id.is_some())),
-    )
+    let mut config = configuration_for_record(record, record_uses_selected_projection(record))?;
+    // Receipt equality compares the reviewed launch configuration.
+    config.reasoning_resolution = None;
+    Ok(config)
+}
+
+fn record_uses_selected_projection(record: &CutexSessionRecord) -> bool {
+    record.explicit_launch.as_ref()
+        .is_some_and(|c| c.version == 4 || (c.version == 3 && c.migration_action_id.is_some()))
+}
+
+pub fn fresh_effort_resolution(record: &CutexSessionRecord) -> anyhow::Result<Option<crate::profiles::reasoning::SessionEffort>> {
+    if record.reasoning_resolution.is_none() {
+        return Ok(None);
+    }
+    Ok(configuration_for_record(record, record_uses_selected_projection(record))?.reasoning_resolution)
 }
 
 /// Only maintenance review calls this before installing the explicit v3 marker.
@@ -1033,7 +1048,9 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
 pub(crate) fn migration_configuration(
     record: &CutexSessionRecord,
 ) -> anyhow::Result<StockConfiguration> {
-    configuration_for_record(record, true)
+    let mut config = configuration_for_record(record, true)?;
+    config.reasoning_resolution = None;
+    Ok(config)
 }
 
 fn configuration_for_record(
@@ -1059,6 +1076,7 @@ fn configuration_for_record(
         None,
         migration,
         false,
+        record.reasoning_resolution.is_some(),
     )?;
     let profiles = crate::profiles::settings_api::load_store()?;
     let family = conversation_family_for_record(record, &profiles);
@@ -1115,6 +1133,7 @@ pub fn bootstrap_configuration(
         None,
         false,
         false,
+        false,
     )
 }
 
@@ -1131,6 +1150,7 @@ pub fn local_bootstrap_configuration(
         Some(&spec.model),
         Some(&spec.reasoning),
         None,
+        true,
         true,
         true,
     )
@@ -1174,6 +1194,7 @@ pub fn local_configuration_with_selection(
         selected_and_default_effort(reasoning, defaults.and_then(|d| d.reasoning.as_ref()), inherited.reasoning.as_ref()).1,
         true,
         false,
+        true,
     )
 }
 
@@ -1202,6 +1223,7 @@ fn configuration_for_selection(
     // A new managed agent: its model must be on the profile's model list
     // (`profiles::model_check`).
     check_listed: bool,
+    resolve_effort: bool,
 ) -> anyhow::Result<StockConfiguration> {
     use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
     // A new-session / inherited default effort is a DEFAULT, not a choice:
@@ -1216,6 +1238,7 @@ fn configuration_for_selection(
         .or(config.default_profile.as_ref())
         .context("stock inherited profile unavailable; explicit current default required")?;
     ensure!(!name.trim().is_empty(), "stock profile is empty");
+    crate::management::v2::feature_profiles::require_agent_id(name)?;
     // An official profile with model edits selects the effective catalog of
     // the live upstream list plus its overlay (content-addressed file, so the
     // review below digests exactly what the runtime reads). Best effort.
@@ -1309,7 +1332,7 @@ fn configuration_for_selection(
             selected.inherit_model_defaults(&shared);
         }
         let profile_default = selected.model_reasoning_effort.clone();
-        let (mut projection, model, reasoning) = selected.review(
+        let (mut projection, model, reviewed_effort) = selected.review(
             &account.id,
             files.auth_path.clone(),
             selected_model,
@@ -1324,7 +1347,28 @@ fn configuration_for_selection(
                 crate::profiles::model_check::unlisted_allowed(),
             )?;
         }
-        let effort_fallback = super::selected_profile::EffortFallback::of(&model, selected_reasoning, profile_default, reasoning.as_deref());
+        let reasoning_resolution = if resolve_effort {
+            let row = match projection.catalog.as_ref() {
+                Some(catalog) => super::selected_profile::catalog_row(catalog, &model)?,
+                None if projection.route == super::selected_profile::Route::ChatgptFile => {
+                    crate::profiles::native_models::for_profile(account, Some(&model)).ok()
+                        .and_then(|models| models.rows.into_iter().find(|row| row["slug"] == model))
+                }
+                None => None,
+            };
+            Some(resolve_native_effort(account, &model, selected_reasoning.map(String::as_str), profile_default.as_deref(), row.as_ref())?)
+        } else {
+            None
+        };
+        let reasoning = reasoning_resolution.as_ref().map_or(reviewed_effort, |resolution| resolution.resolution.value.clone());
+        super::selected_profile::validate_model(&projection.route, &model, reasoning.as_deref(), projection.catalog.as_ref())?;
+        let effort_fallback = if reasoning_resolution.as_ref().is_some_and(|result|
+            result.resolution.source == crate::profiles::reasoning::EffortSource::Model)
+        {
+            None
+        } else {
+            super::selected_profile::EffortFallback::of(&model, selected_reasoning, profile_default, reasoning.as_deref())
+        };
         if let Some(fallback) = &effort_fallback {
             LAST_EFFORT_FALLBACK.with(|slot| *slot.borrow_mut() = Some(fallback.clone()));
         }
@@ -1383,6 +1427,7 @@ fn configuration_for_selection(
             .map_err(|_| anyhow::anyhow!("invalid selected account digest"))?,
             model,
             reasoning,
+            reasoning_resolution,
             model_provider: provider_id,
             provider,
             sandbox,
@@ -1517,6 +1562,7 @@ fn configuration_for_selection(
         .map_err(|_| anyhow::anyhow!("invalid account digest"))?,
         model,
         reasoning,
+        reasoning_resolution: None,
         model_provider: profile.model_provider,
         provider,
         sandbox,
@@ -1525,6 +1571,34 @@ fn configuration_for_selection(
         network_access: false,
         writable_roots: Vec::new(),
     })
+}
+
+fn resolve_native_effort(
+    account: &crate::profiles::model::StoredAccount,
+    model: &str,
+    explicit: Option<&str>,
+    profile: Option<&str>,
+    row: Option<&serde_json::Value>,
+) -> anyhow::Result<crate::profiles::reasoning::SessionEffort> {
+    use crate::profiles::reasoning::{self, EffortSource, SessionEffort};
+    let overrides = reasoning::profile_model_efforts(account)?;
+    let overlay = crate::profiles::catalog_overlay::load(account)?;
+    let pinned = overlay.as_ref().and_then(|overlay| overlay.entries.iter().find(|entry| entry.id == model))
+        .and_then(|entry| entry.overrides.get("default_reasoning_level"))
+        .and_then(serde_json::Value::as_str);
+    let builtin = row.and_then(|row| row["default_reasoning_level"].as_str());
+    let levels = row.and_then(|row| row["supported_reasoning_levels"].is_array()
+        .then(|| super::selected_profile::row_efforts(row)));
+    if let (Some(chosen), Some(levels)) = (explicit.filter(|value| !reasoning::is_default(value)), levels.as_ref()) {
+        if !levels.iter().any(|level| level == chosen) {
+            return Err(crate::profiles::pinned_selection::Unavailable::effort(model, explicit, levels.clone()).into());
+        }
+    }
+    let resolution = reasoning::resolve(
+        explicit, overrides.get(model).map(String::as_str).or(pinned), profile,
+        builtin.map(|value| (value, EffortSource::Catalog)), levels.as_deref(),
+    ).map_err(anyhow::Error::msg)?;
+    Ok(SessionEffort { requested_model: model.to_owned(), resolved_model: None, resolution })
 }
 
 fn validate_selected_permissions(
@@ -1602,6 +1676,36 @@ pub fn validate_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_effort_inherits_when_the_overlay_only_sets_context() {
+        use crate::profiles::catalog_overlay::{Entry, OVERLAY_FILE, Overlay};
+        use crate::profiles::lifecycle::tests::TestHome;
+        use crate::profiles::model::StoredAccount;
+        use crate::profiles::reasoning::EffortSource;
+        use serde_json::json;
+
+        let _home = TestHome::new();
+        let account: StoredAccount = serde_json::from_value(json!({
+            "id": "native-context-only", "name": "Native context only", "cli_kind": "codex"
+        })).unwrap();
+        let dir = crate::profiles::catalog_api::profile_dir(&account).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = Overlay {
+            entries: vec![Entry {
+                id: "gpt-5.5".into(),
+                overrides: [("context_window".into(), json!(100_000))].into_iter().collect(),
+                ..Entry::default()
+            }],
+            ..Overlay::default()
+        };
+        std::fs::write(dir.join(OVERLAY_FILE), serde_json::to_vec(&overlay).unwrap()).unwrap();
+        let inherited = resolve_native_effort(&account, "gpt-5.5", None, Some("medium"), None)
+            .unwrap();
+        assert_eq!(inherited.resolution.source, EffortSource::Profile);
+        assert_eq!(inherited.resolution.value.as_deref(), Some("medium"));
+    }
+
     #[test]
     fn selected_permission_aliases_preserve_effective_policy() {
         for (alias, sandbox) in [
@@ -1959,6 +2063,7 @@ mod tests {
             account_sha256: Sha256::new("c".repeat(64)).unwrap(),
             model: "m".into(),
             reasoning: Some("low".into()),
+            reasoning_resolution: None,
             model_provider: "openai".into(),
             provider: DummyProvider {
                 name: "OpenAI".into(),
@@ -2166,6 +2271,7 @@ mod permission_profile_tests {
             account_sha256: Sha256::new("b".repeat(64)).unwrap(),
             model: "m".into(),
             reasoning: None,
+            reasoning_resolution: None,
             model_provider: "openai".into(),
             provider: DummyProvider {
                 name: "n".into(),

@@ -197,7 +197,7 @@ pub fn stop(
                 let reference=DelegationRef::new(&host,&ask.ask_id).ok()?;
                 let visible=requester.is_none_or(|caller|controllers.readable_by(ask,caller));
                 let authorized=selected.contains(&reference);
-                Some((reference,NodeAccess{visible,available:true,read_attempts:visible,stop:authorized,stop_jobs:authorized,resume_continuation:false}))
+                Some((reference,NodeAccess{visible,available:true,read_attempts:visible,stop:authorized,stop_jobs:authorized,resume_continuation:false,resume_continuation_blocker:None,continuation_approval:None}))
             }).collect();
             let scope=ReadScope{caller:caller.into(),project:None,permission_revision:roster.store_revision,resources};
             let plan=prepare_stop(state,&state.lineage,&host,&scope,&root_ref,cascade,stop_jobs,action,now)?;

@@ -3627,6 +3627,8 @@ mod tests {
             while !stopping.load(Ordering::SeqCst) {
                 match _isolated_bus.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                         let _ = cutex::http::server::read_simple_http_request(&mut stream).unwrap();
                         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").unwrap();
                     }

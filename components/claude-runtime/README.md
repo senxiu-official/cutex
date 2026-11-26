@@ -7,8 +7,8 @@ subscription login or an Anthropic-compatible API key.
 
 ## Public component
 
-**claude-r55** contains adapter **0.8.17**, Claude Agent SDK **0.2.180**,
-Claude Code **2.1.321** and bundled CPython **3.13.17**. Release archives are
+**claude-r59** contains adapter **0.8.18**, Claude Agent SDK **0.2.187**,
+Claude Code **2.1.330** and bundled CPython **3.13.17**. Release archives are
 provided for Linux x64 and Windows x64. macOS uses the desktop as a client
 of a supported host; the source component also declares Darwin arm64.
 
@@ -75,7 +75,7 @@ From this public source checkout, with Git, GNU tar, gzip, sha256sum and a
 bootstrap Python 3.11 or newer:
 
 ```sh
-bash components/claude-runtime/build.sh linux-x64 claude-r55 /path/to/output
+bash components/claude-runtime/build.sh linux-x64 claude-r59 /path/to/output
 ```
 
 Use `windows-x64` for the Windows package. The builder checks that
@@ -91,7 +91,7 @@ requires another unused component number.
 ## Approval notices and background tasks
 
 On a matching host, approval-notice delivery receipts can bound the approval read
-window. The component uses Agent SDK 0.2.180 and its unmodified bundled CLI.
+window. The component uses Agent SDK 0.2.187 and its unmodified bundled CLI.
 Background children remain active while the SDK inventory reports them running;
 their terminal task events and completion notifications settle them. Existing
 sessions retain their selected runtime until explicitly upgraded.
@@ -102,8 +102,10 @@ The adapter bounds automatic retries of recoverable connection and provider fail
 
 ## Ordered input, native children and recovery
 
-Claude claude-r55 preserves original owner input order through interruption and recovery. Pending notes enter at bounded new-turn admission points; missing native delivery or read evidence remains explicit. Uncertain input is retained, and an input can be resent only when the host proves that it was not sent.
+Claude claude-r59 preserves original owner input order through interruption and recovery. Pending notes enter at bounded new-turn admission points; missing native delivery or read evidence remains explicit. Uncertain input is retained, and an input can be resent only when the host proves that it was not sent.
 
 Native child agents remain part of their parent runtime. They can use the documented read-only cutex tools within their parent's visible scope, subject to the daemon's live parent-runtime check. A child does not acquire a separate session or Director authority. After an owner Stop, only the scoped delegation answer can start its permitted follow-up turn; other queued owner input remains held. Per-model compaction settings also support changing the percentage alone.
 
-Existing sessions retain their selected runtime. The component uses Agent SDK 0.2.180 and the unmodified bundled Claude Code CLI 2.1.321.
+Existing sessions retain their selected runtime. The component uses Agent SDK 0.2.187 and the unmodified bundled Claude Code CLI 2.1.330.
+
+The SDK tool-admission hook blocks execution on callback failure. Session and workspace approvals use the SDK permission-rule type and can emit session-scoped rule updates.

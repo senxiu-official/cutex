@@ -208,12 +208,26 @@ impl World {
     }
 
     pub fn hold_input(&self, index: usize, id: &str, held: bool) -> Value {
-        let before = self.input_record(index, id);
         let action = if held { "hold" } else { "releaseHold" };
-        assert!(before["actions"].as_array().is_some_and(|actions| actions.iter().any(|value| value == action)),
-            "source authority must offer {action}: {before}");
-        let result = self.daemon.cutex(self.sid(index), "cutex/input/hold",
-            json!({"inputId": id, "expectedRev": before["rev"], "held": held})).expect("input/hold");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut conflicts = 0;
+        let result = loop {
+            let before = self.input_record(index, id);
+            assert!(before["actions"].as_array().is_some_and(|actions| actions.iter().any(|value| value == action)),
+                "source authority must offer {action}: {before}");
+            match self.daemon.cutex(self.sid(index), "cutex/input/hold",
+                json!({"inputId": id, "expectedRev": before["rev"], "held": held})) {
+                Ok(result) => break result,
+                Err(error) if error["status"] == 409 && error.pointer("/body/error/code").and_then(Value::as_str) == Some("revision_conflict") => {
+                    // Projection may advance after input/get. This refusal happens
+                    // before mutation; model a fresh owner read and recheck authority.
+                    conflicts += 1;
+                    assert!(conflicts <= 16 && Instant::now() < deadline,
+                        "input/hold projection did not stabilize: {error}");
+                }
+                Err(error) => panic!("input/hold: {error}"),
+            }
+        };
         self.recorder.mark("ownerHold057", result.clone());
         assert_eq!(result["record"]["details"]["ownerHold"], held, "{result}");
         let next_action = if held { "releaseHold" } else { "hold" };

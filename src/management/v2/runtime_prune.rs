@@ -46,17 +46,19 @@ fn restore(staged: Staged, reason: &str) -> Value {
         "reason":if restored {reason} else {"io_error"}})
 }
 
-/// The caller holds the reference and session writer fences while isolating targets.
+/// The caller holds the component operation and runtime reference fences.
 /// Same-directory renames prevent new launches at old paths before the final process inventory.
 fn prepare(version: &Version) -> Result<Staged, Value> {
     let mut moved = Vec::<(PathBuf, PathBuf)>::new();
     let result = (|| -> anyhow::Result<()> {
-        for target in &version.targets {
-            inventory::checked_root(target)?; // root identity only, never a recursive walk under a writer fence
+        ensure!(version.targets.len() == version.target_identities.len(), "runtime target identity missing");
+        for (target, identity) in version.targets.iter().zip(&version.target_identities) {
+            ensure!(inventory::inspect_target(target)?.1 == *identity, "runtime target changed");
             let parent = target.parent().context("runtime target parent missing")?;
             let quarantine = parent.join(format!(".runtime-prune-{}", uuid::Uuid::new_v4()));
             std::fs::rename(target, &quarantine)?;
-            moved.push((target.clone(), quarantine));
+            moved.push((target.clone(), quarantine.clone()));
+            ensure!(inventory::inspect_target(&quarantine)?.1 == *identity, "staged runtime target changed");
         }
         Ok(())
     })();

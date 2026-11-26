@@ -282,6 +282,7 @@ impl AppServerRuntimeEventContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerManagedRuntimeStatus {
+    pub claude_diagnostics: Option<super::claude_diagnostics::ClaudeDiagnostics>,
     pub background_work: Option<super::background_work::BackgroundWork>,
     pub cutex_session_id: String,
     pub thread_id: String,
@@ -309,6 +310,7 @@ impl AppServerManagedRuntimeStatus {
     /// Reconnect replaces this with a fresh thread/resume (rollout) snapshot.
     pub fn mask_disconnected_turn(&mut self) {
         if !self.connected {
+            self.claude_diagnostics = None;
             self.background_work = Default::default();
             self.active_turn_id = None;
             self.active_turn_observed_at = None;
@@ -1224,6 +1226,9 @@ impl AppServerRuntimeManager {
             &thread_settings_from_resume_response(&thread_response),
         );
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            claude_diagnostics: runtime_backend.starts_with("claude").then(||
+                thread_response.get("claudeRuntimeDiagnostics")
+                    .and_then(super::claude_diagnostics::ClaudeDiagnostics::from_wire)).flatten(),
             background_work: Default::default(),
             cutex_session_id: cutex_session_id.to_string(),
             thread_id: response_thread_id.clone(),
@@ -1452,6 +1457,9 @@ fn run_event_worker(
                     &origin,
                     &status,
                 );
+                if consume_claude_diagnostics(&status, &event_context, &event) {
+                    continue;
+                }
                 if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(&event) {
                     // Classification above still advances lease/emission-time
                     // bookkeeping. Live payloads never enter diagnostic/deferred
@@ -1636,6 +1644,9 @@ fn replay_taken_over_events(
         return;
     };
     for mut event in ownership.take_replay() {
+        if matches!(&event, AppServerEvent::Notification(n) if n.method == super::claude_diagnostics::NATIVE_METHOD) {
+            continue; // Connection-local state has already consumed this packet.
+        }
         if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(&event) { continue; }
         if !event_sink.should_defer_journal_event(event_context, &event, origin)
             && event_sink.should_journal_event(event_context, &event, origin)
@@ -1745,6 +1756,33 @@ fn thread_settings_from_resume_response(response: &Value) -> Value {
         }
     }
     Value::Object(settings)
+}
+
+fn consume_claude_diagnostics(
+    status: &Arc<Mutex<AppServerManagedRuntimeStatus>>,
+    context: &AppServerRuntimeEventContext,
+    event: &AppServerEvent,
+) -> bool {
+    use super::claude_diagnostics::{ClaudeDiagnostics, NATIVE_METHOD};
+    let AppServerEvent::Notification(notification) = event else { return false };
+    if notification.method != NATIVE_METHOD {
+        return false;
+    }
+    // Even malformed extensions stay out of the journal.
+    if !context.runtime_backend.starts_with("claude") {
+        return true;
+    }
+    let Some(diagnostics) = notification.params.as_ref()
+        .filter(|p| p["threadId"].as_str() == Some(context.thread_id.as_str()))
+        .and_then(|p| ClaudeDiagnostics::from_wire(&p["diagnostics"])) else { return true };
+    if let Ok(mut state) = status.lock() {
+        if state.connected && state.claude_diagnostics.as_ref() != Some(&diagnostics) {
+            state.claude_diagnostics = Some(diagnostics.clone());
+            drop(state);
+            crate::management::v2::repository::publish_claude_diagnostics(context, diagnostics);
+        }
+    }
+    true
 }
 
 fn update_runtime_status_from_event(
@@ -2102,6 +2140,7 @@ mod tests {
         });
         let runtime_alive = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: "saturated-close".to_string(),
             thread_id: "thread-1".to_string(),
@@ -3359,6 +3398,7 @@ mod tests {
     fn native_turn_events_update_active_turn_status() {
         let session = format!("admission-native-events-{}", uuid::Uuid::new_v4());
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: session.clone(),
             thread_id: "thread-1".to_string(),

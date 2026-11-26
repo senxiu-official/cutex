@@ -1,5 +1,8 @@
 # Local runtime deployment
 
+For cutex 0.2.6, the public Native runtime is 0.172.0-r70. On Linux it requires a capable system `bwrap`, `pidfd_open` (Linux 5.3 or newer), and a host policy permitting sandbox startup. It does not bundle bubblewrap. AppArmor restrictions on user namespaces can prevent transparent TCP proxy startup. Missing capabilities refuse startup without silently weakening sandboxing.
+
+
 Linux can select a locally installed light runtime in
 `~/.cutex/runtime/light/deployment.json`:
 

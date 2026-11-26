@@ -156,6 +156,85 @@ fn dst_gap_shifts_forward_and_overlap_never_fires_twice() {
     );
 }
 #[test]
+fn assistant_templates_record_local_dst_slots_once_and_keep_the_confirmed_revision() {
+    use crate::personal_assistants::{
+        recurring::{CoordinationTask, Template},
+        ProjectRef, Seat,
+    };
+    for (before, due, wall) in [
+        (
+            "2026-10-03T15:00:00Z",
+            "2026-10-03T16:00:00Z",
+            "2026-10-04T03:00:00+11:00",
+        ),
+        (
+            "2026-04-04T14:00:00Z",
+            "2026-04-04T15:30:00Z",
+            "2026-04-05T02:30:00+11:00",
+        ),
+    ] {
+        let root = Fixture::new();
+        let store = Store::open(&root.0).unwrap();
+        let mut a = args("dst-template");
+        a.rule = Rule::Daily {
+            time: "02:30".into(),
+        };
+        let template = Template {
+            assistant_id: "assistant".into(),
+            assistant_revision: 2,
+            template_revision: 1,
+            project_ref: ProjectRef {
+                instance_id: "fixture".into(),
+                project_id: "project".into(),
+            },
+            confirmed_seat: Seat {
+                session_id: Some(TARGET.into()),
+                epoch: 4,
+            },
+            task: CoordinationTask::ProjectStatus,
+        };
+        let row = store
+            .create_linked(
+                a,
+                Some(template.clone()),
+                at(before),
+                &TransitionZone,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let run = store
+            .claim(at(due), &TransitionZone, 8)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(run.slot_local.as_deref(), Some(wall));
+        assert_eq!(run.assistant_template, Some(template));
+        assert!(run.coalesced_until.is_none());
+        assert!(store
+            .finish(
+                &run,
+                "handedOff",
+                None,
+                Some("fixture-request".into()),
+                at(due)
+            )
+            .unwrap());
+        assert!(store
+            .claim(at(due) + chrono::Duration::hours(1), &TransitionZone, 8)
+            .unwrap()
+            .is_empty());
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../management/v2/schema/export/schedules.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&json!({"schedule":store.get(&row.id).unwrap()}))
+            .unwrap();
+    }
+}
+
+#[test]
 fn crud_is_cas_guarded_and_action_replays_survive_restart() {
     let root = Fixture::new();
     let store = Store::open(&root.0).unwrap();

@@ -740,7 +740,7 @@ impl EffortFallback {
 }
 
 /// The catalog row of `model` (exactly one), from a reviewed catalog file.
-fn catalog_row(catalog: &VerifiedFile, model: &str) -> anyhow::Result<Option<serde_json::Value>> {
+pub(super) fn catalog_row(catalog: &VerifiedFile, model: &str) -> anyhow::Result<Option<serde_json::Value>> {
     catalog.validate()?;
     let bytes = bounded_asset(&catalog.path)?;
     use sha2::Digest;
@@ -839,32 +839,29 @@ pub fn validate_model(
                 .iter()
                 .filter(|m| m["slug"].as_str() == Some(model))
                 .collect();
-            // r290 P13: explicit owner opt-in admits only an unlisted raw model.
-            // Existing rows and unavailable named configurations retain strict validation.
-            if matched.is_empty() && crate::profiles::model_check::unlisted_allowed() {
-                ensure!(!v["reserved_model_ids"].as_array().is_some_and(|ids|ids.iter().any(|id|id.as_str()==Some(model))),"unavailable model configuration {model} cannot be used as an unlisted model");
-                ensure!(effort.is_none_or(supported_effort),"unsupported reasoning effort");
-                return Ok(());
-            }
-            ensure!(
-                matched.len() == 1
-                    && matched[0]["supported_reasoning_levels"]
-                        .as_array()
-                        .is_some_and(|a| (*route != Route::GlmApiKey && (effort.is_none()
-                            || (a.is_empty() && effort.is_none_or(supported_effort)))) || a
-                            .iter()
-                            .any(|v| v["effort"].as_str() == effort || (effort.is_none() && *route != Route::GlmApiKey))),
-                "{}",
-                if matched.len() == 1 {
-                    format!(
-                        "reasoning effort {} is not offered by model {model}; choose one of: {}",
-                        effort.unwrap_or("(default)"),
-                        row_efforts(matched[0]).join(", ")
-                    )
-                } else {
-                    format!("catalog model/effort missing or ambiguous (model {model})")
+            use crate::profiles::pinned_selection::Unavailable;
+            // Named configurations remain reserved even if unlisted raw IDs
+            // are enabled for this profile.
+            if matched.is_empty() {
+                let reserved = v["reserved_model_ids"].as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(model)));
+                if !reserved && crate::profiles::model_check::unlisted_allowed() {
+                    ensure!(effort.is_none_or(supported_effort), "unsupported reasoning effort");
+                    return Ok(());
                 }
-            );
+                return Err(Unavailable::model(model, effort).into());
+            }
+            ensure!(matched.len() == 1, "catalog model is ambiguous (model {model})");
+            let row = matched[0];
+            let supported = row["supported_reasoning_levels"].as_array()
+                .is_some_and(|levels|
+                    (*route != Route::GlmApiKey
+                        && (effort.is_none() || (levels.is_empty() && effort.is_none_or(supported_effort))))
+                    || levels.iter().any(|value|
+                        value["effort"].as_str() == effort || (effort.is_none() && *route != Route::GlmApiKey)));
+            if !supported {
+                return Err(Unavailable::effort(model, effort, row_efforts(row)).into());
+            }
         }
     }
     Ok(())

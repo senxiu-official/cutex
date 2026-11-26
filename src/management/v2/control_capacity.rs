@@ -3,11 +3,13 @@
 use crate::http::server::SimpleHttpRequest;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const CONTROL_CONNECTION_RESERVE: usize = 32;
-pub const HEAVY_READ_LIMIT: usize = 2;
+const HEAVY_READ_LIMIT: usize = 2;
+pub const HEAVY_READ_CONCURRENCY_OPTIONS: &[usize] = &[2, 4, 6, 8];
+const BACKGROUND_READ_LIMIT: usize = 1;
 pub const HEAVY_READ_QUEUE_LIMIT: usize = 64;
 pub const HEAVY_READ_WAIT: Duration = Duration::from_secs(3);
 pub const BACKGROUND_READ_WAIT: Duration = Duration::from_secs(30);
@@ -18,9 +20,105 @@ pub const FILE_TRANSFER_LIMIT: usize = 2;
 pub const GIT_STATUS_REQUEST_LIMIT: usize = 16;
 static GIT_STATUS_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static TRANSFERS: AtomicUsize = AtomicUsize::new(0);
-static HEAVY: HeavyPool = HeavyPool::new(HEAVY_READ_LIMIT, HEAVY_READ_QUEUE_LIMIT);
+static HEAVY: OnceLock<HeavyPool> = OnceLock::new();
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
 static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn validate_heavy_read_limit(limit: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        HEAVY_READ_CONCURRENCY_OPTIONS.contains(&limit),
+        "must be one of {:?}",
+        HEAVY_READ_CONCURRENCY_OPTIONS
+    );
+    Ok(())
+}
+
+pub fn heavy_read_override(config: &crate::profiles::model::CodezConfig) -> Option<usize> {
+    config.heavy_read_concurrency.filter(|limit| HEAVY_READ_CONCURRENCY_OPTIONS.contains(limit))
+}
+
+#[derive(Default)]
+struct HeavyReadHardware {
+    logical_cpus: Option<usize>,
+    physical_memory_bytes: Option<u64>,
+}
+
+static HEAVY_READ_HARDWARE: LazyLock<HeavyReadHardware> = LazyLock::new(detect_heavy_read_hardware);
+
+pub fn automatic_heavy_read_limit() -> usize {
+    match (HEAVY_READ_HARDWARE.logical_cpus, HEAVY_READ_HARDWARE.physical_memory_bytes) {
+        (Some(cpus), Some(memory)) => hardware_heavy_read_limit(cpus, memory),
+        _ => HEAVY_READ_LIMIT,
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn detect_heavy_read_hardware() -> HeavyReadHardware {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::{GetActiveProcessorCount, ALL_PROCESSOR_GROUPS};
+
+    // SAFETY: ALL_PROCESSOR_GROUPS is the documented selector for a host-wide count.
+    let processors = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
+    // SAFETY: the struct contains integers only. The API requires dwLength and
+    // writes to the initialized, exclusively borrowed buffer.
+    let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let memory_detected = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
+    HeavyReadHardware {
+        logical_cpus: (processors != 0).then_some(processors),
+        physical_memory_bytes: (memory_detected && memory.ullTotalPhys != 0)
+            .then_some(memory.ullTotalPhys),
+    }
+}
+
+fn hardware_heavy_read_limit(processors: usize, memory_bytes: u64) -> usize {
+    // The EVA matrix supports four slots on a machine with 32 logical CPUs and
+    // 93 GiB of physical memory. Keep the first automatic tier close to it.
+    if processors >= 32 && memory_bytes >= 90 * (1 << 30) {
+        4
+    } else {
+        HEAVY_READ_LIMIT
+    }
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn detect_heavy_read_hardware() -> HeavyReadHardware {
+    HeavyReadHardware::default()
+}
+
+#[cfg(test)]
+#[test]
+fn heavy_read_automatic_limit_requires_both_hardware_thresholds() {
+    let threshold = 90 * (1 << 30);
+    assert_eq!(hardware_heavy_read_limit(32, threshold), 4);
+    assert_eq!(hardware_heavy_read_limit(31, threshold), 2);
+    assert_eq!(hardware_heavy_read_limit(32, threshold - 1), 2);
+    assert_eq!(hardware_heavy_read_limit(0, 0), 2);
+}
+
+pub fn selected_heavy_read_limit(config: &crate::profiles::model::CodezConfig) -> usize {
+    heavy_read_override(config).unwrap_or_else(automatic_heavy_read_limit)
+}
+
+/// Called once by Management startup before any listener accepts requests.
+pub fn configure_heavy_reads(config: &crate::profiles::model::CodezConfig) {
+    let selected = selected_heavy_read_limit(config);
+    let pool = HEAVY.get_or_init(|| HeavyPool::new(selected, HEAVY_READ_QUEUE_LIMIT));
+    if pool.limit != selected {
+        eprintln!(
+            "warning: Management heavy-read pool is already initialized with {} slots; requested {}",
+            pool.limit, selected
+        );
+    }
+}
+
+fn heavy_pool() -> &'static HeavyPool {
+    HEAVY.get_or_init(|| HeavyPool::new(HEAVY_READ_LIMIT, HEAVY_READ_QUEUE_LIMIT))
+}
+
+pub fn active_heavy_read_limit() -> usize {
+    heavy_pool().limit
+}
 
 #[cfg(test)]
 #[path="native_admission_scale.rs"]
@@ -83,6 +181,7 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
     if request.method == "GET"
         && (path == "/v2/runtimes/prune"
             || path == "/v2/sessions"
+            || path == super::session_search::PATH
             || matches!(path, "/v2/sessions/page" | "/v2/sessions/changes")
             || (path.starts_with("/v2/sessions/") && super::server::session_id_from_path(path).is_none())
             || path == "/v2/summary"
@@ -181,11 +280,11 @@ impl AdmissionRefusal {
         let capacity = serde_json::json!({
             "approximate": true,
             "heavyReadsActive": self.heavy.0, "heavyReadsWaiting": self.heavy.1,
-            "heavyReadLimit": HEAVY_READ_LIMIT, "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT,
+            "heavyReadLimit": active_heavy_read_limit(), "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT,
             "gitStatusRequestLimit": GIT_STATUS_REQUEST_LIMIT,
             "heavyReadWaitMs": HEAVY_READ_WAIT.as_millis(),
             "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(),
-            "backgroundReadLimit": HEAVY_READ_LIMIT - 1,
+            "backgroundReadLimit": BACKGROUND_READ_LIMIT,
             "foregroundQueueReserve": FOREGROUND_QUEUE_RESERVE,
             "connectionsOpen": self.connections_open,
             "bulkConnections": self.bulk_connections,
@@ -326,8 +425,8 @@ impl HeavyPool {
         self.acquire_priority(budget, false)
     }
 
-    // Background work may occupy at most limit-1 slots. A queued background
-    // reader also keeps one slot from being borrowed by more foreground work.
+    // Background work may occupy one slot. A queued background reader keeps
+    // that slot from being borrowed by more foreground work.
     // Thus neither priority can starve the other; running work is not preempted.
     fn session_available(state: &HeavyState, session: Option<&str>) -> bool {
         session.is_none_or(|session| !state.sessions.contains(session))
@@ -338,7 +437,7 @@ impl HeavyPool {
             return false;
         }
         if background {
-            state.active_background < self.limit.saturating_sub(1)
+            state.active_background < BACKGROUND_READ_LIMIT.min(self.limit.saturating_sub(1))
         } else {
             !(state.active_background == 0
                 && state.tickets.iter().any(|ticket| ticket.background && Self::session_available(state, ticket.session.as_deref()))
@@ -452,7 +551,7 @@ pub fn admit(class: WorkClass) -> Result<Permit, AdmissionRefusal> {
 
 fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, AdmissionRefusal> {
     if class == WorkClass::HeavyRead {
-        let permit = HEAVY.acquire_priority(if background { BACKGROUND_READ_WAIT } else { HEAVY_READ_WAIT }, background);
+        let permit = heavy_pool().acquire_priority(if background { BACKGROUND_READ_WAIT } else { HEAVY_READ_WAIT }, background);
         if permit.is_err() {
             REFUSED.fetch_add(1, Ordering::Relaxed);
         }
@@ -475,7 +574,7 @@ fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, Admissio
             } else {
                 RefusalReason::StreamLimit
             };
-            return Err(AdmissionRefusal::new(reason, HEAVY.counts()));
+            return Err(AdmissionRefusal::new(reason, heavy_pool().counts()));
         }
         Ok(Permit {
             counter: Some(counter),
@@ -505,9 +604,9 @@ pub fn admit_request(
     if class == WorkClass::HeavyRead {
         if !slot.is_none_or(|slot| slot.restrict_to_bulk()) {
             REFUSED.fetch_add(1, Ordering::Relaxed);
-            return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, HEAVY.counts()));
+            return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, heavy_pool().counts()));
         }
-        let permit = HEAVY.acquire_session(
+        let permit = heavy_pool().acquire_session(
             if background { BACKGROUND_READ_WAIT } else { HEAVY_READ_WAIT },
             background, heavy_session(request),
         );
@@ -540,25 +639,31 @@ fn admit_with_bulk(class: WorkClass, restrict: impl FnOnce() -> bool) -> Result<
 fn admit_with_bulk_priority(class: WorkClass, background: bool, restrict: impl FnOnce() -> bool) -> Result<Permit, AdmissionRefusal> {
     if class != WorkClass::Control && !restrict() {
         REFUSED.fetch_add(1, Ordering::Relaxed);
-        return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, HEAVY.counts()));
+        return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, heavy_pool().counts()));
     }
     admit_priority(class, background)
 }
 
 pub fn snapshot() -> serde_json::Value {
-    let (active, waiting) = HEAVY.counts();
-    serde_json::json!({ "controlConnectionReserve": CONTROL_CONNECTION_RESERVE, "heavyReadLimit": HEAVY_READ_LIMIT,
+    let pool = heavy_pool();
+    let (active, waiting) = pool.counts();
+    serde_json::json!({ "controlConnectionReserve": CONTROL_CONNECTION_RESERVE, "heavyReadLimit": pool.limit,
+        "heavyReadConcurrencyActive": pool.limit,
+        "heavyReadConcurrencyHardware": {
+            "logicalCpus": HEAVY_READ_HARDWARE.logical_cpus,
+            "physicalMemoryBytes": HEAVY_READ_HARDWARE.physical_memory_bytes,
+        },
         "connectionsOpen": crate::management::listeners::open_connections(),
         "bulkConnections": crate::management::listeners::bulk_connections(),
         "connectionLimit": crate::management::listeners::MAX_CONNECTIONS,
         "heavyReadsActive": active, "heavyReadsWaiting": waiting,
         "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT, "heavyReadWaitMs": HEAVY_READ_WAIT.as_millis(),
-        "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(), "backgroundReadLimit": HEAVY_READ_LIMIT - 1,
+        "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(), "backgroundReadLimit": BACKGROUND_READ_LIMIT,
         "foregroundQueueReserve": FOREGROUND_QUEUE_RESERVE,
-        "heavyReadsQueuedTotal": HEAVY.queued.load(Ordering::Relaxed),
-        "heavyReadWaitNsTotal": HEAVY.wait_ns.load(Ordering::Relaxed),
-        "heavyReadWaitTimeouts": HEAVY.timed_out.load(Ordering::Relaxed),
-        "heavyReadQueueFull": HEAVY.queue_full.load(Ordering::Relaxed), "streamLimit": STREAM_LIMIT,
+        "heavyReadsQueuedTotal": pool.queued.load(Ordering::Relaxed),
+        "heavyReadWaitNsTotal": pool.wait_ns.load(Ordering::Relaxed),
+        "heavyReadWaitTimeouts": pool.timed_out.load(Ordering::Relaxed),
+        "heavyReadQueueFull": pool.queue_full.load(Ordering::Relaxed), "streamLimit": STREAM_LIMIT,
         "streamsActive": STREAMS.load(Ordering::Relaxed), "fileTransfersActive": TRANSFERS.load(Ordering::Relaxed),
         "fileTransferLimit": FILE_TRANSFER_LIMIT, "refused": REFUSED.load(Ordering::Relaxed),
         "gitStatusRequestLimit": GIT_STATUS_REQUEST_LIMIT, "gitStatusRequestsActive": GIT_STATUS_REQUESTS.load(Ordering::Relaxed),
@@ -664,14 +769,14 @@ mod tests {
             }}}).to_string());
         assert_eq!(classify(&request), WorkClass::HeavyRead);
         let reader = std::thread::spawn(move || admit_request(&request, None).unwrap());
-        wait_for_queue(&HEAVY, 1);
-        assert_eq!(HEAVY.counts(), (2, 1));
+        wait_for_queue(heavy_pool(), 1);
+        assert_eq!(heavy_pool().counts(), (2, 1));
         let control = admit_request(&self::request("POST", "/v2/sessions/cutex.a/app-server/requests",
             r#"{"native":{"message":{"method":"turn/interrupt"}}}"#), None).unwrap();
-        assert_eq!(HEAVY.counts(), (2, 1));
+        assert_eq!(heavy_pool().counts(), (2, 1));
         drop((control, held));
         drop(reader.join().unwrap());
-        assert_eq!(HEAVY.counts(), (0, 0));
+        assert_eq!(heavy_pool().counts(), (0, 0));
     }
 
     #[test]
@@ -826,7 +931,7 @@ mod tests {
         let reader = std::thread::spawn(|| {
             admit(WorkClass::HeavyRead).expect("burst reader waits instead of failing")
         });
-        wait_for_queue(&HEAVY, 1);
+        wait_for_queue(heavy_pool(), 1);
         let control = admit(WorkClass::Control).expect("control must remain admitted");
         let stream = admit(WorkClass::Stream).expect("stream has its own bounded pool");
         drop((permits, control, stream));

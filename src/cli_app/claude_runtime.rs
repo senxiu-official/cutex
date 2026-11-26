@@ -29,6 +29,9 @@ mod busy_delivery;
 #[path = "claude_settlement.rs"]
 mod settlement;
 
+#[path = "claude_ordered_input.rs"]
+mod ordered_input;
+
 pub(super) fn lifecycle(id: &str, online: bool) -> anyhow::Result<serde_json::Value> {
     use anyhow::{ensure, Context};
     use serde_json::json;
@@ -848,12 +851,29 @@ fn deliver_messages_with(
     let capabilities = capabilities(record.runtime_generation);
     let v2 = capabilities.as_ref().is_some_and(super::asks_claude::offers_agent_messages_v2);
     let native = capabilities.as_ref().is_some_and(super::claude_ingress::offers_native);
+    let ordered = capabilities.as_ref().is_some_and(ordered_input::supported);
+    if ordered {
+        if let Err(error) = ordered_input::drive(id, thread, record.runtime_generation, &sessions, repository) {
+            eprintln!("Claude ordered publication for {id}: {error:#}");
+        }
+    } else if let Err(error) = ordered_input::retire_previous(id, thread, record.runtime_generation, repository) {
+        eprintln!("Claude previous ordered binding recovery for {id}: {error:#}");
+    }
     if native && reconciliation_due(attempts, id, record.runtime_generation, Instant::now()) {
         // Notifications can be lost during observer restarts. Reconcile only;
         // neither unknown status nor transport failure schedules a replay.
         for envelope in repository.pending_native_envelopes(id)? {
+            if envelope.thread_id != thread { continue; }
+            if repository.reserved_for_automatic_batch(id, &envelope.message.id)? {
+                continue;
+            }
             if let Err(error) = reconcile_native_message(id, record.runtime_generation, &envelope) {
                 eprintln!("Claude receipt recovery for {id}/{}: {error:#}", envelope.message.id);
+            }
+        }
+        if cutex::management::v2::input_ledger::enabled() && repository.native_timeline_pending(id)? {
+            if let Err(error) = reconcile_native_timeline(id, record.runtime_generation, thread, &repository) {
+                eprintln!("Claude timeline recovery for {id}: {error:#}");
             }
         }
     }
@@ -985,11 +1005,14 @@ fn deliver_messages_with(
         let input_lock = cutex::management::v2::user_input::session_input_lock(id)?;
         let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
         if cutex::management::v2::input_disposal::requested(id,&message.id)? {continue;}
+        if repository.reserved_for_automatic_batch(id, &message.id)? {continue;}
+        if ordered && existing.is_none() && repository.is_ordinary_automatic_input(id, &message.id)? {continue;}
         if repository.owner_delivery_blocked(id, &message.id)? {
             // A carried identity belongs to its owner's atomic request. The
             // observer may recover genuine native proof, but must never submit
             // an Unknown carried item as an independent turn or passive note.
             if let Some(envelope) = repository.snapshot_by_message_id(&message.id)?.and_then(|snapshot| snapshot.external_input) {
+                if envelope.thread_id != thread { continue; }
                 reconcile_native_message(id, record.runtime_generation, &envelope)?;
                 let snapshot = repository.snapshot_by_message_id(&message.id)?;
                 if snapshot.as_ref().is_some_and(|snapshot| snapshot.state == "delivered") {
@@ -1136,6 +1159,8 @@ fn deliver_messages_with(
     }
     match projection_error { Some(error) => Err(error), None => Ok(()) }
 }
+
+pub(crate) use ordered_input::{supported as supports_ordered_input, synchronize_start as synchronize_ordered_start};
 
 /// Whether the Claude observer submits a polled bus message (the rest stay
 /// on the bus): agent messages and alarms, cross-host tells, Claude task
@@ -1820,6 +1845,12 @@ fn record_agent_message_item(
         let Some(message) = params["messageId"].as_str() else { return Ok(()) };
         let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
         let source = repository.source_id_for_native(id, message)?;
+        if let Some(source_id) = source.as_deref() {
+            if repository.reserved_for_automatic_batch(id, source_id)? {
+                wake_delivery(id);
+                return Ok(());
+            }
+        }
         let snapshot = source.as_deref().map(|source| repository.snapshot_by_message_id(source)).transpose()?.flatten();
         if let Some(envelope) = snapshot.and_then(|snapshot| snapshot.external_input) {
             ensure_native_event_binding(id, &params["threadId"], &envelope)?;
@@ -1850,7 +1881,7 @@ fn record_agent_message_item(
         // emits busy `soon` items at claim time).
         if envelope.message.id == message && envelope.owner_id == id
             && params["threadId"].as_str() == Some(envelope.thread_id.as_str()) {
-            repository.input_ledger_native_attempt_item(id, source_id, message, turn)?;
+            repository.input_ledger_native_attempt_item_bound(id, source_id, message, &envelope.thread_id, turn)?;
         }
         return Ok(());
     }
@@ -1877,6 +1908,25 @@ fn record_agent_message_item(
 
 fn ensure_native_event_binding(id: &str, thread: &serde_json::Value, envelope: &cutex::app_server::external_input::Envelope) -> anyhow::Result<()> {
     anyhow::ensure!(envelope.owner_id == id && thread.as_str() == Some(envelope.thread_id.as_str()), "Claude input notification binding mismatch");
+    Ok(())
+}
+
+fn reconcile_native_timeline(id: &str, generation: u64, thread: &str,
+    repository: &cutex::management::v2::agent_bus_state::AgentBusMessageRepository,
+) -> anyhow::Result<()> {
+    use cutex::asks::scheduler::AskRuntime;
+    let Some(status) = manager().status(id)?.filter(|s| s.connected && s.runtime_generation == generation && s.thread_id == thread) else { return Ok(()); };
+    let Some(turn_id) = status.active_turn_id else { return Ok(()); };
+    manager().handle_for_generation(id, generation)?;
+    let runtime = super::asks_runtime::ManagementAskRuntime::default();
+    let Some(turn) = runtime.read_turn(id, &turn_id) else { return Ok(()); };
+    manager().handle_for_generation(id, generation)?;
+    let current = manager().status(id)?;
+    if current.as_ref().is_some_and(|s| s.connected && s.runtime_generation == generation
+        && s.thread_id == thread && s.active_turn_id.as_deref() == Some(turn_id.as_str()))
+        && turn["id"].as_str() == Some(turn_id.as_str()) {
+        repository.input_ledger_native_turn(id, thread, &turn)?;
+    }
     Ok(())
 }
 

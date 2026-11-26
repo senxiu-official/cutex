@@ -526,7 +526,7 @@ fn first_in_queue(repository: &UserInputRepository, session: &str, queue_id: &st
     if ours.is_some_and(|ours| theirs.is_some_and(|theirs| ours < theirs)) {
         return;
     }
-    let before = cutex::management::v2::admission::AdmissionRef { kind: "owner".into(), id: head.id.clone() };
+    let before = cutex::management::v2::admission::AdmissionRef::owner(head.id.clone());
     if let Err(error) = repository.move_admission_item(session, queue_id, snapshot.order_revision, Some(&before), false) {
         eprintln!("cutex/input/interruptSend: {session}: could not move {queue_id} first: {error:#}");
     }

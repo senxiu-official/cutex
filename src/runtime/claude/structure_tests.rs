@@ -263,3 +263,35 @@ fn history_restart_updates_identity_and_fences_stale_results() {
     assert!(apply_binding(&mut current, &committed, Some("uncommitted"), Some("next")).is_err());
     assert_eq!(current.claude_session.as_ref(), Some(&committed));
 }
+
+#[test]
+fn retired_claude_offline_selection_requires_the_pins_capability() {
+    let root = std::env::temp_dir().join(format!("claude-selection-{}", uuid::Uuid::new_v4()));
+    let mut record = source(&root);
+    record.profile = None;
+    record.runtime_pid = None;
+    let binding = record.claude_session.as_mut().unwrap();
+    binding.model = "retired-fixture".into();
+    binding.effort = crate::profiles::appearance::ClaudeEffort::parse("max").unwrap();
+    let before = record.clone();
+
+    let error = apply_offline_launch_selection(&mut record, Some("sonnet"), Some(Some("low"))).unwrap_err();
+    assert!(error.downcast_ref::<crate::profiles::pinned_selection::UpgradeRequired>().is_some());
+    assert_eq!(record, before);
+
+    let feature = record.claude_session.as_ref().unwrap().deployment.adapter_source.join("src/cute_claude/features.json");
+    std::fs::create_dir_all(feature.parent().unwrap()).unwrap();
+    std::fs::write(&feature, br#"{"features":{"offlineLaunchSelection":true}}"#).unwrap();
+    apply_offline_launch_selection(&mut record, Some("sonnet"), Some(Some("low"))).unwrap();
+    let saved = record.claude_session.as_ref().unwrap();
+    let original = before.claude_session.as_ref().unwrap();
+    assert_eq!(saved.model, "sonnet");
+    assert_eq!(saved.effort.unwrap().as_str(), "low");
+    assert_eq!(saved.thread_id, original.thread_id);
+    assert_eq!(saved.native_session_id, original.native_session_id);
+    assert_eq!(saved.state_dir, original.state_dir);
+    assert!(record.claude_launch_selection_pending);
+    assert_eq!(record.runtime_generation, before.runtime_generation);
+    assert!(record.runtime_pid.is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}

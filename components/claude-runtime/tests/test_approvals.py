@@ -1,12 +1,26 @@
 import asyncio
 import sys
 from dataclasses import replace
+from pathlib import Path
 import pytest
 from cute_claude.config import Settings
 from cute_claude.store import identifier
-from cute_claude.subscription import SdkToolBridge
+from cute_claude.subscription import OfficialSdkDriver, SdkToolBridge
 from test_subscription import SubHarness, sh
 from fake_sdk import install_fake_sdk
+
+
+def test_official_sdk_permission_updates_serialize_session_rules(tmp_path):
+    pytest.importorskip('claude_agent_sdk')
+    driver = OfficialSdkDriver(Path('unused-cli'), tmp_path)
+    command = 'echo fixture'
+    [session] = driver.session_rules('Bash', {'command': command})
+    [project] = driver.project_rules([f'Bash({command})', 'Write'])
+    expected = {'type': 'addRules', 'behavior': 'allow', 'destination': 'session',
+                'rules': [{'toolName': 'Bash', 'ruleContent': command}]}
+    assert session.to_dict() == expected
+    assert project.to_dict() == {**expected, 'rules': [*expected['rules'], {'toolName': 'Write'}]}
+
 
 async def wait_for_request(h):
     async with asyncio.timeout(2):

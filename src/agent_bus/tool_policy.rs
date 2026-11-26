@@ -18,6 +18,8 @@ use crate::agent_management::AgentManagementSnapshot;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
+    /// A dedicated, enabled Personal Assistant, checked separately by session.
+    PersonalAssistant,
     /// Every agent.
     Everyone,
     /// Project Directors and delegated Agent Operators.
@@ -43,6 +45,19 @@ const fn rule(tool: &'static str, audience: Audience) -> ToolRule {
 
 /// The role → tool table for the `cutex` MCP server.
 pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
+    rule("pa_self", Audience::PersonalAssistant),
+    rule("pa_project_read", Audience::PersonalAssistant),
+    rule("pa_request_prepare", Audience::PersonalAssistant),
+    rule("pa_request_revise", Audience::PersonalAssistant),
+    rule("pa_request_list", Audience::PersonalAssistant),
+    rule("pa_request_read", Audience::PersonalAssistant),
+    rule("pa_memory_search", Audience::PersonalAssistant),
+    rule("pa_memory_write", Audience::PersonalAssistant),
+    rule("pa_agenda_read", Audience::PersonalAssistant),
+    rule("pa_reminder_set", Audience::PersonalAssistant),
+    rule("pa_reminder_cancel", Audience::PersonalAssistant),
+    rule("director_request_list", Audience::ProjectDirectors),
+    rule("director_request_respond", Audience::ProjectDirectors),
     rule("browser_list", Audience::Everyone),
     rule("browser_read", Audience::Everyone),
     rule("browser_find", Audience::Everyone),
@@ -153,6 +168,7 @@ pub fn owner_notify_allowed(cutex_session_id: &str, audience: &str) -> bool {
 impl Audience {
     pub fn admits(self, roles: AgentRoles) -> bool {
         match self {
+            Self::PersonalAssistant => false,
             Self::Everyone => true,
             Self::ProjectManagers => roles.director || roles.operator,
             Self::ProjectDirectors => roles.director,
@@ -230,6 +246,11 @@ pub fn tools_list_for_session(cutex_session_id: &str) -> Value {
     let runtime = if claude { crate::asks::tools::ToolRuntime::Claude } else { crate::asks::tools::ToolRuntime::Codex };
     let wait = delegation_wait_enabled(cutex_session_id);
     let mut list = crate::agent_bus::mcp::tools_for(runtime, wait);
+    if let Some(names) = assistant_tools(cutex_session_id) {
+        retain_tools(&mut list, &names);
+        return list;
+    }
+    retain_tools_except(&mut list, crate::personal_assistants::tools::ASSISTANT);
     let search = search_tool_enabled(cutex_session_id);
     if owned_session(cutex_session_id) {
         // A quick chat is no Agent Bus agent: at most the browser tools and
@@ -248,6 +269,8 @@ pub fn tools_list_for_session(cutex_session_id: &str) -> Value {
             .map(str::to_string)
             .collect();
         retain_tools(&mut list, &allowed);
+    } else {
+        retain_tools_except(&mut list, crate::personal_assistants::tools::DIRECTOR);
     }
     crate::agent_bus::mcp_browser::filter_listing(&mut list, browser_surface(cutex_session_id));
     if !search {
@@ -440,6 +463,9 @@ pub const LEGACY_ALLOWED: &[&str] = &[crate::asks::tools::DOCUMENT_READ];
 
 /// `POST /api/mcp/v1/toolset` response body for a resolved caller.
 pub fn toolset_response(cutex_session_id: &str, roles: AgentRoles) -> Value {
+    if let Some(names) = assistant_tools(cutex_session_id) {
+        return serde_json::json!({"ok":true,"cutex_session_id":cutex_session_id,"tools":names,"roles":roles});
+    }
     let wait = delegation_wait_enabled(cutex_session_id);
     let browser = browser_surface(cutex_session_id);
     let search = search_tool_enabled(cutex_session_id);
@@ -468,6 +494,26 @@ pub fn toolset_response(cutex_session_id: &str, roles: AgentRoles) -> Value {
         "roles": roles,
         "tools": tools,
     })
+}
+
+fn assistant_tools(session: &str) -> Option<Vec<String>> {
+    let record = match crate::session::store::shared_session_row(session) {
+        Ok(record) => record,
+        Err(_) => return Some(Vec::new()),
+    };
+    match crate::personal_assistants::host::assistant_identity(session, record.as_deref()) {
+        Some(false) => return None,
+        None => return Some(Vec::new()),
+        Some(true) => {}
+    }
+    let enabled = crate::personal_assistants::Store::open_default()
+        .and_then(|s| s.for_session(session))
+        .and_then(|r| r.require_active())
+        .is_ok();
+    if !enabled {
+        return Some(Vec::new());
+    }
+    Some(crate::personal_assistants::tools::ASSISTANT.iter().map(|name| (*name).to_owned()).collect())
 }
 
 #[cfg(test)]

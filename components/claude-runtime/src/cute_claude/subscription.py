@@ -4,7 +4,7 @@ The open adapter owns RPC, FIFO inbox and host tool execution. The unmodified
 selected official runtime owns inference/authentication/native context. Local history
 is an audit projection, never replayed as a native Claude transcript.
 
-Public SDK API target: claude-agent-sdk 0.2.180. No credentials are extracted.
+Public SDK API target: claude-agent-sdk 0.2.187. No credentials are extracted.
 """
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ from .tool_gate import ENDED as GATE_ENDED, EXPIRED as GATE_EXPIRED, HOOK_TIMEOU
 # Largest single message read from Claude Code (SDK `max_buffer_size`; its default is 1 MiB).
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
-SDK_TARGET = '0.2.180'
+SDK_TARGET = '0.2.187'
 SERVER_NAME = 'cutex'
 CALL_FIELD = '_cutex_invocation'
 # Tools a subagent may use in plan mode (besides MCP tools).
@@ -169,9 +169,14 @@ class SdkResponseError(ProviderError):
         texts = [field(block, 'text', '') for block in field(message, 'content', [])]
         from .error_diagnostics import diagnose
         self.diagnostic = diagnose(message, texts)
-        self.additional_details = json.dumps(self.diagnostic.details(), separators=(',', ':'))
+        details = self.diagnostic.details()
         status = self.diagnostic.http_status
-        connection = code in {'server_error', 'unknown'} and self.diagnostic.category in {'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT'}
+        connection = code in {'server_error', 'unknown'} and self.diagnostic.category in {
+            'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT',
+        }
+        if connection:
+            details['diagnosticCode'] = 'unreachable'
+        self.additional_details = json.dumps(details, separators=(',', ':'))
         if code in {'server_error', 'unknown'}:
             if connection:
                 self.codex_error_info = {'httpConnectionFailed': {'httpStatusCode': None}}
@@ -306,7 +311,7 @@ class OfficialSdkDriver:
         exact command) for the rest of the native session only. Never written
         to a settings file."""
         update = getattr(self.sdk, 'PermissionUpdate', None)
-        rule = getattr(self.sdk, 'PermissionRuleValue', None)
+        rule = getattr(getattr(self.sdk, 'types', self.sdk), 'PermissionRuleValue', None)
         if update is None or rule is None:
             return None
         if name in EDIT_TOOLS:
@@ -322,7 +327,7 @@ class OfficialSdkDriver:
         live native session at once (destination session); cutex persists them
         per workspace and passes them as flag settings on every start."""
         update = getattr(self.sdk, 'PermissionUpdate', None)
-        rule = getattr(self.sdk, 'PermissionRuleValue', None)
+        rule = getattr(getattr(self.sdk, 'types', self.sdk), 'PermissionRuleValue', None)
         if update is None or rule is None:
             return None
         values = []
@@ -369,6 +374,9 @@ class OfficialSdkDriver:
                     return self.sdk.PermissionResultAllow(updated_input=args)
                 return self.sdk.PermissionResultDeny(message=CHILD_TOOL_DENIED)
             if engine.permissions.effective_mode(tid) != 'bypassPermissions':
+                owner = self.owners.get(tid)
+                if owner is not None and owner.bridge is bridge:
+                    await owner.tasks.approval_denied(agent_id)
                 return self.sdk.PermissionResultDeny(message=BACKGROUND_NEEDS_APPROVAL)
             safety = getattr(engine, 'safety_grants', None)
             used = safety.consume(tid, name, args, call_id) if safety is not None and call_id else None
@@ -498,9 +506,11 @@ class OfficialSdkDriver:
         options = self.sdk.ClaudeAgentOptions(
             cli_path=str(self.cli), cwd=str(engine.settings.workspace), model=thread['model'],
             effort=engine.thread_effort(tid), thinking=ModelConfig(engine.settings).thinking(),
-            tools={'type':'preset','preset':'claude_code'}, disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{tool.name}' for tool in engine.tools.tools.values() if tool.read_only],
+            tools=[] if engine.settings.personal_assistant else {'type':'preset','preset':'claude_code'},
+            disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{tool.name}' for tool in engine.tools.tools.values() if tool.read_only],
             permission_mode=engine.permissions.effective_mode(tid),
-            extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None, **prompt_args},
+            extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None,
+                        'include-hook-events': None, **prompt_args},
             # One NDJSON message can carry a whole tool result: a screenshot or a large file read is easily
             # over the SDK's 1 MiB default, which ended the turn with CLIJSONDecodeError (2026-10-19).
             max_buffer_size=MAX_MESSAGE_BYTES,
@@ -508,13 +518,16 @@ class OfficialSdkDriver:
             # --strict-mcp-config keeps every other MCP source out; claude.ai connectors (subscription
             # logins only) are fetched by Claude Code only without it.
             mcp_servers={**engine.settings.mcp_servers, SERVER_NAME: server}, strict_mcp_config=not connectors,
-            agents=agent_definitions(self.sdk, engine),
+            agents={} if engine.settings.personal_assistant else agent_definitions(self.sdk, engine),
             # The SDK warns that can_use_tool is never invoked under bypassPermissions; Claude Code still
             # calls it for AskUserQuestion and for its safety checks (NativeTools.approve declines those).
             # Settings sources are the profile's opt-in (project / user = the account home); plugins stay off.
             setting_sources=list(engine.settings.setting_sources), plugins=[], can_use_tool=permission_request,
             # A paused agent holds its next tool call in this hook (tool_gate.py): a long timeout, not the CLI's 600 s.
-            hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool], timeout=HOOK_TIMEOUT)],
+            # This hook owns tool admission and the paused-tool barrier. A
+            # callback failure must be fail-closed, including in Code Mode.
+            hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool], timeout=HOOK_TIMEOUT,
+                                                       on_failure='block')],
                    'PostToolUse': [self.sdk.HookMatcher(hooks=[post_tool])],
                    'PostToolUseFailure': [self.sdk.HookMatcher(hooks=[post_tool])],
                    'SubagentStart': [self.sdk.HookMatcher(hooks=[bridge.subagent_start])],
@@ -768,6 +781,12 @@ class SdkToolBridge:
         return {}
 
     async def pre_tool(self, data: dict, tool_use_id: str | None, context: Any) -> dict:
+        if self.engine.settings.personal_assistant:
+            prefix = f'mcp__{SERVER_NAME}__pa_'
+            name = data.get('tool_name')
+            if (data.get('agent_id') or not isinstance(name, str) or not name.startswith(prefix)
+                    or name.removeprefix(f'mcp__{SERVER_NAME}__') not in self.engine.tools.tools):
+                return self.denied('This assistant can use its own cutex coordination tools only')
         if data.get('agent_id') and data.get('agent_id') in self.background:
             return await self.background_pre_tool(data, tool_use_id)
         binding = self.binding
@@ -1105,7 +1124,8 @@ class SubscriptionEngine(Engine):
                 return
         calls.append(entry)
 
-    def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str) -> bool:
+    def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str,
+                             *, launch_selection: dict | None = None) -> bool:
         """Apply changed host launch defaults only while the native owner is offline.
 
         An unchanged launch descriptor preserves an interactive model override.
@@ -1113,22 +1133,32 @@ class SubscriptionEngine(Engine):
         queued inputs, and never submit or replay an instruction.
         """
         row = self.store.db.execute('SELECT model FROM threads WHERE id=?', (tid,)).fetchone()
-        if row is None:
-            created = self.store.ensure_thread(tid, model, cwd, instructions)
-            self.launch_models_applied.add(tid)
-            return created
-        original = self.store.db.execute('SELECT model FROM thread_launch_models WHERE thread_id=?', (tid,)).fetchone()
-        launch_model = original[0] if original else row[0]
         with self.store.transaction():
+            if row is None:
+                created = self.store.ensure_thread(tid, model, cwd, instructions)
+                if launch_selection is not None:
+                    self._apply_launch_selection(tid, model, launch_selection['effort'])
+                self.launch_models_applied.add(tid)
+                return created
+            original = self.store.db.execute('SELECT model FROM thread_launch_models WHERE thread_id=?', (tid,)).fetchone()
+            launch_model = original[0] if original else row[0]
             self.store.ensure_thread(tid, launch_model, cwd, instructions)
-            if launch_model != model or (self.reset_launch_model and tid not in self.launch_models_applied):
+            if launch_selection is not None or launch_model != model or (self.reset_launch_model and tid not in self.launch_models_applied):
                 owner = getattr(self.driver, 'owners', {}).get(tid)
                 if tid in self.workers or (owner is not None and (not owner.task.done() or owner.lease is not None)):
                     raise RpcError(-32009, 'Close the native runtime before changing its launch model')
                 self.store.db.execute('UPDATE threads SET model=?,updated=? WHERE id=?', (model, time.time(), tid))
                 self.store.db.execute('INSERT OR REPLACE INTO thread_launch_models VALUES(?,?)', (tid, model))
+                if launch_selection is not None:
+                    self._apply_launch_selection(tid, model, launch_selection['effort'])
         self.launch_models_applied.add(tid)
         return False
+
+    def _apply_launch_selection(self, tid: str, model: str, effort: str | None) -> None:
+        from .model_catalog import fast_mode_supported
+        self.store.db.execute('INSERT OR REPLACE INTO thread_efforts VALUES(?,?)', (tid, effort))
+        if self.thread_fast(tid) and not fast_mode_supported(model):
+            self.store.db.execute('INSERT OR REPLACE INTO thread_fast_mode VALUES(?,?)', (tid, False))
 
     def save_model_effort(self, tid: str, model: str, effort, fast: bool | None = None) -> None:
         with self.store.transaction():

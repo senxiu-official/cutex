@@ -15,8 +15,9 @@
 //! changed (purged and re-imported) is re-indexed from the start; rows of a
 //! file that no longer exists are dropped.
 //!
-//! All index writes happen under the usage store lock. Readers pin a SQLite
-//! snapshot and open the ledger files while holding it, then decode outside.
+//! Ledger checkpoints are written under the usage store lock. Report readers
+//! pin a SQLite snapshot and open the ledger files while holding it, then
+//! decode outside. Archive backfill fences each batch against the checkpoint.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -105,7 +106,9 @@ fn index_path(root: &Path) -> PathBuf {
 }
 
 /// Tables this index owns (dropped together on a format change).
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 8] = [
+    "usage_index_archive_samples",
+    "usage_index_archive_ready",
     "usage_index_native_threads",
     "usage_index_entries",
     "usage_index_duplicates",
@@ -113,6 +116,10 @@ const TABLES: [&str; 6] = [
     "usage_index_files",
     "usage_index_meta",
 ];
+
+#[path = "index_archive.rs"]
+mod archive;
+pub(in crate::management::v2) use archive::{ArchiveTotals, read_totals as read_archive_totals};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS usage_index_native_threads (
@@ -210,6 +217,7 @@ impl UsageIndex {
                 stats.files_seen += 1;
                 sync_file(tx.sql(), root, &key, known.get(&key), true, &mut stats)?;
             }
+            archive::mark_catalog_ready(tx.sql())?;
             Ok(stats)
         })?;
         note_sync(&stats);
@@ -249,6 +257,7 @@ impl UsageIndex {
         db.write(|tx| {
             let sql = tx.sql();
             sql.execute_batch(SCHEMA)?;
+            sql.execute_batch(archive::SCHEMA)?;
             let format: Option<i64> = sql
                 .query_row("SELECT value FROM usage_index_meta WHERE key = 'format'", [], |row| row.get(0))
                 .optional()?;
@@ -258,6 +267,7 @@ impl UsageIndex {
                     sql.execute_batch(&format!("DROP TABLE {table};"))?;
                 }
                 sql.execute_batch(SCHEMA)?;
+                sql.execute_batch(archive::SCHEMA)?;
             }
             if format != Some(INDEX_FORMAT) {
                 sql.execute("INSERT INTO usage_index_meta (key, value) VALUES ('format', ?1)", [INDEX_FORMAT])?;
@@ -286,6 +296,7 @@ impl UsageIndex {
             for key in &on_disk {
                 sync_file(sql, root, key, known.get(key), verify, &mut stats)?;
             }
+            archive::mark_catalog_ready(sql)?;
             Ok(stats)
         })?;
         note_sync(&stats);
@@ -503,6 +514,13 @@ fn month_stems(dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 fn drop_file(tx: &Connection, file_id: i64) -> anyhow::Result<()> {
+    // A backfill can still hold this id while a replacement is being indexed.
+    tx.execute(
+        "INSERT INTO usage_index_meta VALUES ('retired_file_id', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+        [file_id],
+    )?;
+    archive::drop_file(tx, file_id)?;
     tx.execute("DELETE FROM usage_index_native_threads WHERE file_id = ?1", [file_id])?;
     tx.execute("DELETE FROM usage_index_entries WHERE file_id = ?1", [file_id])?;
     tx.execute("DELETE FROM usage_index_warnings WHERE file_id = ?1", [file_id])?;
@@ -563,12 +581,17 @@ fn sync_file(
     let file_id = match start {
         Some((file_id, ..)) => file_id,
         None => {
-            tx.execute(
-                "INSERT INTO usage_index_files (source, month, checkpoint, lines, last_unterminated, fingerprint)
-                 VALUES (?1, ?2, 0, 0, 0, x'')",
+            let id = tx.query_row(
+                "INSERT INTO usage_index_files (file_id, source, month, checkpoint, lines, last_unterminated, fingerprint)
+                 VALUES (max(
+                     coalesce((SELECT max(file_id) FROM usage_index_files), 0),
+                     coalesce((SELECT value FROM usage_index_meta WHERE key = 'retired_file_id'), 0)
+                 ) + 1, ?1, ?2, 0, 0, 0, x'') RETURNING file_id",
                 params![key.source, key.month],
+                |row| row.get(0),
             )?;
-            tx.last_insert_rowid()
+            archive::drop_file(tx, id)?;
+            id
         }
     };
     let (offset, mut lines, mut unterminated) = start.take().map_or((0, 0, false), |(_, c, l, u)| (c, l, u));
@@ -591,6 +614,9 @@ fn sync_file(
          (entry_id, observed_at, observed_ms, kind, source, profile_id, file_id, offset, len)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
+    let archive_ready = key.source == OWN_SOURCE
+        && (offset == 0 || known.map(|state| archive::ready(tx, state)).transpose()?.unwrap_or(false));
+    let mut archive_insert = archive::inserter(tx)?;
     let mut piece = Vec::new();
     let mut position = offset;
     loop {
@@ -651,6 +677,21 @@ fn sync_file(
                     line_offset as i64,
                     bytes.len() as i64,
                 ];
+                if key.source == OWN_SOURCE {
+                    if let Some(sample) = &row.archive {
+                        // A duplicate in the tail must not take the place of
+                        // an earlier occurrence that backfill has yet to write.
+                        let earlier = !archive_ready && tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM usage_index_entries WHERE entry_id = ?1 AND file_id = ?2
+                                UNION ALL SELECT 1 FROM usage_index_duplicates WHERE entry_id = ?1 AND file_id = ?2)",
+                            params![row.entry_id, file_id],
+                            |found| found.get::<_, bool>(0),
+                        )?;
+                        if !earlier {
+                            sample.insert(&mut archive_insert, &row.entry_id, file_id, &key.month, row.observed_ms)?;
+                        }
+                    }
+                }
                 let changed = insert_entry.execute(values)?;
                 stats.entries_added += changed as u64;
                 if changed == 0 {
@@ -672,6 +713,9 @@ fn sync_file(
     }
     drop(reader);
     let fingerprint = fingerprint(&mut file, length)?;
+    if archive_ready {
+        archive::mark_ready(tx, file_id, length, &fingerprint)?;
+    }
     tx.execute(
         "UPDATE usage_index_files SET checkpoint = ?2, lines = ?3, last_unterminated = ?4, fingerprint = ?5 WHERE file_id = ?1",
         params![file_id, length as i64, lines as i64, unterminated as i64, fingerprint],
@@ -698,6 +742,7 @@ struct IndexRow {
     kind: i64,
     source: String,
     profile_id: Option<String>,
+    archive: Option<archive::Sample>,
 }
 
 /// One ledger line as the old reader judged it: `Ok(None)` blank,
@@ -733,6 +778,7 @@ fn index_line(bytes: &[u8]) -> Result<Option<IndexRow>, String> {
         kind,
         source,
         profile_id,
+        archive: match entry { UsageLedgerEntry::Usage(sample) => Some(archive::Sample::from_usage(*sample)), _ => None },
     }))
 }
 

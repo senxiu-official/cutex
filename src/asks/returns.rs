@@ -53,6 +53,22 @@ fn record_native_held(state: &mut AskState, session: &str, event_id: &str, reaso
     remove_event_lease(state,session,event_id);
 }
 
+pub(crate) fn hold_replaced_automatic_results(
+    state: &mut AskState, session: &str, verified_events: &[String], generation: u64, now: DateTime<Utc>,
+) {
+    for id in verified_events {
+        if !state.events.get(id).is_some_and(|event|
+            event.cutex_session_id == session && !event.acknowledged && event.turn_id.is_none()
+        ) {
+            continue;
+        }
+        record_native_held(state, session, id, "runtimeGenerationChanged", now);
+        if let Some(event) = state.events.get_mut(id) {
+            event.held_runtime_generation = Some(generation);
+        }
+    }
+}
+
 fn reconcile_native_held(runtime:&dyn AskRuntime,store:&AskStore,now:DateTime<Utc>)->anyhow::Result<()> {
     type Key=(std::path::PathBuf,String);
     static QUERIES:OnceLock<Mutex<std::collections::BTreeMap<Key,DateTime<Utc>>>>=OnceLock::new();
@@ -169,14 +185,20 @@ pub fn return_item(store: &AskStore, state: &AskState, delivery: &DeliveryRecord
             }
         }
         DeliveryKind::State => ReturnItem::State {
+            notice: super::terminal_notices::for_delivery(ask,delivery),
             ask_id: ask.ask_id.clone(),
             title: ask.title.clone(),
             target: target_label(ask),
             // r290 P7: resolve the exact failed attempt, never the newest one.
             failure: delivery.ref_id.strip_prefix(super::handler_failure::PREFIX)
                 .and_then(|n| n.parse::<u32>().ok()).and_then(|n|ask.attempts.iter().find(|r|r.n == n))
-                .and_then(|r|r.handler_failure.clone()),
-            state: if super::delivery::is_gate_notice(delivery) {
+                .and_then(|r|r.handler_failure.clone()).map(|mut failure|{failure.delegation_open=ask.is_open();failure}),
+            state: if delivery.ref_id.starts_with(super::terminal_notices::PREFIX) {
+                super::terminal_notices::for_delivery(ask,delivery).and_then(|n|
+                    if n.closed==Some(CloseOutcome::Completed) {serde_json::to_value(n.execution).ok()}
+                    else {serde_json::to_value(n.closed).ok()})
+                    .and_then(|v|v.as_str().map(str::to_owned)).unwrap_or_else(||"closed".into())
+            } else if super::delivery::is_gate_notice(delivery) {
                 "held: target last turn failed or was interrupted; ask the Director or owner to resume".to_string()
             } else {
                 delivery.ref_id.split('@').next().unwrap_or("changed").to_string()
@@ -209,10 +231,11 @@ pub fn item_json(item: &ReturnItem) -> Value {
             "question_id": question_id,
             "questions": questions,
         }),
-        ReturnItem::State { ask_id, title, target, state, failure } => {
+        ReturnItem::State { ask_id, title, target, state, failure,notice } => {
             let mut value = json!({"kind":"state","ask_id":ask_id,"title":title,"target":target,"state":state});
             // r290 P7
             if let Some(failure) = failure { value["handlerFailure"] = json!(failure); }
+            if let Some(notice)=notice {value["notice"]=json!(notice);}
             if let Some(detail) = state.strip_prefix("held: ") {
                 value["state"] = json!("held");
                 value["detail"] = json!(detail);
@@ -253,6 +276,21 @@ pub(crate) fn oldest_pending(state: &AskState, requester: &str) -> Option<DateTi
         })
         .filter_map(|delivery| super::parse_time(&delivery.created_at))
         .min()
+}
+
+/// An ordinary, unsubmitted occurrence eligible for the shared automatic
+/// inbox. Owner Stop exceptions and review decisions retain their own lanes.
+pub(crate) fn ordinary_automatic_result(state: &AskState, session: &str, delivery: &DeliveryRecord) -> bool {
+    !state.pauses.contains_key(session)
+        && delivery.unsubmitted
+        && !delivery.passive
+        && delivery.owner_input_id.is_none()
+        && delivery.event_id.is_none()
+        && !super::delivery::is_gate_notice(delivery)
+        && !(delivery.kind == DeliveryKind::State && delivery.ref_id.starts_with(REVIEW_REFUSAL_REF_PREFIX))
+        && super::delivery::is_for(state, delivery, session)
+        && super::delivery::actionable(state, delivery)
+        && delivery_admissible(state, session, delivery)
 }
 
 /// Whether `requester` has an actionable "rejected" state item: a delegation
@@ -539,7 +577,7 @@ pub(super) fn event_submission(state: &AskState, event: &EventOutboxRecord, text
 }
 
 /// The ask a return item belongs to.
-fn return_ask_id(item: &ReturnItem) -> &str {
+pub(super) fn return_ask_id(item: &ReturnItem) -> &str {
     match item {
         ReturnItem::Answer { ask_id, .. } | ReturnItem::Question { ask_id, .. } | ReturnItem::State { ask_id, .. } => ask_id,
     }
@@ -618,6 +656,65 @@ pub fn fit_returns(
     fitted.text = text;
     fitted.item_bytes = item_bytes;
     fitted
+}
+
+/// Render one occurrence for its own position in a mixed automatic batch.
+/// The receiver's ordinary result budget and overlength rendering apply.
+pub fn prepare_automatic_result(
+    store: &AskStore,
+    state: &AskState,
+    session: &str,
+    delivery_id: &str,
+    budget: &crate::app_server::external_input::size::Budget,
+    preview_bytes: usize,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<(crate::management::v2::automatic_input::PreparedResult, Submission)>> {
+    let Some(delivery) = state.deliveries.get(delivery_id)
+        .filter(|delivery| ordinary_automatic_result(state, session, delivery))
+    else { return Ok(None); };
+    let Some(item) = return_item(store, state, delivery) else { return Ok(None); };
+    let items = [item];
+    let message_id = new_id("cutex-ordered-result");
+    let fitted = fit_returns(&items, budget, &message_id, preview_bytes);
+    if fitted.included.is_empty() {
+        if !fitted.unfit.is_empty() {
+            super::pause_admission::with_state_or(store, (), |current, _| {
+                if current.deliveries.get(delivery_id) == Some(delivery)
+                    && ordinary_automatic_result(current, session, delivery)
+                {
+                    make_passive(current, session, &[delivery_id.to_owned()], vec![delivery.ask_id.clone()],
+                        format!("{0}: delegation result exceeds receiver limit {1}; it remains readable with delegation_wait / agent_list",
+                            super::EVENT_TOO_LARGE, budget.limit.describe()), now);
+                }
+            })?;
+        }
+        return Ok(None);
+    }
+    let view = super::views::results_view_with_stop_answer(
+        &items,
+        &|ask_id| state.asks.get(ask_id).map(|ask| &**ask),
+        &|answer_id| state.answers.get(answer_id).and_then(|answer| answer.preview.clone()),
+        None,
+    );
+    let artifact_id = store.put_artifact(
+        fitted.text.as_bytes(), "text/plain; charset=utf-8", &[], None, now,
+    )?;
+    let prepared = crate::management::v2::automatic_input::PreparedResult {
+        source: delivery.clone(),
+        native_message_id: message_id.clone(),
+        artifact_id,
+        view: view.clone(),
+    };
+    let submission = Submission {
+        message_id,
+        source_agent: None,
+        event_type: fitted.event_type,
+        text: fitted.text,
+        asks: vec![delivery.ask_id.clone()],
+        attempt: None,
+        view: Some(view),
+    };
+    Ok(Some((prepared, submission)))
 }
 
 /// An event lease whose outcome cannot be reconciled: drop the event and
@@ -764,7 +861,7 @@ pub fn stage_owner_results(
     // Preserve overflow policy and FIFO rather than silently dropping rows.
     if !fitted.deferred.is_empty() || !fitted.unfit.is_empty() { return Ok(false); }
     let view = super::views::results_view(&items,
-        &|id| state.asks.get(id).map(|a| (a.target_cutex_session_id.clone(), a.target_name.clone())).unwrap_or_default(),
+        &|id| state.asks.get(id).map(|ask| &**ask),
         &|id| state.answers.get(id).and_then(|a| a.preview.clone()));
     let artifact = store.put_artifact(fitted.text.as_bytes(), "text/plain; charset=utf-8", &[], None, now)?;
     let reserved = super::pause_admission::with_state_or(store, None, |state, _| {
@@ -805,7 +902,7 @@ pub fn stage_owner_results(
 
 // Same existing aggregate budget and degradation policy, applied inside the
 // final result reservation rather than opening a nested AskStore transaction.
-fn reserve_result_turn(state:&mut AskState,key:&str,requester:&str,limit:usize,now:DateTime<Utc>)->bool {
+pub(crate) fn reserve_result_turn(state:&mut AskState,key:&str,requester:&str,limit:usize,now:DateTime<Utc>)->bool {
     if super::budget::auto_turns_last_hour(state,key,now)>=limit {
         let degraded=super::delivery::degrade_to_passive(state,requester,now);
         if degraded>0 {state.notice("cutex/ask/budgetExceeded",vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.into(),requester.into()],json!({"budget":"autoTurnsPerHour","key":key,"limit":limit,"requester":requester,"degradedToPassive":degraded}));}
@@ -817,7 +914,7 @@ fn reserve_result_turn(state:&mut AskState,key:&str,requester:&str,limit:usize,n
     times.push(now_rfc3339(now));true
 }
 
-fn refund_result_turn(state:&mut AskState,key:&str,now:DateTime<Utc>) {
+pub(crate) fn refund_result_turn(state:&mut AskState,key:&str,now:DateTime<Utc>) {
     // Aggregate multiset: remove exactly one charge at this reservation's
     // timestamp. Equal timestamps are interchangeable; never clear the key.
     if let Some(times)=state.auto_turns.get_mut(key) {
@@ -913,6 +1010,9 @@ pub fn admit_events(
         let Some(event) = state.events.get(event_id) else {
             continue;
         };
+        if event.automatic_batch_id.is_some() {
+            continue;
+        }
         let next_step = is_next_step_event(&event.native_message_id);
         if !in_slot && !next_step {
             continue; // never written: only next-step events go beside a lease
@@ -1127,6 +1227,7 @@ pub fn admit_events(
                 else if status.plan_mode { "planMode" } else { "runtimeUnsupported" }.into());
             continue;
         }
+        let ordered = runtime.ordered_automatic_inputs(&requester, status.runtime_generation);
         // A Stop exception starts a separate result turn. It must never steer
         // into another input or carry QUESTION/STATE items beside that turn.
         if stop_answer_ready(&state,&requester) && status.active_turn_id.is_some() { continue; }
@@ -1207,6 +1308,7 @@ pub fn admit_events(
             .iter()
             .filter_map(|id| state.deliveries.get(id))
             .filter(|delivery| delivery_admissible(&state, &requester, delivery))
+            .filter(|delivery| !ordered || !ordinary_automatic_result(&state, &requester, delivery))
             .filter_map(|delivery| return_item(store, &state, delivery).map(|item| (delivery.delivery_id.clone(), item)))
             .collect();
         let all_items: Vec<ReturnItem> = pairs.iter().map(|(_, item)| item.clone()).collect();
@@ -1221,13 +1323,7 @@ pub fn admit_events(
         let stop_since = stop_answer_ready(&state,&requester).then(||state.pauses[&requester].since.as_str());
         let results_view = super::views::results_view_with_stop_answer(
             &items,
-            &|ask_id| {
-                state
-                    .asks
-                    .get(ask_id)
-                    .map(|ask| (ask.target_cutex_session_id.clone(), ask.target_name.clone()))
-                    .unwrap_or_else(|| (String::new(), None))
-            },
+            &|id| state.asks.get(id).map(|ask| &**ask),
             &|answer_id| state.answers.get(answer_id).and_then(|answer| answer.preview.clone()),
             stop_since,
         );
@@ -1239,7 +1335,8 @@ pub fn admit_events(
         let taken = super::pause_admission::with_state_or(store,None, |state, _| {
             if results_admissible(state,&requester).as_ref()!=Some(&held_turn)
                 || !pairs.iter().all(|(id,_)| state.deliveries.get(id)==expected.deliveries.get(id)
-                    && state.deliveries.get(id).is_some_and(|d|delivery_admissible(state,&requester,d)&&super::delivery::actionable(state,d)&&!d.passive&&super::delivery::is_for(state,d,&requester)))
+                    && state.deliveries.get(id).is_some_and(|d|delivery_admissible(state,&requester,d)&&super::delivery::actionable(state,d)&&!d.passive&&super::delivery::is_for(state,d,&requester)
+                        && (!ordered || !ordinary_automatic_result(state,&requester,d))))
             {
                 return None;
             }

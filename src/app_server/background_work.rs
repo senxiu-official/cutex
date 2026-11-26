@@ -652,6 +652,7 @@ mod tests {
 
     fn status(context: &AppServerRuntimeEventContext) -> Status {
         Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: context.cutex_session_id.clone(),
             thread_id: context.thread_id.clone(),

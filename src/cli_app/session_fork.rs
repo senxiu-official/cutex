@@ -213,6 +213,7 @@ fn creation_defaults(record: &CutexSessionRecord) -> Option<cutex::agent_managem
         profile,
         model,
         reasoning: record.reasoning_defaults.clone(),
+        reasoning_resolution: None,
         permissions: launch_permissions(record).filter(|permissions| permissions.validate_shape().is_ok()),
     })
 }
@@ -245,6 +246,7 @@ fn target_creation_defaults(
         profile: profile.into(),
         model: model.into(),
         reasoning,
+        reasoning_resolution: None,
         permissions: launch_permissions(record).filter(|p| p.validate_shape().is_ok()),
     }
 }
@@ -407,6 +409,10 @@ pub(crate) fn fork_for_management(
         )
     })?;
     let source = store.sessions[&key].clone();
+    if let Some(profile) = request.profile.as_deref().or(source.profile.as_deref()) {
+        use cutex::management::v2::feature_profiles::{require_agent_id, AgentRefusal};
+        require_agent_id(profile).map_err(|_| AgentRefusal.user_input_error())?;
+    }
     let roster = cutex::memory::load_agent_management_directory()
         .map_err(|error|failed("reading fork name scope",error,json!({})))?;
     let name_project = cutex::memory::project_for_session(&roster,&source.cutex_session_id);

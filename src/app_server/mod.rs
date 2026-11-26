@@ -8,6 +8,7 @@ pub mod activity_bridge;
 pub mod bus_bridge;
 pub mod background_work;
 pub mod client;
+pub mod claude_diagnostics;
 pub mod commands;
 pub mod external_input;
 pub mod external_recovery;

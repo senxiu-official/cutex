@@ -200,6 +200,7 @@
             "external",
             "managed",
             "worker",
+            "integration",
             "static"
           ]
         },
@@ -369,6 +370,10 @@
             "string",
             "null"
           ]
+        },
+        "remoteAccess": {
+          "type": "boolean",
+          "description": "Owner-only remote gateway grant (services-remote-access-v1); absent on older hosts means false."
         },
         "ownerScope": {
           "enum": [

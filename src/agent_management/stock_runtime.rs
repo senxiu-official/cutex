@@ -753,6 +753,11 @@ impl AgentManagementProvider {
                         && current.explicit_launch.as_ref() == Some(&review.contract),
                     "stock config changed during readiness; claim retained"
                 );
+                if let Some(resolution) = crate::launch::stock::fresh_effort_resolution(current)? {
+                    anyhow::ensure!(resolution.resolution.value == review.configuration.reasoning,
+                        "reasoning configuration changed during readiness");
+                    current.reasoning_resolution = Some(resolution);
+                }
                 current.app_server_launch_claim_id = None;
                 current.updated_at = chrono::Utc::now().to_rfc3339();
                 receipt.stage = StockRuntimeStage::Ready;

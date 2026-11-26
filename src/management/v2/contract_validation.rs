@@ -86,6 +86,14 @@ fn validate_semantic_event_contract(message: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_method_schema_digest_is_pinned_to_lf() {
+        assert!(!super::CUTEX_METHOD_SCHEMA.contains('\r'));
+        assert_eq!(
+            super::cutex_method_schema_sha256(),
+            "e37b0709d75f0eab5cfad024bc696720e33fc20154964db4afbb40167868f363"
+        );
+    }
 
     #[test]
     fn memory_injection_defaults_update_contract_is_boolean_for_all_runtimes() {

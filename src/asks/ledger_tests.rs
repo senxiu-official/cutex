@@ -222,6 +222,30 @@ fn now_text() -> String {
     super::super::now_rfc3339(now())
 }
 
+#[test]
+fn cancelled_unadmitted_resume_never_inherits_the_previous_failed_turn() {
+    let mut run=Run::new();let id=create(&mut run,"terminal-resume-occurrence");
+    set(&mut run,&id,|ask| {
+        let mut record=attempt(AttemptState::Failed,Some("previous-failed-turn"));
+        record.started_at=Some(now_text());record.ended_at=Some(now_text());
+        record.handler_failure=Some(crate::asks::handler_failure::diagnostic(&json!({"message":"blocked","code":"safety"}),
+            Some("previous-failed-turn"),&Default::default(),now()));
+        ask.attempts.push(record);ask.execution=ExecutionState::Failed;
+    });
+    assert_eq!(run.record(TARGET,&id).state,InputState::InContext);
+    run.write(|s|{crate::asks::awaits::resume_now(s,&id,None,Some("retry"),now()).unwrap();});
+    let retry=run.state.asks[&id].request_input_id();assert_ne!(retry,id);
+    assert_eq!(run.record(TARGET,&retry).state,InputState::Waiting);
+    assert!(run.record(TARGET,&retry).turn_id.is_none());
+    // Even an administrative closure of the unadmitted occurrence cannot
+    // promote it to inContext by reading the old failed attempt's turn.
+    set(&mut run,&id,|ask| {ask.execution=ExecutionState::Interrupted;ask.resume=None;
+        ask.closed=Some(CloseOutcome::Stopped);ask.closed_at=Some(now_text());});
+    let row=run.record(TARGET,&retry);
+    assert_eq!(row.state,InputState::Discarded);assert!(row.turn_id.is_none());
+    assert_eq!(run.record(TARGET,&id).turn_id.as_deref(),Some("previous-failed-turn"));
+}
+
 // ---------------------------------------------------------------------------
 // Delegation request (target side)
 
@@ -414,7 +438,7 @@ fn request_to_another_host_is_recorded_there() {
             local_terminal: false, reconcile_at: None, interrupt_reason: None,
             state: "queued".into(), last_remote_revision: 0, pending_ops: vec![],
             last_error: None, next_attempt_at: None,
-            last_received_at: now_text(), failures: 0, accepted: false,
+            last_received_at: now_text(), failures: 0, accepted: false, admitted: false,
         },
     });
     remote.execution = ExecutionState::Running;
@@ -492,7 +516,11 @@ fn review_settled_then_wait_claim_records_the_claim() {
             }
             set(&mut run, &ask, |ask| ask.closed = Some(outcome));
             assert_eq!(run.record(REQUESTER, &id).surface, Surface::None);
-            run.write(|state| { assert_eq!(crate::asks::delivery::claim_for_wait(state, REQUESTER, &[], "w-review", now()).len(), 1); });
+            run.write(|state| {
+                let claimed=crate::asks::delivery::claim_for_wait(state, REQUESTER, &[], "w-review", now());
+                assert_eq!(claimed.len(),2);assert!(claimed.iter().any(|d|d.delivery_id==id));
+                assert_eq!(claimed.iter().filter(|d|crate::asks::terminal_notices::is_notice(d)).count(),1);
+            });
             let row = run.record(REQUESTER, &id);
             assert_eq!(row.state, InputState::InContext, "{outcome:?}, uncertain={uncertain}");
             assert_eq!(row.evidence, Some(Evidence::ClaimedByWait));
@@ -508,7 +536,8 @@ fn settled_delegation_retires_unchanged_pending_deliveries() {
         let (ask, ids) = pending_result_kinds(&mut run, "settled-live");
         let deliveries = run.state.deliveries.clone();
         run.write(|state| { state.update_ask(&ask, now(), |ask| ask.closed = Some(outcome)); });
-        assert_eq!(run.state.deliveries, deliveries, "the business delivery records are retained");
+        for (id,record) in deliveries.iter(){assert_eq!(&run.state.deliveries[id],record,"existing business delivery retained");}
+        assert_eq!(run.state.deliveries.len(),deliveries.len()+1,"closure adds its own durable state item");
         for id in ids {
             assert!(!crate::asks::delivery::actionable(&run.state, &run.state.deliveries[&id]));
             let row = run.record(REQUESTER, &id);

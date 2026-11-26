@@ -363,6 +363,11 @@ pub fn owner_stop(state: &mut AskState, session: &str, now: DateTime<Utc>) {
 }
 
 pub fn turn_stop(state: &mut AskState, session: &str, owner_authorized: bool, now: DateTime<Utc>) {
+    let affected:Vec<_>=state.asks.values().filter(|a|a.target_cutex_session_id==session && a.is_open()
+        && matches!(a.execution,ExecutionState::Admitted|ExecutionState::Running)).map(|a|a.ask_id.clone()).collect();
+    for id in affected {super::terminal_notices::set_cause(state,&id,
+        if owner_authorized {super::terminal_notices::Actor::Owner}
+        else {super::terminal_notices::Actor::System{component:"turnStop".into()}},"ownerStopped");}
     super::waits::cancel_waits(state, session);
     // A stop supersedes a closed-gate pause: it is the owner's own hold now.
     if runtime_gate_closed(state, session) {

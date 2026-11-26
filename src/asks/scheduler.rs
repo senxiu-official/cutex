@@ -362,6 +362,12 @@ pub enum RespondOutcome {
     Unknown(String),
 }
 
+pub struct QuestionResponse<'a> {
+    pub answers: &'a Value,
+    pub actor: crate::management::v2::interaction_history::Actor,
+    pub answered_at: DateTime<Utc>,
+}
+
 /// The management process's runtime connections, as asks need them.
 pub trait AskRuntime {
     /// The live runtime's owner-input lane. Acquire it before freezing result
@@ -448,6 +454,10 @@ pub trait AskRuntime {
         let _ = (session, generation);
         false
     }
+
+    fn ordered_automatic_inputs(&self, _session: &str, _generation: u64) -> bool {
+        false
+    }
     /// Durable inboxes must reconcile the same identity across runtime
     /// generations. A restart never grants permission to create another event.
     fn durable_next_step(&self, session: &str) -> bool {
@@ -456,7 +466,7 @@ pub trait AskRuntime {
     }
     /// Answer a native pending request (a question) through the same
     /// first-response-wins claim as owner clients (`server_requests`).
-    fn respond_question(&self, session: &str, generation: u64, response_id: &str, request_id: &Value, result: &Value) -> RespondOutcome;
+    fn respond_question(&self, session: &str, generation: u64, response_id: &str, request_id: &Value, response: QuestionResponse<'_>) -> RespondOutcome;
     /// Call a tool of one of the agent's MCP servers as the agent itself
     /// (`mcpServer/tool/call` with the thread's `_meta.threadId`): the
     /// `stop_jobs` cancel of Job Service jobs (delegation await §5).
@@ -776,6 +786,8 @@ pub(super) fn fail_ask(state: &mut AskState, ask_id: &str, code: &str, now: Date
 
 /// [`fail_ask`] with a `lastError` that explains `code`.
 fn fail_ask_with(state: &mut AskState, ask_id: &str, code: &str, detail: Option<&str>, now: DateTime<Utc>) {
+    super::terminal_notices::set_cause(state,ask_id,
+        super::terminal_notices::Actor::System{component:"scheduler".into()},detail.unwrap_or(code));
     state.update_ask(ask_id, now, |ask| {
         ask.execution = ExecutionState::Failed;
         ask.hold = None;
@@ -899,6 +911,8 @@ fn apply_review_verdict(state: &mut AskState, ask_id: &str, verdict: GateVerdict
             }
         }
         GateVerdict::Rejected { gate, note } => {
+            super::terminal_notices::set_cause(state,ask_id,super::terminal_notices::Actor::Owner,
+                note.as_deref().unwrap_or("Capability approval denied"));
             state.update_ask(ask_id, now, |ask| {
                 ask.gate = Some(gate);
                 ask.execution = ExecutionState::Rejected;
@@ -1123,6 +1137,7 @@ pub(crate) fn reconcile_bound(
     super::lease_reconcile::online(store.dir(), lease);
     let restarted = status.runtime_generation != lease.runtime_generation;
     if !restarted && status.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+        super::start_catchup::reconcile(runtime, store, lease, now)?;
         super::lease_reconcile::active_turn(store.dir(), lease);
         return Ok(());
     }
@@ -1944,7 +1959,13 @@ fn admit_continuation(
         }
         if !continuation_permitted || state.asks.get(ask_id).is_none_or(|current|current.revision!=ask.revision
             || controllers.controller(current).ok()!=continuation_controller) {return false;}
-        if routing_admission_in(state, authority, controllers, host, ask_id, routing_required, false, now) != RoutingAdmission::Pass { return false; }
+        let routing = routing_admission_in(state, authority, controllers, host, ask_id, routing_required, false, now);
+        if routing != RoutingAdmission::Pass {
+            if let (RoutingAdmission::Waiting, Some(wake_id)) = (routing, &continuation.bounded_wake_id) {
+                super::continuation::runtime::record_routing_wait(state, ask_id, wake_id, now);
+            }
+            return false;
+        }
         if let Some(wake_id) = &continuation.bounded_wake_id {
             let Some(current) = state.asks.get(ask_id) else { return false };
             // Rendering and the queue snapshot may have raced a declaration,
@@ -1962,11 +1983,15 @@ fn admit_continuation(
         }
         // Spend only after every continuation gate/CAS passed, immediately
         // before the actual attempt/lease commit. No recursive authority fence.
-        if routing_admission_in(state, authority, controllers, host, ask_id, routing_required, true, now) != RoutingAdmission::Pass {
+        let routing = routing_admission_in(state, authority, controllers, host, ask_id, routing_required, true, now);
+        if routing != RoutingAdmission::Pass {
             if let Some(wake_id) = &continuation.bounded_wake_id {
                 state.update_ask(ask_id, now, |ask| {
                     let _ = ask.bounded_continuation.admission_definitely_refused(wake_id, &message_id);
                 });
+                if routing == RoutingAdmission::Waiting {
+                    super::continuation::runtime::record_routing_wait(state, ask_id, wake_id, now);
+                }
             }
             return false;
         }
@@ -2537,6 +2562,11 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
     // requester is offline (§5.9).
     fall_through_questions(store, |requester| !runtime.target_status(requester).online, now)?;
     review_pending(world, store, &mut report, now)?;
+    if store.inspect(|s| s.routing.approvals.values().any(|a|a.state==super::routing_policy::ApprovalState::Pending))? {
+        let notices=with_admission_state(world,store,|state,authority,controllers,host|
+            super::routing_policy::notifications::pending(state,authority,host,controllers))?;
+        super::routing_policy::notifications::publish(store.dir(),notices);
+    }
     timing.stage(ControlStage::StoreRead);
     let state = store.shared()?;
     for lease in state.leases.values() {
@@ -2547,6 +2577,31 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
     super::lease_reconcile::retain(store.dir(), |session| state.leases.contains_key(session));
     report.interrupted.extend(super::stop_settlement::reconcile(world, store, now)?);
     settle_unreachable_stops(world, runtime, store, &mut report, now)?;
+    if store.inspect(|s|s.deliveries.values().any(|d|super::terminal_notices::needs_retirement(s,d)))? {
+        // Lifecycle fence -> directory/controller facts -> AskStore. A busy
+        // fence or failed directory read preserves the unclaimed item.
+        super::routing_policy::integration::try_with_authority_for_world(world, |_| {
+            let Ok(directory)=world.directory() else {return Ok(());};
+            let gone = |session: &str| directory.get(session).is_none_or(|a|a.archived);
+            // Bound each tick to 64 proven-retired delegations; revalidate all
+            // delivery predicates under the keyed mutation's store lock.
+            let records = store.inspect(|s| {
+                let mut records = std::collections::BTreeSet::new();
+                for d in s.deliveries.values() {
+                    if super::terminal_notices::needs_retirement(s,d)
+                        && super::delivery::recipient(s,d).is_some_and(|r|gone(&r)) {
+                        records.insert(d.ask_id.clone());
+                        if records.len() == 64 { break; }
+                    }
+                }
+                records.into_iter().collect::<Vec<_>>()
+            }).map_err(|e|AskError::new("persistence_unavailable",format!("retired notice keys: {e:#}")))?;
+            if records.is_empty() { return Ok(()); }
+            let keys: Vec<_> = records.iter().map(String::as_str).collect();
+            store.with_records(&keys,|s|super::terminal_notices::retire_unreachable(s,&keys,gone,now))
+                .map_err(|e|AskError::new("persistence_unavailable",format!("retired notices: {e:#}")))
+        }).map_err(|e|anyhow::anyhow!("{e}"))?;
+    }
     send_compaction_reminders(runtime, store, world.documents().margin_percent, now)?;
     // Await timeouts (and waits met while the turn still ran).
     super::awaits::poll_follow_up_ended(runtime,store,now)?;
@@ -2554,6 +2609,9 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
         store.with_state(|state| super::awaits::wake_due(state, now))?;
     }
     super::continuation::runtime::tick_due(world, runtime, store, now)?;
+    if world.route_legacy_project_asks() {
+        super::continuation::approval::tick(store, now)?;
+    }
     super::revisions::reconcile(world, store, now)?;
     timing.stage(ControlStage::StoreRead);
     let pending = store.shared()?;
@@ -2913,6 +2971,34 @@ pub(crate) mod tests {
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn future_continuation_wait_does_not_block_another_queued_ask() {
+        use crate::asks::continuation::{self as c,Actor,AttemptIdentity,DeclareRequest,Guards};
+        let (world,dir)=world("routing-other-continuation");
+        let (store,store_dir)=temp_store("routing-other-continuation");
+        let runtime=FakeRuntime::idle(&[TARGET]);let now=Utc::now();
+        let (waiting,queued)=store.with_state(|state| {
+            let waiting=state.create_ask(new_ask("timer-review","waiting review"),now).unwrap().0.ask_id;
+            let context=AttemptIdentity{delegation_id:waiting.clone(),attempt_id:format!("{waiting}#1"),
+                owner_session_id:TARGET.into(),runtime_generation:1,parent_turn_id:"yielded-turn".into()};
+            let idle=Guards{online:true,permission_valid:true,occurrence_valid:true,..Default::default()};
+            let mut data=c::ContinuationData::default();
+            data.declare(&Actor::Agent{session_id:TARGET.into()},&context,&DeclareRequest{
+                action_id:"wait-review".into(),expected_attempt_id:context.attempt_id.clone(),expected_revision:None,
+                note:"waiting for proof".into(),wake:Some(c::WakeCondition::After{delay_seconds:3600})},
+                false,Guards{running_turn:true,..idle},Default::default(),now).unwrap();
+            assert_eq!(data.end_turn(&context,c::EndKind::Normal,Some("stage-note".into()),idle,now,None),c::EndDisposition::StageNote);
+            let ask=state.asks.get_mut(&waiting).unwrap();ask.execution=ExecutionState::Running;ask.bounded_continuation=data;
+            let queued=state.create_ask(new_ask("approved-next","other work"),now).unwrap().0.ask_id;
+            (waiting,queued)
+        }).unwrap();
+        assert!(!store.snapshot().unwrap().leases.contains_key(TARGET));
+        assert_eq!(tick(&world,&runtime,&store,now).unwrap().admitted,vec![queued]);
+        assert_eq!(store.snapshot().unwrap().asks[&waiting].bounded_continuation.current.as_ref().unwrap().state,c::Phase::Waiting);
+        if dir.exists() {std::fs::remove_dir_all(dir).unwrap();}
+        std::fs::remove_dir_all(store_dir).unwrap();
+    }
 
     #[test]
     fn final_admission_always_defers_on_lifecycle_even_without_visible_routing_or_pause() {
@@ -3332,8 +3418,8 @@ pub(crate) mod tests {
             if let Some(hook) = self.read_turn_hook.borrow_mut().take() { hook(); }
             self.turns.borrow().get(turn_id).cloned()
         }
-        fn respond_question(&self, session: &str, _generation: u64, _response_id: &str, request_id: &Value, result: &Value) -> RespondOutcome {
-            self.responses.borrow_mut().push((session.to_string(), request_id.clone(), result.clone()));
+        fn respond_question(&self, session: &str, _generation: u64, _response_id: &str, request_id: &Value, response: QuestionResponse<'_>) -> RespondOutcome {
+            self.responses.borrow_mut().push((session.to_string(), request_id.clone(), json!({"answers":response.answers})));
             RespondOutcome::Submitted
         }
         fn call_mcp_tool(&self, session: &str, server: &str, tool: &str, arguments: &Value) -> anyhow::Result<Value> {
@@ -3618,7 +3704,7 @@ pub(crate) mod tests {
             assert_eq!(tick(&world, &runtime, &store, now).unwrap().admitted, vec![first.clone()]);
             let lease = store.snapshot().unwrap().leases[TARGET].clone();
             let admission = queue.admission(TARGET).unwrap();
-            let before = admission.items.iter().find(|item| item.id == second).unwrap().reference();
+            let before = crate::management::v2::admission::AdmissionRef::ask(second.clone());
             let (moved, _, _, changed) = queue.move_admission_item(TARGET, &owner.queue_id, admission.order_revision,
                 if to_tail { None } else { Some(&before) }, true).unwrap();
             assert!(changed);
@@ -3775,7 +3861,7 @@ pub(crate) mod tests {
         admission.next_step.push(crate::management::v2::admission::AdmissionNextStep {
             id: "pending-bus".into(), delivery_kind: "bus".into(), label: None,
             enqueued_at: now.to_rfc3339(), timing: "afterTurn".into(), next_step_at: None, wait_reason: None, held: None, ask_id: None,
-            from: None, from_host: None, from_cutex_session_id: None, preview: None, eligible: true, settlement: None,
+            from: None, from_host: None, from_peer_instance_id: None, from_cutex_session_id: None, preview: None, eligible: true, settlement: None,
         });
         status.admission = Some(admission);
         assert_eq!(store.with_state(|state| plan_target(state, TARGET, &status, now)).unwrap(), None);
@@ -5203,6 +5289,7 @@ pub(crate) mod tests {
         let now = Utc::now();
         store.with_state(|state| {
             state.events.insert("event".into(), EventOutboxRecord {
+                automatic_batch_id: None,
                 held_runtime_generation: None,
                 event_id: "event".into(), cutex_session_id: REQUESTER.into(), delivery_ids: vec![], native_message_id: "message".into(),
                 event_artifact: None, turn_id: Some("event-turn".into()), acknowledged: false, created_at: now_rfc3339(now), view: None,
@@ -5346,6 +5433,9 @@ pub(crate) mod tests {
             state.notices.clear();
         }).unwrap();
         // Settle whatever the first passes still do.
+        store.with_state(|state| {for item in state.deliveries.values_mut() {
+            item.state=DeliveryState::Acknowledged;item.settled_by=Some("read".into());
+        }}).unwrap();
         for _ in 0..3 {
             tick(&world, &runtime, &store, now).unwrap();
         }

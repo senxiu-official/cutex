@@ -1190,6 +1190,11 @@ pub(crate) fn auto_decide(
     consume: bool,
     director_grant: Option<&DirectorGrant>,
 ) -> Option<ApprovalRecord> {
+    if request.kind == ApprovalKind::WorkflowRun
+        && request.details["unconfirmedSteps"].as_bool() == Some(true)
+    {
+        return None;
+    }
     for rule in &mut store.approval_rules {
         mark_expired(rule, now);
     }
@@ -1815,6 +1820,12 @@ mod tests {
         assert_eq!(workflow_request.details["maxAgents"], 8);
         assert_eq!(workflow_request.details["maxTokens"], 1_500);
         assert!(constraint_match(&workflow_rule, &workflow_request));
+        let mut uncertain = workflow_request.clone();
+        uncertain.details["unconfirmedSteps"] = json!(true);
+        store.with_store(|data| {
+            assert!(auto_decide(data, &uncertain, now, true, None).is_none());
+            assert!(auto_decide(data, &workflow_request, now, true, None).is_some());
+        }).unwrap();
         let mut too_large = workflow_request;
         too_large.details["maxAgents"] = json!(11);
         assert!(!constraint_match(&workflow_rule, &too_large));

@@ -45,6 +45,19 @@ def test_reference_fixed_ids_efforts_and_aliases_are_separate():
     assert "https://code.claude.com/docs/en/model-config" in reference["sourceUrls"]
 
 
+def test_sdk_resolution_is_separate_from_alias_label_and_effort():
+    entries = merge_catalog(reference_catalog(), cli_version="2.1.321", selected_model="opus",
+                            sdk_names={"opus": "Opus"}, sdk_efforts={"opus": ["medium", "high"]},
+                            sdk_resolved={"opus": "claude-opus-5-5"})["entries"]
+    row = next(entry for entry in entries if entry["id"] == "opus")
+    assert row["resolvedModel"] == "claude-opus-5-5"
+    assert row["resolvedModelSource"] == "sdkHandshake"
+    assert row["resolvedDisplayName"] == "Opus 5.5"
+    assert row["resolvedDisplayVersion"] == "5.5"
+    assert row["supportedEffortLevels"] == ["medium", "high"]
+    assert row["displayName"].endswith(" (alias)")
+
+
 def test_nonempty_sdk_catalog_keeps_pinned_versions_without_resolving_aliases():
     rows = indexed(merged(sdk_names={"opus": "Opus 5.5", "future-model": "Provider custom"}))
     assert rows["claude-opus-5-5"]["displayName"] == "Opus 5.5"

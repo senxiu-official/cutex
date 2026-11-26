@@ -347,6 +347,58 @@ fn bounded_bus_legacy_wire_is_unchanged_and_pages_recover_omitted_rows() {
 }
 
 #[test]
+fn indexed_history_matches_legacy_projection_and_skips_other_sessions() {
+    let root = TestRoot::new();
+    let mut selected = vec![
+        row("received-old", "delivered", Some("old")),
+        row("received-visible", "delivered", Some("visible")),
+        row("received-pending", "pending", Some("old")),
+    ];
+    // Historical rows may carry a distinct routing recipient. The received
+    // history predicate has always used the durable owner.
+    selected[1].snapshot.to_cutex_session_id = "renamed-recipient".into();
+    let mut sent = row("sent-visible", "failed", None);
+    sent.owner_cutex_session_id = "elsewhere".into();
+    sent.snapshot.from_cutex_session_id = Some("recipient".into());
+    sent.meta.as_mut().unwrap().facts.sender_turn_id = Some("visible".into());
+    selected.push(sent);
+    let mut self_sent = row("self-sent", "delivered", None);
+    self_sent.snapshot.from_cutex_session_id = Some("recipient".into());
+    selected.push(self_sent);
+    for i in 0..200 {
+        let mut unrelated = row(&format!("unrelated-{i:03}"), "delivered", Some("visible"));
+        unrelated.owner_cutex_session_id = "elsewhere".into();
+        selected.push(unrelated);
+    }
+    let expected = store(selected);
+    fs::write(
+        root.path().join(AGENT_BUS_STATE_FILE),
+        serde_json::to_vec(&expected).unwrap(),
+    ).unwrap();
+    let repo = AgentBusMessageRepository::open(root.path()).unwrap();
+    repo.migrate_legacy_v1().unwrap();
+
+    let window = Window::from_native(&json!({"result":{"thread":{"turns":[{"id":"visible"}]}}}));
+    let (answer, work) = crate::store::metrics::measure(|| repo.bounded_bootstrap("recipient", &window));
+    assert_eq!(answer.unwrap(), bounded(&expected, "recipient", &window).unwrap());
+    assert_eq!(work.rows_visited, 6, "five message rows and the store version");
+    assert_eq!(repo.snapshot("recipient").unwrap(), full_received(&expected, "recipient").unwrap());
+    assert_eq!(repo.sent_snapshot("recipient", 1).unwrap(), full_sent(&expected, "recipient", 1).unwrap());
+    for direction in ["received", "sent"] {
+        let path = format!("?direction={direction}&limit=1");
+        let query = parse_query("recipient", &request(&path)).unwrap();
+        let first = repo.history_page("recipient", &query).unwrap();
+        assert_eq!(first, page(&expected, "recipient", &query).unwrap());
+        let cursor = first["page"]["nextCursor"].as_str().unwrap();
+        let next = parse_query("recipient", &request(&format!("{path}&cursor={cursor}"))).unwrap();
+        assert_eq!(
+            repo.history_page("recipient", &next).unwrap(),
+            page(&expected, "recipient", &next).unwrap(),
+        );
+    }
+}
+
+#[test]
 fn bounded_bus_all_optional_fields_match_full_mode_rows_in_both_directions() {
     // A serialization fixture, not a permissible delivery lifecycle: populate
     // every optional snapshot field so no transport detail can silently vanish.

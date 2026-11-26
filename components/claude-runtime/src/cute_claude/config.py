@@ -166,12 +166,18 @@ class Settings:
     # claude.ai connectors of a subscription login. Claude Code fetches them
     # only without --strict-mcp-config (subscription backend only).
     claude_ai_connectors: bool = False
+    personal_assistant: bool = False
 
     def preset_append(self, instructions: str, permission_mode: str | None = None) -> str:
         """The `append` of the Claude Code preset system prompt for a thread.
 
         ``permission_mode`` is the thread's mode when the session starts
         (``auto`` adds AUTO_MODE_LIMIT)."""
+        if self.personal_assistant:
+            instructions += ("\nYou are the owner's Personal Assistant. Read pa_self for your current project scope. "
+                             "For project work, explain that the Director handles execution. Prepare a concrete request "
+                             "with pa_request_prepare, then ask the owner to confirm it in the conversation. "
+                             "Track its durable state and report the Director's answer. Keep notes in pa_memory_write.")
         base = self.system if self.system_append is None else self.system_append
         limits = RUNTIME_LIMITS if self.allow_exec else RUNTIME_LIMITS + ' ' + NO_EXEC_LIMIT
         if permission_mode == 'auto':
@@ -200,6 +206,9 @@ class Settings:
         if type(self.claude_ai_connectors) is not bool:
             raise ValueError("claude_ai_connectors must be a boolean")
         validate_mcp_servers(self.mcp_servers, self.mcp_tool_filters)
+        if self.personal_assistant and (self.backend != "subscription" or self.allow_write or self.allow_exec
+                or self.setting_sources or self.mcp_servers or self.claude_ai_connectors or self.managed_skills_roots):
+            raise ValueError("Personal Assistants require the scoped cutex tool surface")
         if self.agent_turn_questions not in {"decide", "wait"}:
             raise ValueError("agent_turn_questions must be decide or wait")
         if self.thinking not in {"adaptive", "disabled"}:

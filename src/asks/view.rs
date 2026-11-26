@@ -260,7 +260,7 @@ fn insert_control_value(value: &mut Value, control: Option<Value>, snake: bool) 
 
 /// The current attempt for clients (`AskSummary.attempt`, r208).
 pub fn attempt_summary(attempt: &AttemptRecord) -> Value {
-    json!({
+    let mut value = json!({
         "n": attempt.n,
         "state": attempt.state,
         "turnId": attempt.turn_id,
@@ -282,7 +282,11 @@ pub fn attempt_summary(attempt: &AttemptRecord) -> Value {
         "stopRequested": attempt.stop_requested,
         "stopDeadline": attempt.stop_deadline,
         "stopUnconfirmed": attempt.stop_unconfirmed,
-    })
+    });
+    if attempt.started_at.is_some() && attempt.started_at_inferred {
+        value["startedAtInferred"] = json!(true);
+    }
+    value
 }
 
 
@@ -337,17 +341,17 @@ pub fn with_receipt_projections(
 }
 
 pub fn summary_with_receipts(
-    state: &AskState, ask: &AskRecord,
+    state: &AskState, ask: &AskRecord, position: Option<u64>,
     receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
 ) -> Value {
-    with_receipt_projections(summary(state, ask), ask, receipts)
+    with_receipt_projections(summary_at_position(state, ask, position), ask, receipts)
 }
 
 pub fn owner_view_with_receipts(
-    state: &AskState, ask: &AskRecord,
+    state: &AskState, ask: &AskRecord, position: Option<u64>,
     receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
 ) -> Value {
-    with_receipt_projections(owner_view(state, ask), ask, receipts)
+    with_receipt_projections(owner_view_at_position(state, ask, position), ask, receipts)
 }
 
 pub fn requester_view_with_receipts(
@@ -410,13 +414,72 @@ fn insert_review_refs(value: &mut Value, state: &AskState, ask: &AskRecord) {
             .unwrap_or("Project delegation routing review was denied")))
         .unwrap_or(Value::Null);
 }
+
+/// Navigation and current state for activity rows. These references convey no
+/// action authority; the destination applies its existing access checks.
+fn activity_link(state: &AskState, ask: &AskRecord, summary: &Value) -> Value {
+    let delegation = json!({"kind": "delegation", "askId": ask.ask_id});
+    let (blocker, next) = if !ask.is_open() {
+        (None, "none")
+    } else if ask.execution == ExecutionState::PendingReview || ask.hold == Some(Hold::WaitingForApproval) {
+        (Some("approval"), "openApproval")
+    } else if summary["ownerQuestions"].as_u64().unwrap_or(0) > 0 {
+        (Some("question"), "openDelegation")
+    } else if ask.execution == ExecutionState::Interrupted
+        && ask.current_attempt().and_then(|a| a.interrupt_reason) == Some(InterruptReason::OutcomeUnknown)
+    {
+        (Some("outcomeUnknown"), "openDelegation")
+    } else if ask.review == Some(ReviewState::AwaitingAcceptance) {
+        (Some("acceptance"), "openResult")
+    } else if ask.execution == ExecutionState::Failed {
+        (Some("failed"), "openDelegation")
+    } else {
+        match &ask.hold {
+            Some(Hold::Blocked { by: BlockedReason::Quota }) => (Some("quota"), "openDelegation"),
+            Some(Hold::Blocked { by: BlockedReason::Login }) => (Some("login"), "openDelegation"),
+            Some(Hold::Paused { .. }) => (Some("paused"), "openDelegation"),
+            Some(Hold::WaitingForEvent { .. }) => (Some("waitingForEvent"), "openDelegation"),
+            Some(Hold::TargetBusy { .. }) => (Some("targetBusy"), "wait"),
+            Some(_) => (Some("held"), "openDelegation"),
+            None => (None, "none"),
+        }
+    };
+    let approval = if blocker == Some("approval") {
+        let routing_pending = ask.routing_approval_id.as_ref()
+            .and_then(|id| state.routing.approvals.get(id))
+            .is_some_and(|approval| approval.state == super::routing_policy::ApprovalState::Pending);
+        let kind = if routing_pending { "routing" } else { "capability" };
+        summary["reviewRefs"].as_array()
+            .and_then(|refs| refs.iter().find(|reference| reference["kind"] == kind))
+            .cloned()
+    } else {
+        None
+    };
+    let result = ask.answer_id.as_ref().map(|id| json!({"kind": "delegationResult", "askId": ask.ask_id, "answerId": id}));
+    let next = match next {
+        "openApproval" if approval.is_none() => "openDelegation",
+        "openResult" if result.is_none() => "openDelegation",
+        _ => next,
+    };
+    json!({"delegation": delegation, "approval": approval, "result": result, "blocker": blocker, "next": next})
+}
 // r290 P14: one privacy-safe wait projection for owner, phone and agent lists.
 // No child IDs, declaration text, proofs or action receipts belong in a list.
 pub fn continuation_wait(ask: &AskRecord) -> Value {
     use super::continuation::{Phase, WakeCondition};
-    if !ask.is_open() || ask.follow_up_ended
-        || !ask.current_attempt().is_some_and(|a| a.state == AttemptState::Yielded)
-    {
+    if !ask.is_open() || ask.follow_up_ended {
+        return Value::Null;
+    }
+    let yielded = ask.current_attempt().is_some_and(|a| a.state == AttemptState::Yielded);
+    let data = &ask.bounded_continuation;
+    let approved_submission = super::continuation::runtime::is_approved_wake(data)
+        && data.current.as_ref().and_then(|record| record.wake.as_ref()).is_some_and(|wake| {
+            ask.current_attempt().is_some_and(|attempt| {
+                matches!(attempt.state, AttemptState::Refused | AttemptState::Submitting)
+                    && attempt.continuation.as_ref().and_then(|c| c.bounded_wake_id.as_deref()) == Some(wake.id.as_str())
+            })
+        });
+    if !yielded && !approved_submission {
         return Value::Null;
     }
     if let Some(record) = ask.bounded_continuation.current.as_ref().filter(|r|
@@ -431,8 +494,12 @@ pub fn continuation_wait(ask: &AskRecord) -> Value {
             Some(WakeCondition::Children { .. }) => "children",
             _ => "after",
         };
-        return json!({"state":state,"kind":kind,"since":record.declaration.yielded_at,
+        let mut wait = json!({"state":state,"kind":kind,"since":record.declaration.yielded_at,
             "nextWakeAt":if kind=="after" && state!="limited" {json!(record.next_wake_at)} else {Value::Null}});
+        if let Some(reason) = super::continuation::runtime::waiting_blocker(ask) {
+            wait["blockedReason"] = json!(reason);
+        }
+        return wait;
     }
     if let Some(wait) = &ask.awaiting {
         return json!({"state":if ask.resume.is_some(){"ready"}else{"waiting"},
@@ -446,10 +513,19 @@ pub fn continuation_wait(ask: &AskRecord) -> Value {
 }
 
 pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
+    owner_view_at_position(state, ask, queue_position(state, ask).map(|position| position as u64))
+}
+
+pub(crate) fn owner_view_at_position(state: &AskState, ask: &AskRecord, position: Option<u64>) -> Value {
     let mut value = serde_json::to_value(ask).unwrap_or(Value::Null);
     if let Some(object) = value.as_object_mut() {
-        object.insert("queuePosition".into(), json!(queue_position(state, ask)));
+        object.insert("queuePosition".into(), json!(position));
         object.insert("continuationWait".into(), continuation_wait(ask)); // r290 P14
+        if ask.project_id.is_none() {
+            if let Some(card) = super::continuation::approval::action_card(ask, None) {
+                object.insert("continuationApproval".into(), card);
+            }
+        }
         object.insert("requester".into(), ask_requester(ask));
         object.remove("peerInbound");
         object.insert("lateAnswer".into(), json!(ask.remote.as_ref().and_then(|r|r.late_answer.as_ref())));
@@ -479,11 +555,16 @@ pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
     }
     insert_review_refs(&mut value, state, ask);
     insert_control(&mut value, ask, false);
+    crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
     value
 }
 
 /// Compact list row (`GET /v2/asks`, `agent_list`).
 pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
+    summary_at_position(state, ask, queue_position(state, ask).map(|position| position as u64))
+}
+
+fn summary_at_position(state: &AskState, ask: &AskRecord, position: Option<u64>) -> Value {
     let mut value = json!({
         "continuationWait": continuation_wait(ask), // r290 P14
         "askId": ask.ask_id,
@@ -502,7 +583,7 @@ pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
         "review": ask.review,
         "closed": ask.closed,
         "followUpEnded": ask.follow_up_ended,
-        "queuePosition": queue_position(state, ask),
+        "queuePosition": position,
         "attempts": ask.attempts.len(),
         "answerId": ask.answer_id,
         "openQuestions": state
@@ -528,7 +609,9 @@ pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
         value["admissionFailure"] = json!(code);
     }
     insert_review_refs(&mut value, state, ask);
+    value["activityLink"] = activity_link(state, ask, &value);
     insert_control(&mut value, ask, false);
+    crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
     value
 }
 
@@ -577,6 +660,7 @@ pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, con
     });
     insert_review_refs(&mut value, state, ask);
     insert_control_value(&mut value, control, true);
+    crate::peers::receipt::insert(&mut value, crate::peers::receipt::delegation(ask));
     value
 }
 
@@ -584,6 +668,29 @@ pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, con
 mod tests {
     use super::*;
     use crate::asks::store::tests::new_ask;
+
+    #[test]
+    fn inferred_start_is_optional_in_summary_and_owner_detail() {
+        let mut state = AskState::default();
+        let now = chrono::Utc::now();
+        let id = state.create_ask(new_ask("inferred-start-api", "work"), now).unwrap().0.ask_id;
+        let mut record = AttemptRecord::submitting(1, "native".into(), 1, super::super::now_rfc3339(now));
+        record.started_at = Some(super::super::now_rfc3339(now));
+        // Old records and ordinary observed starts keep their old shape.
+        let old = serde_json::to_value(&record).unwrap();
+        assert!(old.get("startedAtInferred").is_none());
+        let legacy: AttemptRecord = serde_json::from_value(old).unwrap();
+        assert!(!legacy.started_at_inferred);
+        assert!(attempt_summary(&legacy).get("startedAtInferred").is_none());
+        record.started_at_inferred = true;
+        state.update_ask(&id, now, |ask| ask.attempts.push(record));
+        let ask = &state.asks[&id];
+        let row = summary(&state, ask);
+        assert_eq!(row["attempt"]["startedAtInferred"], true);
+        assert_eq!(owner_view(&state, ask)["attempts"][0]["startedAtInferred"], true);
+        crate::management::v2::schema_export::assert_valid("asks", "askList",
+            &json!({"hostId":"fixture","asks":[row],"hasMore":false}));
+    }
 
     #[test]
     fn views_carry_queue_position_and_attempt_ids() {

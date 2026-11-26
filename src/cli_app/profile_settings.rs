@@ -99,7 +99,11 @@ fn apply_profile_settings_patch_inner(
 
     changed |= apply_optional_update(&mut account.source, &patch.source);
     let plan_label = normalize_plan_label(&patch.plan_type)?;
-    changed |= apply_optional_update(&mut account.plan_label, &plan_label);
+    let before_label = account.plan_label.clone();
+    if apply_optional_update(&mut account.plan_label, &plan_label) {
+        cutex::profiles::plan_label::record_change(account, before_label.as_deref());
+        changed = true;
+    }
     changed |= apply_quota_preset_update(account, &patch.quota_preset);
     changed |= apply_optional_update(&mut account.email, &patch.email);
 

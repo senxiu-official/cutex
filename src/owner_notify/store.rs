@@ -140,6 +140,8 @@ pub struct OwnerNotification {
     /// `deliveryFailed`, `idleDelegation` (r217 – r218 also wrote `preActivationSkipped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_review: Option<TemplateReview>,
     /// A runtime safety check the agent's runtime declined under full
     /// access (`systemKind: safetyBlock`, capability
     /// `claude-safety-grants`, docs/safety-grants.md). Its `state` decides
@@ -196,6 +198,15 @@ impl SafetyBlock {
     pub fn is_open(&self) -> bool {
         self.state == Self::BLOCKED
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateReview {
+    pub assistant_id: String,
+    pub schedule_id: String,
+    pub template_revision: i64,
+    pub reason: String,
 }
 
 impl OwnerNotification {
@@ -443,7 +454,7 @@ impl OwnerNotifyState {
         );
     }
 
-    fn notice(&mut self, method: &str, record: &OwnerNotification) {
+    pub(super) fn notice(&mut self, method: &str, record: &OwnerNotification) {
         self.push_notice(method, &record.agent_id, json!({ "notification": record }));
     }
 
@@ -529,6 +540,7 @@ impl OwnerNotifyState {
             actions: Some(decision.actions.clone()),
             system_kind: if origin == Origin::System { system_kind.map(str::to_string) } else { None },
             safety_block: None,
+            template_review: None,
         };
         self.notifications.insert(record.notification_id.clone(), record.clone());
         self.notice(super::CREATED_EVENT, &record);

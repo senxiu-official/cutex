@@ -55,12 +55,16 @@ tomlkit==0.15.1
 trove-classifiers==2026.9.21.13
 """
 SDK_SDIST_SHA256 = {
+    "0.2.187": "40558f133cb57286989521d6b4e89afb1fb9a853268d009716d35d7a9580ae21",
     "0.2.180": "1c0935c881a1b5232e6b6b894078ee79b315d75d449408af2202bddfa990a16c",
     "0.2.175": "cb4739bd91ace43b9a52810a6f1821b9043f1964a40e154b28f6c39c6700337c",
 }
 SOURCE_DATE_EPOCH = "1735689600"
 # sha256 of Anthropic's platform wheels on PyPI. A new SDK pin needs all three wheels reviewed.
 SDK_WHEEL_SHA256 = {
+    ("0.2.187", "windows-x64"): "53e570a9b20849778cd5a8b8f53ca4881609e25e05a680da00bbc8eaf7e3ae55",
+    ("0.2.187", "linux-x64"): "693132296d1ffca857b5d393e449fd138a89bd08024d9a3e519615ba4040d9c3",
+    ("0.2.187", "darwin-arm64"): "83e3a0471f116e08f31dd2c60d5002ff3ea34943fb4cd72a0f57147d93cb97c2",
     ("0.2.180", "windows-x64"): "77c8186cf29c928bd424b5803caf4c69ac91ad00c058bddc86b7bb4e7893c551",
     ("0.2.180", "linux-x64"): "0e5237ce189ae316ffbdfbb205277ea9387222b9c3cb6668ce533335ce7c759d",
     ("0.2.180", "darwin-arm64"): "a4177b29a877f820abfd1b7862e61bcea14e1cd7f16c75fcee364b4d95f4c7c4",
@@ -68,6 +72,7 @@ SDK_WHEEL_SHA256 = {
     ("0.2.175", "linux-x64"): "5f7401b9057face095334e0858ef98ed5b458c2a1852f63df515d5edd49c1ffd",
     ("0.2.175", "darwin-arm64"): "5f1fa909d9885a8af2992e1146c7d1cfc2947602d64f0d3ee0275e8465a9a7a9",
 }
+SDK_CLI_VERSION_METADATA = {"0.2.187": b"2.1.330 (Claude Code)"}
 REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s;#]+)")
 
 
@@ -139,10 +144,17 @@ def download_sdk_wheel(platform: str, version: str, expected_sha256: str, out: P
     if actual != expected_sha256:
         raise SystemExit(f"{wheel.name}: sha256 {actual} is not the pinned {expected_sha256}")
     expected_cli = "claude_agent_sdk/_bundled/claude.exe" if platform == "windows-x64" else "claude_agent_sdk/_bundled/claude"
+    expected_members = [expected_cli]
+    version_path = "claude_agent_sdk/_bundled/claude.version"
+    version_metadata = SDK_CLI_VERSION_METADATA.get(version)
+    if version_metadata is not None:
+        expected_members.append(version_path)
     with zipfile.ZipFile(wheel) as bundle:
         bundled = [name for name in bundle.namelist() if "/_bundled/" in name and not name.endswith((".gitignore", "/"))]
-        if bundled != [expected_cli]:
-            raise SystemExit(f"{wheel.name}: expected only {expected_cli}, got {bundled}")
+        if sorted(bundled) != sorted(expected_members):
+            raise SystemExit(f"{wheel.name}: expected {expected_members}, got {bundled}")
+        if version_metadata is not None and bundle.read(version_path).splitlines() != [version_metadata]:
+            raise SystemExit(f"{wheel.name}: unexpected bundled Claude CLI version metadata")
         if bundle.getinfo(expected_cli).file_size < 1_000_000:
             raise SystemExit(f"{wheel.name}: bundled Claude CLI is unexpectedly small")
         licenses = [name for name in bundle.namelist() if ".dist-info/licenses/" in name and not name.endswith("/")]

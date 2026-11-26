@@ -28,6 +28,24 @@ use serde_json::Value;
 use super::health::RuntimeSnapshot;
 use super::health::ServiceHealth;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn changed_content_by_nonregistrant(before: &ServiceRecord, after: &ServiceRecord, caller: &Caller) -> bool {
+    let registrant = matches!(caller, Caller::Agent { cutex_session_id, .. }
+        if before.owner_cutex_session_id.as_ref() == Some(cutex_session_id));
+    !registrant && execution_source_changed(before, after)
+}
+
+fn execution_source_changed(before: &ServiceRecord, after: &ServiceRecord) -> bool {
+    before.runtime != after.runtime || before.host != after.host || before.port != after.port
+        || before.path != after.path || before.root != after.root || before.command != after.command
+        || before.cwd != after.cwd || before.env != after.env
+        || before.proxy_host_header != after.proxy_host_header
+        || before.login_link_command != after.login_link_command
+}
+
 pub const REGISTRY_FILE: &str = "registry.json";
 pub const STATE_FILE: &str = "state.json";
 pub const DEFAULT_PORT_RANGE_START: u16 = 24400;
@@ -47,6 +65,8 @@ pub enum ServiceRuntime {
     /// A supervised process without a web endpoint; readiness is process liveness.
     Worker,
     Static,
+    /// An owner application integration which publishes notices without a proxy or child process.
+    Integration,
 }
 
 impl ServiceRuntime {
@@ -56,6 +76,7 @@ impl ServiceRuntime {
             Self::Managed => "managed",
             Self::Worker => "worker",
             Self::Static => "static",
+            Self::Integration => "integration",
         }
     }
 
@@ -65,12 +86,17 @@ impl ServiceRuntime {
             "managed" => Some(Self::Managed),
             "worker" => Some(Self::Worker),
             "static" => Some(Self::Static),
+            "integration" => Some(Self::Integration),
             _ => None,
         }
     }
 
     pub fn supervised(self) -> bool {
         matches!(self, Self::Managed | Self::Worker)
+    }
+
+    pub fn has_view(self) -> bool {
+        !matches!(self, Self::Worker | Self::Integration)
     }
 }
 
@@ -86,6 +112,10 @@ pub enum ServiceCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceRecord {
+    /// Owner grants access through the external client-certificate gateway.
+    /// Omitted while false; older records and older-daemon rewrites fail closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remote_access: bool,
     #[serde(default = "default_proxy_host_header")]
     pub proxy_host_header: String,
     pub slug: String,
@@ -192,6 +222,9 @@ pub struct ServiceRecord {
     pub tile_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Binds a notification credential to this registration's execution source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_instance: Option<String>,
 }
 
 /// Who may manage a service (update / restart / unregister / re-register the
@@ -332,8 +365,8 @@ fn provenance_for(caller: &Caller) -> ServiceProvenance {
 
 impl ServiceRecord {
     pub fn require_view(&self) -> ServicesResult<()> {
-        if self.runtime == ServiceRuntime::Worker {
-            return Err(ServicesError::new(409, "service_has_no_view", "This worker has no web view."));
+        if !self.runtime.has_view() {
+            return Err(ServicesError::new(409, "service_has_no_view", "This service has no proxied web view."));
         }
         Ok(())
     }
@@ -533,9 +566,22 @@ where
 
 /// `PATCH /v2/services/{slug}` and `service_update`. `null` clears
 /// optional fields; `env` merges (`"KEY": null` removes a key).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceRegistration {
+    pub created_at: String,
+    pub owner_cutex_session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRequest {
+    /// Optional owner-side compare-and-set for a grant/migration or stale UI.
+    #[serde(default)]
+    pub if_registration: Option<ServiceRegistration>,
+    /// Owner Management PATCH only; never an agent-controlled setting.
+    #[serde(default)]
+    pub remote_access: Option<bool>,
     #[serde(default)]
     pub idle_stop_preset: Option<String>,
     #[serde(default)]
@@ -779,11 +825,16 @@ fn validate_project_id(id: &str) -> ServicesResult<String> {
 
 /// Supervised runtimes need a command; external ones must not have one.
 fn validate_runtime_fields(record: &ServiceRecord) -> ServicesResult<()> {
-    if record.runtime == ServiceRuntime::Worker
+    if !record.runtime.has_view()
         && (record.port != 0 || record.path.is_some() || record.root.is_some()
             || record.tile_path.is_some() || record.login_link_command.is_some())
     {
-        return Err(ServicesError::bad_request("worker forbids port, path, root, tilePath and loginLinkCommand"));
+        return Err(ServicesError::bad_request("portless services forbid port, path, root, tilePath and loginLinkCommand"));
+    }
+    if record.runtime == ServiceRuntime::Integration
+        && (record.owner_cutex_session_id.is_some() || record.project_id.is_some() || record.remote_access)
+    {
+        return Err(ServicesError::bad_request("integrations are owned locally by the desktop owner"));
     }
     if record.runtime == ServiceRuntime::Static {
         if record.root.is_none()
@@ -994,7 +1045,7 @@ impl ServiceStore {
         let registry = self.load()?;
         Ok(registry.settings.ephemeral_idle_minutes == 0
             || registry.services.values().any(|record| {
-                record.runtime == ServiceRuntime::Worker
+                !record.runtime.has_view()
                     || record.purpose.is_some()
                     || record.purpose_owner_set
                     || record.idle_ttl_minutes.is_some()
@@ -1072,6 +1123,19 @@ impl ServiceStore {
         }
         registry.schema_version = registry.schema_version.max(3);
         let result = f(&mut registry)?;
+        for (slug, record) in &mut registry.services {
+            if let Some(previous) = before.services.get(slug) {
+                if previous.notification_instance.is_some()
+                    && (execution_source_changed(previous, record)
+                        || previous.owner_cutex_session_id != record.owner_cutex_session_id
+                        || previous.project_id != record.project_id
+                        || previous.owner_scope != record.owner_scope
+                        || (!previous.archived && record.archived))
+                {
+                    record.notification_instance = None;
+                }
+            }
+        }
         if registry != before {
             registry.revision = before.revision + 1;
             crate::config::atomic::write_private_pretty_json_atomic(
@@ -1139,14 +1203,17 @@ impl ServiceStore {
         let runtime = match request.runtime.as_deref() {
             None => ServiceRuntime::External,
             Some(value) => ServiceRuntime::parse(value).ok_or_else(|| {
-                ServicesError::bad_request("runtime must be external, managed, worker or static")
+                ServicesError::bad_request("runtime must be external, managed, worker, static or integration")
             })?,
         };
-        if runtime == ServiceRuntime::Worker
+        if runtime == ServiceRuntime::Integration && !matches!(caller, Caller::Owner) {
+            return Err(ServicesError::new(403, "owner_only", "only the owner can register an integration"));
+        }
+        if !runtime.has_view()
             && (request.port.is_some() || request.path.is_some() || request.root.is_some()
                 || request.tile_path.is_some() || request.login_link_command.is_some() || request.reveal)
         {
-            return Err(ServicesError::bad_request("worker forbids port, path, root, tilePath, loginLinkCommand and reveal"));
+            return Err(ServicesError::bad_request("portless services forbid port, path, root, tilePath, loginLinkCommand and reveal"));
         }
         if runtime == ServiceRuntime::Static
             && (request.port.is_some()
@@ -1276,7 +1343,7 @@ impl ServiceStore {
                     format!("at most {MAX_SERVICES} services per host"),
                 ));
             }
-            let (port, port_allocated) = if matches!(runtime, ServiceRuntime::Static | ServiceRuntime::Worker) {
+            let (port, port_allocated) = if !runtime.has_view() || runtime == ServiceRuntime::Static {
                 (0, false)
             } else {
                 match (request.port, &existing) {
@@ -1394,7 +1461,8 @@ impl ServiceStore {
             } else {
                 None
             };
-            let record = ServiceRecord {
+            let mut record = ServiceRecord {
+                remote_access: existing.as_ref().is_some_and(|r| r.remote_access && r.owner_cutex_session_id == owner),
                 proxy_host_header: validate_proxy_host_header(
                     request.proxy_host_header.as_deref().unwrap_or("preserve"),
                 )?,
@@ -1448,7 +1516,11 @@ impl ServiceStore {
                     .map(|record| record.created_at.clone())
                     .unwrap_or_else(|| now.clone()),
                 updated_at: now,
+                notification_instance: existing.as_ref().and_then(|record| record.notification_instance.clone()),
             };
+            if existing.as_ref().is_some_and(|before| changed_content_by_nonregistrant(before, &record, caller)) {
+                record.remote_access = false;
+            }
             validate_runtime_fields(&record)?;
             let unchanged = existing.as_ref().is_some_and(|existing| {
                 ServiceRecord {
@@ -1538,7 +1610,9 @@ impl ServiceStore {
         expected: Option<&ServiceRecord>,
     ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
         if matches!(caller, Caller::Agent { .. })
-            && (request.owner_cutex_session_id.is_some()
+            && (request.remote_access.is_some()
+                || request.if_registration.is_some()
+                || request.owner_cutex_session_id.is_some()
                 || request.project_id.is_some()
                 || request.pinned.is_some()
                 || request.purpose.is_some()
@@ -1550,7 +1624,7 @@ impl ServiceStore {
                 || request.archived.is_some())
         {
             return Err(ServicesError::bad_request(
-                "owner, project, retention pin and organisation are owner only",
+                "remoteAccess, owner, project, retention pin and organisation are owner only",
             ));
         }
         let requested_scope = request
@@ -1569,6 +1643,14 @@ impl ServiceStore {
             ensure_owns(&record, caller)?;
             ensure_unchanged(Some(&record), expected.map(Some))?;
             let before = record.clone();
+            if let Some(expected) = &request.if_registration {
+                if expected.created_at != record.created_at
+                    || expected.owner_cutex_session_id != record.owner_cutex_session_id
+                {
+                    return Err(ServicesError::new(409, "service_registration_changed",
+                        "The service registration changed; refresh before changing it."));
+                }
+            }
             if let Some(scope) = requested_scope {
                 if let Caller::Agent { project_id, .. } = caller {
                     if scope == ServiceOwnerScope::Session
@@ -1618,6 +1700,9 @@ impl ServiceStore {
             }
             if let Some(pinned) = request.pinned {
                 record.pinned = pinned;
+            }
+            if let Some(remote_access) = request.remote_access {
+                record.remote_access = remote_access;
             }
             if let Some(group) = &request.group_name {
                 record.group_name = group
@@ -1719,6 +1804,9 @@ impl ServiceStore {
                 record.owner_cutex_session_id =
                     owner.as_deref().map(validate_session_id).transpose()?;
             }
+            if record.owner_cutex_session_id != before.owner_cutex_session_id {
+                record.remote_access = false;
+            }
             if let Some(project) = &request.project_id {
                 record.project_id = project.as_deref().map(validate_project_id).transpose()?;
             }
@@ -1747,7 +1835,7 @@ impl ServiceStore {
                 record.port = 0;
                 record.port_allocated = false;
             }
-            if (record.runtime == ServiceRuntime::Worker) != (before.runtime == ServiceRuntime::Worker) {
+            if record.runtime != before.runtime && (!record.runtime.has_view() || !before.runtime.has_view()) {
                 return Err(ServicesError::bad_request("worker runtime cannot be changed in place; unregister and register a new service"));
             }
             if record.archived {
@@ -1760,6 +1848,9 @@ impl ServiceStore {
             if !super::idle::eligible(&record) || record.stopped || record.archived {
                 record.stopped_idle_at = None;
                 record.idle_wake_failed_at = None;
+            }
+            if changed_content_by_nonregistrant(&before, &record, caller) {
+                record.remote_access = false;
             }
             validate_runtime_fields(&record)?;
             record.ceiling = ceiling_for(record.runtime);
@@ -1836,6 +1927,7 @@ impl ServiceStore {
                     && record.owner_cutex_session_id.as_deref() == Some(cutex_session_id)
                 {
                     record.owner_cutex_session_id = None;
+                    record.remote_access = false;
                     record.updated_at = now_rfc3339();
                     slugs.push(record.slug.clone());
                 }
@@ -2153,6 +2245,7 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
     view["purpose"] = json!(record.purpose);
     view["idleTtlMinutes"] = json!(record.idle_ttl_minutes);
     view["pinned"] = json!(record.pinned);
+    view["remoteAccess"] = json!(record.remote_access);
     view["groupName"] = json!(record.group_name);
     view["starred"] = json!(record.starred);
     view["sortOrder"] = json!(record.sort_order);
@@ -2161,7 +2254,7 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
     view["archived"] = json!(record.archived);
     view["archivedAt"] = json!(record.archived_at);
     view["link"] = json!(service_link(record));
-    if record.runtime == ServiceRuntime::Worker {
+    if !record.runtime.has_view() {
         for field in ["port", "url", "localUrl", "proxyHost", "link"] {
             view[field] = Value::Null;
         }
@@ -2323,6 +2416,85 @@ mod tests {
             slug: slug.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn remote_access_is_owner_patch_only_and_resets_on_new_registration() {
+        let store = temp_store();
+        let (record, _) = store.register(register("remote"), &agent(S1)).unwrap();
+        assert!(!record.remote_access);
+        assert_eq!(service_view(&record, None)["remoteAccess"], false);
+        for value in [true, false] {
+            assert!(serde_json::from_value::<RegisterRequest>(json!({"slug":"remote", "remoteAccess":value})).is_err());
+            let patch = serde_json::from_value(json!({"remoteAccess":value})).unwrap();
+            assert!(store.update("remote", patch, &agent(S1)).is_err());
+        }
+        let patch = serde_json::from_value(json!({"remoteAccess":true})).unwrap();
+        let enabled = store.update("remote", patch, &Caller::Owner).unwrap();
+        assert!(enabled.remote_access);
+        assert!(store.get("remote").unwrap().remote_access);
+        assert_eq!(service_view(&enabled, None)["remoteAccess"], true);
+        assert_eq!(record.launch_fingerprint(), enabled.launch_fingerprint());
+        // Repeating the same agent's registration is an upsert, not a new grant.
+        assert!(store.register(register("remote"), &agent(S1)).unwrap().0.remote_access);
+        store.update("remote", UpdateRequest { display_name:Some("New title".into()), ..Default::default() }, &agent(S1)).unwrap();
+        assert!(store.get("remote").unwrap().remote_access);
+        // A new registrant cannot inherit the previous owner's grant, even when
+        // a project Director was permitted to manage the existing service.
+        let reassigned = store.update("remote", UpdateRequest {
+            owner_cutex_session_id:Some(Some(S2.into())), remote_access:Some(true), ..Default::default()
+        }, &Caller::Owner).unwrap();
+        assert!(!reassigned.remote_access);
+        store.update("remote", UpdateRequest { remote_access:Some(true), ..Default::default() }, &Caller::Owner).unwrap();
+        assert_eq!(store.register(register("remote"), &agent(S1)).unwrap_err().code, "slug_taken");
+        assert!(store.register(register("remote"), &agent(S2)).unwrap().0.remote_access);
+        store.remove("remote", &Caller::Owner).unwrap();
+        assert!(!store.register(register("remote"), &agent(S1)).unwrap().0.remote_access);
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn remote_access_persistence_is_additive_and_absent_is_false() {
+        let store = temp_store();
+        let (record, _) = store.register(register("remote"), &Caller::Owner).unwrap();
+        let old = serde_json::to_value(&record).unwrap();
+        assert!(old.get("remoteAccess").is_none());
+        assert!(!serde_json::from_value::<ServiceRecord>(old.clone()).unwrap().remote_access);
+        let mut future = old;
+        future["remoteAccess"] = json!(true);
+        future["futureAdditiveField"] = json!("ignored");
+        assert!(serde_json::from_value::<ServiceRecord>(future).unwrap().remote_access);
+        store.update("remote", UpdateRequest { remote_access:Some(true), ..Default::default() }, &Caller::Owner).unwrap();
+        let disk = std::fs::read_to_string(store.dir().join(REGISTRY_FILE)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&disk).unwrap()["services"]["remote"]["remoteAccess"], true);
+        store.update("remote", UpdateRequest { remote_access:Some(false), ..Default::default() }, &Caller::Owner).unwrap();
+        assert!(!store.get("remote").unwrap().remote_access);
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn remote_access_grant_fences_registration_and_registrant_removal() {
+        let store = temp_store();
+        let request = RegisterRequest { owner_scope:Some("project".into()), ..register("remote") };
+        let (record, _) = store.register(request, &agent(S1)).unwrap();
+        let stale = UpdateRequest {
+            remote_access:Some(true),
+            if_registration:Some(ServiceRegistration { created_at:"stale".into(), owner_cutex_session_id:Some(S1.into()) }),
+            ..Default::default()
+        };
+        assert_eq!(store.update("remote", stale, &Caller::Owner).unwrap_err().code, "service_registration_changed");
+        assert!(!store.get("remote").unwrap().remote_access);
+        let valid = UpdateRequest {
+            remote_access:Some(true),
+            if_registration:Some(ServiceRegistration { created_at:record.created_at, owner_cutex_session_id:Some(S1.into()) }),
+            ..Default::default()
+        };
+        assert!(store.update("remote", valid, &Caller::Owner).unwrap().remote_access);
+        store.forget_registrant(S1).unwrap();
+        let detached = store.get("remote").unwrap();
+        assert!(detached.owner_cutex_session_id.is_none());
+        assert!(!detached.remote_access);
+        std::fs::remove_dir_all(store.dir()).unwrap();
     }
 
     #[test]

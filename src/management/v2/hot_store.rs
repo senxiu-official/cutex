@@ -6,6 +6,8 @@
 
 #[path = "bus_changes.rs"]
 pub(crate) mod bus_changes;
+#[path = "automatic_input_order.rs"]
+pub(crate) mod automatic_input_order;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(db)
 }
 
-fn read_connection(path: &Path) -> anyhow::Result<Connection> {
+pub(super) fn read_connection(path: &Path) -> anyhow::Result<Connection> {
     let db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -68,7 +70,7 @@ fn read_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(db)
 }
 
-fn connection(path: &Path) -> anyhow::Result<Connection> {
+pub(super) fn connection(path: &Path) -> anyhow::Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -93,6 +95,7 @@ fn connection(path: &Path) -> anyhow::Result<Connection> {
            FOREIGN KEY (store) REFERENCES hot_store_meta(store) ON DELETE CASCADE
          ) WITHOUT ROWID;",
     )?;
+    automatic_input_order::install(&db)?;
     // The expression is maintained by SQLite in the same transaction as each
     // message write, including writes by older binaries. No second projection
     // or invalidation protocol can fall behind the authoritative row.
@@ -101,6 +104,12 @@ fn connection(path: &Path) -> anyhow::Result<Connection> {
          (json_extract(CAST(value_json AS TEXT), '$.snapshot.state'), row_key)
          WHERE store = 'agent_bus' AND collection = 'message';",
     )?;
+    db.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS agent_bus_history_received ON hot_store_rows
+         ({BUS_HISTORY_RECEIVER}) WHERE {BUS_MESSAGE_ROWS};
+         CREATE INDEX IF NOT EXISTS agent_bus_history_sent ON hot_store_rows
+         ({BUS_HISTORY_SENDER}) WHERE {BUS_MESSAGE_ROWS};"
+    ))?;
     // Open presentation obligations by recipient and next attempt (058 C1).
     // Independent of the message state: an ACKed input keeps its display work.
     db.execute_batch(&format!(
@@ -263,6 +272,18 @@ fn meta(connection: &Connection, store: &str) -> anyhow::Result<Option<(u64, boo
 
 pub(crate) fn prepare(path: &Path) -> anyhow::Result<()> { drop(connection(path)?); Ok(()) }
 
+/// Called only for a verified ask store while holding its writer lock.
+pub(crate) fn prepare_ask_short_id_indexes(path: &Path) -> anyhow::Result<()> {
+    use crate::asks::short_id_lookup::{install_indexes, Tier};
+
+    let db = open_connection(path)?;
+    install_indexes(&db, Tier::Hot)?;
+    if table_exists(&db, "asks_archive_rows")? {
+        install_indexes(&db, Tier::Cold)?;
+    }
+    Ok(())
+}
+
 pub(crate) const ADMISSION_CANDIDATE: &str = "store='agent_bus' AND collection='message'
     AND (json_extract(CAST(value_json AS TEXT),'$.snapshot.state') IN ('pending','inbox_accepted','stale_held')
          OR json_extract(CAST(value_json AS TEXT),'$.admissionStartedIdle')=1)
@@ -413,7 +434,7 @@ pub(crate) fn clear_cached_generation() {
     }
 }
 
-fn table_exists(connection: &Connection, table: &str) -> anyhow::Result<bool> {
+pub(super) fn table_exists(connection: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
         [table],
@@ -879,6 +900,37 @@ const SETTLEMENT_OUTBOX_ROWS: &str = "store='agent_bus' AND collection='message'
 
 fn existing_index(db: &Connection, name: &str) -> anyhow::Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",[name],|row|row.get(0))?)
+}
+
+const BUS_MESSAGE_ROWS: &str = "store='agent_bus' AND collection='message'";
+const BUS_HISTORY_RECEIVER: &str = "json_extract(CAST(value_json AS TEXT),'$.ownerCutexSessionId')";
+const BUS_HISTORY_SENDER: &str = "json_extract(CAST(value_json AS TEXT),'$.snapshot.fromCutexSessionId')";
+
+/// Read both directions, or just the requested direction, in the caller's WAL snapshot.
+pub(super) fn bus_history_rows(
+    db: &Connection,
+    received_by: Option<&str>,
+    sent_by: Option<&str>,
+) -> anyhow::Result<Rows> {
+    let mut rows = Rows::new();
+    for (session, field, name) in [
+        (received_by, BUS_HISTORY_RECEIVER, "agent_bus_history_received"),
+        (sent_by, BUS_HISTORY_SENDER, "agent_bus_history_sent"),
+    ] {
+        let Some(session) = session else { continue };
+        // A verified database from an older build is readable even before a
+        // normal writer has installed the indexes.
+        let index = if existing_index(db, name)? { format!(" INDEXED BY {name}") } else { String::new() };
+        let mut query = db.prepare(&format!(
+            "SELECT row_key,value_json FROM hot_store_rows{index} WHERE {BUS_MESSAGE_ROWS} AND {field}=?1"
+        ))?;
+        let mut selected = query.query([session])?;
+        while let Some(row) = selected.next()? {
+            rows.insert(("message".into(), row.get(0)?), row.get(1)?);
+        }
+    }
+    note_bus_rows("agent_bus", rows.len(), rows.values().map(Vec::len).sum());
+    Ok(rows)
 }
 
 pub(crate) fn management_start_rows(db: &Connection, sender: &str, control: &str) -> anyhow::Result<Rows> {

@@ -428,6 +428,28 @@ pub(crate) struct PreparedAdmission {
     projection: Option<(SessionInputState, super::admission::AdmissionSnapshot)>,
 }
 
+/// Read numbered positions without opening a writable repository or projecting
+/// ridealongs. Collection and history reads may run before owner-queue import.
+pub(crate) fn readonly_admission_positions(
+    root: &Path,
+    asks: &crate::asks::store::AskState,
+    sessions: &std::collections::BTreeSet<&str>,
+) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+    let mut positions = std::collections::HashMap::new();
+    if sessions.is_empty() {
+        return Ok(positions);
+    }
+    sql::read_numbered_sessions(root, sessions, |session, stored| {
+        let mut state = admission_projection(stored);
+        let numbered = UserInputRepository::sync_numbered(session, &mut state, asks)?;
+        positions.extend(numbered.items.into_iter()
+            .filter(|item| item.kind == "ask")
+            .map(|item| (item.id, item.position)));
+        Ok(())
+    })?;
+    Ok(positions)
+}
+
 pub fn user_input_repository() -> anyhow::Result<&'static UserInputRepository> {
     USER_INPUT_REPOSITORY.get_or_open(
         || Ok(runtime_dir()?.join("management-v2")),
@@ -734,7 +756,7 @@ impl UserInputRepository {
                     .filter(|(index, _)| last_owner.is_none_or(|last| *index > last))
                     .find(|(_, row)| row.kind == "ask" && asks.asks.get(&row.id)
                         .is_some_and(|ask| ask.execution == crate::asks::model::ExecutionState::Queued && ask.attempts.is_empty()))
-                    .map(|(_, row)| row.reference());
+                    .map(|(_, row)| super::admission::AdmissionRef::ask(row.id.clone()));
                 if let Some(before) = before {
                     state.admission.move_owner(&item.queue_id, Some(&before), true)?;
                 }
@@ -1018,7 +1040,7 @@ impl UserInputRepository {
     pub(crate) fn numbered_admission_with_state(&self, session: &str, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
         self.read_session(session, &[], true, |store| {
             let mut state = admission_projection(store.sessions.get(session));
-            let mut admission = self.sync_numbered(session, &mut state, asks)?;
+            let mut admission = Self::sync_numbered(session, &mut state, asks)?;
             admission.next_step.clear();
             admission.current_turn = None;
             admission.ridealongs_held = None;
@@ -1049,7 +1071,7 @@ impl UserInputRepository {
             for session in &sessions {
                 let (before, revision) = sql::selected(tx.sql(), session, &[], true)?;
                 let mut state = before.clone().unwrap_or_default();
-                let items = self.numbered_items(session, &state, asks);
+                let items = Self::numbered_items(session, &state, asks);
                 state.admission.priority_asks = asks.asks.values().filter(|ask| ask.target_cutex_session_id == *session && ask.resume_pending()).map(|ask| ask.ask_id.clone()).collect();
                 state.admission.sync_approved(items, &approved)?;
                 if before.as_ref().is_none_or(|prior| !prior.admission.persisted_eq(&state.admission)) {
@@ -1063,13 +1085,13 @@ impl UserInputRepository {
         Ok(())
     }
 
-    fn sync_numbered(&self, session: &str, state: &mut SessionInputState, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
-        let items = self.numbered_items(session, state, asks);
+    fn sync_numbered(session: &str, state: &mut SessionInputState, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
+        let items = Self::numbered_items(session, state, asks);
         state.admission.priority_asks = asks.asks.values().filter(|ask| ask.target_cutex_session_id == session && ask.resume_pending()).map(|ask| ask.ask_id.clone()).collect();
         state.admission.sync(items)
     }
 
-    fn numbered_items(&self, session: &str, state: &SessionInputState, asks: &crate::asks::store::AskState) -> Vec<super::admission::AdmissionItem> {
+    fn numbered_items(session: &str, state: &SessionInputState, asks: &crate::asks::store::AskState) -> Vec<super::admission::AdmissionItem> {
         let mut items = super::admission::ask_items(asks, session);
         for stored in &state.items {
             let item = &stored.item;
@@ -1088,7 +1110,7 @@ impl UserInputRepository {
     }
 
     fn sync_admission(&self, session: &str, state: &mut SessionInputState, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
-        self.sync_numbered(session, state, asks)?;
+        Self::sync_numbered(session, state, asks)?;
         if self.host_queue {
             let notes = super::agent_bus_state::agent_bus_message_repository()?.pending_admission_notes(session)?;
             let mut attached = false;
@@ -1103,8 +1125,31 @@ impl UserInputRepository {
             if notes_changed { state.admission.snapshot.revision = next_revision(state.admission.snapshot.revision)?; }
         }
         let mut next_step = super::admission::ask_next_step(asks, session);
+        let mut ordered_automatic_input = None;
         if self.host_queue {
-            next_step.extend(super::agent_bus_state::agent_bus_message_repository()?.pending_admission_messages(session, asks)?);
+            let bus = super::agent_bus_state::agent_bus_message_repository()?;
+            next_step.extend(bus.pending_admission_messages(session, asks)?);
+            if crate::agent_bus::busy_delivery::ordered_for_session(session) {
+                let queue = super::automatic_input::AutomaticInputQueue::at_management_root(
+                    &crate::config::paths::runtime_dir()?.join("management-v2"));
+                let busy = asks.presence.get(session).is_some_and(|p| p.busy);
+                let mut next_step_at = None;
+                if busy {
+                    let candidates = queue.pending(session, asks, bus)?;
+                    let deadline = queue.current_window(session)?
+                        .filter(|window| window.anchored_in(&candidates))
+                        .and_then(|window| window.deadline());
+                    next_step_at = deadline.map(|at| at.to_rfc3339());
+                    let now = Utc::now();
+                    for row in &mut next_step {
+                        if row.eligible && row.held.is_none() && candidates.iter().any(|item| item.id == row.id) {
+                            row.timing = if deadline.is_some_and(|at| at <= now) { "nextStep" } else { "afterTurn" }.into();
+                            row.next_step_at.clone_from(&next_step_at);
+                        }
+                    }
+                }
+                ordered_automatic_input = Some(super::admission::OrderedAutomaticTiming { busy, next_step_at });
+            }
             if next_step.iter().any(|row| row.delivery_kind == "answer" && row.eligible && row.wait_reason.is_none()) {
                 if let Some(context) = crate::asks::result_coalescing::context_for_session(session) {
                     super::admission::project_result_window(
@@ -1132,6 +1177,7 @@ impl UserInputRepository {
             || snapshot.ridealongs_held != ridealongs_held
             || snapshot.owner_yielded != owner_yielded
             || snapshot.auto_retry != auto_retry
+            || snapshot.ordered_automatic_input != ordered_automatic_input
         {
             snapshot.revision = next_revision(snapshot.revision)?;
         }
@@ -1140,6 +1186,7 @@ impl UserInputRepository {
         snapshot.ridealongs_held = ridealongs_held;
         snapshot.owner_yielded = owner_yielded;
         snapshot.auto_retry = auto_retry;
+        snapshot.ordered_automatic_input = ordered_automatic_input;
         Ok(snapshot.clone())
     }
 
@@ -2288,6 +2335,39 @@ drop(repository);
             });
             holder.clear_session(TARGET).unwrap();
         }
+    }
+
+    #[test]
+    fn owner_interrupt_invalidates_an_in_flight_admission_projection() {
+        use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+        let (asks, dir) = temp_store("list-owner-interrupt");
+        let queue = asks.queue_repository().unwrap();
+        let now = Utc::now();
+        let id = asks.with_state(|state| {
+            state.create_ask(new_ask("on-stop", "queued delegation"), now).unwrap().0.ask_id
+        }).unwrap();
+        let active = queue.list_admission(TARGET).unwrap().3;
+        // Keep the last committed projection different from the prepared read
+        // so that this reader would write it back without the CAS.
+        queue.clear_session(TARGET).unwrap();
+        let snapshot = asks.shared().unwrap();
+        let prepared = queue.prepare_list_admission(TARGET, &snapshot).unwrap();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| asks.with_state(|state| {
+                crate::asks::control::owner_stop(state, TARGET, now);
+            }).unwrap()).join().unwrap();
+        });
+
+        assert!(queue.commit_list_admission(TARGET, prepared).unwrap().is_none());
+        let stopped = queue.list_admission(TARGET).unwrap().3;
+        assert_eq!(stopped.ridealongs_held.as_deref(), Some("ownerStop"));
+        assert_eq!(stopped.items.len(), 1);
+        assert_eq!(stopped.items[0].id, id);
+        assert_eq!(stopped.items[0].position, active.items[0].position);
+        assert_eq!(stopped.items[0].state, "paused");
+        drop(queue);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Ordering: a projection computed from an AskState snapshot older than

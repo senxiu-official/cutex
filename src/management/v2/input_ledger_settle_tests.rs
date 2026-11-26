@@ -668,6 +668,7 @@ fn bus_drift_corrects_only_a_state_the_store_proves() {
     use crate::management::v2::input_ledger_bus::{BusFacts, Target};
     let f = Fixture::new();
     let facts = |state: &str, inbox: bool| BusFacts {
+        native_timeline: None,
         stale_release_allowed: false, projection_failure: None,
         delivery_diagnostics: None,
         state: state.into(), timing: Timing::AfterTurn, frozen: false, a2: false, inbox, a4: false,

@@ -716,13 +716,13 @@ fn is_terminal_task_status(status: &str) -> bool {
 }
 
 /// Last recorded status per `<session>|<taskId>`.
-static CLAUDE_TASK_STATUS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static CLAUDE_TASK_STATUS: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
 
 /// Remember `status` for the task; false when it is the one recorded last.
-fn claude_task_status_changed(session: &str, task_id: &str, status: &str) -> bool {
+fn claude_task_status_changed(session: &str, task_id: &str, status: &str, approval_denied: bool) -> bool {
     let key = format!("{session}|{task_id}");
     let mut seen = CLAUDE_TASK_STATUS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if seen.get(&key).map(String::as_str) == Some(status) {
+    if seen.get(&key).is_some_and(|(previous, denied)| previous == status && *denied == approval_denied) {
         return false;
     }
     if seen.len() >= MAX_RUNNING_TASKS {
@@ -733,7 +733,7 @@ fn claude_task_status_changed(session: &str, task_id: &str, status: &str) -> boo
     if is_terminal_task_status(status) {
         seen.remove(&key);
     } else {
-        seen.insert(key, status.to_string());
+        seen.insert(key, (status.to_string(), approval_denied));
     }
     true
 }
@@ -747,7 +747,8 @@ pub fn record_claude_task(cutex_session_id: &str, params: &Value) -> anyhow::Res
     let (Some(task_id), Some(status)) = (task["taskId"].as_str(), task["status"].as_str()) else {
         return Ok(());
     };
-    if !claude_task_status_changed(cutex_session_id, task_id, status) {
+    let approval_denied = task["approvalState"].as_str() == Some("deniedUnattended");
+    if !claude_task_status_changed(cutex_session_id, task_id, status, approval_denied) {
         return Ok(());
     }
     let cut = |value: &Value| value.as_str().map(|text| json!(text.chars().take(500).collect::<String>()));
@@ -756,6 +757,9 @@ pub fn record_claude_task(cutex_session_id: &str, params: &Value) -> anyhow::Res
         if let Some(value) = task.get(field).filter(|v| !v.is_null()) {
             summary[field] = value.clone();
         }
+    }
+    if approval_denied {
+        summary["approvalState"] = json!("deniedUnattended");
     }
     for field in ["description", "command"] {
         if let Some(value) = cut(&task[field]) {

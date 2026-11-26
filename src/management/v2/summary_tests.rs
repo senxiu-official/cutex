@@ -136,6 +136,11 @@ fn native_approval_needs_clear_on_disconnect_and_do_not_return_for_old_generatio
         let online = synth(&agent);
         assert_eq!(online.needs_you_count, 1);
         assert_eq!(online.agents[0]["needs"][0]["kind"], "approval");
+        assert_eq!(online.agents[0]["needs"][0]["activityLink"], json!({
+            "blocker": "approval",
+            "next": "openNativeRequest",
+            "target": {"kind": "nativeRequest", "sessionId": "cutex.a", "requestId": 7},
+        }));
         for status in ["error", "offline", "closing"] {
             agent["runtime"]["status"] = json!(status);
             let gone = synth(&agent);
@@ -287,7 +292,8 @@ fn synthesize_builds_rows_status_needs_and_counts() {
     assert_eq!(need["status"], "needsInput");
     let kinds: Vec<&str> = need["needs"].as_array().unwrap().iter().map(|n| n["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["ownerApproval", "approval", "delegationReview"]);
-    assert_eq!(synthesis.projects, vec![json!({"id":"p1","name":"Proj","color":"blue"})]);
+    assert_eq!(synthesis.projects, vec![json!({"id":"p1","name":"Proj","color":"blue",
+        "online_member_count":1,"last_activity_at":"2026-10-08T00:05:00+00:00"})]);
     assert_eq!(synthesis.approvals_count, 2);
     assert_eq!(synthesis.asks_count, 1);
     // cutex.need + the approval of an unlisted agent.

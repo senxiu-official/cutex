@@ -43,6 +43,7 @@ pub const STATE_DIRS: &[&str] = &[
     // r265 write-only stored profile keys (current key, version and the
     // retired keys kept for redaction; `profiles::stored_keys::KEYS_DIR`).
     "profile-keys",
+    crate::management::v2::feature_profiles::DIR,
     // r266 Kimi accounts (homes with the OAuth credential) and their registry.
     "kimi-accounts",
     "runtime/kimi",
@@ -54,6 +55,8 @@ pub const STATE_DIRS: &[&str] = &[
     "runtime/profile-link",
     "runtime/claude",
     "runtime/asks",
+    "runtime/personal-assistants",
+    "runtime/schedules",
     "runtime/owner-notify",
     "runtime/owner-pins",
     "runtime/documents",
@@ -645,6 +648,35 @@ mod tests {
     }
 
     #[test]
+    fn rollback_backup_contains_assistant_and_schedule_database_snapshots() {
+        let home = temp("assistant-schedules");
+        let dest = temp("assistant-schedules-backup");
+        let mut writers = Vec::new();
+        let stores = [
+            ("runtime/personal-assistants/assistants-v1.sqlite3", 4),
+            ("runtime/schedules/schedules-v1.sqlite3", 2),
+        ];
+        for (relative, version) in stores {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0").unwrap();
+            db.pragma_update(None, "user_version", version).unwrap();
+            writers.push(db);
+        }
+        let manifest = backup(&home, &dest).unwrap();
+        for (relative, version) in stores {
+            assert!(manifest.files.iter().any(|file| file.path == relative && file.sqlite));
+            let copy = rusqlite::Connection::open(dest.join("home").join(relative)).unwrap();
+            let copied_version: i64 = copy.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+            assert_eq!(copied_version, version);
+        }
+        drop(writers);
+        std::fs::remove_dir_all(dest).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn backs_up_files_and_sqlite_snapshots() {
         let (home, source_db) = home();
         let dest = temp("dest");
@@ -850,7 +882,8 @@ mod tests {
             assert!(STATE_FILES.contains(&file), "{file}");
         }
         for dir in ["services", "runtime/users", "runtime/approvals", "runtime/agent-management", "runtime/profile-avatars",
-            crate::profiles::stored_keys::KEYS_DIR, crate::profiles::kimi_accounts::HOMES_DIR, "runtime/kimi"] {
+            crate::profiles::stored_keys::KEYS_DIR, crate::management::v2::feature_profiles::DIR,
+            crate::profiles::kimi_accounts::HOMES_DIR, "runtime/kimi"] {
             assert!(STATE_DIRS.contains(&dir), "{dir}");
         }
     }

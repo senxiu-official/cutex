@@ -27,9 +27,9 @@ class ErrorDiagnostic:
 _HTTP = re.compile(r'^(?:API Error:\s*(?:HTTP\s+)?|HTTP\s+)([45]\d{2})(?=[\s:.,]|$)', re.I)
 _REPEATED_OVERLOAD = re.compile(r'^(?:API Error:\s*)?Repeated\s+529\s+Overloaded\s+errors\b', re.I)
 _NETWORK = re.compile(
-    r'^API Error:\s*(?:Connection (?:dropped|failed|timed out)|'
+    r'^API Error:\s*(?:Connection (?:dropped|failed|refused|timed out)|'
     r"Can.t reach the API server|Request timed out)[^\r\n]{0,240}"
-    r'\((ECONNRESET|ENOTFOUND|ETIMEDOUT)\)', re.I)
+    r'\((ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT)\)', re.I)
 _OVERLOADED = re.compile(r'^(?:API Error:\s*)?overloaded(?:_error)?(?=[\s:.,]|$)', re.I)
 _REQUEST_ID = re.compile(r'req_[A-Za-z0-9]{16,64}', re.ASCII)
 

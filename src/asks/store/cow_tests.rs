@@ -105,6 +105,9 @@ fn merged_history_matches_a_full_decode_and_follows_every_write() {
         state.notices.clear();
         ask.ask_id
     }).unwrap();
+    store.with_state(|state| {for item in state.deliveries.values_mut() {
+        item.state=DeliveryState::Acknowledged;item.settled_by=Some("read".into());
+    }}).unwrap();
     assert_eq!(store.archive_before(Some(cutoff), cutoff).unwrap().asks, 1);
     let hot = store.with_state(|state| state.create_ask(tests::new_ask("cow-hot", "now"), Utc::now()).unwrap().0.ask_id).unwrap();
     let full = || ask_state_from_rows(&crate::asks::archive::history_rows(&store.database_path()).unwrap()).unwrap();

@@ -21,8 +21,19 @@ pub struct ExportedSchema {
 }
 
 pub const SCHEMAS: &[ExportedSchema] = &[
+    ExportedSchema {
+        name:"project-table",title:"Project table summaries and owner lifecycle batches",
+        routes:&["GET /v2/agent-management/projects?includeTableSummary=true", "GET /v2/agent-management/projects/{id}?includeTableSummary=true", "GET /v2/summary?includeTableSummary=true", "POST /v2/agent-management/projects/archive-batch"],
+        text:include_str!("schema/export/project-table.json"),
+    },
     // r290 P6
     ExportedSchema {name:"board",title:"Host project board",routes:&["GET /v2/board", "If-None-Match / ETag"],text:include_str!("schema/export/board.json")},
+    ExportedSchema {
+        name: "feature-profiles", title: "Owner Feature Profiles",
+        routes: &["GET|POST /v2/feature-profiles", "GET|PATCH|DELETE /v2/feature-profiles/{id}"],
+        text: include_str!("schema/export/feature-profiles.json"),
+    },
+    ExportedSchema { name:"text-rewrite", title:"One-shot composer text rewrite", routes:&["POST /v2/text-rewrite"], text:include_str!("schema/export/text-rewrite.json") },
     // r290 P13
     ExportedSchema {
         name: "model-context-settings", title: "Unified Profile model and context settings",
@@ -58,9 +69,21 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     },
     super::archive::api::EXPORTED_SCHEMA,
     ExportedSchema {
+        name: "archived-agents",
+        title: "Archived session statistics and owner batch actions",
+        routes: &["GET /v2/sessions?lifecycle=retired&includeArchiveStats=true", "POST /v2/sessions/archive-batch"],
+        text: include_str!("schema/export/archived-agents.json"),
+    },
+    ExportedSchema {
         name: "host-session", title: "Exact host session catalog row",
         routes: &["GET /v2/host/sessions/{id}"],
         text: include_str!("schema/export/host-session.json"),
+    },
+    ExportedSchema {
+        name: "session-search",
+        title: "Host session and old task search",
+        routes: &["GET /v2/sessions/search"],
+        text: include_str!("schema/export/session-search.json"),
     },
     ExportedSchema {
         name: "session-deltas",
@@ -188,9 +211,15 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         text: include_str!("schema/export/approval-rules.json"),
     },
     ExportedSchema {
+        name: "continuation-approvals",
+        title: "Continuation approvals",
+        routes: &["GET /v2/projects/{id}/delegation-approvals", "GET /v2/projects/{id}/delegations", "GET /v2/delegations/continuation-approvals", "GET /v2/asks/{id}", "POST /v2/delegations/{id}/resume-continuation"],
+        text: include_str!("schema/export/continuation-approvals.json"),
+    },
+    ExportedSchema {
         name: "asks",
         title: "Asks (delegations)",
-        routes: &["GET /v2/asks", "GET /v2/asks/{id}"],
+        routes: &["GET /v2/asks", "GET /v2/asks?idPrefix={hex}", "GET /v2/asks/{id}"],
         text: include_str!("schema/export/asks.json"),
     },
     ExportedSchema {
@@ -504,14 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn background_work_schema_hashes_and_ephemeral_status_contract() {
+    fn background_work_and_claude_diagnostics_schema_hashes_and_ephemeral_status_contract() {
         assert_valid("sessions", "newAgentMemoryInjection", &json!({"memoryInjection":false}));
         assert_valid("sessions", "newAgentMemoryInjection", &json!({}));
         assert!(!validator("sessions", "newAgentMemoryInjection").unwrap().is_valid(&json!({"memoryInjection":null})));
         use sha2::{Digest,Sha256};
         for (name,expected) in [
-            ("sessions","6d6330acac5674c0abdcb70802f366db75e3c84373ba2a87c7e9967f409df957".to_string()),
-            ("events","aaacd6fffa8fbd4d082d64c0409efe0f2f4a0e736e4b0f14c67c8aac8fe1753c".to_string()),
+            ("sessions","2a1df2f56cacb7c17432fd9761ae67ff1051fe6f3f75c76cc6cae62e063a8c6e".to_string()),
+            ("events","8896b6e8967e149d6445abe47a5af4f3b52435993660e10c877e7a27261abe45".to_string()),
         ] {
             let text=SCHEMAS.iter().find(|s|s.name==name).unwrap().text;
             assert!(!text.contains('\r'),"embedded schema must stay LF");
@@ -527,6 +556,15 @@ mod tests {
                 "cursor":"","sequence":0,"cutex":{"method":"cutex/session/backgroundWork/changed","params":params}}));
         }
         let capabilities=super::super::capabilities::capabilities_resource();
+        let diagnostics = json!({"warnings":["configurationNotApplied"],
+            "activeHooks":[{"event":"PreToolUse","startedAtMs":1795542452229_u64}]});
+        assert_valid("sessions", "claudeDiagnostics", &diagnostics);
+        let params = json!({"cutexSessionId":"cutex.a","runtimeGeneration":1,"claudeDiagnostics":diagnostics});
+        assert_valid("events", "sessionClaudeDiagnosticsChanged", &params);
+        assert_valid("events", "sessionStatusEnvelope", &json!({"contractVersion":2,"source":"cutex",
+            "cutexSessionId":"cutex.a","hostId":"test","cursor":"","sequence":0,
+            "cutex":{"method":"cutex/session/claudeDiagnostics/changed","params":params}}));
+        assert_eq!(capabilities["features"]["claudeRuntimeDiagnosticsV1"], true);
         assert_eq!(capabilities["features"]["sessionBackgroundWork"],true);
         assert!(capabilities["featureList"].as_array().unwrap().iter().any(|v|v=="session-background-work"));
     }
@@ -643,6 +681,29 @@ mod tests {
     }
 
     #[test]
+    fn pinned_selection_error_details_match_their_exported_code() {
+        use crate::profiles::pinned_selection::{CODE, UPGRADE_CODE, Unavailable};
+
+        let validator = validator("error", "errorBody").unwrap();
+        for (code, details) in [
+            (CODE, Unavailable::model("fixture", None).details()),
+            (UPGRADE_CODE, json!({"requiredCapability": "offlineLaunchSelection"})),
+        ] {
+            let mut envelope = json!({
+                "contractVersion": 2,
+                "error": {"source": "cutex", "code": code, "message": "fixture",
+                    "retryable": false, "details": details}
+            });
+            assert!(validator.is_valid(&envelope), "{envelope}");
+            envelope["error"]["retryable"] = json!(true);
+            assert!(!validator.is_valid(&envelope));
+            envelope["error"]["retryable"] = json!(false);
+            envelope["error"]["details"] = json!({});
+            assert!(!validator.is_valid(&envelope));
+        }
+    }
+
+    #[test]
     fn ask_handover_view_fields_are_exported_optional_and_match_real_views(){
         use crate::asks::{model::route::{pin,Pin},store::{AskState,tests::new_ask}};
         let mut state=AskState::default();
@@ -742,7 +803,7 @@ mod tests {
     fn real_resources_match_their_schemas() {
         let asks=SCHEMAS.iter().find(|s|s.name=="asks").unwrap();
         assert!(!asks.text.contains('\r'));
-        { use sha2::{Digest,Sha256}; assert_eq!(format!("{:x}",Sha256::digest(asks.text.as_bytes())),"80974457891b038e30d22b007de0a4862e404d2781e95811bd9baa2feae2ce84"); }
+        { use sha2::{Digest,Sha256}; assert_eq!(format!("{:x}",Sha256::digest(asks.text.as_bytes())),"3ecc61bc381599273a971c04fb05898dea8091efb33016ec33622705fc8685e3"); }
         use crate::management::v2::model::{
             EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
         };

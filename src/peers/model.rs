@@ -208,6 +208,9 @@ pub struct Sync {
     pub last_received_at: String,
     pub failures: u32,
     pub accepted: bool,
+    /// Positive scheduler admission observed in an authenticated snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admitted: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

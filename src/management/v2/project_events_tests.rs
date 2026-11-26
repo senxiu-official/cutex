@@ -822,12 +822,14 @@ fn claude_background_commands_start_and_finish_and_runtimes_reset_running_tasks(
 }
 
 #[test]
-fn claude_task_changes_are_recorded_once_per_status() {
+fn claude_diagnostics_task_changes_are_recorded_once_per_status() {
     let session = format!("cutex.status-{}", uuid::Uuid::new_v4());
-    assert!(claude_task_status_changed(&session, "t", "running"));
-    assert!(!claude_task_status_changed(&session, "t", "running"), "progress ticks repeat the status");
-    assert!(claude_task_status_changed(&session, "t", "completed"));
-    assert!(claude_task_status_changed(&session, "t", "completed"), "terminal statuses are forgotten");
+    assert!(claude_task_status_changed(&session, "t", "running", false));
+    assert!(!claude_task_status_changed(&session, "t", "running", false), "progress ticks repeat the status");
+    assert!(claude_task_status_changed(&session, "t", "running", true), "the approval refusal changes the event");
+    assert!(!claude_task_status_changed(&session, "t", "running", true), "progress cannot repeat the refusal event");
+    assert!(claude_task_status_changed(&session, "t", "completed", true));
+    assert!(claude_task_status_changed(&session, "t", "completed", true), "terminal statuses are forgotten");
 }
 
 #[test]

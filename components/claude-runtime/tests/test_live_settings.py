@@ -53,6 +53,39 @@ def flag_requests(client):
             for request in rest if request.get('subtype') == 'apply_flag_settings']
 
 
+async def test_inherited_effort_uses_the_exact_live_connection_without_becoming_explicit(ph):
+    tid = await ph.thread()
+    status = await ph.call('claude/runtime/start', {'threadId': tid})
+    owner = ph.engine.driver.owners[tid]
+    request = {'threadId': tid, 'model': status['model'], 'connectionId': status['connectionId'],
+               'generation': status['nativeConnectionGeneration'], 'effort': 'medium'}
+    assert (await ph.call('claude/effort/applyInherited', request))['effort'] == 'medium'
+    assert flag_requests(owner.client) == [{'effortLevel': 'medium'}]
+    assert ph.engine.thread_effort(tid) is None
+    await ph.call('claude/effort/applyInherited', {**request, 'generation': 99, 'effort': 'low'}, error=True)
+    assert flag_requests(owner.client) == [{'effortLevel': 'medium'}]
+
+
+@pytest.mark.parametrize('cli', ['2.1.290', '2.1.321'])
+async def test_fast_mode_preserves_inherited_effort_before_next_turn(ph, monkeypatch, cli):
+    monkeypatch.setattr(ph.server.model_catalog.probe, 'read', AsyncMock(return_value=cli))
+    tid = await ph.thread()
+    ph.engine.save_model_effort(tid, 'opus', None)
+    status = await ph.call('claude/runtime/start', {'threadId': tid})
+    owner = ph.engine.driver.owners[tid]
+    first = owner.client
+    await ph.call('claude/effort/applyInherited', {
+        'threadId': tid, 'model': 'opus', 'connectionId': status['connectionId'],
+        'generation': status['nativeConnectionGeneration'], 'effort': 'high',
+    })
+    await ph.call('thread/settings/update', {'threadId': tid, 'serviceTier': 'priority'})
+    assert (owner.client is first) == (cli == '2.1.321')
+    assert owner.client.options.effort == 'high'
+    assert flag_requests(owner.client)[-1]['effortLevel'] == 'high'
+    assert owner.snapshot()['reasoningResolution']['effort'] == 'high'
+    assert ph.engine.thread_effort(tid) is None
+
+
 async def test_effort_and_model_change_while_a_turn_runs_go_to_the_running_child(ph, monkeypatch):
     monkeypatch.setattr(ph.server.model_catalog.probe, 'read', AsyncMock(return_value='2.1.301'))
     tid, turn, _ = await running_turn(ph)

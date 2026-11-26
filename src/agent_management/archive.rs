@@ -1178,6 +1178,13 @@ impl AgentManagementProvider {
             && receipt.stage == AgentArchiveStage::Committed
         {
             settle_archive_if_current(path, &receipt);
+            if Some(path.to_path_buf()) == crate::session::store::cutex_sessions_path().ok() {
+                if let Some(record) = receipt.result.as_ref() {
+                    crate::management::v2::archive_jobs::after_archive(
+                        &record.cutex_session_id, record.durable_revision(),
+                    );
+                }
+            }
         }
         Ok(receipt)
     }

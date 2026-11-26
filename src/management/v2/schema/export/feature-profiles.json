@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:feature-profiles",
+  "title": "Owner Feature Profiles",
+  "$ref": "#/$defs/list",
+  "$defs": {
+    "create": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "protocol",
+        "baseUrl",
+        "model",
+        "quotaType",
+        "apiKey"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "protocol": {
+          "enum": [
+            "openaiResponses",
+            "anthropicMessages"
+          ]
+        },
+        "baseUrl": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "quotaType": {
+          "enum": [
+            "subscriptionWindow",
+            "periodicAllowance",
+            "balance",
+            "payAsYouGo"
+          ]
+        },
+        "apiKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "writeOnly": true
+        }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "protocol": {
+          "enum": [
+            "openaiResponses",
+            "anthropicMessages"
+          ]
+        },
+        "baseUrl": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "quotaType": {
+          "enum": [
+            "subscriptionWindow",
+            "periodicAllowance",
+            "balance",
+            "payAsYouGo"
+          ]
+        },
+        "apiKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "writeOnly": true
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "protocol",
+        "baseUrl",
+        "model",
+        "quotaType",
+        "id",
+        "keyPresent"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "protocol": {
+          "enum": [
+            "openaiResponses",
+            "anthropicMessages"
+          ]
+        },
+        "baseUrl": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "quotaType": {
+          "enum": [
+            "subscriptionWindow",
+            "periodicAllowance",
+            "balance",
+            "payAsYouGo"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^fp-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+        },
+        "keyPresent": {
+          "const": true
+        }
+      }
+    },
+    "list": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion",
+        "profiles",
+        "errors"
+      ],
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "profiles": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/item"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "code"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^fp-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+              },
+              "code": {
+                "const": "invalid_feature_profile_record"
+              }
+            }
+          }
+        }
+      }
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion",
+        "profile"
+      ],
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "profile": {
+          "$ref": "#/$defs/item"
+        }
+      }
+    },
+    "deleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion",
+        "deleted"
+      ],
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "deleted": {
+          "const": true
+        }
+      }
+    }
+  }
+}

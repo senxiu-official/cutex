@@ -18,6 +18,144 @@ use std::{
 const ROOT: &str = "access-http-test-root-credential";
 
 #[test]
+fn interaction_history_http_reads_submitted_replies_after_disconnect_with_session_scope() {
+    use crate::app_server::manager::AppServerManagedRuntimeStatus;
+    use crate::management::server::ManagementNativeForwardError;
+    use crate::management::v2::server_requests::{clear_session, record_request, resolve_request};
+
+    const SESSION: &str = "cutex.interaction-history";
+    const HISTORY: &str = "/v2/sessions/cutex.interaction-history/history/interactions";
+    const RESPOND: &str = "/v2/sessions/cutex.interaction-history/app-server/server-request-responses";
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let mut record = crate::session::model::CutexSessionRecord::new(
+        SESSION.into(), Some("interaction-thread".into()), crate::platform::host::current_host_name(),
+        instance.root.to_string_lossy().into_owned(), None,
+    ).unwrap();
+    record.runtime_generation = 7;
+    record.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
+    let mut sessions = crate::session::model::CutexSessionStore::default();
+    sessions.sessions.insert(SESSION.into(), record);
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+
+    let users = UserStore::open_default().unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let user = users.create_user("History reader", None, Grant {
+        standalone_agents: [SESSION.into()].into(), send: true, ..Grant::default()
+    }, "root").unwrap();
+    let token = tokens.issue("history-reader").unwrap();
+    users.bind_token(&token.token_id, Some(&user.id), "root").unwrap();
+    let outsider = users.create_user("Outside history", None, Grant::default(), "root").unwrap();
+    let outsider_token = tokens.issue("outside-history").unwrap();
+    users.bind_token(&outsider_token.token_id, Some(&outsider.id), "root").unwrap();
+
+    let mut ctx = p2_context();
+    ctx.load_runtime_status = |session| Ok((session == SESSION).then(|| AppServerManagedRuntimeStatus {
+        background_work: None,
+        claude_diagnostics: None,
+        cutex_session_id: SESSION.into(),
+        thread_id: "interaction-thread".into(),
+        runtime_generation: 7,
+        connected: true,
+        active_turn_id: Some("question-turn".into()),
+        active_turn_observed_at: None,
+        thread_status: None,
+        thread_status_observed_at: None,
+        thread_settings: None,
+        thread_settings_source: None,
+        thread_settings_complete: false,
+        thread_settings_observed_at: None,
+        runtime_workspace_roots: None,
+        instruction_sources: None,
+        resume_snapshot_observed_at: None,
+        event_method_counts: Default::default(),
+        initialized_user_agent: None,
+        last_event_at: None,
+        last_error: None,
+    }));
+    ctx.respond_native_server_request = |session, generation, reply| {
+        assert_eq!((session, generation), (SESSION, 7));
+        match reply["id"].as_str() {
+            Some("failed") => Err(ManagementNativeForwardError::BeforeForward("fixture".into())),
+            Some("uncertain") => Err(ManagementNativeForwardError::OutcomeUnknown("fixture".into())),
+            Some("1") => {
+                // A disconnect can clear the claim before the writer returns.
+                clear_session(session).unwrap();
+                Ok(())
+            }
+            _ => {
+                // Resolution may arrive before the Management write returns.
+                assert!(resolve_request(session, generation, &reply["id"]).unwrap());
+                Ok(())
+            }
+        }
+    };
+    let post = |token: &str, body: Value| {
+        exchange_with(ctx, "POST", RESPOND, Some(token), body.to_string().into_bytes(), "application/json",
+            "If-Match: \"cutex-runtime-generation:7\"\r\n").0
+    };
+    let question = json!({"id":1,"method":"item/tool/requestUserInput","params":{
+        "turnId":"question-turn","questions":[{"id":"q","question":"Which?","options":null},
+            {"id":"secret","question":"Private input","isSecret":true,"options":null}] }});
+    record_request(SESSION, 7, question.clone()).unwrap();
+    let answer = json!({"responseId":"question-reply","native":{"message":{"id":1,"result":{"answers":{
+        "q":{"answers":["Windows"]},"secret":{"answers":["fixture-password"]}}}}}});
+    assert_eq!(post(&token.token, answer.clone()), 200);
+    assert_eq!(post(ROOT, answer), 200, "a retry must keep the original answerer");
+
+    for (id, status) in [("1", 200), ("failed", 502), ("uncertain", 409), ("cancelled", 200), ("abandoned", 0)] {
+        record_request(SESSION, 7, json!({"id":id,"method":"item/commandExecution/requestApproval","params":{
+            "turnId":"approval-turn","command":"git status","reason":"Inspect worktree"}})).unwrap();
+        if id == "abandoned" {
+            assert!(resolve_request(SESSION, 7, &json!(id)).unwrap());
+            continue;
+        }
+        let reply = if id == "cancelled" {
+            json!({"id":id,"error":{"code":-32800,"message":"cancelled"}})
+        } else {
+            json!({"id":id,"result":{"decision":"decline"}})
+        };
+        assert_eq!(post(ROOT, json!({"responseId":id,"native":{"message":reply}})), status);
+    }
+    clear_session(SESSION).unwrap();
+
+    // The offline context has a registry but panics if asked for native history.
+    let get = |path: &str, token: Option<&str>| {
+        let (status, _, bytes) = exchange_with(p2_context(), "GET", path, token, vec![], "application/json", "");
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap_or_default())
+    };
+    REMOTE.with(|remote| remote.set(true));
+    let unauthenticated = get(HISTORY, None);
+    REMOTE.with(|remote| remote.set(false));
+    assert_eq!(unauthenticated.0, 401);
+    let (status, first) = get(&format!("{HISTORY}?limit=1"), Some(&token.token));
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["contractVersion"], 2);
+    assert_eq!(first["interactions"][0]["native"]["id"], "1");
+    assert_eq!(first["interactions"][0]["result"], json!({"decision":"decline"}));
+    assert_eq!(first["interactions"][0]["actor"], json!({"kind":"owner"}));
+    let cursor = first["nextCursor"].as_str().unwrap();
+    let (_, older) = get(&format!("{HISTORY}?limit=1&cursor={cursor}"), Some(ROOT));
+    assert_eq!(older["interactions"][0]["native"], question);
+    assert_eq!(older["interactions"][0]["actor"], json!({"kind":"user","userId":user.id,"name":"History reader"}));
+    assert_eq!(older["interactions"][0]["result"], json!({"answers":{"q":{"answers":["Windows"]}}}));
+    assert_eq!(older["interactions"][0]["redactedQuestionIds"], json!(["secret"]));
+    assert!(chrono::DateTime::parse_from_rfc3339(older["interactions"][0]["answeredAt"].as_str().unwrap()).is_ok());
+    assert!(older["nextCursor"].is_null());
+    let (_, turn) = get(&format!("{HISTORY}?turnIds=%5B%22question-turn%22%2C%22a-different-turn%22%5D"), Some(ROOT));
+    assert_eq!(turn["interactions"], older["interactions"]);
+    assert_eq!(get(&format!("{HISTORY}?cursor=broken"), Some(ROOT)).0, 400);
+    assert_eq!(get("/v2/sessions/cutex.missing/history/interactions", Some(ROOT)).0, 404);
+    let (status, denied) = get(HISTORY, Some(&outsider_token.token));
+    assert_eq!(status, 404, "{denied}");
+    assert!(denied.get("interactions").is_none());
+    crate::management::v2::interaction_history::forget_deleted_session(SESSION).unwrap();
+    let (_, empty) = get(HISTORY, Some(ROOT));
+    assert_eq!(empty["interactions"], json!([]));
+    assert!(empty["nextCursor"].is_null());
+}
+
+#[test]
 fn scoped_offline_submit_http_never_receives_owner_runtime_review_authority() {
     use std::sync::atomic::{AtomicUsize,Ordering};
     static OWNER_STARTS:AtomicUsize=AtomicUsize::new(0);
@@ -280,6 +418,149 @@ fn guides_preferences_dispatch_shares_owner_state_and_enforces_device_scope() {
     assert!(reset.1["skippedThrough"].is_null());
     assert!(reset.1["updatedAt"].is_string());
     assert!(storage.exists());
+}
+
+#[test]
+fn feature_profiles_http_is_owner_only_and_never_projects_credentials() {
+    use crate::management::v2::{feature_profiles, schema_export::assert_valid};
+
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let users = UserStore::open_default().unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let member = users.create_user("Feature Profile member", None, Grant::default(), "root").unwrap();
+    let member_token = tokens.issue("feature-profile-member").unwrap();
+    users.bind_token(&member_token.token_id, Some(&member.id), "root").unwrap();
+    let path = feature_profiles::PATH;
+    let create = json!({
+        "name":"Rewrite provider", "protocol":"openaiResponses", "baseUrl":"http://127.0.0.1:9/v1",
+        "model":"rewrite-fixture", "quotaType":"balance", "apiKey":"synthetic-fixture-key"
+    });
+    assert_valid("feature-profiles", "create", &create);
+    assert_eq!(exchange("POST", path, None, &create).0, 401);
+    assert_eq!(exchange("POST", path, Some(&member_token.token), &create).0, 403);
+    let (status, created) = exchange("POST", path, Some(ROOT), &create);
+    assert_eq!(status, 201, "{created}");
+    assert_valid("feature-profiles", "detail", &created);
+    assert!(!created.to_string().contains("synthetic-fixture-key"));
+    let id = created["profile"]["id"].as_str().unwrap();
+    let item = format!("{path}/{id}");
+    assert_eq!(exchange("GET", &item, Some(&member_token.token), &json!({})).0, 403);
+    let narrowed = tokens.issue_scoped("feature-rewrite-read", crate::management::client_tokens::DeviceScope::Read).unwrap();
+    users.bind_token(&narrowed.token_id, Some(OWNER), "root").unwrap();
+    let rewrite = |route| exchange("POST", "/v2/text-rewrite", Some(&narrowed.token),
+        &json!({"templateId":"prompt-enhance-v1","text":"fixture","route":route}));
+    for route in [
+        json!({"mode":"featureProfiles","featureProfileIds":[id]}),
+        json!({"mode":"profile","profileIds":[id]}),
+        json!({"mode":"agent","sessionId":"cutex.missing","fallbackFeatureProfileIds":[id]}),
+        json!({"mode":"agent","sessionId":"cutex.missing","fallbackProfileIds":[id]}),
+    ] {
+        let (status, error) = rewrite(route);
+        assert_eq!((status,code(&error)), (403,"device_scope_denied"), "{error}");
+    }
+    let (status, error) = exchange("POST", "/v2/text-rewrite", Some(ROOT), &json!({
+        "templateId":"prompt-enhance-v1", "text":"fixture",
+        "route":{"mode":"agent","sessionId":"cutex.missing"},
+    }));
+    assert_eq!((status,code(&error)), (422,"invalid_rewrite_route"), "{error}");
+
+    let (status, listed) = exchange("GET", path, Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{listed}");
+    assert_valid("feature-profiles", "list", &listed);
+    assert_eq!(listed["profiles"], json!([created["profile"]]));
+    let (status, ordinary) = exchange("GET", "/v2/profiles", Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{ordinary}");
+    assert!(!ordinary.to_string().contains(id));
+    assert!(!ordinary.to_string().contains("Rewrite provider"));
+    let capability = exchange("GET", "/v2/capabilities", Some(ROOT), &json!({})).1;
+    assert_eq!(capability["features"]["featureProfiles"], true);
+
+    let (status, patched) = exchange("PATCH", &item, Some(ROOT), &json!({"quotaType":"periodicAllowance"}));
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["profile"]["quotaType"], "periodicAllowance");
+    let recorded = feature_profiles::provider(id).unwrap().unwrap();
+    assert_eq!(recorded.key, crate::profiles::stored_keys::SecretKey::new("synthetic-fixture-key").unwrap());
+    assert_eq!(exchange("PATCH", &item, Some(ROOT), &json!({"apiKey":null})).0, 400);
+    let (status, _) = exchange("PATCH", &item, Some(ROOT), &json!({"apiKey":"synthetic-replacement"}));
+    assert_eq!(status, 200);
+    let recorded = feature_profiles::provider(id).unwrap().unwrap();
+    assert_eq!(recorded.key, crate::profiles::stored_keys::SecretKey::new("synthetic-replacement").unwrap());
+
+    let (status, deleted) = exchange("DELETE", &item, Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{deleted}");
+    assert_valid("feature-profiles", "deleted", &deleted);
+    assert_eq!(exchange("GET", &item, Some(ROOT), &json!({})).0, 404);
+    assert!(feature_profiles::provider(id).unwrap().is_none());
+}
+
+#[test]
+fn feature_profiles_http_reports_control_port_refusals() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let config = crate::profiles::model::CodezConfig {
+        management_port: Some(35470),
+        agent_bus_port: Some(35460),
+        ..Default::default()
+    };
+    crate::config::store::save_codez_config(&config).unwrap();
+
+    let path = crate::management::v2::feature_profiles::PATH;
+    let mut create = json!({
+        "name":"Rewrite provider", "protocol":"openaiResponses",
+        "baseUrl":"http://127.0.0.1:35470/v1", "model":"rewrite-fixture",
+        "quotaType":"balance", "apiKey":"synthetic-fixture-key"
+    });
+    let (status, error) = exchange("POST", path, Some(ROOT), &create);
+    assert_eq!((status, code(&error)), (400, "feature_profile_control_port"));
+
+    create["baseUrl"] = json!("invalid URL");
+    let (status, error) = exchange("POST", path, Some(ROOT), &create);
+    assert_eq!((status, code(&error)), (400, "invalid_feature_profile"));
+
+    create["baseUrl"] = json!("https://example.invalid/v1");
+    let (status, created) = exchange("POST", path, Some(ROOT), &create);
+    assert_eq!(status, 201, "{created}");
+    let id = created["profile"]["id"].as_str().unwrap();
+    let item = format!("{path}/{id}");
+    let patch = json!({"baseUrl":"http://127.0.0.1:35460/v1"});
+    let (status, error) = exchange("PATCH", &item, Some(ROOT), &patch);
+    assert_eq!((status, code(&error)), (400, "feature_profile_control_port"));
+
+    let (status, current) = exchange("GET", &item, Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{current}");
+    assert_eq!(current["profile"]["baseUrl"], create["baseUrl"]);
+}
+
+#[test]
+fn feature_profiles_list_marks_damaged_files_and_keeps_create_available() {
+    use crate::management::v2::{feature_profiles, schema_export::assert_valid};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let good = feature_profiles::create_rewrite_fixture();
+    let ids = ["fp-00000000-0000-4000-8000-000000000001", "fp-00000000-0000-4000-8000-000000000002"];
+    let root = crate::config::paths::config_dir().unwrap().join(feature_profiles::DIR);
+    std::fs::write(root.join(format!("{}.json",ids[0])), "invalid synthetic private payload").unwrap();
+    std::fs::write(root.join(format!("{}.json",ids[1])), vec![b'X'; 16385]).unwrap();
+    let list = || {
+        let (status, value) = exchange("GET", feature_profiles::PATH, Some(ROOT), &json!({}));
+        assert_eq!(status, 200, "{value}");
+        assert_valid("feature-profiles", "list", &value);
+        assert_eq!(value["errors"], json!([
+            {"id":ids[0],"code":"invalid_feature_profile_record"},
+            {"id":ids[1],"code":"invalid_feature_profile_record"},
+        ]));
+        assert!(!value.to_string().contains("synthetic private payload"));
+        value["profiles"].as_array().unwrap().iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+    };
+    assert_eq!(list(), [good.clone()]);
+    let added = feature_profiles::create_rewrite_fixture();
+    let mut found = list();
+    found.sort_unstable();
+    let mut expected = vec![good, added];
+    expected.sort_unstable();
+    assert_eq!(found, expected);
 }
 
 #[test]
@@ -653,6 +934,46 @@ fn exchange_with_tokens(
 
 fn code(value: &Value) -> &str {
     value.pointer("/error/code").and_then(Value::as_str).unwrap_or("")
+}
+
+#[test]
+fn service_notifications_loopback_listener_accepts_only_the_non_browser_service_bearer() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let slug = "service-notification-http-test";
+    let (status, service) = exchange("POST", "/v2/services", Some(ROOT), &json!({
+        "slug": slug,
+        "runtime": "integration",
+        "displayName": "Service notification test",
+        "lifetime": "persistent",
+    }));
+    assert_eq!(status, 201, "{service}");
+    let settings = serde_json::to_value(crate::services::notifications::Settings {
+        enabled: true,
+        ..Default::default()
+    }).unwrap();
+    let (status, configured) = exchange(
+        "PUT", &format!("/v2/services/{slug}/notification-settings"), Some(ROOT), &settings,
+    );
+    assert_eq!(status, 200, "{configured}");
+    let (status, issued) = exchange(
+        "POST", &format!("/v2/services/{slug}/notification-credential"), Some(ROOT),
+        &json!({"mode": "manual"}),
+    );
+    assert_eq!(status, 201);
+    let token = issued["token"].as_str().unwrap();
+    assert!(token.starts_with("ctsvc1_"));
+
+    let route = format!("/v2/services/{slug}/notifications");
+    let body = json!({"title": "Synthetic service notice", "priority": "normal", "dedupKey": "loopback"});
+    let (status, value) = exchange("POST", &route, Some(token), &body);
+    assert_eq!(status, 201, "{value}");
+    assert_eq!(value["disposition"], "accepted");
+    let (status, _, response) = exchange_raw(
+        "POST", &route, Some(token), &body, "Origin: https://service-notification.invalid\r\n",
+    );
+    assert_eq!(status, 401);
+    assert_eq!(code(&serde_json::from_slice(&response).unwrap()), "service_credential_required");
 }
 
 #[test]
@@ -2688,6 +3009,10 @@ fn credential_locations_are_denied_for_read_chat_on_all_owner_token_transports()
     let alias=instance.root.join("ordinary-alias.txt");std::fs::hard_link(&secret,&alias).unwrap();
     let config=crate::config::paths::config_dir().unwrap();
     let key=config.join("profile-keys/test.json");std::fs::create_dir_all(key.parent().unwrap()).unwrap();std::fs::write(&key,"synthetic credential").unwrap();
+    let feature_key = config.join(crate::management::v2::feature_profiles::DIR)
+        .join("fp-00000000-0000-4000-8000-000000000000.json");
+    std::fs::create_dir_all(feature_key.parent().unwrap()).unwrap();
+    std::fs::write(&feature_key, "synthetic credential").unwrap();
     let report=config.join("projects/p/memory/MEMORY.md");let artifact=config.join("runtime/artifacts/blobs/ab/hash");
     for file in [&report,&artifact] {std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(file,"ordinary preview").unwrap();}
     let mut runtime_cases = Vec::new();
@@ -2705,7 +3030,7 @@ fn credential_locations_are_denied_for_read_chat_on_all_owner_token_transports()
                     let out=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(&token.token),&json!({}));
                     REMOTE.with(|r|r.set(false));out
                 };
-                for file in [&secret,&alias,&key].into_iter().chain(runtime_cases.iter()) {
+                for file in [&secret,&alias,&key,&feature_key].into_iter().chain(runtime_cases.iter()) {
                     let (status,value)=read(file);
                     if scope.is_full() {assert_eq!(status,200,"{value}");assert_eq!(value["content"],"synthetic credential");}
                     else {assert_eq!((status,code(&value)),(403,"credential_read_denied"),"{scope:?} paired={paired} remote={remote}: {value}");assert!(value["error"]["message"].as_str().unwrap().contains("full owner token"));}

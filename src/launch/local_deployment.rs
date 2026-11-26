@@ -917,7 +917,7 @@ fn validate_copied_history(
 }
 
 #[cfg(target_os = "linux")]
-fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
+pub(crate) fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     for process in std::fs::read_dir("/proc")? {
         let process = process?;
         if process
@@ -954,7 +954,7 @@ fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 #[cfg(windows)]
-fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
+pub(crate) fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     use std::os::windows::fs::OpenOptionsExt;
     // Denying write sharing conflicts with an already open rollout writer.
     match std::fs::OpenOptions::new().read(true).share_mode(1).open(history) {
@@ -964,10 +964,10 @@ fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     }
 }
 #[cfg(target_os = "macos")]
-fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
+pub(crate) fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     Ok(!crate::platform::macos_proc::open_writers(history)?.is_empty())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn has_history_writer(_: &Path) -> anyhow::Result<bool> {
+pub(crate) fn has_history_writer(_: &Path) -> anyhow::Result<bool> {
     anyhow::bail!("local adoption requires Linux")
 }

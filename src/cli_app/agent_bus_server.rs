@@ -2023,6 +2023,7 @@ fn run_agent_bus_with_service_root(
     // Single instance: held for the whole serve loop, taken before binding.
     let _migration_guard = cutex::peers::strip::daemon_guard()?;
     let _host_lock = acquire_agent_bus_host_lock(service_root)?;
+    super::asks_runtime::warm_short_id_indexes();
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("Failed to bind cutex agent bus on 127.0.0.1:{port}"))?;
     println!(

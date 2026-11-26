@@ -20,10 +20,43 @@ use super::model::RunError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AskPoll {
-    Pending { activity: Option<String>, tokens: u64, blocked: bool },
+    Pending { activity: Option<String>, tokens: u64, blocked: bool, quota_reset_known: bool },
     Answered { text: String, tokens: u64 },
     Failed { code: String, message: String, tokens: u64 },
     Missing,
+}
+
+/// The owner ask action ids emitted by the workflow engine. Repair attempts
+/// have the same prefix and stay subject to the same redelivery rules.
+pub fn is_workflow_step(ask: &AskRecord) -> bool {
+    if !matches!(ask.requester, Requester::Owner) {
+        return false;
+    }
+    let mut parts = ask.action_id.split(':');
+    let (Some(run), Some(step)) = (parts.next(), parts.next()) else { return false };
+    let Some(run) = run.strip_prefix("wr-") else { return false };
+    let Some((digest, occurrence)) = step.split_once('#') else { return false };
+    run.len() == 16 && run.bytes().all(|b| b.is_ascii_hexdigit())
+        && digest.len() == 16 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        && occurrence.parse::<u64>().is_ok_and(|number| number > 0)
+        && matches!(parts.next(), None | Some("repair")) && parts.next().is_none()
+}
+
+pub fn quota_reset_matches(
+    ask: &AskRecord, pending: &crate::management::v2::quota_continue::Pending,
+) -> bool {
+    !pending.estimated && ask.current_attempt().is_some_and(|attempt| {
+        attempt.runtime_generation == pending.runtime_generation
+            && attempt.turn_id.is_some()
+            && attempt.turn_id == pending.turn_id
+    })
+}
+
+pub(crate) fn step_may_have_effects(ask: &AskRecord, attempt: &AttemptRecord) -> bool {
+    attempt.activity.tool_calls != 0
+        || !attempt.activity.in_flight_tools.is_empty()
+        || attempt.native_diff_artifact.is_some()
+        || !ask.jobs.is_empty()
 }
 
 fn run_error(code: &str, message: impl Into<String>) -> RunError {
@@ -59,7 +92,20 @@ pub fn poll(store: &AskStore, ask_ids: &[String]) -> HashMap<String, AskPoll> {
             return out;
         }
     };
+    let has_quota_holds = ask_ids.iter().any(|id| state.asks.get(id)
+        .is_some_and(|ask| matches!(ask.hold, Some(Hold::Blocked { by: BlockedReason::Quota }))));
+    let quota_state = has_quota_holds.then(|| {
+        crate::management::v2::quota_continue::Store::open_default()
+            .and_then(|store| store.snapshot()).ok()
+    }).flatten();
     for id in ask_ids {
+        let history;
+        let state = if state.asks.contains_key(id) {
+            &state
+        } else {
+            history = store.lookup_snapshot(&[id]).ok();
+            history.as_ref().unwrap_or(&state)
+        };
         let Some(ask) = state.asks.get(id) else {
             out.insert(id.clone(), AskPoll::Missing);
             continue;
@@ -76,11 +122,17 @@ pub fn poll(store: &AskStore, ask_ids: &[String]) -> HashMap<String, AskPoll> {
                     .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned());
                 match text {
                     Some(text) => AskPoll::Answered { text, tokens },
-                    None => AskPoll::Failed { code: "no_answer".into(), message: "the step ended without a final message".into(), tokens },
+                    None => AskPoll::Failed { code: "outcome_unknown".into(), message: "the step's final answer is unavailable".into(), tokens },
                 }
             }
             ExecutionState::Failed => AskPoll::Failed {
-                code: "step_failed".into(),
+                code: if ask.current_attempt().is_some_and(|attempt| {
+                    attempt.handler_failure.as_ref().is_some_and(|failure| matches!(
+                        failure.kind,
+                        crate::asks::handler_failure::FailureKind::Quota
+                            | crate::asks::handler_failure::FailureKind::RateLimited
+                    )) && step_may_have_effects(ask, attempt)
+                }) { "outcome_unknown" } else { "step_failed" }.into(),
                 message: ask.attempts.last().and_then(|a| a.last_error.clone()).unwrap_or_else(|| "the step's turn failed".into()),
                 tokens,
             },
@@ -98,9 +150,15 @@ pub fn poll(store: &AskStore, ask_ids: &[String]) -> HashMap<String, AskPoll> {
                 AskPoll::Failed { code: "stopped".into(), message: "the step was stopped".into(), tokens }
             }
             ExecutionState::PendingReview | ExecutionState::Queued | ExecutionState::Admitted | ExecutionState::Running => {
-                let blocked = matches!(ask.hold, Some(Hold::Blocked { by: BlockedReason::Login | BlockedReason::Quota }));
+                let quota = matches!(ask.hold, Some(Hold::Blocked { by: BlockedReason::Quota }));
+                let blocked = quota || matches!(ask.hold, Some(Hold::Blocked { by: BlockedReason::Login }));
+                let quota_reset_known = quota && {
+                    quota_state.as_ref().and_then(|state| state.sessions.get(&ask.target_cutex_session_id))
+                        .and_then(|session| session.pending.as_ref())
+                        .is_some_and(|pending| quota_reset_matches(ask, pending))
+                };
                 let activity = ask.attempts.last().and_then(|a| a.activity.line.clone());
-                AskPoll::Pending { activity, tokens, blocked }
+                AskPoll::Pending { activity, tokens, blocked, quota_reset_known }
             }
         };
         out.insert(id.clone(), poll);

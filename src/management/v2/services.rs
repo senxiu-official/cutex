@@ -10,6 +10,7 @@
 //!   (capability `services-eligible-owners`; all known non-archived sessions)
 //! - `PATCH  /v2/services/{slug}` → `{service}`; `ownerCutexSessionId` reassigns
 //!   (must name an existing, non-archived cutex session; `null` clears);
+//!   `remoteAccess: bool` owner-only gateway grant (`services-remote-access-v1`);
 //!   `ownerScope: session|project` (capability `services-project-scope`;
 //!   project needs a `projectId`, settable in the same request)
 //! - `DELETE /v2/services/{slug}` → `{slug, removed: true}`
@@ -358,10 +359,20 @@ impl ServicesContext {
         Ok(view)
     }
 
+    fn snapshot(&self, slug: &str) -> Option<crate::services::health::RuntimeSnapshot> {
+        match &self.supervisor {
+            Some(supervisor) => supervisor.snapshot(slug),
+            None => self.store.load_state().remove(slug),
+        }
+    }
+
     /// The tile answer of a service (cached, see [`crate::services::tile`]).
     fn tile(&self, slug: &str) -> ServicesResult<(ServiceRecord, Value)> {
-        let record = self.store.get(slug)?;
-        let fetchable = crate::services::tile::fetchable(&record, self.snapshots().get(slug));
+        let (record, snapshot) = match self.supervisor.as_ref().and_then(|s| s.tile_record(slug)) {
+            Some(cached) => cached,
+            None => (self.store.get(slug)?, self.snapshot(slug)),
+        };
+        let fetchable = crate::services::tile::fetchable(&record, snapshot.as_ref());
         // A full caller may have fetched a static tile from a credential
         // namespace. Narrowed readers must resolve it under their own policy.
         let scope = tile_cache_scope(self.store.dir());
@@ -394,7 +405,7 @@ impl ServicesContext {
                 "the service tile has no image",
             ));
         };
-        if !tile::fetchable(&record, self.snapshots().get(slug)) {
+        if !tile::fetchable(&record, self.snapshot(slug).as_ref()) {
             return Err(ServicesError::new(
                 502,
                 "tile_image_unavailable",
@@ -1266,6 +1277,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn remote_access_owner_patch_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cutex-remote-access-{}", uuid::Uuid::new_v4()));
+        let context = ServicesContext {
+            store: ServiceStore::new(&dir, "fixture").with_port_probe(|_| true),
+            supervisor: None, owner_check: |_| Ok(()), caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
+        };
+        let call = |method: &str, path: &str, body: &str| {
+            route_json(&context, method, path, &parse_path(path).unwrap(), body.as_bytes())
+        };
+        let (_, created) = call("POST", "/v2/services", r#"{"slug":"notes"}"#).unwrap();
+        assert_eq!(created["service"]["remoteAccess"], false);
+        let (_, updated) = call("PATCH", "/v2/services/notes", r#"{"remoteAccess":true}"#).unwrap();
+        assert_eq!(updated["service"]["remoteAccess"], true);
+        crate::management::v2::schema_export::assert_valid("services", "service", &updated["service"]);
+        let (_, listed) = call("GET", "/v2/services", "").unwrap();
+        assert_eq!(listed["services"][0]["remoteAccess"], true);
+        assert_eq!(super::super::access::classify("PATCH", "/v2/services/notes"), Some(super::super::access::Class::OwnerOnly));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

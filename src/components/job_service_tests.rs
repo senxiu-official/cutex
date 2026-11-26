@@ -176,20 +176,64 @@ fn ctx<'a>(f: &'a Fixture, exec: &'a FakeExec, version: &str, dry_run: bool) -> 
 /// A stand-in daemon on the job socket answering `capabilities` (this test
 /// process: its executable is not under the components dir).
 fn fake_daemon(paths: &Paths) -> std::thread::JoinHandle<()> {
-    use std::io::{BufRead, Write};
     std::fs::create_dir_all(&paths.root).unwrap();
     let _ = std::fs::remove_file(&paths.socket);
     let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
-    std::thread::spawn(move || {
-        for _ in 0..64 {
-            let Ok((mut stream, _)) = listener.accept() else { return };
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
-            if line.contains("\"capabilities\"") {
-                let _ = writeln!(stream, "{}", json!({"ok": true, "result": {"sources": ["nci"], "externalNotifyFile": true}}));
-            }
+    std::thread::spawn(move || serve_fixture(listener))
+}
+
+fn serve_fixture(listener: std::os::unix::net::UnixListener) {
+    use std::io::{BufRead, Write};
+    for _ in 0..64 {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+        if line.contains("\"capabilities\"") {
+            let _ = writeln!(stream, "{}", json!({"ok": true, "result": {"sources": ["nci"], "externalNotifyFile": true, "maintenanceFence": true}}));
         }
-    })
+    }
+}
+
+#[test]
+#[ignore = "spawned from the managed Job component fixture"]
+fn managed_socket_fixture_child() {
+    let socket = std::env::var_os("CUTEX_JOB_FIXTURE_SOCKET").expect("fixture socket");
+    serve_fixture(std::os::unix::net::UnixListener::bind(socket).unwrap());
+}
+
+struct ManagedDaemon {
+    child: std::process::Child,
+    socket: PathBuf,
+}
+
+impl Drop for ManagedDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+fn fake_managed_daemon(layout: &Layout, paths: &Paths) -> ManagedDaemon {
+    let dir = super::super::version_dir(layout, NAME, "0.1.5-fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(JOB_EXE);
+    let current = std::env::current_exe().unwrap();
+    if std::fs::hard_link(&current, &exe).is_err() {
+        std::fs::copy(&current, &exe).unwrap();
+    }
+    let child = std::process::Command::new(exe)
+        .args(["--ignored", "--exact", "components::job_service::tests::managed_socket_fixture_child"])
+        .env("CUTEX_JOB_FIXTURE_SOCKET", &paths.socket)
+        .stdout(std::process::Stdio::null())
+        .spawn().unwrap();
+    let daemon = ManagedDaemon { child, socket: paths.socket.clone() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !paths.socket.exists() {
+        assert!(Instant::now() < deadline, "managed Job socket fixture did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    daemon
 }
 
 fn stop_daemon(paths: &Paths, daemon: std::thread::JoinHandle<()>) {
@@ -304,7 +348,7 @@ fn select_restarts_selects_and_defers_while_jobs_run() {
 
     // A daemon answers (not V2's binary, so selecting V2 needs a restart),
     // and a local job runs: the restart is deferred.
-    let daemon = fake_daemon(&paths);
+    let daemon = fake_managed_daemon(&f.layout, &paths);
     jobs(&paths, json!({
         "job-local": {"state": "running"},
         "job-nci": {"state": "running", "external": {"source": "nci"}},
@@ -337,7 +381,7 @@ fn select_restarts_selects_and_defers_while_jobs_run() {
     assert!(job.adapter.path.ends_with(format!("{V2}/cutex-job-service")));
     // The selected descriptor pins V2.
     assert_eq!(h.pins(&f.layout).get(V2).copied(), Some(1));
-    stop_daemon(&paths, daemon);
+    drop(daemon);
 
     // Deselect: unit gone, descriptor unselected, credentials and state kept.
     exec.calls.lock().unwrap().clear();
@@ -359,7 +403,7 @@ fn ended_follow_up_process_blocks_restart_select_and_remove_until_natural_exit()
     let h = handler();
     h.prepare(&ctx(&f, &exec, V1, false)).unwrap();
     h.select(&ctx(&f, &exec, V1, false)).unwrap();
-    let daemon = fake_daemon(&paths);
+    let daemon = fake_managed_daemon(&f.layout, &paths);
     jobs(&paths, json!({"pending":{"state":"unconfirmed","launchPending":true}}));
     assert_eq!(active_jobs(&paths).unwrap(), vec!["pending".to_string()]);
     assert!(h.restart_gate(&f.layout).is_err());
@@ -384,7 +428,7 @@ fn ended_follow_up_process_blocks_restart_select_and_remove_until_natural_exit()
     assert!(child.wait().unwrap().success());
     assert!(active_jobs(&paths).unwrap().is_empty());
     assert!(h.restart_gate(&f.layout).is_ok());
-    stop_daemon(&paths, daemon);
+    drop(daemon);
 }
 
 #[test]
@@ -395,6 +439,9 @@ fn a_service_cutex_did_not_install_is_external() {
     assert!(!h.external(&f.layout));
     let daemon = fake_daemon(&paths);
     assert!(h.external(&f.layout), "a daemon outside the components dir");
+    let exec = FakeExec::default();
+    assert_eq!(code(&h.select(&ctx(&f, &exec, V1, false)).unwrap_err()), "component_external");
+    assert!(exec.calls.lock().unwrap().is_empty());
     stop_daemon(&paths, daemon);
     assert!(!h.external(&f.layout));
 }

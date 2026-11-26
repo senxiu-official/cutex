@@ -12,7 +12,7 @@ pub const NAME: &str = "delegation_routing";
 
 pub fn definition() -> Value {
     let reference = json!({"type":"object","properties":{"hostId":{"type":"string"},"id":{"type":"string"}},"required":["hostId","id"],"additionalProperties":false});
-    json!({"name":NAME,"description":"Inspect your own exact action receipt with lookup_action (read-only; a miss is still outcome unknown). Controls require the current authenticated project Director: inspect policy/grants/approvals; update policy; issue/revoke a one-use reviewer grant; approve/deny a request; reset an exhausted continuation budget; read/pause/resume project run control. Project scope all is owner-only; members scope excludes the current Director and operators. approvalRequired needs BOTH approval and the scoped one-use grant. Does not replace owner capability approval or bypass pause/stop/cross-host checks.",
+    json!({"name":NAME,"description":"Inspect your own exact action receipt with lookup_action (read-only; a miss is still outcome unknown). Controls require the current authenticated project Director: inspect policy/grants/approvals; update policy; issue/revoke a one-use reviewer grant; approve/deny a request; decide an expired continuation approval with resume_continuation; read/pause/resume project run control. Project scope all is owner-only; members scope excludes the current Director and operators. approvalRequired needs BOTH approval and the scoped one-use grant; approving a local same-project member review completes that exact grant atomically. Does not replace owner capability approval or bypass pause/stop/cross-host checks.",
         "inputSchema":{"type":"object","properties":{
             "operation":{"type":"string","enum":["lookup_action","read","read_run_control","pause_project","resume_project","update_policy","create_grant","revoke_grant","decide_approval","resume_continuation"]},
             "lookup_action_id":{"type":"string","minLength":1,"maxLength":256,"description":"Original control action ID to inspect. Identity is the authenticated caller; cannot select another actor. Does not execute or retry work."},
@@ -78,6 +78,10 @@ enum Args {
         project_id: String,
         delegation_ref: RoutingRef,
         expected_revision: u64,
+        expected_digest: String,
+        expected_epoch: u64,
+        decision: RoutingDecision,
+        decision_note: Option<String>,
     },
 }
 impl Args {
@@ -185,7 +189,8 @@ pub fn handle(ctx: &ToolContext<'_>, value: Value, action: &str) -> Result<Value
                     let mut view=serde_json::to_value(g).expect("grant serializes");view.as_object_mut().unwrap().remove("consumption");
                     view["allowedActions"]=json!({"revoke":g.revoked_at.is_none()});view
                 }).collect();
-                return Ok(json!({"ok":true,"policy":state.routing.policy(&authority.project_id),"grants":grants,"routingApprovals":approvals}));
+                return Ok(json!({"ok":true,"policy":state.routing.policy(&authority.project_id),"grants":grants,
+                    "routingApprovals":approvals,"continuationApprovals":crate::asks::continuation::approval::list(state,Some(&authority),true)}));
             }
             let request=json!({"domain":"delegation-routing-control-v1","projectId":authority.project_id,"arguments":value});
             operations::execute(state,ctx.caller,NAME,action,&request,ctx.now,|next| {
@@ -223,23 +228,13 @@ pub fn handle(ctx: &ToolContext<'_>, value: Value, action: &str) -> Result<Value
                         let grant=next.routing.revoke_grant(grant_id,&authority,&RevokeGrantRequest{action_id:action.into(),expected_revision:*expected_revision},ctx.now).map_err(integration::error)?;
                         json!({"ok":true,"grant":grant})
                     }
-                    Args::ResumeContinuation{delegation_ref,expected_revision,..}=> {
-                        use crate::asks::continuation::{self,Guards};
+                    Args::ResumeContinuation{delegation_ref,expected_revision,expected_digest,expected_epoch,decision,decision_note,..}=> {
+                        use crate::asks::continuation;
                         if delegation_ref.host_id()!=host { return Err(integration::cross_host_unsupported()); }
-                        let ask=next.asks.get(delegation_ref.id()).filter(|a|a.project_id.as_deref()==Some(authority.project_id.as_str()))
-                            .ok_or_else(||AskError::new("ask_not_found","No such project delegation"))?;
-                        let target=directory.get(&ask.target_cutex_session_id).ok_or_else(||AskError::new("recipient_not_found","Handler is unavailable"))?;
-                        let presence=next.presence.get(&ask.target_cutex_session_id);
-                        let generation_valid=presence.and_then(|p|p.runtime_generation)==Some(target.runtime_generation);
-                        let guards=Guards{stopped:!ask.is_open(),archived:target.archived,
-                            paused:next.pauses.contains_key(&ask.target_cutex_session_id)||crate::asks::pause_admission::is_paused_in(next,snapshot,&ask.target_cutex_session_id),
-                            online:presence.is_some_and(|p|p.online),permission_valid:target.agent_enabled&&target.project.as_deref()==Some(authority.project_id.as_str()),
-                            occurrence_valid:generation_valid,running_turn:next.leases.contains_key(&ask.target_cutex_session_id),
-                            submission_unknown:ask.bounded_continuation.current.as_ref().is_some_and(|r|r.reconciling),restarting:!generation_valid};
                         let actor=continuation::Actor::Agent{session_id:ctx.caller.into()};
-                        let current_director=authority.current_director.as_ref().map(|r|r.id());
-                        let mut result=continuation::runtime::resume_limited(next,delegation_ref.id(),continuation::Authority{actor:&actor,current_director},
-                            &continuation::ResetRequest{action_id:action.into(),expected_revision:*expected_revision},guards,ctx.now)?;
+                        let request=continuation::approval::DecisionRequest{action_id:action.into(),expected_revision:*expected_revision,
+                            expected_digest:expected_digest.clone(),expected_epoch:*expected_epoch,decision:*decision,decision_note:decision_note.clone()};
+                        let mut result=continuation::approval::decide(next,delegation_ref.id(),Some(&authority),&actor,&request,ctx.now)?;
                         result["ok"]=json!(true);result
                     }
                     Args::DecideApproval{approval_id,expected_revision,expected_digest,decision,decision_note,..}=> {
@@ -248,6 +243,7 @@ pub fn handle(ctx: &ToolContext<'_>, value: Value, action: &str) -> Result<Value
                         let (request,root)=integration::request_and_root(next,ask,&host,controllers.as_ref().expect("decision loaded ownership before AskStore"))?;
                         let input=DecideRoutingRequest{action_id:action.into(),decision:*decision,expected_digest:expected_digest.clone(),expected_revision:*expected_revision,decision_note:decision_note.clone()};
                         let decided=next.routing.decide_approval(approval_id,&authority,&request,&root,&input,ctx.now).map_err(integration::error)?;
+                        integration::complete_approved_review(next,snapshot,approval.delegation_ref.id(),&host,ctx.now,controllers.as_ref().expect("decision controllers"))?;
                         let mut recipients=vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.to_owned()];
                         if let Some(director)=&authority.current_director {recipients.push(director.id().to_owned());}
                         next.notice(integration::ROUTING_CHANGED,recipients,json!({"projectId":authority.project_id,"resourceId":approval_id,"revision":decided.revision}));

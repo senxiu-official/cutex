@@ -23,6 +23,7 @@ pub enum CutexSessionArchiveError {
     AlreadyActive,
     RuntimeStillOnline,
     RuntimeStopFailed { detail: String },
+    RestoreDataUnavailable { detail: String },
     PersistenceUnavailable { detail: String },
     PersistenceUncertain { detail: String },
     UnsupportedMethod { method: String },
@@ -54,6 +55,9 @@ impl fmt::Display for CutexSessionArchiveError {
             }
             Self::RuntimeStopFailed { detail } => {
                 write!(formatter, "safe runtime stop failed: {detail}")
+            }
+            Self::RestoreDataUnavailable { detail } => {
+                write!(formatter, "archived history could not be restored: {detail}")
             }
             Self::PersistenceUnavailable { detail } => {
                 write!(

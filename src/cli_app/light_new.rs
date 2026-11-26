@@ -92,7 +92,11 @@ pub(super) fn human_configuration(
                 launch.and_then(|launch| launch.reasoning_effort.as_ref()).filter(|effort| !effort.is_empty()),
             )?
         }
-        None => cutex::launch::stock::local_configuration()?,
+        None => cutex::launch::stock::local_configuration_with_selection(
+            None,
+            launch.and_then(|launch| launch.model.as_ref()),
+            launch.and_then(|launch| launch.reasoning_effort.as_ref()).filter(|effort| !effort.is_empty()),
+        )?,
     };
     let permissions = cutex::config::new_thread::resolve_for_create(kind, launch)?;
     configuration = configuration.with_permissions(&permissions)?;
@@ -103,7 +107,9 @@ pub(super) fn human_configuration(
     }
     if let Some(effort) = launch.and_then(|launch| launch.reasoning_effort.as_ref()) {
         ensure!(valid_reasoning(effort), "unsupported reasoning effort: {effort}");
-        configuration.reasoning = Some(effort.clone());
+        if !cutex::profiles::reasoning::is_default(effort) {
+            configuration.reasoning = Some(effort.clone());
+        }
         reselected = true;
     }
     ensure!(!configuration.model.trim().is_empty(), "Model required");
@@ -176,6 +182,7 @@ pub(super) fn create_configured_with(
                 profile: configuration.profile_name.clone(),
                 model: configuration.model.clone(),
                 reasoning: configuration.reasoning.clone(),
+                reasoning_resolution: configuration.reasoning_resolution.clone(),
                 permissions: Some(launch_permissions(&configuration)),
             }),
             action_id: cutex::agent_management::AgentActionId::new(format!("human-new-{native}"))?,
@@ -609,6 +616,7 @@ pub(super) fn create_owned_session_with(
             profile: profile.into(),
             model: configuration.model,
             reasoning: configuration.reasoning,
+            reasoning_resolution: configuration.reasoning_resolution,
             permissions: Some(permissions),
         }),
     })

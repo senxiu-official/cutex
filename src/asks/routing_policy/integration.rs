@@ -12,6 +12,10 @@ use serde_json::json;
 
 pub const ROUTING_CHANGED: &str = "cutex/delegation/routingApprovalChanged";
 
+#[path = "approved_review.rs"]
+mod approved_review;
+pub use approved_review::complete_approved_review;
+
 /// One immutable ownership+roster view, loaded before the AskStore transaction.
 /// Hold the authority mutation fence for mutation/admission use. This preserves
 /// provenance, accepted handover, owner/reconcile holds, and private ownership;
@@ -367,6 +371,13 @@ fn evidence<'a>(approval: Option<&'a str>, grant: Option<&'a str>) -> RouteAutho
     }
 }
 
+fn requested_notice(state:&mut AskState,ctx:&RoutingContext,approval:&RoutingApproval) {
+    let mut recipients=vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.into()];
+    if let Some(director)=&ctx.current_director { recipients.push(director.id().to_owned()); }
+    state.notice(ROUTING_CHANGED,recipients,json!({"projectId":ctx.project_id,
+        "resourceId":approval.id,"revision":approval.revision}));
+}
+
 /// Shared local/peer creation hook. Ask, pending approval, notice and binding
 /// are written atomically by the surrounding candidate-state transaction.
 pub fn register_created(
@@ -417,8 +428,7 @@ pub fn register_created(
         ask.routing_approval_id = Some(approval.id.clone());
         ask.execution = ExecutionState::PendingReview;
         if created {
-            state.notice(ROUTING_CHANGED,ctx.current_director.as_ref().map(|r|vec![r.id().to_owned()]).unwrap_or_else(||vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.into()]),
-            json!({"projectId":ctx.project_id,"resourceId":approval.id,"revision":approval.revision}));
+            requested_notice(state,&ctx,&approval);
         }
     }
     ask.routing_request = Some(request);
@@ -494,8 +504,7 @@ pub fn check_admission(
                 ask.routing_grant_id = None;
             }
             if created {
-                state.notice(ROUTING_CHANGED,ctx.current_director.as_ref().map(|r|vec![r.id().into()]).unwrap_or_else(||vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.into()]),
-                    json!({"projectId":ctx.project_id,"resourceId":approval.id,"revision":approval.revision}));
+                requested_notice(state,&ctx,&approval);
             }
             state.update_ask(ask_id, now, |stored| {
                 stored.routing_approval_id = ask.routing_approval_id.clone();
@@ -508,6 +517,14 @@ pub fn check_admission(
                 }
             });
         }
+    }
+    // An exact local member approval authorizes its one-use review grant too.
+    // Repair approvals committed by older adapters without weakening either
+    // low-level proof or consuming a grant before final admission.
+    // Repair failure cannot preempt the primary approval/grant verdict below.
+    // The explicit decision adapter remains atomic and reports creation errors.
+    if approved_review::ensure_grant(state, snapshot, &mut ask, host, now, controllers).unwrap_or(false) {
+        state.update_ask(ask_id, now, |stored| stored.routing_grant_id = ask.routing_grant_id.clone());
     }
     // Find only exact matching evidence; never spend on this read/preflight.
     let grant_valid = ask
@@ -790,7 +807,8 @@ pub fn check_outbound_source(
     if ask.project_id.is_none() {
         return Ok(());
     }
-    let ctx = context_of(snapshot, ask, host, controllers)?;
+    let refusal = crate::peers::receipt::RoutingRefusal::Source;
+    let ctx = context_of(snapshot, ask, host, controllers).map_err(|_| refusal.ask_error())?;
     if ctx.actor.reference().is_some_and(|actor| paused(actor.id())) {
         return Err(AskError::new(
             "routing_source_paused",
@@ -803,6 +821,6 @@ pub fn check_outbound_source(
     {
         Ok(())
     } else {
-        Err(cross_host_unsupported())
+        Err(refusal.ask_error())
     }
 }

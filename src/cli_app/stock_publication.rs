@@ -380,6 +380,14 @@ mod tests {
         };
         let publication = serde_json::from_value(evidence["publication"].clone()).unwrap();
         let unpublished = evidence["pid"].as_u64().unwrap() as u32;
+        // Pin the unpublished child while its live creator still owns the gate.
+        #[cfg(target_os = "linux")]
+        let unpublished_exit = {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, unpublished, 0) as i32 };
+            assert!(fd >= 0, "pin unpublished child: {}", std::io::Error::last_os_error());
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+        };
         assert!(!root.join("native-proof").exists());
         assert!(lease(&claim, Some(&publication))
             .unwrap_err()
@@ -388,8 +396,8 @@ mod tests {
         // Actual SIGKILL, not Drop cleanup. Only the owned creator is targeted.
         creator.kill().unwrap();
         creator.wait().unwrap();
-        // Blocking on the exact flock is an event oracle: its inherited holder
-        // must exit on gate EOF before absence is established, no sleep proof.
+        // Reacquire the exact lease after its inherited holder releases the fd.
+        // The pidfd below separately proves process exit without a sleep oracle.
         let witness = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -399,6 +407,23 @@ mod tests {
         drop(witness);
         let (same, file) = lease(&claim, Some(&publication)).unwrap();
         assert_eq!(same, publication);
+        // exit_files releases flock before exit_notify makes /proc show Z.
+        // Wait on the pinned process exit, rather than treating fd closure as exit.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut event = libc::pollfd { fd: unpublished_exit.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "unpublished child did not exit after creator death");
+                let ready = unsafe { libc::poll(&mut event, 1, remaining.as_millis().max(1) as i32) };
+                if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+                assert_eq!(ready, 1, "wait for unpublished child exit");
+                assert_ne!(event.revents & libc::POLLIN, 0, "unpublished child exit event");
+                break;
+            }
+        }
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{unpublished}/stat")) {
             assert_eq!(
                 stat.rsplit(')').next().unwrap().split_whitespace().next(),

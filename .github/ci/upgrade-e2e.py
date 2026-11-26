@@ -52,7 +52,7 @@ owner-private directory under the test user's profile.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import base64
 import hashlib
 import datetime as dt
@@ -1828,10 +1828,109 @@ def formal_assert_api(host: FormalHost, fixture: dict, blobs: dict[str, bytes], 
     require(status == 200 and (answer or {}).get("text") == next(iter(blobs.values())).decode(), "formal API lost answer text")
 
 
-def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: dict[str, bytes]) -> dict:
+@contextmanager
+def formal_backup_read_fault(host: FormalHost):
+    """Deny reading one exclusively-created fixture note, without changing signed files."""
+    require(host.created_state, "backup fault requires this fixture's state")
+    parent = host.home / ".cutex/notes"
+    require(not parent.is_symlink(), "fixture notes must not be a link")
+    parent.mkdir(exist_ok=True)
+    path = parent / "formal-before-swap-fault.bin"
+    with path.open("xb") as output:
+        output.write(b"owned formal backup fault\n")
+    identity = path.stat()
+    handle = None
+    try:
+        if WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            create = kernel.CreateFileW
+            create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                               wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            create.restype = wintypes.HANDLE
+            handle = create(str(path), 0x80000000, 0, None, 3, 0x80, None)
+            if handle in (None, ctypes.c_void_p(-1).value):
+                handle = None
+                raise ValueError("could not lock fixture note")
+        else:
+            path.chmod(0)
+            require(not os.access(path, os.R_OK), "runner can bypass fixture read fault")
+        yield
+    finally:
+        if handle not in (None, -1):
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.restype = wintypes.BOOL
+            require(bool(kernel.CloseHandle(handle)), "fixture note handle did not close")
+        require(not path.is_symlink() and (path.stat().st_dev, path.stat().st_ino) == (identity.st_dev, identity.st_ino),
+                "fixture note was replaced")
+        path.chmod(0o600)
+        path.unlink()
+
+
+@contextmanager
+def formal_runtime_select_fault(host: FormalHost):
+    """Obstruct only the unsigned generated bundle path, first written after activation."""
+    parent = host.base / "releases" / host.args.to_release / "manifests"
+    require(parent.resolve().is_relative_to(host.base.resolve()) and not parent.is_symlink(), "bundle fault escapes fixture")
+    existed = parent.exists()
+    parent.mkdir(exist_ok=True)
+    path = parent / "default.json"
+    require(not path.exists(), "generated bundle already exists before fault injection")
+    path.mkdir()
+    try:
+        yield
+    finally:
+        require(not path.is_symlink(), "bundle fault directory was replaced")
+        path.rmdir()  # Exclusive empty directory only; never recursively remove a runtime file.
+        if not existed:
+            parent.rmdir()
+
+
+def formal_assert_failure_boundary(run: dict, active: str, before: str, after: str, fault: str) -> None:
+    require(run.get("class") == "one-way" and run.get("fromRelease") == before and run.get("toRelease") == after,
+            "fault did not exercise the declared one-way transition")
+    if fault == "before-swap":
+        require(run.get("phase") == "rolled-back" and (run.get("error") or {}).get("code") == "backup_failed"
+                and active == before, "before-swap backup failure did not retain the old release")
+    elif fault == "after-swap":
+        require(run.get("phase") == "needs-owner" and (run.get("error") or {}).get("code") == "select_failed"
+                and active == after and "one-way" in (run.get("needsOwner") or {}).get("reason", ""),
+                "old updater switched back or missed the post-swap one-way hold")
+    else:
+        raise ValueError("unknown formal failure case")
+
+
+def execute_formal_failure(host: FormalHost, docs: dict, baseline: dict, blobs: dict[str, bytes],
+                           fault: str, old_hashes: dict, target_hashes: dict) -> dict:
+    require(docs["expectedClass"] == "one-way", "fault cases require one-way signed metadata")
+    injection = formal_backup_read_fault if fault == "before-swap" else formal_runtime_select_fault
+    # Always invoke the actual installed 0.2.5 updater, not the new program's guard.
+    updater = host.installed_cli
+    require(ce.sha256(updater) == old_hashes[f"cutex{EXE}"], "failure driver is not the original old binary")
+    with injection(host):
+        code, _, _ = host.command(*apply_arguments({"class": "one-way", "release": host.args.to_release},
+                                                   host.args.confirm_one_way), "--package-run", "none",
+                                   exe=updater, allow_failure=True)
+    run = (json.loads((host.base / "upgrade/state.json").read_text(encoding="utf-8"))).get("run") or {}
+    active = host.install_record().get("activeRelease")
+    formal_assert_failure_boundary(run, active, host.args.from_release, host.args.to_release, fault)
+    expected = old_hashes if fault == "before-swap" else target_hashes
+    require(all(ce.sha256(host.installed_cli.parent / name) == value for name, value in expected.items()),
+            "installed bytes do not match the expected release after induced failure")
+    if fault == "before-swap":
+        require(host.wait_ready(host.args.from_release) is not None, "old services did not recover before swap")
+        formal_assert_api(host, baseline, blobs)
+    return {"case": fault, "passed": True, "phase": run["phase"], "class": run["class"],
+            "errorCode": run["error"]["code"], "activeRelease": active, "driverRelease": host.args.from_release,
+            "runId": run.get("runId"), "cliExit": code, "signedArchiveBytesUnchanged": True,
+            "automaticSwitchBack": False, "rollbackAttempted": fault == "before-swap"}
+
+
+def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: dict[str, bytes], *, fault: str | None = None) -> dict:
     old, target = docs[host.args.from_release], docs[host.args.to_release]
     old_dir, target_dir = host.work / "old-release", host.work / "target-reference"
-    extract_formal_release(old["archive"], old_dir)
+    old_hashes = extract_formal_release(old["archive"], old_dir)
     target_hashes = extract_formal_release(target["archive"], target_dir)
     for name in ("manifest.json", "manifest.json.minisig"):
         shutil.copyfile(old["dir"] / name, old_dir / name)
@@ -1867,6 +1966,8 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     if docs["expectedClass"] == "one-way":
         code, _, refusal = host.command("upgrade", "apply", "--max-wait", "600", allow_failure=True)
         require(code != 0 and "one_way_unconfirmed" in refusal, "production updater did not refuse missing one-way consent")
+    if fault is not None:
+        return execute_formal_failure(host, docs, baseline, blobs, fault, old_hashes, target_hashes)
     host.command(*apply_arguments(available, host.args.confirm_one_way), "--package-run", "none")
     host.upgrade_executed = True
     ready = host.wait_ready(host.args.to_release)
@@ -1909,6 +2010,32 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
             "productionServices": True, "backupVerifiedFiles": len(backup_manifest["files"]), "testTrustOverrides": False, "rollbackAttempted": False}
 
 
+def execute_formal_cases(args: argparse.Namespace, docs: dict) -> dict:
+    require(args.from_release == "0.2.5" and args.to_release == "0.2.6" and docs["expectedClass"] == "one-way",
+            "failure cases require the exact public 0.2.5 -> 0.2.6 one-way transition")
+    result = None
+    faults = []
+    for case in ("success", "before-swap", "after-swap"):
+        case_args = argparse.Namespace(**vars(args))
+        case_args.work = args.work / case
+        home = formal_runner_home(case_args)
+        case_args.work.mkdir()
+        host = FormalHost(case_args, home)
+        fixture, blobs = formal_seed()
+        try:
+            proof = execute_formal_upgrade(host, docs, fixture, blobs, fault=None if case == "success" else case)
+            (host.work / "case-result.json").write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+            if case == "success":
+                result = proof
+            else:
+                faults.append(proof)
+        finally:
+            host.cleanup()  # A cleanup failure stops the suite; never reuse a live fixture home.
+    require(result is not None and len(faults) == 2, "incomplete formal failure coverage")
+    result["inducedFailures"] = faults
+    return result
+
+
 def formal_assets(argv: list[str]) -> int:
     """Actual formal signed 0.2.1 -> 0.2.2 managed upgrade, fresh hosted runner only.
 
@@ -1916,7 +2043,9 @@ def formal_assets(argv: list[str]) -> int:
     accepts the nested Sign dry-run artifact; --old-assets and --native-assets contain
     the original published archives and detached signatures. All signed JSON is copied
     byte-for-byte to a production Source::Dir mirror. No signing key, debug/test overrides,
-    source rebuild, forced service replacement, model calls or rollback is used.
+    source rebuild, forced service replacement or model calls are used. Optional one-way
+    failure cases obstruct a fixture backup read and the unsigned generated runtime bundle
+    path; signed archives/binaries are unchanged. Each case gets fresh state/services.
     The parent workflow must verify hosted-runner and Build/Sign run provenance first.
     """
     parser = argparse.ArgumentParser(description=formal_assets.__doc__)
@@ -1933,6 +2062,7 @@ def formal_assets(argv: list[str]) -> int:
     parser.add_argument("--management-port", default=24770, type=int)
     parser.add_argument("--bus-port", default=24760, type=int)
     parser.add_argument("--confirm-release", "--confirm-one-way", dest="confirm_one_way", required=True)
+    parser.add_argument("--one-way-failure-cases", action="store_true")
     args = parser.parse_args(argv)
     args.work = args.work.resolve()
     home = formal_runner_home(args)  # before any subprocess, file mutation or service action
@@ -1941,9 +2071,12 @@ def formal_assets(argv: list[str]) -> int:
     host = None
     try:
         docs = prepare_formal_mirror(args, args.work)
-        fixture, blobs = formal_seed()
-        host = FormalHost(args, home)
-        result.update(execute_formal_upgrade(host, docs, fixture, blobs))
+        if args.one_way_failure_cases:
+            result.update(execute_formal_cases(args, docs))
+        else:
+            fixture, blobs = formal_seed()
+            host = FormalHost(args, home)
+            result.update(execute_formal_upgrade(host, docs, fixture, blobs))
     except Exception as error:
         result["error"] = str(error)
         log("formal-assets failed: " + str(error))

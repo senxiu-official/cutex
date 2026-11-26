@@ -53,6 +53,18 @@ impl PeerTellFacts {
             .unwrap_or_else(|| crate::peers::wire::sanitize_name(&self.sender_id));
         format!("{name}@{}", crate::peers::wire::sanitize_name(&self.host))
     }
+
+    pub(crate) fn receipt(&self, message: &AgentBusMessage) -> Option<serde_json::Value> {
+        use crate::peers::receipt::{CrossHost, DeliveryState, Direction};
+        let time = i64::try_from(message.created_at_epoch_secs).ok()
+            .filter(|seconds| *seconds > 0)
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            .map(|at| crate::asks::now_rfc3339(at));
+        CrossHost::new(
+            Direction::Inbound, &self.peer_id, &self.host, DeliveryState::DeliveredToPeer,
+            None, time.as_deref(),
+        ).map(|proof| serde_json::json!(proof))
+    }
 }
 
 fn is_control_type(control_type: Option<&str>) -> bool {
@@ -145,13 +157,11 @@ pub fn model_text(message: &AgentBusMessage) -> anyhow::Result<(PeerTellFacts, S
     } else {
         String::new()
     };
-    Ok((
-        facts,
-        format!(
-            "Message Type: MESSAGE\nSender: {label} (an agent on another host, {host}; its id there: {id})\nOrigin: another host. Paths and ids in this note refer to that host, not this machine.\n{delivery}Reply: agent_tell to=\"{label}\" (works only if that host lets you reach it)\nPayload:\n{}",
-            message.content
-        ),
-    ))
+    let text = format!(
+        "Message Type: MESSAGE\nSender: {label} (an agent on another host, {host}; its id there: {id})\nOrigin: {host} ({}). Paths and ids in this note refer to that host, not this machine.\n{delivery}Reply: agent_tell to=\"{label}\" (works only if that host lets you reach it)\nPayload:\n{}",
+        facts.peer_id, message.content
+    );
+    Ok((facts, text))
 }
 
 pub const VIEW_SCHEMA: &str = "cutex.peer-message.v1";
@@ -172,6 +182,9 @@ pub fn view(
         "deliveryKind": message.delivery_mode.kind(),
         "body": "",
     });
+    if let Some(receipt) = facts.receipt(message) {
+        data["crossHost"] = receipt;
+    }
     if facts.wake_downgraded.is_some() {
         data["wakeDowngraded"] = serde_json::json!(true);
     }
@@ -225,6 +238,9 @@ mod tests {
         assert_eq!(view.data["senderName"], "worker@alpha");
         assert_eq!(view.data["deliveryKind"], "note");
         assert_eq!(view.data["body"], "see /tmp/x");
+        assert_eq!(view.data["crossHost"]["direction"], "inbound");
+        assert_eq!(view.data["crossHost"]["peer"]["instanceId"], facts.peer_id);
+        assert_eq!(view.data["crossHost"]["receipt"]["state"], "deliveredToPeer");
         let mut long = message();
         long.content = "\"x\n".repeat(9000);
         assert_eq!(

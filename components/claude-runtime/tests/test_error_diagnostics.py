@@ -15,7 +15,10 @@ def test_network_error_is_not_a_confirmed_http_500(code):
         {'text': f'API Error: Connection failed ({code}). private prompt, sk-ant-private'}]}, None)
     assert e.codex_error_info == {'httpConnectionFailed': {'httpStatusCode': None}}
     assert str(e).startswith(f'Official Claude connection failed ({code}).')
-    assert json.loads(e.additional_details) == {'category': code, 'httpStatusCode': None, 'requestId': None}
+    assert json.loads(e.additional_details) == {
+        'category': code, 'httpStatusCode': None, 'requestId': None,
+        'diagnosticCode': 'unreachable',
+    }
     assert 'private' not in str(e) + e.additional_details
 
 

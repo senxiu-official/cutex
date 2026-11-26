@@ -996,6 +996,16 @@ pub fn read_committed(v1_root: &Path) -> anyhow::Result<Option<AgentManagementSn
     }
 }
 
+pub(crate) fn reference_meta_at(v1_root: &Path) -> anyhow::Result<Option<RosterMeta>> {
+    let path = database_path(v1_root);
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let connection = open_ro(&path)?;
+    connection.busy_timeout(Duration::from_millis(10))?;
+    meta(&connection)
+}
+
 /// Read-only status for kit check-only: never imports, never locks.
 pub fn status(v1_root: &Path) -> anyhow::Result<serde_json::Value> {
     let path = database_path(v1_root);

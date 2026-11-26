@@ -213,7 +213,7 @@ class Rpc:
 
 async def run(args):
     import sys
-    require(importlib.metadata.version('claude-agent-sdk') == '0.2.180', 'requires installed SDK 0.2.180')
+    require(importlib.metadata.version('claude-agent-sdk') == '0.2.187', 'requires installed SDK 0.2.187')
     bundled = Path(importlib.util.find_spec('claude_agent_sdk').origin).parent / '_bundled'
     cli = bundled / ('claude.exe' if os.name == 'nt' else 'claude')
     require(cli.is_file(), 'bundled CLI missing')
@@ -247,12 +247,12 @@ async def run(args):
     version_proc = await asyncio.create_subprocess_exec(str(cli), '--version', env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     version_bytes, _ = await asyncio.wait_for(version_proc.communicate(), 30)
-    require(version_proc.returncode == 0 and version_bytes.decode().split()[0] == '2.1.321', 'requires bundled CLI 2.1.321')
+    require(version_proc.returncode == 0 and version_bytes.decode().split()[0] == '2.1.330', 'requires bundled CLI 2.1.330')
     command = [sys.executable, '-B', '-m', 'cute_claude', '--backend', 'subscription',
                '--claude-cli', str(cli), '--claude-config-dir', str(dirs['config']),
                '--api-account-config', str(account), '--workspace', str(dirs['workspace']),
                '--state-dir', str(dirs['state']), '--model', 'claude-sonnet-4-6', '--thinking', 'disabled']
-    report = {'sdk': '0.2.180', 'cli': '2.1.321', 'adapterPid': None, 'cases': [], 'success': False,
+    report = {'sdk': '0.2.187', 'cli': '2.1.330', 'adapterPid': None, 'cases': [], 'success': False,
               'scope': 'real SDK/CLI/adapter; loopback API fixture only, not claude.ai account quota'}
     process = rpc = None
     try:

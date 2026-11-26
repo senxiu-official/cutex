@@ -316,6 +316,7 @@ pub fn resume_now(state: &mut AskState, ask_id: &str, requester: Option<&str>, n
     state.update_ask(ask_id, now, |ask| {
         // r290 P7: resume_pending requires the scheduler's Running state.
         ask.execution = ExecutionState::Running;
+        ask.terminal_cause=None;
         to_resume(ask, ResumeReason::Resumed, Some(by), note, now);
     });
     Ok(json!({"ok": true, "ask_id": ask_id, "resuming": true,
@@ -359,6 +360,7 @@ pub fn reopen(state: &mut AskState, ask_id: &str, requester: Option<&str>, note:
         ask.review = None;
         ask.closed = None;
         ask.closed_at = None;
+        ask.terminal_cause=None;
         to_resume(ask, ResumeReason::Reopened, Some(by), Some(note.clone()), now);
     });
     // The controller decided about the answer: pending items about it are

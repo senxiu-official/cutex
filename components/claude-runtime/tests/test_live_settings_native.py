@@ -1,5 +1,4 @@
-"""Opt-in native check: model and effort changed while a turn runs reach the next model request of that
-same turn, without a new Claude Code child (claude-r24, live_settings).
+"""Opt-in native check for the model and effort boundaries on a running child.
 
 Set CUTEX_TEST_CLAUDE_CLI to an explicitly selected Claude executable. A fake loopback Anthropic endpoint
 answers the turn's first request with one Bash `sleep` tool call and records every request; only a synthetic
@@ -67,7 +66,7 @@ async def test_mid_turn_model_and_effort_change_applies_to_the_next_step(tmp_pat
     private_home.mkdir()
     monkeypatch.setenv('HOME', str(private_home))
     monkeypatch.setenv('USERPROFILE', str(private_home))
-    for name in CONFLICTING_ENV + ('CLAUDE_CODE_EFFORT_LEVEL',):
+    for name in CONFLICTING_ENV + ('CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'):
         monkeypatch.delenv(name, raising=False)
     key_file = tmp_path / 'keys' / 'ca-loopback.json'
     key_file.parent.mkdir()
@@ -77,7 +76,8 @@ async def test_mid_turn_model_and_effort_change_applies_to_the_next_step(tmp_pat
     }, FAKE_KEY, key_file)
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
-    driver = OfficialSdkDriver(Path(os.environ['CUTEX_TEST_CLAUDE_CLI']), private_home / 'claude', api_account=account)
+    cli = Path(os.environ['CUTEX_TEST_CLAUDE_CLI']).resolve()
+    driver = OfficialSdkDriver(cli, private_home / 'claude', api_account=account)
     h = SubHarness(Settings(workspace, tmp_path / 'state', model='claude-opus-5-5', effort='high', mock=False,
                             backend='subscription', allow_exec=True, allow_write=True), driver)
     try:
@@ -97,7 +97,19 @@ async def test_mid_turn_model_and_effort_change_applies_to_the_next_step(tmp_pat
         assert owner.native_connection_generation == generation, 'no new Claude Code child'
         first, after = requests[0], next(r for r in requests if r['after_tool'])
         assert (first['model'], first['effort']) == ('claude-opus-5-5', 'high')
-        assert (after['model'], after['effort']) == ('claude-sonnet-5-5', 'low'), requests
+        # On 2.1.330 the model switches immediately and effort waits for a new
+        # turn on these cache-compatible models. The reported model/default
+        # behavior is related: https://github.com/anthropics/claude-code/issues/108311.
+        # See also https://code.claude.com/docs/en/agent-sdk/typescript#applyflagsettings.
+        version = await h.server.model_catalog.probe.read(cli)
+        assert version, 'could not determine the selected CLI version'
+        same_turn_effort = 'high' if version == '2.1.330' else 'low'
+        assert (after['model'], after['effort']) == ('claude-sonnet-5-5', same_turn_effort), requests
+        await h.turn(tid, 'Run one new turn after the effort update.')
+        await h.drain()
+        assert owner.native_connection_generation == generation
+        assert len(requests) == 3 and (requests[-1]['model'], requests[-1]['effort']) == (
+            'claude-sonnet-5-5', 'low'), requests
     finally:
         await h.close()
         server.shutdown()

@@ -107,14 +107,20 @@ fn disposed_bus_input_never_reaches_native_or_legacy_claude_submit() {
                 native.submits.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(!disposed)
             );
-            assert_eq!(
-                repository
-                    .snapshot_by_message_id(&message.id)
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                "pending"
-            );
+            let snapshot = repository.snapshot_by_message_id(&message.id).unwrap().unwrap();
+            if disposed {
+                assert!(cutex::management::v2::input_disposal::requested(owner, &message.id).unwrap());
+                // A disposal worker started by another test can settle the
+                // source before this observation. Both phases must still
+                // suppress native dispatch and retain the owner intent.
+                assert!(matches!(snapshot.state.as_str(), "pending" | "discarded"));
+                if snapshot.state == "discarded" {
+                    assert_eq!(snapshot.error.as_ref().unwrap()["code"],
+                        cutex::management::v2::agent_bus_state::OWNER_DISCARD_CODE);
+                }
+            } else {
+                assert_eq!(snapshot.state, "pending");
+            }
         }
     }
 }

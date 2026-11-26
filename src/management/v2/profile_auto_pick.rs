@@ -401,6 +401,8 @@ pub enum Resolution {
 /// `refresh_stale`: re-read an opted-in profile whose last gauge read is
 /// older than 15 minutes (creation does; the preview does not).
 pub fn resolve_live(profile: &str, spend: &Spend, refresh_stale: bool) -> Result<Resolution, PickRefusal> {
+    use super::feature_profiles::{require_agent_id, AGENT_REFUSAL_CODE};
+    require_agent_id(profile).map_err(|error| refusal(AGENT_REFUSAL_CODE, error.to_string()))?;
     let kind = requested(profile);
     if kind == Requested::Profile {
         return Ok(Resolution::Profile);

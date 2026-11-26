@@ -37,6 +37,7 @@ const STOP_SETTLE: Duration = Duration::from_secs(90);
 /// storage page will make this a setting.
 pub const FINISHED_RUN_RETENTION_DAYS: Option<i64> = None;
 const PROVIDER_BLOCK_GRACE: Duration = Duration::from_secs(120);
+const STEP_OUTCOME_UNKNOWN: &str = "step_outcome_unknown";
 const ALLOWED_OPTS: &[&str] = &["label", "phase", "schema", "profile", "model", "effort"];
 
 /// Host settings (`config.json` `workflows`, design §3.3 / §5.5).
@@ -173,6 +174,8 @@ pub trait Facts: Send + Sync {
 pub trait StepBackend: Send + Sync {
     /// Create the step session and its first ask (slow: seconds).
     fn start(&self, step: &StepStart) -> Result<StepHandle, RunError>;
+    /// Read an already-created owner ask. Never recreate it during recovery.
+    fn find_started_step(&self, action_id: &str) -> Result<Option<StepHandle>, RunError>;
     /// Another ask to the same step session (the schema repair).
     fn follow_up(&self, session_id: &str, action_id: &str, title: &str, text: &str) -> Result<String, RunError>;
     fn poll(&self, ask_ids: &[String]) -> HashMap<String, AskPoll>;
@@ -290,6 +293,46 @@ enum Msg {
 
 fn new_run_id() -> String {
     format!("wr-{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
+}
+
+fn unknown_step_error() -> RunError {
+    RunError {
+        code: STEP_OUTCOME_UNKNOWN.into(),
+        message: "A step may have made changes before its result was recorded. Review it before retrying.".into(),
+    }
+}
+
+fn ask_outcome_unknown(poll: &AskPoll) -> bool {
+    matches!(poll, AskPoll::Missing)
+        || matches!(poll, AskPoll::Failed { code, .. } if matches!(code.as_str(), "runtime_restart" | "outcome_unknown"))
+}
+
+fn step_needs_owner(step: &StepRecord) -> bool {
+    step.state.is_live()
+        || step.error.as_ref().is_some_and(|error| matches!(
+            error.code.as_str(), STEP_OUTCOME_UNKNOWN | "ask_missing" | "runtime_restart" | "outcome_unknown"
+        ))
+}
+
+/// A retry that ended before reaching a step must not hide the previous
+/// receipt. The newest recorded occurrence of each step takes precedence.
+fn predecessor_steps(store: &WorkflowStore, previous: &RunRecord) -> anyhow::Result<HashMap<String, StepRecord>> {
+    let mut rows = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut ancestor = Some(previous.clone());
+    while let Some(run) = ancestor {
+        anyhow::ensure!(seen.insert(run.run_id.clone()), "workflow resume ancestry contains a cycle");
+        for step in store.steps(&run.run_id)? {
+            if step.state != StepState::Queued {
+                rows.entry(step.step_key.clone()).or_insert(step);
+            }
+        }
+        ancestor = match run.resumed_from.as_deref() {
+            Some(id) => Some(store.run(id)?.ok_or_else(|| anyhow::anyhow!("an earlier workflow journal is missing"))?),
+            None => None,
+        };
+    }
+    Ok(rows)
 }
 
 fn validate_schema(schema: &Value) -> Result<(), String> {
@@ -422,6 +465,7 @@ impl WorkflowService {
                 "runId": run.run_id, "revision": run.revision, "state": run.state, "stopReason": run.stop_reason,
                 "phase": run.current_phase, "counts": run.counts, "tokens": run.tokens, "maxTokens": run.limits.max_tokens,
                 "authorCutexSessionId": run.author.session(), "approvalId": run.approval_id, "name": run.name, "seq": run.seq,
+                "error": run.error,
             }),
         );
     }
@@ -647,32 +691,98 @@ impl WorkflowService {
     pub fn recover(self: &Arc<Self>) {
         let settings = self.settings();
         let Ok(open) = self.store.open_runs() else { return };
-        for mut run in open {
+        'runs: for mut run in open {
             if run.state == RunState::PendingApproval {
                 continue;
             }
-            let steps = self.store.steps(&run.run_id).unwrap_or_default();
-            let live: Vec<String> = steps.iter().filter(|s| s.state == StepState::Running).filter_map(|s| s.ask_id.clone()).collect();
+            let Ok(mut steps) = self.store.steps(&run.run_id) else { continue };
+            for step in &mut steps {
+                if step.state != StepState::Starting || step.ask_id.is_some() {
+                    continue;
+                }
+                let action_id = format!("{}:{}", run.run_id, step.step_key);
+                match self.backend.find_started_step(&action_id) {
+                    Ok(Some(handle)) => {
+                        step.session_id = Some(handle.session_id);
+                        if !step.ask_ids.contains(&handle.ask_id) {
+                            step.ask_ids.push(handle.ask_id.clone());
+                        }
+                        step.ask_id = Some(handle.ask_id);
+                        if let Err(error) = self.store.save_step(step) {
+                            self.log(&run.run_id, "warn", &format!("recovery deferred: could not save step's ask: {error:#}"));
+                            continue 'runs;
+                        }
+                        self.emit_step(step);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.log(&run.run_id, "warn", &format!("recovery deferred: could not look up step's ask: {}", error.message));
+                        continue 'runs;
+                    }
+                }
+            }
+            let live: Vec<String> = steps.iter().filter(|s| s.state.is_live()).filter_map(|s| s.ask_id.clone()).collect();
             let polled = self.backend.poll(&live);
-            let lost = steps.iter().any(|s| s.state == StepState::Starting)
-                || polled.values().any(|p| matches!(p, AskPoll::Missing) || matches!(p, AskPoll::Failed { code, .. } if code == "runtime_restart" || code == "outcome_unknown"));
+            let lost = steps.iter().any(|step| {
+                if step.state.is_live() {
+                    step.state == StepState::Starting
+                        || step.ask_id.as_ref().and_then(|id| polled.get(id)).is_none_or(ask_outcome_unknown)
+                } else {
+                    step_needs_owner(step)
+                }
+            });
             if settings.auto_resume_after_restart && !lost && run.state == RunState::Running {
                 self.log(&run.run_id, "info", "daemon restarted: continuing the run (finished steps are not repeated)");
                 self.start_driver(run, true);
             } else {
-                for step in &steps {
+                let unsettled: Vec<String> = live.iter()
+                    .filter(|id| !matches!(polled.get(*id), Some(AskPoll::Answered { .. })))
+                    .cloned()
+                    .collect();
+                for ask in &unsettled {
+                    self.backend.stop(ask);
+                }
+                // A final answer can win the race with Stop. Preserve it too.
+                let after_stop = self.backend.poll(&unsettled);
+                for step in &mut steps {
                     if step.state.is_live() {
-                        if let Some(ask) = &step.ask_id {
-                            self.backend.stop(ask);
+                        let observed = step.ask_id.as_ref().and_then(|id| {
+                            after_stop.get(id).filter(|poll| matches!(poll, AskPoll::Answered { .. }))
+                                .or_else(|| polled.get(id))
+                        });
+                        if let Some(AskPoll::Answered { text, tokens }) = observed {
+                            let result = match step.opts.get("schema") {
+                                Some(schema) => parse_json_answer(text).filter(|value| schema_errors(schema, value).is_empty()),
+                                None => Some(json!(truncate_utf8(text, MAX_STEP_RESULT_BYTES))),
+                            };
+                            step.tokens = step.tokens.max(*tokens);
+                            step.error = result.is_none().then(|| RunError {
+                                code: "schema_validation".into(),
+                                message: "the observed answer did not match the schema".into(),
+                            });
+                            step.state = if result.is_some() { StepState::Done } else { StepState::Failed };
+                            step.result = result;
+                            step.ended_at = Some(now_rfc3339());
+                            self.save_step(step);
+                            continue;
                         }
+                        step.state = StepState::Failed;
+                        step.error = Some(unknown_step_error());
+                        step.ended_at = Some(now_rfc3339());
+                        self.save_step(step);
                     }
+                }
+                run.counts = run_counts(&steps);
+                run.tokens = steps.iter().map(|step| step.tokens).sum();
+                if steps.iter().any(step_needs_owner) {
+                    run.error = Some(unknown_step_error());
                 }
                 run.state = RunState::Stopped;
                 run.stop_reason = Some(StopReason::Interrupted);
                 run.ended_at = Some(now_rfc3339());
                 self.log(&run.run_id, "warn", "daemon restarted: the run cannot continue by itself (resume it)");
-                self.save_run(&mut run);
                 self.release_sessions(&run.run_id);
+                self.save_run(&mut run);
                 self.notify(&mut run);
             }
         }
@@ -728,8 +838,15 @@ impl WorkflowService {
     }
 
     fn start_driver(self: &Arc<Self>, run: RunRecord, recovering: bool) {
-        let driver = Arc::new(Driver { stop: AtomicBool::new(false), stop_reason: Mutex::new(None), wake: Mutex::new(None) });
-        self.drivers.lock().unwrap().insert(run.run_id.clone(), driver.clone());
+        let driver = {
+            let mut drivers = self.drivers.lock().unwrap();
+            let std::collections::hash_map::Entry::Vacant(slot) = drivers.entry(run.run_id.clone()) else {
+                return;
+            };
+            let driver = Arc::new(Driver { stop: AtomicBool::new(false), stop_reason: Mutex::new(None), wake: Mutex::new(None) });
+            slot.insert(driver.clone());
+            driver
+        };
         let service = self.clone();
         let run_id = run.run_id.clone();
         let spawned = std::thread::Builder::new().name(format!("cutex-workflow-{}", &run_id)).spawn(move || {
@@ -739,6 +856,7 @@ impl WorkflowService {
             service.wake_all();
         });
         if let Err(error) = spawned {
+            self.drivers.lock().unwrap().remove(&run_id);
             eprintln!("workflow {run_id}: driver thread failed: {error}");
         }
     }
@@ -864,10 +982,19 @@ pub fn submit_run(
     let args_sha256 = sha256_hex(canonical(&request.args).as_bytes());
     // Resume without a new approval: same author, same script and args, no raised caps,
     // same profiles (§3.4; an edited script asks again).
-    let needs_approval = author.session().is_some()
+    let unconfirmed = match &predecessor {
+        Some(previous) => predecessor_steps(store, previous).map_err(internal)?.values().any(step_needs_owner),
+        None => false,
+    };
+    let needs_approval = unconfirmed || (author.session().is_some()
         && settings.require_approval
         && !predecessor.as_ref().is_some_and(|previous| {
-            previous.approval_id.is_some()
+            let approved = previous.approval_id.as_deref()
+                .and_then(|id| approvals.and_then(|store| store.get(id, chrono::Utc::now()).ok().flatten()))
+                .is_some_and(|record| record.kind == ApprovalKind::WorkflowRun
+                    && record.state == ApprovalState::Consumed
+                    && Some(record.requester_cutex_session_id.as_str()) == author.session());
+            approved
                 && previous.script_sha256 == script_sha256
                 && previous.args_sha256 == args_sha256
                 && previous.limits.max_agents >= limits.max_agents
@@ -875,7 +1002,7 @@ pub fn submit_run(
                 && previous.limits.max_concurrency >= limits.max_concurrency
                 && previous.step_profiles.iter().all(|p| step_profiles.contains(p))
                 && step_profiles.iter().all(|p| previous.step_profiles.contains(p))
-        });
+        }));
     let now = now_rfc3339();
     let mut run = RunRecord {
         run_id: new_run_id(),
@@ -919,7 +1046,12 @@ pub fn submit_run(
     if needs_approval {
         let approvals = approvals.ok_or_else(|| ApiError::new(503, "approvals_unavailable", "owner approvals are not available"))?;
         run.state = RunState::PendingApproval;
-        let request = approval_request(&run, &facts);
+        let mut request = approval_request(&run, &facts);
+        if unconfirmed {
+            request.summary = format!("Review unconfirmed steps before retrying workflow {}", run.name);
+            request.details["unconfirmedSteps"] = json!(true);
+            run.warnings.push("A previous attempt may have made changes. Review its step records before approving the retry.".into());
+        }
         match approvals.gate(request, chrono::Utc::now()).map_err(internal)? {
             GateOutcome::Pending { record, created } => {
                 run.approval_id = Some(record.approval_id.clone());
@@ -1039,6 +1171,9 @@ fn completion_text(run: &RunRecord) -> String {
         }
     }
     if matches!(run.state, RunState::Stopped | RunState::Errored) {
+        if run.error.as_ref().is_some_and(|error| error.code == STEP_OUTCOME_UNKNOWN) {
+            text.push_str("A retry requires the owner's approval. Inspect the step records before requesting it.\n");
+        }
         text.push_str(&format!("To continue from the finished steps: workflow_start with resume_from_run_id=\"{}\" (same script).\n", run.run_id));
     }
     if let Some(path) = &run.draft_path {
@@ -1181,15 +1316,30 @@ impl RunDriver {
     fn run(service: Arc<WorkflowService>, driver: Arc<Driver>, mut run: RunRecord, recovering: bool) {
         let (tx, rx) = mpsc::channel();
         *driver.wake.lock().unwrap() = Some(tx.clone());
-        let own = service.store.steps(&run.run_id).unwrap_or_default();
-        let mut cache = HashMap::new();
-        if let Some(previous) = &run.resumed_from {
-            for step in service.store.steps(previous).unwrap_or_default() {
-                if matches!(step.state, StepState::Done | StepState::Cached) {
-                    cache.insert(step.step_key.clone(), step);
+        let read_journal = || -> anyhow::Result<_> {
+            let own = service.store.steps(&run.run_id)?;
+            let cache = match run.resumed_from.as_deref() {
+                Some(id) => {
+                    let previous = service.store.run(id)?.ok_or_else(|| anyhow::anyhow!("predecessor journal is missing"))?;
+                    predecessor_steps(&service.store, &previous)?
+                        .into_iter().filter(|(_, step)| matches!(step.state, StepState::Done | StepState::Cached))
+                        .collect()
                 }
+                None => HashMap::new(),
+            };
+            Ok((own, cache))
+        };
+        let (own, cache) = match read_journal() {
+            Ok(journal) => journal,
+            Err(error) => {
+                run.state = RunState::Errored;
+                run.error = Some(RunError { code: "workflow_journal_unavailable".into(), message: format!("{error:#}") });
+                run.ended_at = Some(now_rfc3339());
+                service.save_run(&mut run);
+                service.notify(&mut run);
+                return;
             }
-        }
+        };
         let mut steps = HashMap::new();
         let mut order = Vec::new();
         let mut agents_used = 0;
@@ -1272,6 +1422,9 @@ impl RunDriver {
                 last_poll = Instant::now();
                 self.poll();
             }
+            if self.run.error.as_ref().is_some_and(|error| error.code == STEP_OUTCOME_UNKNOWN) {
+                return self.finish_stopped(StopReason::Interrupted, &rx);
+            }
             self.admit();
             if self.run.state != RunState::Running {
                 return;
@@ -1287,7 +1440,8 @@ impl RunDriver {
     /// while and nothing else can progress: stop as `provider` (§3.1).
     fn provider_blocked(&mut self) -> Option<&'static str> {
         let since = self.blocked_since?;
-        (since.elapsed() >= PROVIDER_BLOCK_GRACE && self.queue.is_empty()).then_some("quota or login")
+        let cannot_admit = self.queue.is_empty() || self.running_count() >= self.run.limits.max_concurrency;
+        (since.elapsed() >= PROVIDER_BLOCK_GRACE && cannot_admit).then_some("quota or login")
     }
 
     fn handle(&mut self, message: Msg) {
@@ -1566,6 +1720,9 @@ impl RunDriver {
                 }
             }
             Err(error) => {
+                if matches!(error.code.as_str(), "runtime_restart" | "outcome_unknown") {
+                    self.run.error = Some(unknown_step_error());
+                }
                 self.service.log(&self.run.run_id, "warn", &format!("step {} could not start: {} ({})", step.label.clone().unwrap_or_else(|| key.clone()), error.message, error.code));
                 self.settle(step, StepState::Failed, None, Some(error));
             }
@@ -1598,8 +1755,10 @@ impl RunDriver {
             return;
         }
         let polled = self.service.backend.poll(&asks);
-        let all_blocked = asks.iter().all(|ask| matches!(polled.get(ask), Some(AskPoll::Pending { blocked: true, .. })));
-        if all_blocked {
+        let all_blocked_without_reset = asks.iter().all(|ask| matches!(
+            polled.get(ask), Some(AskPoll::Pending { blocked: true, quota_reset_known: false, .. })
+        ));
+        if all_blocked_without_reset {
             self.blocked_since.get_or_insert_with(Instant::now);
         } else {
             self.blocked_since = None;
@@ -1623,11 +1782,17 @@ impl RunDriver {
                 }
                 AskPoll::Failed { code, message, tokens } => {
                     step.tokens = tokens.max(step.tokens);
+                    if matches!(code.as_str(), "runtime_restart" | "outcome_unknown") {
+                        self.run.error = Some(unknown_step_error());
+                        self.settle(step, StepState::Failed, None, Some(unknown_step_error()));
+                        continue;
+                    }
                     self.service.log(&self.run.run_id, "warn", &format!("step {} failed: {message} ({code})", step.label.clone().unwrap_or_else(|| step.step_key.clone())));
                     self.settle(step, StepState::Failed, None, Some(RunError { code, message }));
                 }
                 AskPoll::Missing => {
-                    self.settle(step, StepState::Failed, None, Some(RunError { code: "ask_missing".into(), message: "the step's ask is gone".into() }));
+                    self.run.error = Some(unknown_step_error());
+                    self.settle(step, StepState::Failed, None, Some(unknown_step_error()));
                 }
             }
         }
@@ -1739,7 +1904,8 @@ impl RunDriver {
         }
         for step in self.steps.values().cloned().collect::<Vec<_>>() {
             if step.state.is_live() {
-                self.settle(step, StepState::Failed, None, Some(Self::err("stopped", "the run was stopped")));
+                self.run.error = Some(unknown_step_error());
+                self.settle(step, StepState::Failed, None, Some(unknown_step_error()));
             }
         }
         self.finish(RunState::Stopped, Some(reason));

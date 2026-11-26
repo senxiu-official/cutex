@@ -888,6 +888,9 @@ pub fn owner_batch_retry_blocked(record: &InputRecord) -> bool {
 
 /// The owner actions of the full record, including retained batch custody.
 pub fn record_actions(record: &InputRecord, delivery: Option<&Value>) -> Vec<Action> {
+    if bus_timeline_retry_blocked(record) {
+        return vec![Action::Dismiss];
+    }
     if owner_batch_retry_blocked(record) {
         return vec![Action::Dismiss];
     }
@@ -910,6 +913,37 @@ pub fn record_actions(record: &InputRecord, delivery: Option<&Value>) -> Vec<Act
         }
     }
     actions
+}
+
+/// The original native attempt was offered to a turn. A missing durable ACK
+/// keeps the row uncertain, but is not permission to mint a duplicate input.
+/// Explicit new attempts clear both identities in `plan`.
+pub fn bus_timeline_retry_blocked(record: &InputRecord) -> bool {
+    matches!(record.kind, InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm | InputKind::SystemNotice)
+        && matches!(record.state, InputState::Uncertain | InputState::Failed)
+        && record.turn_id.is_some() && record.timeline_item_id.is_some()
+}
+
+/// Explain the same current-record proof which removes Retry. Derived for
+/// legacy rows too: the desktop must not infer it from missing buttons. No
+/// receipt, state, stage timestamp or historical attempt is manufactured.
+fn project_bus_retry_diagnostic(record: &mut InputRecord) {
+    let blocked = bus_timeline_retry_blocked(record);
+    if let Some(diagnostic) = record.details.get_mut("deliveryDiagnostics").and_then(Value::as_object_mut) {
+        if blocked {
+            diagnostic.insert("retryBlocked".into(), json!(true));
+            let waiting = diagnostic.get("waitingFor").and_then(Value::as_str).map(str::to_owned);
+            if waiting.is_none() || waiting.as_deref().is_some_and(|wait|matches!(wait,
+                "nativeInbox" | "nativeAcceptance" | "nativeReconciliation" | "nextTurn" | "nextInputBoundary")) {
+                if let Some(waiting) = waiting { diagnostic.entry("sourceWaitingFor").or_insert(json!(waiting)); }
+                diagnostic.insert("waitingFor".into(), json!("contextReceipt"));
+            }
+        }
+        else { diagnostic.remove("retryBlocked"); }
+    } else if blocked {
+        if !record.details.is_object() { record.details = json!({}); }
+        record.details["deliveryDiagnostics"] = json!({"retryBlocked":true,"waitingFor":"contextReceipt"});
+    }
 }
 
 /// [`actions_for`] plus `interruptSend` when [`interrupt_send_legal`] under
@@ -1290,6 +1324,7 @@ fn apply(
         // Preserve independently requested receipt/admission deadlines.
         record.deadline=None;
     }
+    project_bus_retry_diagnostic(&mut record);
     record.actions = record_actions(&record, delivery);
     Ok(record)
 }
@@ -2056,14 +2091,32 @@ impl InputLedger {
     /// Deadline scheduler input: unsettled records whose deadline is at or
     /// before `now`, oldest first (index `input_ledger_deadline`).
     pub fn due(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<DueInput>, LedgerError> {
+        self.due_excluding(now, limit, &[])
+    }
+
+    /// Use the deadline index and skip sessions with one check already in flight.
+    pub(super) fn due_excluding(
+        &self, now: DateTime<Utc>, limit: usize, sessions: &[&str],
+    ) -> Result<Vec<DueInput>, LedgerError> {
         let mut guard = self.lock()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
-        let mut statement = connection.prepare_cached(
+        let mut sql = String::from(
             "SELECT session, input_id, state, rev, deadline_ms FROM input_ledger
-             WHERE deadline_ms IS NOT NULL AND deadline_ms <= ?1 ORDER BY deadline_ms LIMIT ?2",
-        )?;
+             WHERE deadline_ms IS NOT NULL AND deadline_ms <= ?1",
+        );
+        if !sessions.is_empty() {
+            let placeholders = (3..sessions.len() + 3).map(|index| format!("?{index}")).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND session NOT IN ({placeholders})"));
+        }
+        sql.push_str(" ORDER BY deadline_ms LIMIT ?2");
+        let mut parameters = vec![
+            rusqlite::types::Value::Integer(now.timestamp_millis()),
+            rusqlite::types::Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ];
+        parameters.extend(sessions.iter().map(|session| rusqlite::types::Value::Text((*session).into())));
+        let mut statement = connection.prepare_cached(&sql)?;
         let rows = statement.query_map(
-            params![now.timestamp_millis(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            rusqlite::params_from_iter(parameters),
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
         )?;
         let mut due = Vec::new();
@@ -2674,6 +2727,7 @@ fn session_row(connection: &Connection, session: &str) -> Result<Option<SessionR
 fn decode_record(json: &str) -> serde_json::Result<InputRecord> {
     let mut record: InputRecord = serde_json::from_str(json)?;
     if record.kind != InputKind::Owner {
+        project_bus_retry_diagnostic(&mut record);
         record.actions = record_actions(&record, None);
     }
     Ok(record)
@@ -2715,39 +2769,49 @@ pub fn run_deadline_pass(
 ) -> Result<usize, LedgerError> {
     let mut count = 0;
     for due in ledger.due(now, limit)? {
-        // Expiry must not wait for a runtime check that can hang.
-        let observed = ledger.get(&due.cutex_session_id, &[due.input_id.clone()])?.records.pop();
-        let expired = observed.as_ref().filter(|record|matches!(record.state,InputState::Received|InputState::Sending)).and_then(|record| record.details["observationDeadline"].as_str())
-            .and_then(|text| DateTime::parse_from_rfc3339(text).ok()).is_some_and(|at| at <= now);
-        let legacy_cap=observed.as_ref().filter(|record|
-            matches!(record.state,InputState::Held|InputState::Accepted)
-                && record.deadline.is_some()
-                && record.details["observationDeadline"].as_str()==record.deadline.as_deref());
-        let next = if let Some(record)=legacy_cap {
-            // Do not reinterpret the previous build's artificial cap as a
-            // source receipt deadline (which could query a missing runtime
-            // and invent uncertainty on upgrade). Retire metadata only.
-            let mut details=record.details.clone();
-            if let Some(object)=details.as_object_mut(){object.remove("observationDeadline");}
-            let mut next=Next::to(record.state).details(details).deadline(None);
-            next.reason=record.reason.clone();next.stage=record.stage;next
-        } else if expired {
-            Next::uncertain("outcomeUnknown").details(json!({"absoluteDeadlineElapsed":true}))
-        } else {
-            let Some(next) = decide(&due) else { continue }; next
-        };
-        match ledger.transition(&due.cutex_session_id, &due.input_id, Expect::rev(due.rev), next) {
-            Ok(transition) => {
-                if transition.changed {
-                    count += 1;
-                    applied(&transition);
-                }
-            }
-            Err(LedgerError::Conflict { .. }) => {}
-            Err(error) => return Err(error),
+        if let Some(transition) = run_deadline_item(ledger, &due, now, |_| decide(&due))? {
+            count += 1;
+            applied(&transition);
         }
     }
     Ok(count)
+}
+
+pub(super) fn run_deadline_item(
+    ledger: &InputLedger,
+    due: &DueInput,
+    now: DateTime<Utc>,
+    decide: impl FnOnce(&InputRecord) -> Option<Next>,
+) -> Result<Option<Transition>, LedgerError> {
+    let Some(observed) = ledger.get(&due.cutex_session_id, std::slice::from_ref(&due.input_id))?.records.pop()
+        .filter(|record| record.rev == due.rev) else {
+        return Ok(None);
+    };
+    // Expiry must not wait for a runtime check that can hang.
+    let observation_deadline = observed.details["observationDeadline"].as_str();
+    let expired = matches!(observed.state, InputState::Received | InputState::Sending)
+        && observation_deadline.and_then(|text| DateTime::parse_from_rfc3339(text).ok()).is_some_and(|at| at <= now);
+    let legacy_cap = matches!(observed.state, InputState::Held | InputState::Accepted)
+        && observed.deadline.is_some() && observation_deadline == observed.deadline.as_deref();
+    let next = if legacy_cap {
+        // Remove only the previous artificial cap. It is not a receipt deadline.
+        let mut details = observed.details.clone();
+        if let Some(object) = details.as_object_mut() { object.remove("observationDeadline"); }
+        let mut next = Next::to(observed.state).details(details).deadline(None);
+        next.reason = observed.reason;
+        next.stage = observed.stage;
+        next
+    } else if expired {
+        Next::uncertain("outcomeUnknown").details(json!({"absoluteDeadlineElapsed":true}))
+    } else {
+        let Some(next) = decide(&observed) else { return Ok(None); };
+        next
+    };
+    match ledger.transition(&due.cutex_session_id, &due.input_id, Expect::rev(due.rev), next) {
+        Ok(transition) => Ok(transition.changed.then_some(transition)),
+        Err(LedgerError::Conflict { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Time of the next deadline (`None`: nothing pending). The loop sleeps until

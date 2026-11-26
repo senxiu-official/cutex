@@ -2,10 +2,11 @@
 //! these rows retain the existing queue, native-send reservation and dedupe facts.
 use super::*;
 use crate::store::{self, ChangeKind, OpCounts, Scope, StoreDb, WriteTx};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::sync::Arc;
 
 const ID: &str = "user-input";
+const DATABASE_FILE: &str = "owner-input.sqlite3";
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS owner_sessions(
  session TEXT PRIMARY KEY, revision INTEGER NOT NULL, admission_revision INTEGER NOT NULL, asks_revision INTEGER NOT NULL,
@@ -67,7 +68,7 @@ fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
 pub(super) fn open(root: &Path) -> anyhow::Result<Arc<StoreDb>> {
     let db = StoreDb::open_at(
         &store::domain::OWNER_INPUT,
-        &root.join("owner-input.sqlite3"),
+        &root.join(DATABASE_FILE),
     )?;
     let ready = db.read(|tx| {
         Ok(tx.sql().query_row(
@@ -217,6 +218,46 @@ pub(super) fn identity(
         )
         .optional()?;
     bytes.map(decode).transpose()
+}
+
+/// Read live owner rows in one SQLite snapshot. Before a verified import
+/// (including after rollback), the legacy file is still authoritative.
+pub(super) fn read_numbered_sessions(
+    root: &Path,
+    sessions: &std::collections::BTreeSet<&str>,
+    mut visit: impl FnMut(&str, Option<&SessionInputState>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let database = root.join(DATABASE_FILE);
+    if database.try_exists()? {
+        let mut connection = Connection::open_with_flags(
+            database, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = connection.transaction()?;
+        let has_migrations = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='store_migrations')",
+            [], |row| row.get::<_, bool>(0),
+        )?;
+        if has_migrations && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM store_migrations WHERE store=?1 AND version=1)",
+            [ID], |row| row.get::<_, bool>(0),
+        )? {
+            for session in sessions {
+                let (state, _) = selected(&tx, session, &[], true)?;
+                visit(session, state.as_ref())?;
+            }
+            return Ok(());
+        }
+    }
+    let state: UserInputStateStore = match File::open(root.join(USER_INPUT_STATE_FILE)) {
+        Ok(file) => serde_json::from_reader(file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserInputStateStore::default(),
+        Err(error) => return Err(error.into()),
+    };
+    for session in sessions {
+        visit(session, state.sessions.get(*session))?;
+    }
+    Ok(())
 }
 
 /// Load the requested session's live queue and only its queued/explicit

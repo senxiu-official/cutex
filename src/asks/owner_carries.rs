@@ -98,6 +98,19 @@ pub fn reserve_owner_results(
     settings: DocumentSettings,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<OwnerResultBundle>> {
+    reserve_owner_results_filtered(store, session, owner_input_id, generation, receiver_limit, settings, now, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reserve_owner_results_filtered(
+    store: &AskStore, session: &str, owner_input_id: &str, generation: u64,
+    receiver_limit: ReceiverLimit, settings: DocumentSettings, now: DateTime<Utc>,
+    ordered_start: bool,
+) -> anyhow::Result<Option<OwnerResultBundle>> {
+    let eligible_for_owner = |state: &AskState, delivery: &DeliveryRecord| {
+        eligible(state, delivery, session)
+            && (!ordered_start || !super::returns::ordinary_automatic_result(state, session, delivery))
+    };
     anyhow::ensure!(
         !owner_input_id.is_empty(),
         "owner input id must not be empty"
@@ -114,7 +127,7 @@ pub fn reserve_owner_results(
         state
             .deliveries
             .values()
-            .filter(|d| eligible(&state, d, session))
+            .filter(|d| eligible_for_owner(&state, d))
             .map(|d| d.delivery_id.clone())
             .collect(),
     );
@@ -150,13 +163,7 @@ pub fn reserve_owner_results(
     let items: Vec<_> = pairs.iter().map(|(_, item)| item.clone()).collect();
     let mut view = super::views::results_view(
         &items,
-        &|id| {
-            state
-                .asks
-                .get(id)
-                .map(|a| (a.target_cutex_session_id.clone(), a.target_name.clone()))
-                .unwrap_or_default()
-        },
+        &|id| state.asks.get(id).map(|ask| &**ask),
         &|id| state.answers.get(id).and_then(|a| a.preview.clone()),
     );
     // Views may omit tail rows, including the only answer. Freeze the
@@ -185,7 +192,7 @@ pub fn reserve_owner_results(
                 state
                     .deliveries
                     .get(id)
-                    .is_some_and(|d| eligible(state, d, session))
+                    .is_some_and(|d| eligible_for_owner(state, d))
             })
         {
             return None;

@@ -79,7 +79,8 @@ pub fn diagnostic(
             | "content_policy_violation"
             | "policy_violation"
             | "refusal"
-            | "safety",
+            | "safety"
+            | "misalignmentPolicyViolation",
         ) => FailureKind::ProviderRefused,
         Some(
             "usageLimitExceeded" | "sessionBudgetExceeded" | "insufficient_quota" | "billing_error",
@@ -336,9 +337,9 @@ mod tests {
             g: u64,
             id: &str,
             req: &Value,
-            result: &Value,
+            response: crate::asks::scheduler::QuestionResponse<'_>,
         ) -> crate::asks::scheduler::RespondOutcome {
-            self.inner.respond_question(s, g, id, req, result)
+            self.inner.respond_question(s, g, id, req, response)
         }
     }
 

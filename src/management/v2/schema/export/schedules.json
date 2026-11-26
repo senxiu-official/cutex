@@ -12,13 +12,20 @@
     ]},
     "date":{"type":"string","format":"date-time"},
     "nullableDate":{"anyOf":[{"$ref":"#/$defs/date"},{"type":"null"}]},
+    "template":{"type":"object","required":["assistantId","assistantRevision","projectRef","templateRevision","confirmedSeat","task"],"properties":{
+      "assistantId":{"type":"string"},"assistantRevision":{"type":"integer","minimum":1},"templateRevision":{"type":"integer","minimum":1},
+      "projectRef":{"type":"object","required":["instanceId","projectId"],"properties":{"instanceId":{"type":"string"},"projectId":{"type":"string"}}},
+      "confirmedSeat":{"type":"object","required":["sessionId","epoch"],"properties":{"sessionId":{"type":"string"},"epoch":{"type":"integer","minimum":0}}},
+      "task":{"enum":["projectStatus","dueRequests","calendarSummary"]}
+    }},
     "run":{"type":"object","required":["id","sequence","scheduleId","scheduleRevision","targetSessionId","message","scheduledAt","startedAt","finishedAt","outcome","attempts","nextAttemptAt","lastError","messageId"],"properties":{
       "id":{"type":"string"},"sequence":{"type":"integer","minimum":1},"scheduleId":{"type":"string"},"scheduleRevision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},
       "scheduledAt":{"$ref":"#/$defs/date"},"startedAt":{"$ref":"#/$defs/nullableDate"},"finishedAt":{"$ref":"#/$defs/nullableDate"},
-      "outcome":{"enum":["pending","dispatching","held","retrying","handedOff","refused","cancelled"]},"attempts":{"type":"integer","minimum":0},"nextAttemptAt":{"$ref":"#/$defs/date"},"lastError":{"type":["string","null"]},"messageId":{"type":["string","null"]},"leaseToken":{"type":["string","null"]}
+      "outcome":{"enum":["pending","dispatching","held","retrying","handedOff","refused","cancelled"]},"attempts":{"type":"integer","minimum":0},"nextAttemptAt":{"$ref":"#/$defs/date"},"lastError":{"type":["string","null"]},"messageId":{"type":["string","null"]},"leaseToken":{"type":["string","null"]},
+      "assistantTemplate":{"$ref":"#/$defs/template"},"requestId":{"type":"string"},"coalescedUntil":{"$ref":"#/$defs/date"},"slotLocal":{"$ref":"#/$defs/date"}
     }},
     "schedule":{"type":"object","required":["id","revision","targetSessionId","message","rule","timezone","enabled","nextRunAt","createdAt","updatedAt","deletedAt","lastRun"],"properties":{
-      "id":{"type":"string"},"revision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},"rule":{"$ref":"#/$defs/rule"},"timezone":{"const":"host"},"enabled":{"type":"boolean"},"nextRunAt":{"$ref":"#/$defs/nullableDate"},"createdAt":{"$ref":"#/$defs/date"},"updatedAt":{"$ref":"#/$defs/date"},"deletedAt":{"$ref":"#/$defs/nullableDate"},"lastRun":{"anyOf":[{"$ref":"#/$defs/run"},{"type":"null"}]}
+      "id":{"type":"string"},"revision":{"type":"integer","minimum":1},"targetSessionId":{"type":"string"},"message":{"type":"string"},"rule":{"$ref":"#/$defs/rule"},"timezone":{"const":"host"},"enabled":{"type":"boolean"},"nextRunAt":{"$ref":"#/$defs/nullableDate"},"createdAt":{"$ref":"#/$defs/date"},"updatedAt":{"$ref":"#/$defs/date"},"deletedAt":{"$ref":"#/$defs/nullableDate"},"lastRun":{"anyOf":[{"$ref":"#/$defs/run"},{"type":"null"}]},"assistantTemplate":{"$ref":"#/$defs/template"}
     }},
     "item":{"type":"object","required":["schedule"],"properties":{"schedule":{"$ref":"#/$defs/schedule"}}},
     "list":{"type":"object","required":["data","nextCursor"],"properties":{"data":{"type":"array","items":{"$ref":"#/$defs/schedule"},"maxItems":100},"nextCursor":{"type":["string","null"]}}},

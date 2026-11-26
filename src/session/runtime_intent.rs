@@ -400,6 +400,7 @@ mod tests {
 
     fn claude_status(connected: bool, runtime_generation: u64) -> crate::app_server::manager::AppServerManagedRuntimeStatus {
         crate::app_server::manager::AppServerManagedRuntimeStatus {
+            claude_diagnostics: None,
             background_work: Default::default(),
             cutex_session_id: "cutex.claude".into(),
             thread_id: "thread".into(),

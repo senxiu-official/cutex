@@ -182,7 +182,8 @@ fn windows_process_started_at(pid: u32) -> anyhow::Result<DateTime<Utc>> {
             handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
         }
         if handle.is_null() {
-            anyhow::bail!("failed to open runtime pid {pid} for creation-time verification");
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open runtime pid {pid} for creation-time verification"));
         }
         let zero_filetime = || FILETIME {
             dwLowDateTime: 0,

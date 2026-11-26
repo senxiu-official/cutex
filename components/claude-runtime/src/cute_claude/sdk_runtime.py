@@ -20,7 +20,9 @@ import time
 from typing import Any, Awaitable, Callable
 import uuid
 
+from .model_catalog import reference_catalog, resolved_display
 from .provider import ProviderError, TransportFailure
+from .runtime_diagnostics import RuntimeDiagnostics
 from .runtime_tasks import stop_outcome
 from .subscription_auth import SubscriptionSetupError
 
@@ -35,6 +37,7 @@ from .subscription_auth import SubscriptionSetupError
 AUTONOMOUS_QUIET_SECONDS = 3.0
 AUTONOMOUS_START_SECONDS = 10.0
 AUTONOMOUS_WAIT_SECONDS = 120.0
+EFFORT_RESOLUTION_WAIT_SECONDS = 8.0
 
 
 def tool_results(message: Any) -> bool:
@@ -354,6 +357,11 @@ class RuntimeOwner:
         self.identity_observed = False
         self.model_catalog: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
+        self.resolved_models: dict[str, str] = {}
+        self.resolved_model_display: dict[str, dict] = {}
+        self.applied_effort: dict | None = None
+        self.effort_resolution_deadline: float | None = None
+        self.effort_resolution_unreported = False
         self.native_connection_generation = 1
         self.recovery_revision = 0
         self.recovery_arrivals = 0
@@ -363,6 +371,7 @@ class RuntimeOwner:
         self.reconnect_attempts = 0
         from .runtime_tasks import RuntimeTasks
         self.tasks = RuntimeTasks(engine, tid, self.session_id)
+        self.diagnostics = RuntimeDiagnostics(engine, tid)
         self.task = asyncio.create_task(self._own(), name=f'claude-sdk-owner:{tid}')
 
     @staticmethod
@@ -398,6 +407,15 @@ class RuntimeOwner:
                 'reconnectAttempts': self.reconnect_attempts,
                 'pidObservation': 'sdk-private-diagnostic-only',
                 'modelObservation': self.engine.model_status(self.tid),
+                'reasoningResolution': self.applied_effort,
+                'reasoningResolutionPending': self.effort_resolution_deadline is not None,
+                'reasoningResolutionUnreported': self.effort_resolution_unreported,
+                'modelResolution': {
+                    'resolvedModels': self.resolved_models.copy(),
+                    'resolvedModelDisplay': self.resolved_model_display.copy(),
+                    'supportedEffortLevels': self.model_efforts.copy(),
+                    'source': 'sdkHandshake',
+                },
                 'ownerTaskAlive': not self.task.done()}
 
     async def status(self, state: str) -> None:
@@ -427,7 +445,8 @@ class RuntimeOwner:
         return await asyncio.wait_for(future, timeout=4)
 
     async def control(self, kind: str, **arguments):
-        if kind not in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files', 'flag_settings'}:
+        if kind not in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files',
+                        'flag_settings', 'apply_inherited_effort'}:
             raise ProviderError('Unknown native runtime control operation')
         await asyncio.shield(self.ready)
         if not self.accepting or self.task.done():
@@ -487,7 +506,13 @@ class RuntimeOwner:
         turn runs: Claude Code uses them from its next model request (live_settings)."""
         engine, tid = self.engine, self.tid
         current, effort = engine.store.thread(tid)['model'], engine.thread_effort(tid)
-        settings: dict = {'effortLevel': command.effort}
+        inherited = self.applied_effort
+        if (inherited is not None and inherited['requestedModel'] == command.model
+                and command.model == current and command.effort is None):
+            settings: dict = {'effortLevel': inherited['effort']}
+        else:
+            inherited = None
+            settings = {'effortLevel': command.effort}
         if command.fast is not None:
             settings['fastMode'] = command.fast
         compaction = getattr(engine, 'compaction', None)
@@ -516,6 +541,10 @@ class RuntimeOwner:
             engine.save_model_effort(tid, command.model, command.effort)
         else:
             engine.save_model_effort(tid, command.model, command.effort, command.fast)
+        self.applied_effort = inherited
+        if command.effort is not None:
+            self.effort_resolution_deadline = None
+            self.effort_resolution_unreported = False
         command.future.set_result(None)
         if not self.active:
             await self.status('waiting')
@@ -592,6 +621,8 @@ class RuntimeOwner:
         if not self.deferred:
             return None
         now = asyncio.get_running_loop().time()
+        if self.effort_resolution_deadline is not None:
+            return None
         if self.autonomous_until is not None and now >= self.autonomous_until:
             self.autonomous_until = None
         if self.autonomous_until is not None:
@@ -602,6 +633,17 @@ class RuntimeOwner:
         run = self.deferred.pop(0)
         self.deferred_until = (now + AUTONOMOUS_WAIT_SECONDS) if self.deferred else None
         return run
+
+    async def _expire_effort_resolution(self) -> None:
+        deadline = self.effort_resolution_deadline
+        if deadline is None or asyncio.get_running_loop().time() < deadline:
+            return
+        self.effort_resolution_deadline = None
+        self.effort_resolution_unreported = True
+        print(f'claude runtime {self.tid}: generation {self.native_connection_generation} '
+              f'effort resolution timed out after {EFFORT_RESOLUTION_WAIT_SECONDS:g}s; '
+              'using this child\'s default effort until host resolution succeeds', file=sys.stderr)
+        await self.status(self.state)
 
     def _fail_deferred(self, error: BaseException) -> None:
         for run in self.deferred:
@@ -635,6 +677,11 @@ class RuntimeOwner:
             # These events bypass the ordinary turn callback, but may describe
             # effects that make a silent-turn retry unsafe.
             self.engine.retry_blocked.add(self.active.turn_id)
+        if typ in {'SystemMessage', 'system', 'HookEventMessage'}:
+            if self.active and self.active.interrupted and field(message, 'subtype') == 'hook_started':
+                return
+            if await self.diagnostics.settings_or_hook(message):
+                return
         self._observe_autonomous(message, typ)
         await self._publish_notification_hold()
         if await self.tasks.observe(message, self.active.turn_id if self.active else None):
@@ -665,6 +712,9 @@ class RuntimeOwner:
                 and self.active and not self.active.interrupted):
             await self.active.callback(message)
             return
+        terminal = typ in {'ResultMessage', 'result'}
+        if terminal and field(message, 'session_id') == self.session_id:
+            await self.diagnostics.clear_hooks()
         # Background/status events are session-scoped, never guessed to belong
         # to the next user turn. Do not save their raw text or data in diagnostics.
         ordinary = {'StreamEvent', 'stream_event', 'AssistantMessage', 'assistant', 'UserMessage', 'user', 'ResultMessage', 'result'}
@@ -677,7 +727,6 @@ class RuntimeOwner:
                     {'running', 'completed', 'failed', 'stopped', 'cancelled'} else None})
             return
         active = self.active
-        terminal = typ in {'ResultMessage', 'result'}
         if typ in {'AssistantMessage','assistant','UserMessage','user'}:
             await self.bridge.native.message(message)
         if terminal:
@@ -733,7 +782,8 @@ class RuntimeOwner:
                 return True
             # Hold, not reject: the owner loop submits it when the autonomous
             # turn ends. Inputs already held keep their order.
-            if not released and (self.autonomous_until is not None or self.deferred):
+            if not released and (self.effort_resolution_deadline is not None
+                                 or self.autonomous_until is not None or self.deferred):
                 if not self.deferred:
                     self.deferred_until = asyncio.get_running_loop().time() + AUTONOMOUS_WAIT_SECONDS
                 self.deferred.append(command)
@@ -796,7 +846,7 @@ class RuntimeOwner:
             except BaseException as exc:
                 raise OutcomeUncertain(str(safe_error(exc, 'query'))) from None
             return True
-        if command.kind in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files', 'flag_settings'}:
+        if command.kind in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files', 'flag_settings', 'apply_inherited_effort'}:
             args = command.arguments or {}
             try:
                 if command.kind in {'mcp_reconnect', 'mcp_toggle', 'rewind_files'} and (
@@ -818,6 +868,25 @@ class RuntimeOwner:
                             # a runtime that refuses it applies the rules at its next start.
                             result = await self.client._query._send_control_request(
                                 {'subtype': 'apply_flag_settings', 'settings': args['settings']})
+                        elif command.kind == 'apply_inherited_effort':
+                            model = self.engine.store.thread(self.tid)['model']
+                            if (args['model'] != model or args['connection_id'] != self.connection_id
+                                    or args['generation'] != self.native_connection_generation
+                                    or self.engine.thread_effort(self.tid) is not None or self.active):
+                                raise ProviderError('Claude inherited effort configuration changed')
+                            effort = args['effort']
+                            previous = self.applied_effort
+                            if effort is not None or previous is not None:
+                                await self.client._query._send_control_request({
+                                    'subtype': 'apply_flag_settings', 'settings': {'effortLevel': effort}})
+                            self.applied_effort = {
+                                'requestedModel': model,
+                                'resolvedModel': self.resolved_models.get(model),
+                                'effort': effort,
+                            }
+                            self.effort_resolution_deadline = None
+                            self.effort_resolution_unreported = False
+                            result = self.applied_effort
                         elif command.kind == 'task_stop':
                             try:
                                 if args.get('expected_connection_id', self.connection_id) != self.connection_id:
@@ -899,6 +968,7 @@ class RuntimeOwner:
                 self.process = getattr(getattr(self.client, '_transport', None), '_process', None)
                 if self.process is not None:
                     self.lease.record_process(self.process.pid)
+                await self.restore_model_handshake()
                 self.native_connection_generation += 1
                 self.connected_at = int(time.time() * 1000)
                 # The replaced child's autonomous turn ended with it.
@@ -968,6 +1038,7 @@ class RuntimeOwner:
                 return True
             self.active.interrupted = True
             self.bridge.revoke()
+            await self.diagnostics.clear_hooks()
             await self.status('interrupting')
             await self.bridge.cancel_tools()
             try:
@@ -995,6 +1066,7 @@ class RuntimeOwner:
         self.bridge.accepting = False
         if self.active:
             self.finishing_turn_id = self.active.turn_id
+        await self.diagnostics.clear()
         await self.status('reconnecting')
         if self.active:
             await self.engine.busy_delivery.context_receipts.flush(self.tid, self.active.turn_id)
@@ -1041,6 +1113,7 @@ class RuntimeOwner:
         if self.process is None:
             raise OutcomeUncertain('Replacement child has no observable process; refusing an unleased writer.')
         self.lease.record_process(self.process.pid)
+        await self.restore_model_handshake()
         self.process_exit_confirmed = None
         self.native_connection_generation += 1
         self.connected_at = int(time.time() * 1000)
@@ -1052,6 +1125,70 @@ class RuntimeOwner:
         if active and not active.future.done():
             active.future.set_exception(failure)
         self._complete_interrupts()
+
+    async def restore_model_handshake(self) -> None:
+        previous, self.applied_effort = self.applied_effort, None
+        async with asyncio.timeout(self.driver.control_timeout):
+            await self.read_model_handshake()
+            model = self.engine.store.thread(self.tid)['model']
+            if self.engine.thread_effort(self.tid) is not None:
+                self.effort_resolution_deadline = None
+                self.effort_resolution_unreported = False
+                return
+            if previous is None:
+                return
+            target = self.resolved_models.get(model)
+            effort = previous['effort']
+            levels = self.model_efforts.get(model, self.model_efforts.get(target))
+            if (previous['requestedModel'] != model or target != previous['resolvedModel']
+                    or (effort is not None and levels is not None and effort not in levels)):
+                self.effort_resolution_deadline = (
+                    asyncio.get_running_loop().time() + EFFORT_RESOLUTION_WAIT_SECONDS)
+                return
+            # The owner finishes this control before it can dequeue a query.
+            if effort is not None:
+                await self.client._query._send_control_request({
+                    'subtype': 'apply_flag_settings', 'settings': {'effortLevel': effort}})
+            self.applied_effort = previous
+
+    async def read_model_handshake(self) -> None:
+        # Evidence belongs to the current child, even when it reports no model information.
+        self.model_catalog.clear()
+        self.model_efforts.clear()
+        self.resolved_models.clear()
+        self.resolved_model_display.clear()
+        info_method = getattr(self.client, 'get_server_info', None)
+        if info_method is None:
+            return
+        info = await info_method()
+        models = info.get('models') if isinstance(info, dict) else None
+        if not isinstance(models, list):
+            return
+        for model in models[:128]:
+            if not isinstance(model, dict):
+                continue
+            value = model.get('value')
+            label = model.get('displayName', value)
+            if not (isinstance(value, str) and 0 < len(value) <= 256
+                    and isinstance(label, str) and 0 < len(label) <= 256
+                    and not any(ord(c) < 32 for c in value + label)):
+                continue
+            self.model_catalog[value] = label
+            resolved = model.get('resolvedModel')
+            if isinstance(resolved, str) and 0 < len(resolved) <= 200 and not any(
+                    ch.isspace() or ord(ch) < 32 for ch in resolved):
+                self.resolved_models[value] = resolved
+            levels = model.get('supportedEffortLevels')
+            if isinstance(levels, list):
+                self.model_efforts[value] = [
+                    x for x in levels if isinstance(x, str) and x in {'low', 'medium', 'high', 'xhigh', 'max'}
+                ]
+        if self.resolved_models:
+            with suppress(OSError, ValueError, KeyError, TypeError):
+                rows = {row['id']: row for row in reference_catalog()['models']}
+                for target in set(self.resolved_models.values()):
+                    if display := resolved_display(rows, target):
+                        self.resolved_model_display[target] = display
 
     async def _own(self) -> None:
         failure: BaseException | None = None
@@ -1065,24 +1202,7 @@ class RuntimeOwner:
             async with asyncio.timeout(self.driver.connect_timeout):
                 await self.client.connect()
             connected = True
-            # Public SDK initialization metadata; no prompt or extra subprocess.
-            info_method = getattr(self.client, 'get_server_info', None)
-            if info_method is not None:
-                info = await info_method()
-                models = info.get('models', []) if isinstance(info, dict) else []
-                if isinstance(models, list):
-                    for model in models[:128]:
-                        if not isinstance(model, dict):
-                            continue
-                        value = model.get('value')
-                        label = model.get('displayName', value)
-                        if (isinstance(value, str) and 0 < len(value) <= 256
-                                and isinstance(label, str) and 0 < len(label) <= 256
-                                and not any(ord(c) < 32 for c in value + label)):
-                            self.model_catalog[value] = label
-                            levels = model.get('supportedEffortLevels')
-                            if isinstance(levels, list):
-                                self.model_efforts[value] = [x for x in levels if isinstance(x, str) and x in {'low', 'medium', 'high', 'xhigh', 'max'}]
+            await self.read_model_handshake()
             # Not a control dependency: the process object is retained only to
             # distinguish SDK disconnect from observed child exit. Version-pinned
             # internal accessor, absent -> close_unverified, never fake success.
@@ -1095,13 +1215,18 @@ class RuntimeOwner:
             self.ready.set_result(None)
             stage = 'stream'
             while True:
+                await self._expire_effort_resolution()
                 command = self._due_deferred()
                 released = command is not None
                 if command is None:
                     now = asyncio.get_running_loop().time()
                     deadlines = [self.interrupt_deadline] if self.interrupt_deadline is not None else []
-                    if self.deferred:
-                        deadlines += [d for d in (self.autonomous_until, self.deferred_until) if d is not None]
+                    if self.effort_resolution_deadline is not None:
+                        deadlines.append(self.effort_resolution_deadline)
+                    elif self.deferred:
+                        deadlines.append(self.deferred_until)
+                        if self.autonomous_until is not None:
+                            deadlines.append(self.autonomous_until)
                     remaining = max(0, min(deadlines) - now) if deadlines else None
                     try:
                         async with asyncio.timeout(remaining):
@@ -1148,6 +1273,7 @@ class RuntimeOwner:
                 if self.active:
                     self.finishing_turn_id = self.active.turn_id
             try:
+                await self.diagnostics.clear()
                 await self.status('closing')
             except BaseException as exc:
                 record_cleanup(exc, 'publish-close')

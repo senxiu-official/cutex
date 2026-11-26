@@ -199,7 +199,8 @@ fn r29_release_policy_bundles_an_unmodified_cli_by_default_and_keeps_the_off_swi
 
     let vendor = include_str!("../../components/claude-runtime/scripts/vendor_wheels.py");
     assert!(vendor.contains("actual != expected_sha256"));
-    assert!(vendor.contains("if bundled != [expected_cli]"));
+    assert!(vendor.contains("if sorted(bundled) != sorted(expected_members)"));
+    assert!(vendor.contains("bundle.read(version_path).splitlines() != [version_metadata]"));
     assert!(vendor.contains("shutil.copyfile(wheel, target)"));
 
     let notices = include_str!("../../components/claude-runtime/scripts/wheel_notices.py");

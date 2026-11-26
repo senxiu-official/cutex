@@ -72,6 +72,7 @@ pub const BROWSER_FENCE_PATH: &str = "/api/mcp/v1/browser-fence";
 /// The Agent Bus routes the cutex MCP adapter calls
 /// (`client::submit_mcp_control`). The agent list is a GET, the rest POST.
 pub const MCP_ROUTE_PATHS: &[&str] = &[
+    crate::personal_assistants::tools::PATH,
     crate::agent_bus::native_subagent::PATH,
     MCP_AGENT_LIST_PATH,
     "/api/agent-management/v1/actions",

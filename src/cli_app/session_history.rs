@@ -162,24 +162,7 @@ pub(crate) fn isolated_endpoint(
             home,
         )?
         .args(["--listen", "stdio://"]);
-        let mut command = launch.to_command();
-        command.current_dir(&cwd);
-        let mut options =
-            cutex::catalog::StdioAppServerOptions::new(&bundle.executable.path, home.to_path_buf());
-        options.max_message_bytes = HISTORY_MAX_MESSAGE_BYTES;
-        let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
-        let initialized = endpoint.request("initialize", json!({"clientInfo":{"name":"cutex_history","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
-        // Compare canonically: Windows homes are stored verbatim (`\\?\C:\...`)
-        // while the native runtime reports the plain path.
-        ensure!(
-            initialized["codexHome"]
-                .as_str()
-                .and_then(|reported| Path::new(reported).canonicalize().ok())
-                == Some(home.canonicalize()?),
-            "native history home mismatch"
-        );
-        endpoint.notify("initialized", None)?;
-        Ok(endpoint)
+        start_native_reader(launch.to_command(), &bundle.executable.path, home, &cwd)
     } else {
         let launch = super::session_native_workflow::NativeLaunch {
             cwd,
@@ -189,6 +172,90 @@ pub(crate) fn isolated_endpoint(
         };
         launch.endpoint_bounded(Some(HISTORY_MAX_MESSAGE_BYTES))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+struct ArchiveHistoryEndpoint {
+    endpoint: NativeHistoryOnly,
+    _home: cutex::management::v2::archive_records::ArchiveReaderHome,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+impl cutex::catalog::CatalogEndpoint for ArchiveHistoryEndpoint {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, cutex::catalog::CatalogError> {
+        self.endpoint.request(method, params)
+    }
+
+    fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), cutex::catalog::CatalogError> {
+        self.endpoint.notify(method, params)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn start_native_reader(
+    mut command: std::process::Command,
+    program: &Path,
+    home: &Path,
+    cwd: &Path,
+) -> anyhow::Result<OwnedStdioEndpoint> {
+    command.current_dir(cwd);
+    let mut options = cutex::catalog::StdioAppServerOptions::new(program, home.to_path_buf());
+    options.max_message_bytes = HISTORY_MAX_MESSAGE_BYTES;
+    let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
+    let initialized = endpoint.request("initialize", json!({"clientInfo":{"name":"cutex_history","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
+    ensure!(
+        initialized["codexHome"]
+            .as_str()
+            .and_then(|reported| Path::new(reported).canonicalize().ok())
+            == Some(home.canonicalize()?),
+        "native history home mismatch"
+    );
+    endpoint.notify("initialized", None)?;
+    Ok(endpoint)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+struct NativeHistoryOnly(OwnedStdioEndpoint);
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+impl CatalogEndpoint for NativeHistoryOnly {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, cutex::catalog::CatalogError> {
+        if !matches!(method, "thread/read" | "thread/turns/list" | "thread/items/list") {
+            return Err(cutex::catalog::CatalogError::InvalidInput("history reader accepts only history reads".into()));
+        }
+        self.0.request(method, params)
+    }
+
+    fn notify(&mut self, _: &str, _: Option<Value>) -> Result<(), cutex::catalog::CatalogError> {
+        Err(cutex::catalog::CatalogError::InvalidInput("history reader accepts no notifications".into()))
+    }
+}
+
+/// The verified Native pin reads its own saved history. It needs neither a
+/// current profile projection nor a provider login for this offline request.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn pinned_history_launch(program: &Path, home: &Path) -> anyhow::Result<cutex::launch::command::LaunchCommand> {
+    let launch = super::stock_lifecycle::clean_launch(program, home)?;
+    let launch = super::stock_lifecycle::option(launch, "analytics.enabled", false)?;
+    // A saved home can contain an effort from a newer catalog. This value
+    // only initializes the reader. No thread is resumed or run.
+    let launch = super::stock_lifecycle::option(launch, "model_reasoning_effort", "medium")?;
+    Ok(launch.args(["--listen", "stdio://"]))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn offline_native_history_reader(
+    record: &cutex::session::model::CutexSessionRecord,
+    home: &Path,
+) -> anyhow::Result<NativeHistoryOnly> {
+    let endpoint = if let Some(contract) = record.explicit_launch.as_ref() {
+        let bundle = cutex::launch::stock::StockBundle::load_running(contract)?;
+        let launch = pinned_history_launch(&bundle.executable.path, home)?;
+        start_native_reader(launch.to_command(), &bundle.executable.path, home, home)?
+    } else {
+        isolated_endpoint(Some(record), home)?
+    };
+    Ok(NativeHistoryOnly(endpoint))
 }
 
 /// `ManagementRequestContext::open_offline_history`: a read-only native
@@ -226,8 +293,13 @@ pub(crate) fn open_offline_history_endpoint(
                 session.state_dir.clone(),
             ));
         }
+        if let Some(reader_home) = cutex::management::v2::archive_records::open_reader(record)? {
+            let endpoint = offline_native_history_reader(record, reader_home.path())?;
+            let path = reader_home.path().to_owned();
+            return Ok((Box::new(ArchiveHistoryEndpoint { endpoint, _home: reader_home }), path));
+        }
         let home = native_home_for(Some(record))?;
-        let endpoint = isolated_endpoint(Some(record), &home)?;
+        let endpoint = offline_native_history_reader(record, &home)?;
         Ok((Box::new(endpoint), home))
     }
 }
@@ -1143,6 +1215,43 @@ pub(super) fn run(
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn retired_native_selection_opens_history_on_pinned_app_server() {
+        let Some(program) = std::env::var_os("CUTEX_Z5_NATIVE_APP_SERVER").map(PathBuf::from) else {
+            eprintln!("skipped: CUTEX_Z5_NATIVE_APP_SERVER is not set");
+            return;
+        };
+        let _test = super::super::test_home::IsolatedTestHome::new_private("z5-native-reader").unwrap();
+        let home = cutex::config::paths::config_dir().unwrap().join("reader");
+        let dir = home.join("sessions/2026/11/24");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = "model = \"retired-fixture\"\nmodel_reasoning_effort = \"retired-effort\"\n";
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let rollout = dir.join(format!("rollout-2026-11-24T12-00-00-{thread}.jsonl"));
+        let records = [
+            json!({"ordinal":0,"timestamp":"2026-11-24T12:00:00Z","type":"session_meta",
+                "payload":{"session_id":thread,"id":thread,"timestamp":"2026-11-24T12:00:00Z",
+                    "cwd":home,"originator":"cutex-fixture","cli_version":"0.171.0","source":"cli",
+                    "model_provider":"openai","history_mode":"paginated"}}),
+            json!({"ordinal":1,"timestamp":"2026-11-24T12:00:01Z","type":"event_msg",
+                "payload":{"type":"user_message","message":"old history","images":[],"local_images":[],"text_elements":[]}}),
+        ];
+        let data = records.iter().map(|record| format!("{record}\n")).collect::<String>();
+        std::fs::write(&rollout, &data).unwrap();
+        let mut endpoint = NativeHistoryOnly(start_native_reader(
+            pinned_history_launch(&program, &home).unwrap().to_command(),
+            &program, &home, &home,
+        ).unwrap());
+        let read = endpoint.request("thread/read", json!({"threadId":thread,"includeTurns":false})).unwrap();
+        assert_eq!(read["thread"]["id"], thread);
+        assert_eq!(read["thread"]["preview"], "old history");
+        assert!(endpoint.request("turn/start", json!({"threadId":thread})).is_err());
+        drop(endpoint);
+        assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), config);
+        assert_eq!(std::fs::read_to_string(rollout).unwrap(), data);
+    }
     /// Rust <-> adapter handshake of the offline Claude history reader. Runs
     /// when CUTEX_TEST_CLAUDE_PYTHON names a Python with the adapter's
     /// dependencies (e.g. `components/claude-runtime/.venv`); no model or login is used.
@@ -1159,7 +1268,7 @@ mod tests {
         let session: cutex::runtime::claude::ClaudeSession = serde_json::from_value(json!({
             "deployment": {"python": python, "adapter_source": adapter, "claude_cli": "/claude",
                            "claude_home": "/home", "tui_binary": "/tui"},
-            "thread_id": "8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a11", "state_dir": state, "model": "sonnet"
+            "thread_id": "8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a11", "state_dir": state, "model": "retired-fixture-model", "effort": "max"
         }))
         .unwrap();
         // Never started: no state yet, empty pages, typed thread/read error.
@@ -1179,7 +1288,7 @@ mod tests {
                 "-c",
                 concat!(
                     "import sys; from pathlib import Path; from cute_claude.store import Store; ",
-                    "s = Store(Path(sys.argv[1])); s.ensure_thread('8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a11', 'sonnet', sys.argv[1], ''); s.close()",
+                    "s = Store(Path(sys.argv[1])); s.ensure_thread('8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a11', 'retired-fixture-model', sys.argv[1], ''); s.close()",
                 ),
             ])
             .arg(&state)

@@ -28,6 +28,10 @@ pub fn claude_soon(capabilities: &Value) -> bool {
             ["after_turn", "passive", "soon"].iter().all(|mode| modes.iter().any(|v| v.as_str() == Some(*mode))))
 }
 
+pub fn claude_ordered(capabilities: &Value) -> bool {
+    claude_soon(capabilities) && capabilities["externalInputOrderedBatch"] == 1
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Observed {
@@ -81,7 +85,7 @@ pub fn record(session: &str, thread: &str, generation: u64, initialize: &Value) 
     let result = (|| -> anyhow::Result<()> {
         let dir = directory()?; let Some(file) = path(&dir, session, generation) else { return Ok(()) };
         let mut kept = serde_json::Map::new();
-        for key in ["externalInputVersion", "externalInputVersions", "externalInputDeliveries"] {
+        for key in ["externalInputVersion", "externalInputVersions", "externalInputDeliveries", "externalInputOrderedBatch"] {
             if let Some(value) = initialize.get(key) { kept.insert(key.into(), value.clone()); }
         }
         std::fs::create_dir_all(&dir)?;
@@ -94,11 +98,20 @@ pub fn record(session: &str, thread: &str, generation: u64, initialize: &Value) 
     if let Err(error) = result { eprintln!("busy wake capability: {error:#}"); }
 }
 
-pub fn for_record(record: &CutexSessionRecord) -> Capability {
+fn observed(record: &CutexSessionRecord) -> Option<Observed> {
     let observed = directory().ok().and_then(|dir| path(&dir, &record.cutex_session_id, record.runtime_generation))
         .and_then(|file| std::fs::read(file).ok()).and_then(|bytes| serde_json::from_slice::<Observed>(&bytes).ok());
-    let Some(observed) = observed.filter(|v| v.session == record.cutex_session_id
-        && v.generation == record.runtime_generation && Some(v.thread.as_str()) == record.app_server_thread_id()) else { return Capability::None };
+    observed.filter(|v| v.session == record.cutex_session_id
+        && v.generation == record.runtime_generation && Some(v.thread.as_str()) == record.app_server_thread_id())
+}
+
+pub fn ordered_for_session(session: &str) -> bool {
+    crate::session::store::shared_session_row(session).ok().flatten().is_some_and(|record|
+        record.claude_session.is_some() && observed(&record).is_some_and(|value| claude_ordered(&value.initialize)))
+}
+
+pub fn for_record(record: &CutexSessionRecord) -> Capability {
+    let Some(observed) = observed(record) else { return Capability::None };
     if record.claude_session.is_some() {
         return if claude_soon(&observed.initialize) { Capability::Soon } else { Capability::AfterTurn };
     }

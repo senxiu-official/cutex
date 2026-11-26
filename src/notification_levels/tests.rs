@@ -398,6 +398,7 @@ fn recommended_event_preset_matches_section_2_1() {
         ("system.deliveryFailed", Level::Record),
         ("system.idleDelegation", Level::Record),
         ("system.turnAuthFailed", Level::Inform),
+        ("system.assistantTemplateNeedsReview", Level::NeedsYou),
         ("delegation.deliveryFailed", Level::Record),
         ("agentBus.messageFailed", Level::Record),
         ("job.completed.agent", Level::Record),

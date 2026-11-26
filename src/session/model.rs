@@ -495,6 +495,9 @@ pub struct CutexSessionRecord {
     /// Claude identity is not a Codex rollout ID or a selected OpenAI profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session: Option<crate::runtime::claude::ClaudeSession>,
+    /// An explicit offline selection awaits application by the pinned adapter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_launch_selection_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_session: Option<crate::runtime::dsh::DshSession>,
     /// r265: profile + runtime variant + credential reference frozen at
@@ -607,6 +610,12 @@ pub struct CutexSessionRecord {
     pub model_defaults: Option<String>,
     #[serde(default)]
     pub reasoning_defaults: Option<String>,
+    /// Evidence from this exact Claude connection. Set only after startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model_handshake: Option<crate::profiles::claude_models::ModelHandshake>,
+    /// None marks a session created before explicit effort resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_resolution: Option<crate::profiles::reasoning::SessionEffort>,
     /// Native service tier for this session (`session-fast-mode`): `priority`
     /// (Fast), `default` (standard) or `flex`; None follows the profile config.
     /// Mirrored from `thread/settings/updated` and sent on every thread start /
@@ -708,6 +717,7 @@ impl CutexSessionRecord {
             explicit_launch: None,
             creation_action: crate::session::creation_identity::current_action(),
             claude_session: None,
+            claude_launch_selection_pending: false,
             dsh_session: None,
             profile_binding: None,
             provider_family: None,
@@ -750,6 +760,8 @@ impl CutexSessionRecord {
             sandbox_writable_roots: Vec::new(),
             model_defaults: None,
             reasoning_defaults: None,
+            claude_model_handshake: None,
+            reasoning_resolution: None,
             service_tier: None,
             alden_session_name: None,
             alden_pid: None,

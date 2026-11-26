@@ -610,13 +610,21 @@ impl AskRuntime for ManagementAskRuntime {
         generation: u64,
         response_id: &str,
         request_id: &serde_json::Value,
-        result: &serde_json::Value,
+        response: cutex::asks::scheduler::QuestionResponse<'_>,
     ) -> RespondOutcome {
         use cutex::management::v2::server_requests::{self, ServerResponseClaimDecision};
-        let message = json!({"id": request_id, "result": result});
+        // Serialize forwarding and history writes with session deletion.
+        let lane = match app_server_user_input::session_input_lock(session) {
+            Ok(lane) => lane,
+            Err(error) => return RespondOutcome::NotSent(format!("{error:#}")),
+        };
+        let Ok(_operation) = lane.lock() else {
+            return RespondOutcome::NotSent("session input lock poisoned".into());
+        };
+        let message = json!({"id": request_id, "result": {"answers": response.answers}});
         let claim = json!({"expectedRuntimeGeneration": generation, "body": {"responseId": response_id, "native": {"message": message}}});
-        match server_requests::claim_response(session, generation, response_id, &claim, &message) {
-            Ok(ServerResponseClaimDecision::Submit) => {}
+        let native_request = match server_requests::claim_response(session, generation, response_id, &claim, &message) {
+            Ok(ServerResponseClaimDecision::Submit(native)) => native,
             Ok(ServerResponseClaimDecision::Deduplicated) => return RespondOutcome::Submitted,
             Ok(ServerResponseClaimDecision::InProgress) => return RespondOutcome::NotSent("in progress".into()),
             Ok(ServerResponseClaimDecision::InvalidAnswer(message)) => {
@@ -624,7 +632,7 @@ impl AskRuntime for ManagementAskRuntime {
             }
             Ok(_) => return RespondOutcome::AlreadyResolved,
             Err(error) => return RespondOutcome::NotSent(format!("{error:#}")),
-        }
+        };
         let handle = match app_server_user_input::session_manager(session).handle_for_generation(session, generation) {
             Ok(handle) => handle,
             Err(error) => {
@@ -633,9 +641,11 @@ impl AskRuntime for ManagementAskRuntime {
             }
         };
         use cutex::app_server::client::AppServerClientError as E;
-        match handle.respond_raw(message) {
+        match handle.respond_raw(message.clone()) {
             Ok(()) => {
-                let _ = server_requests::mark_response_submitted(session, generation, response_id);
+                let _ = server_requests::mark_response_submitted(
+                    session, generation, response_id, native_request, &message, response.actor, response.answered_at,
+                );
                 RespondOutcome::Submitted
             }
             Err(E::Transport(error)) | Err(E::Disconnected(error)) => {
@@ -849,6 +859,12 @@ impl AskRuntime for ManagementAskRuntime {
         record(session).is_some_and(|record| record.claude_session.is_some())
     }
 
+    fn ordered_automatic_inputs(&self, session: &str, generation: u64) -> bool {
+        record(session).is_some_and(|record| record.claude_session.is_some() && record.runtime_generation == generation)
+            && super::asks_claude::adapter_capabilities(session, generation)
+                .is_some_and(|caps| super::claude_runtime::supports_ordered_input(&caps))
+    }
+
     fn resume_gate(&self, session: &str) -> anyhow::Result<()> {
         // A busy fence is not a pause: ride out a brief hold, then report the
         // retryable deferral itself rather than a misleading `agent_paused`.
@@ -930,47 +946,102 @@ fn spawn_rolling_archive() -> anyhow::Result<()> {
 /// The driver: scheduler ticks, Management v2 notices, owner-queue flushes
 /// the scheduler unblocked, and periodic pruning.
 pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
-    // Do the one-shot split before this process starts admission threads.
+    use cutex::asks::scheduler_health::SCHEDULER;
+    // Advance each startup step only after success. Retrying a full sequence
+    // after a storage or thread error would duplicate already-started workers.
+    let steps: &[fn() -> anyhow::Result<()>] = &[
+        prepare_ask_archive,
+        spawn_rolling_archive,
+        cutex::peers::worker::spawn,
+        super::model_overload_retry::spawn_worker,
+        super::claude_quota_continue::spawn_worker,
+        cutex::runtime::kimi::account_tokens::spawn_keeper,
+        spawn_admission,
+    ];
+    let mut next = 0;
+    SCHEDULER.spawn(move || {
+        while let Some(step) = steps.get(next) {
+            SCHEDULER.housekeeping(*step)?;
+            next += 1;
+        }
+        run_scheduler();
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn warm_short_id_indexes() {
+    if let Err(error) = AskStore::open_default().and_then(|store| store.prepare_short_id_indexes()) {
+        eprintln!("asks: short-ID index preparation warning: {error:#}");
+    }
+}
+
+fn prepare_ask_archive() -> anyhow::Result<()> {
     // The persisted cutoff is reused at restart; an explicit mismatch fails.
-    let now=Utc::now();
-    let requested=std::env::var("CUTEX_ASKS_ARCHIVE_BEFORE").ok()
-        .map(|value|cutex::asks::archive::activation_cutoff(now,Some(&value))).transpose()?;
-    let archived=AskStore::open_default()?.archive_before(requested,now)?;
-    if archived.rows!=0 {eprintln!("asks: archived {} records / {} bytes ({} delegations)",archived.rows,archived.bytes,archived.asks);}
-    spawn_rolling_archive()?;
-    cutex::peers::worker::spawn()?;
-    super::model_overload_retry::spawn_worker()?;
-    super::claude_quota_continue::spawn_worker()?;
-    cutex::runtime::kimi::account_tokens::spawn_keeper()?;
-    std::thread::Builder::new().name("cutex-admission".into()).spawn(|| {
-        let mut published = std::collections::HashMap::new();
-        let mut ridealongs = std::collections::BTreeSet::<String>::new();
-        let mut busy_wait = cutex::agent_bus::delivery::wake_busy_wait();
-        let mut deadlines = std::collections::HashMap::<String, chrono::DateTime<Utc>>::new();
-        loop {
-            cutex::management::v2::admission::wait_for_changes(TICK);
-            cutex::management::v2::admission_wait::wake_expired();
-            // Poll only while somebody observes admission or runtime work needs it.
-            // Direct list/bootstrap and source changes always read fresh state.
-            let observed = cutex::management::v2::repository::management_v2_repository()
-                .map(|events| events.has_live_subscribers()).unwrap_or(true);
-            let runtime_work = || cutex::management::v2::user_input::user_input_repository()
-                .and_then(|queue| queue.needs_admission_poll()).unwrap_or(true);
-            if observed || runtime_work() {
-                let _ = cutex::management::v2::agent_bus_state::agent_bus_message_repository()
-                    .and_then(|bus| bus.refresh_admission_if_changed());
-            }
-            let configured_wait = cutex::agent_bus::delivery::wake_busy_wait();
-            if configured_wait != busy_wait {
-                for session in &ridealongs { cutex::management::v2::admission::changed(session); }
-                busy_wait = configured_wait;
-            }
-            let now = Utc::now();
-            for (session, _) in deadlines.iter().filter(|(_, at)| **at <= now) {
-                cutex::management::v2::admission::changed(session);
-            }
-            deadlines.retain(|_, at| *at > now);
-            for session in cutex::management::v2::admission::take_changes() {
+    let now = Utc::now();
+    let requested = std::env::var("CUTEX_ASKS_ARCHIVE_BEFORE").ok()
+        .map(|value| cutex::asks::archive::activation_cutoff(now, Some(&value))).transpose()?;
+    let archived = AskStore::open_default()?.archive_before(requested, now)?;
+    if archived.rows != 0 {
+        eprintln!("asks: archived {} records / {} bytes ({} delegations)", archived.rows, archived.bytes, archived.asks);
+    }
+    // This pass also covers stores first verified during legacy migration.
+    warm_short_id_indexes();
+    Ok(())
+}
+
+#[derive(Default)]
+struct AdmissionWork {
+    published: std::collections::HashMap<String, u64>,
+    ridealongs: std::collections::BTreeSet<String>,
+    deadlines: std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    pending: Vec<String>,
+    busy_wait: Option<Duration>,
+}
+
+fn spawn_admission() -> anyhow::Result<()> {
+    use cutex::asks::scheduler_health::ADMISSION;
+    let mut work = AdmissionWork::default();
+    ADMISSION.spawn(move || {
+        run_admission(&mut work);
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+fn run_admission(work: &mut AdmissionWork) {
+    use cutex::asks::scheduler_health::ADMISSION;
+    let AdmissionWork { published, ridealongs, deadlines, pending, busy_wait } = work;
+    loop {
+        let mut ok = true;
+        cutex::management::v2::admission::wait_for_changes(TICK);
+        cutex::management::v2::admission_wait::wake_expired();
+        // Poll only while somebody observes admission or runtime work needs it.
+        // Direct list/bootstrap and source changes always read fresh state.
+        let observed = cutex::management::v2::repository::management_v2_repository()
+            .map(|events| events.has_live_subscribers()).unwrap_or(true);
+        let runtime_work = || cutex::management::v2::user_input::user_input_repository()
+            .and_then(|queue| queue.needs_admission_poll()).unwrap_or(true);
+        if observed || runtime_work() {
+            ok = cutex::management::v2::agent_bus_state::agent_bus_message_repository()
+                .and_then(|bus| bus.refresh_admission_if_changed()).is_ok();
+        }
+        let configured_wait = cutex::agent_bus::delivery::wake_busy_wait();
+        if configured_wait != *busy_wait {
+            for session in ridealongs.iter() { cutex::management::v2::admission::changed(session); }
+            *busy_wait = configured_wait;
+        }
+        let now = Utc::now();
+        for (session, _) in deadlines.iter().filter(|(_, at)| **at <= now) {
+            cutex::management::v2::admission::changed(session);
+        }
+        deadlines.retain(|_, at| *at > now);
+        if pending.is_empty() {
+            pending.extend(cutex::management::v2::admission::take_changes().into_iter().rev());
+        }
+        // A session panic requeues just that session and leaves the batch running.
+        while let Some(session) = pending.last().cloned() {
+            ADMISSION.run_admission_session(&session, || {
                 let result = (|| -> anyhow::Result<()> {
                     let queue = cutex::management::v2::user_input::user_input_repository()?;
                     let (_, _, _, admission) = queue.list_admission(&session)?;
@@ -1007,96 +1078,118 @@ pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
                         Some(streak) => if streak.is_power_of_two() {
                             eprintln!("admission: {session}: {error:#} (deferral #{streak}; retrying with backoff)");
                         },
-                        None => eprintln!("admission: {session}: {error:#}"),
+                        None => {
+                            ok = false;
+                            eprintln!("admission: {session}: {error:#}");
+                        }
                     },
                 }
-            }
+            }, |session| {
+                cutex::management::v2::admission::retry_later(session);
+            });
+            pending.pop();
         }
-    })?;
-    std::thread::Builder::new()
-        .name("cutex-asks".into())
-        .spawn(|| {
-            let runtime = ManagementAskRuntime::default();
-            let mut last_prune = std::time::Instant::now();
-            let mut last_sweep: Option<std::time::Instant> = None;
-            let mut last_receipt_prune: Option<std::time::Instant> = None;
-            let mut last_archive=std::time::Instant::now();
-            let mut ticks: u64 = 0;
-            // 054 decision 9: delegations that ended `outcomeUnknown` before
-            // the input ledger existed get their `uncertain` record once, so
-            // the owner can dismiss them (no-op with the switch off).
-            if let Err(error) = AskStore::open_default().and_then(|store| cutex::asks::ledger::backfill_outcome_unknown(&store)) {
-                eprintln!("asks: input ledger backfill warning: {error:#}");
+        ADMISSION.tick_finished(ok);
+    }
+}
+
+fn run_scheduler() {
+    use cutex::asks::scheduler_health::SCHEDULER;
+    let runtime = ManagementAskRuntime::default();
+    let mut last_prune = std::time::Instant::now();
+    let mut last_sweep: Option<std::time::Instant> = None;
+    let mut last_receipt_prune: Option<std::time::Instant> = None;
+    let mut last_archive=std::time::Instant::now();
+    let mut ticks: u64 = 0;
+    // 054 decision 9: delegations that ended `outcomeUnknown` before
+    // the input ledger existed get their `uncertain` record once, so
+    // the owner can dismiss them (no-op with the switch off).
+    if let Err(error) = SCHEDULER.housekeeping(|| {
+        AskStore::open_default().and_then(|store| cutex::asks::ledger::backfill_outcome_unknown(&store))
+    }) {
+        eprintln!("asks: input ledger backfill warning: {error:#}");
+    }
+    loop {
+        // Agent → owner messages made in the Agent Bus process.
+        cutex::management::v2::owner_notify::publish_default();
+        let tick = drive_once(&runtime);
+        SCHEDULER.tick_finished(tick.is_ok());
+        if let Err(error) = tick {
+            eprintln!("asks: scheduler warning: {error:#}");
+        }
+        if ticks % 5 == 0 {
+            let refresh = AskStore::open_default().and_then(|store| refresh_presence(&store));
+            SCHEDULER.presence_finished(refresh.is_ok());
+            if let Err(error) = refresh {
+                eprintln!("asks: presence warning: {error:#}");
             }
-            loop {
-                // Agent → owner messages made in the Agent Bus process.
-                cutex::management::v2::owner_notify::publish_default();
-                if let Err(error) = drive_once(&runtime) {
-                    eprintln!("asks: scheduler warning: {error:#}");
-                }
-                if ticks % 5 == 0 {
-                    if let Err(error) = AskStore::open_default().and_then(|store| refresh_presence(&store)) {
-                        eprintln!("asks: presence warning: {error:#}");
-                    }
-                    reconnect_for_owner_queue(&runtime);
-                }
-                // r276: tell live runtimes about agent pauses (tool gate).
-                if let Err(error) = AskStore::open_default().and_then(|store| super::tool_gate::reconcile(&store, &runtime)) {
-                    eprintln!("agent pause: tool gate warning: {error:#}");
-                }
-                ticks += 1;
-                if last_archive.elapsed()>=Duration::from_secs(300) {
-                    if let Err(error)=AskStore::open_default().and_then(|store|store.archive_before(None,Utc::now())) {
-                        eprintln!("asks: incremental permanent archive warning: {error:#}");
-                    }
-                    last_archive=std::time::Instant::now();
-                }
-                if last_prune.elapsed() > Duration::from_secs(3600) {
-                    // Housekeeping only: closed asks leave through the
-                    // retention sweep, which archives them first.
-                    if let Ok(store) = AskStore::open_default() {
-                        let _ = store.prune_with(None, Utc::now());
-                    }
-                    last_prune = std::time::Instant::now();
-                }
-                let settings = cutex::config::documents::current();
-                let interval = Duration::from_secs(u64::from(settings.sweep_interval_hours) * 3600);
-                let due = last_sweep.is_none_or(|at: std::time::Instant| at.elapsed() >= interval)
-                    || (ticks % 600 == 0
-                        && cutex::documents::DocumentStore::open_default()
-                            .is_ok_and(|store| cutex::documents::sweep::nearly_full(&store, &settings))
-                        && last_sweep.is_some_and(|at| at.elapsed() >= Duration::from_secs(600)));
-                if due {
-                    match cutex::documents::sweep::run_default(&settings) {
-                        Ok(report) if !report.errors.is_empty() => eprintln!("documents: sweep warnings: {:?}", report.errors),
-                        Ok(_) => {}
-                        Err(error) => eprintln!("documents: sweep failed: {error:#}"),
-                    }
-                    last_sweep = Some(std::time::Instant::now());
-                }
-                // Session store: prune explicit-launch receipts nothing
-                // needs (once at start, then every 6 h; idempotent).
-                if last_receipt_prune.is_none_or(|at: std::time::Instant| {
-                    at.elapsed() >= cutex::session::receipt_retention::PRUNE_INTERVAL
-                }) {
-                    match cutex::session::receipt_retention::prune_default_store() {
-                        Ok(report) if report.changed() => eprintln!(
-                            "session store: pruned {} explicit-launch receipts ({} of removed agents), {} kept; tombstones +{} -{}",
-                            report.pruned,
-                            report.pruned_orphaned,
-                            report.kept,
-                            report.tombstones_added,
-                            report.tombstones_expired + report.tombstones_superseded,
-                        ),
-                        Ok(_) => {}
-                        Err(error) => eprintln!("session store: receipt pruning failed: {error:#}"),
-                    }
-                    last_receipt_prune = Some(std::time::Instant::now());
-                }
-                std::thread::sleep(TICK);
+            reconnect_for_owner_queue(&runtime);
+        }
+        // r276: tell live runtimes about agent pauses (tool gate).
+        if let Err(error) = AskStore::open_default().and_then(|store| super::tool_gate::reconcile(&store, &runtime)) {
+            eprintln!("agent pause: tool gate warning: {error:#}");
+        }
+        ticks += 1;
+        if last_archive.elapsed()>=Duration::from_secs(300) {
+            if let Err(error) = SCHEDULER.housekeeping(|| AskStore::open_default().and_then(|store| store.archive_before(None, Utc::now()))) {
+                eprintln!("asks: incremental permanent archive warning: {error:#}");
             }
-        })?;
-    Ok(())
+            last_archive=std::time::Instant::now();
+        }
+        if last_prune.elapsed() > Duration::from_secs(3600) {
+            // Housekeeping only: closed asks leave through the
+            // retention sweep, which archives them first.
+            SCHEDULER.housekeeping(|| {
+                if let Ok(store) = AskStore::open_default() {
+                    let _ = store.prune_with(None, Utc::now());
+                }
+            });
+            last_prune = std::time::Instant::now();
+        }
+        let settings = cutex::config::documents::current();
+        let interval = Duration::from_secs(u64::from(settings.sweep_interval_hours) * 3600);
+        let due = last_sweep.is_none_or(|at: std::time::Instant| at.elapsed() >= interval)
+            || (ticks % 600 == 0
+                && cutex::documents::DocumentStore::open_default()
+                    .is_ok_and(|store| cutex::documents::sweep::nearly_full(&store, &settings))
+                && last_sweep.is_some_and(|at| at.elapsed() >= Duration::from_secs(600)));
+        if due {
+            match SCHEDULER.housekeeping(|| cutex::documents::sweep::run_default(&settings)) {
+                Ok(report) if !report.errors.is_empty() => {
+                    eprintln!("documents: sweep warnings: {:?}", report.errors);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("documents: sweep failed: {error:#}");
+                }
+            }
+            last_sweep = Some(std::time::Instant::now());
+        }
+        // Session store: prune explicit-launch receipts nothing
+        // needs (once at start, then every 6 h; idempotent).
+        if last_receipt_prune.is_none_or(|at: std::time::Instant| {
+            at.elapsed() >= cutex::session::receipt_retention::PRUNE_INTERVAL
+        }) {
+            match SCHEDULER.housekeeping(cutex::session::receipt_retention::prune_default_store) {
+                Ok(report) if report.changed() => {
+                    eprintln!(
+                        "session store: pruned {} explicit-launch receipts ({} of removed agents), {} kept; tombstones +{} -{}",
+                        report.pruned,
+                        report.pruned_orphaned,
+                        report.kept,
+                        report.tombstones_added,
+                        report.tombstones_expired + report.tombstones_superseded,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("session store: receipt pruning failed: {error:#}");
+                }
+            }
+            last_receipt_prune = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(TICK);
+    }
 }
 
 fn drive_once(runtime: &ManagementAskRuntime) -> anyhow::Result<()> {

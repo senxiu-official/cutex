@@ -41,7 +41,7 @@
 //!   write of the store. Only copied aside (`new-owner-devices.json`), so the
 //!   owner can still review those devices; the store is not changed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::json;
@@ -64,7 +64,12 @@ enum RollbackTarget {
 
 impl RollbackTarget {
     fn reads_current_stores(self) -> bool {
-        matches!(self, Self::Public(major, minor, patch) if (major, minor, patch) >= (0, 2, 0))
+        self == Self::Release(295)
+            || matches!(self, Self::Public(major, minor, patch) if (major, minor, patch) >= (0, 2, 0))
+    }
+
+    fn r295_reader(self) -> bool {
+        matches!(self, Self::Release(295) | Self::Public(0, 2, 5))
     }
 
     /// Every supported internal rollback target is r252 or newer and reads
@@ -87,6 +92,9 @@ impl RollbackTarget {
 }
 
 fn rollback_target(target: &str) -> anyhow::Result<RollbackTarget> {
+    if target == "r295" {
+        return Ok(RollbackTarget::Release(295));
+    }
     if let Some(number) = target.strip_prefix('r') {
         let number = number.parse::<u64>().with_context(|| format!("unknown rollback target {target:?}"))?;
         anyhow::ensure!(!matches!(number, 263 | 264) || matches!(target, "r263" | "r264"), "the predecessor target must be spelled exactly r263 or r264");
@@ -124,12 +132,277 @@ pub(super) fn preflight_worker_services(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn preflight_rollback(home: &Path, target: &str) -> anyhow::Result<()> {
+    if rollback_target(target).is_ok_and(RollbackTarget::r295_reader) {
+        preflight_r295(home, target)
+    } else {
+        preflight_worker_services(home)
+    }
+}
+
+fn preflight_r295(home: &Path, target: &str) -> anyhow::Result<()> {
+    let registry = home.join("services").join(crate::services::store::REGISTRY_FILE);
+    if let Some(before) = super::r264_rollback::fingerprint(&registry)? {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&registry)?)
+            .context("invalid services registry; inspect it before rollback")?;
+        anyhow::ensure!(
+            super::r264_rollback::fingerprint(&registry)? == Some(before),
+            "services registry changed during rollback validation; retry"
+        );
+        let services = value["services"].as_object().context("invalid services registry")?;
+        let blockers: Vec<_> = services.iter().filter_map(|(name, record)| {
+            let runtime = record["runtime"].as_str().unwrap_or("missing");
+            (!matches!(runtime, "external" | "managed" | "static" | "worker"))
+                .then(|| format!("{name:?} ({runtime:?})"))
+        }).collect();
+        anyhow::ensure!(
+            blockers.is_empty(),
+            "rollback to {target} cannot read these service registrations: {}. Remove or convert the listed services to a supported runtime, or stay on the current build.",
+            blockers.join(", ")
+        );
+    }
+    for (relative, maximum, label) in [
+        ("runtime/personal-assistants/assistants-v1.sqlite3", 3, "personal assistant"),
+        ("runtime/schedules/schedules-v1.sqlite3", 1, "schedules"),
+    ] {
+        inspect_rollback_database(&home.join(relative), |db| {
+            let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            anyhow::ensure!(
+                version <= maximum,
+                "rollback to {target} cannot read the {label} database (v{version}, maximum v{maximum}). Stay on the current build, or preserve the current data and restore a verified pre-upgrade snapshot before rollback."
+            );
+            Ok(())
+        })?;
+    }
+    let management = home.join("runtime/management-v2")
+        .join(crate::management::v2::hot_store::DATABASE_FILE);
+    inspect_rollback_database(&management, |db| {
+        if rollback_table(db, "automatic_input_publications")? {
+            let pending: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM automatic_input_publications LIMIT 1)", [], |row| row.get(0)
+            )?;
+            anyhow::ensure!(!pending, "rollback to {target} has unresolved ordered input publications; drain or reconcile them on the current build");
+        }
+        Ok(())
+    })?;
+    preflight_claude_ordered_inboxes(home, target)
+}
+
+struct RollbackScratch(PathBuf);
+
+impl RollbackScratch {
+    fn new() -> anyhow::Result<Self> {
+        let path = std::env::temp_dir().join(format!("cutex-r295-check-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&path)?;
+        let scratch = Self(path);
+        #[cfg(windows)]
+        crate::platform::private_fs::secure_directory(&scratch.0)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(scratch)
+    }
+}
+
+impl Drop for RollbackScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    value.into()
+}
+
+fn copy_rollback_inputs(sources: &[(PathBuf, PathBuf)]) -> anyhow::Result<Vec<bool>> {
+    use super::r264_rollback::fingerprint;
+    let before = sources.iter().map(|(src, _)| fingerprint(src)).collect::<anyhow::Result<Vec<_>>>()?;
+    for ((source, destination), expected) in sources.iter().zip(&before) {
+        if let Some(expected) = expected {
+            std::fs::copy(source, destination)?;
+            let copy = fingerprint(destination)?.context("missing rollback snapshot copy")?;
+            anyhow::ensure!(
+                copy.0 == expected.0 && copy.2 == expected.2,
+                "rollback input changed while copying {}. Retry when writes settle.", source.display()
+            );
+        }
+    }
+    for ((source, _), expected) in sources.iter().zip(&before) {
+        anyhow::ensure!(
+            fingerprint(source)? == *expected,
+            "rollback input changed while copying {}. Retry when writes settle.", source.display()
+        );
+    }
+    Ok(before.iter().map(Option::is_some).collect())
+}
+
+fn sqlite_rollback_inputs(source: &Path, destination: &Path) -> Vec<(PathBuf, PathBuf)> {
+    // SQLite builds a new SHM from the copied WAL in the private directory.
+    ["", "-wal", "-journal"].into_iter()
+        .map(|suffix| (with_suffix(source, suffix), with_suffix(destination, suffix)))
+        .collect()
+}
+
+fn inspect_rollback_database(
+    path: &Path,
+    inspect: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let scratch = RollbackScratch::new()?;
+    let copy = scratch.0.join("state.sqlite3");
+    let present = copy_rollback_inputs(&sqlite_rollback_inputs(path, &copy))?;
+    if !present[0] {
+        anyhow::ensure!(!present[1] && !present[2], "orphan SQLite rollback sidecar: {}", path.display());
+        return Ok(());
+    }
+    let db = rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("inspect rollback database {}", path.display()))?;
+    inspect(&db)
+}
+
+fn rollback_table(db: &rusqlite::Connection, table: &str) -> anyhow::Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table], |row| row.get(0)
+    )?)
+}
+
+#[derive(serde::Deserialize)]
+struct RollbackClaudePin {
+    state_dir: PathBuf,
+    thread_id: String,
+}
+
+fn legacy_claude_pins(bytes: &[u8]) -> anyhow::Result<Vec<(String, RollbackClaudePin)>> {
+    #[derive(serde::Deserialize)]
+    struct Store {
+        #[serde(default)]
+        sessions: std::collections::HashMap<String, Session>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Session {
+        cutex_session_id: String,
+        claude_session: Option<RollbackClaudePin>,
+    }
+
+    let store: Store = serde_json::from_slice(bytes)?;
+    Ok(store.sessions.into_values().filter_map(|session| {
+        Some((session.cutex_session_id, session.claude_session?))
+    }).collect())
+}
+
+fn sqlite_claude_pins(
+    copy: &Path,
+    legacy_store: Option<&[u8]>,
+) -> anyhow::Result<Vec<(String, RollbackClaudePin)>> {
+    let db = rusqlite::Connection::open_with_flags(copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    anyhow::ensure!(version == 1, "r295 rollback cannot read session SQLite schema version {version}");
+    if let Some(bytes) = legacy_store {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let (imported_sha, imported_revision, store_revision): (Option<String>, Option<String>, Option<String>) =
+            db.query_row(
+                "SELECT MAX(CASE WHEN key='imported_sha256' THEN value END),
+                        MAX(CASE WHEN key='imported_revision' THEN value END),
+                        MAX(CASE WHEN key='store_revision' THEN value END)
+                 FROM meta WHERE key IN ('imported_sha256','imported_revision','store_revision')",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if imported_sha.as_deref() != Some(sha.as_str()) {
+            // Apply the session reader's authority rule without doing import recovery.
+            anyhow::ensure!(
+                imported_revision.is_some() && imported_revision == store_revision,
+                "cutex session store conflict: SQLite and legacy JSON both changed after import"
+            );
+            db.close().map_err(|(_, error)| error)?;
+            return legacy_claude_pins(bytes);
+        }
+    }
+    let pins = {
+        let mut stmt = db.prepare(
+            "SELECT cutex_session_id, json_extract(record_json, '$.claude_session')
+             FROM sessions WHERE json_type(record_json, '$.claude_session') IS NOT NULL
+               AND json_type(record_json, '$.claude_session') <> 'null'",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut pins = Vec::new();
+        while let Some(row) = rows.next()? {
+            let binding: String = row.get(1)?;
+            pins.push((row.get(0)?, serde_json::from_str(&binding)?));
+        }
+        pins
+    };
+    db.close().map_err(|(_, error)| error)?;
+    Ok(pins)
+}
+
+fn rollback_claude_pins(home: &Path) -> anyhow::Result<Vec<(String, RollbackClaudePin)>> {
+    let scratch = RollbackScratch::new()?;
+    let database = "cutex-sessions.sqlite3";
+    let copy = scratch.0.join(database);
+    let legacy_copy = scratch.0.join(SESSIONS);
+    let mut inputs = sqlite_rollback_inputs(&home.join(database), &copy);
+    inputs.push((home.join(SESSIONS), legacy_copy.clone()));
+    let present = copy_rollback_inputs(&inputs)?;
+    anyhow::ensure!(present[0] || (!present[1] && !present[2]), "orphan session SQLite rollback sidecar");
+    let legacy = present[3].then(|| std::fs::read(&legacy_copy)).transpose()?;
+    let legacy_store = legacy.as_deref().filter(|bytes| !crate::session::store::is_session_store_sentinel(bytes));
+    if present[0] {
+        return sqlite_claude_pins(&copy, legacy_store)
+            .with_context(|| format!("inspect rollback session database {}", home.join(database).display()));
+    }
+    if let Some(bytes) = legacy_store {
+        return legacy_claude_pins(bytes);
+    }
+    anyhow::ensure!(!present[3], "session SQLite rollback database missing with migrated JSON sentinel");
+    Ok(Vec::new())
+}
+
+fn preflight_claude_ordered_inboxes(home: &Path, target: &str) -> anyhow::Result<()> {
+    let mut inboxes = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (session, claude) in rollback_claude_pins(home)? {
+        anyhow::ensure!(claude.state_dir.is_absolute(), "relative Claude rollback state path for {session}");
+        inboxes.entry(claude.state_dir.join("state.sqlite3")).or_default()
+            .push((session, claude.thread_id));
+    }
+    for (path, pins) in inboxes {
+        inspect_rollback_database(&path, |db| {
+            let inputs = rollback_table(db, "inputs")?;
+            let notes = rollback_table(db, "notes")?;
+            for (session, thread) in pins {
+                let pending_input: bool = inputs && db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM inputs WHERE thread_id=?1 AND state IN ('queued','processing')
+                        AND json_type(payload,'$.metadata.automaticInputOrder')='array' LIMIT 1)",
+                    [&thread], |row| row.get(0)
+                )?;
+                let pending_note: bool = notes && db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM notes WHERE thread_id=?1 AND state IN ('pending','reserved')
+                        AND (json_extract(payload,'$.metadata.automaticNoteBatch') IS NOT NULL
+                             OR json_extract(payload,'$.metadata.automaticBatchMember')=1) LIMIT 1)",
+                    [&thread], |row| row.get(0)
+                )?;
+                anyhow::ensure!(
+                    !(pending_input || pending_note),
+                    "rollback to {target} has pending ordered Claude inputs for {session}; drain or reconcile them on the current build"
+                );
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// Read-only proof that every compatibility conversion can safely start.
 /// Standalone rollback export calls this before creating its backup tree;
 /// the stopped-writer prepare/export path repeats it immediately before any
 /// compatibility mutation.
 pub fn preflight(home: &Path, target: &str) -> anyhow::Result<()> {
-    preflight_worker_services(home)?;
+    preflight_rollback(home, target)?;
+    if rollback_target(target)?.r295_reader() { return Ok(()); }
     // No existing target reads the SQLite roster (058 S4): its R1 export runs first.
     crate::agent_management::ensure_roster_legacy_authoritative(&home.join("runtime/agent-management/v1"))?;
     if rollback_target(target)?.reads_current_stores() { return Ok(()); }
@@ -369,7 +642,7 @@ fn preflight_r260_state(home: &Path, target: &str) -> anyhow::Result<()> {
 
 /// `target`: the release label the rollback switches to.
 pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Vec<String>> {
-    preflight_worker_services(home)?;
+    preflight_rollback(home, target)?;
     let target_capabilities = rollback_target(target)?;
     if target_capabilities.reads_current_stores() { return Ok(Vec::new()); }
     preflight(home, target)?;
@@ -388,7 +661,7 @@ pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Ve
 /// rollback runner calls this only after it has stopped the services; the
 /// standalone CLI requires the same condition to be acknowledged explicitly.
 pub fn export_hot_stores(home: &Path, target: &str, daemon_stopped: bool) -> anyhow::Result<Vec<String>> {
-    preflight_worker_services(home)?;
+    preflight_rollback(home, target)?;
     if rollback_target(target)?.reads_current_stores() { return Ok(Vec::new()); }
     anyhow::ensure!(daemon_stopped, "stop cutex services, then repeat with --daemon-stopped");
     preflight(home, target)?;
@@ -555,8 +828,20 @@ fn validate_preserved_snapshot(home: &Path, reader: super::r265_rollback::Reader
         // may orphan rows vanish behind the optional metadata lookup.
         let mut tables=db.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
         let names=tables.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        anyhow::ensure!(names.iter().any(|s|s=="hot_store_meta") && names.iter().any(|s|s=="hot_store_rows")
-            && names.iter().all(|s|matches!(s.as_str(),"hot_store_meta"|"hot_store_rows"|"asks_archive_meta"|"asks_archive_rows")),"unknown management hot-store schema");
+        anyhow::ensure!(names.iter().any(|s|s=="hot_store_meta") && names.iter().any(|s|s=="hot_store_rows"),
+            "unknown management hot-store schema");
+        let mut ordered_schema = false;
+        for name in &names {
+            match name.as_str() {
+                "hot_store_meta" | "hot_store_rows" | "asks_archive_meta" | "asks_archive_rows" => {},
+                "automatic_input_order" | "automatic_input_windows" | "automatic_input_window_anchors"
+                | "automatic_input_publications" | "sqlite_sequence" => ordered_schema = true,
+                _ => anyhow::bail!("unknown management hot-store schema"),
+            }
+        }
+        if ordered_schema {
+            crate::management::v2::hot_store::automatic_input_order::validate_empty_rollback_schema(&db)?;
+        }
         let invalid:i64=db.query_row("SELECT count(*) FROM hot_store_meta WHERE store NOT IN ('asks','agent_bus') OR verified NOT IN (0,1)",[],|r|r.get(0))?;
         let orphan:i64=db.query_row("SELECT count(*) FROM hot_store_rows r LEFT JOIN hot_store_meta m ON r.store=m.store WHERE m.store IS NULL",[],|r|r.get(0))?;
         anyhow::ensure!(invalid==0 && orphan==0,"unknown/orphan hot-store metadata or rows");
@@ -1566,5 +1851,182 @@ mod tests {
         let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(displaced.join(OUT_DIR).join("new-owner-devices.json")).unwrap()).unwrap();
         assert_eq!(kept["newOwnerDevices"][0]["tokenId"], "mct-1");
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&users).unwrap()).unwrap(), state, "store unchanged");
+    }
+
+    #[test]
+    fn r295_service_runtime_boundary_accepts_exact_legacy_set_and_refuses_future_values() {
+        let home = temp("r295-service-allowlist");
+        let registry = home.join("services/registry.json");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let mut value = json!({"services":{
+            "one":{"runtime":"external"}, "two":{"runtime":"managed"},
+            "three":{"runtime":"static"}, "four":{"runtime":"worker"}
+        }});
+        std::fs::write(&registry, serde_json::to_vec(&value).unwrap()).unwrap();
+        preflight_rollback(&home, "r295").unwrap();
+        preflight_rollback(&home, "0.2.5").unwrap();
+        value["services"]["future"] = json!({"runtime":"future-runtime"});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&registry, &bytes).unwrap();
+        let error = prepare(&home, &home.join("displaced"), "r295").unwrap_err().to_string();
+        assert!(error.contains("future-runtime") && error.contains("Remove or convert"));
+        assert_eq!(std::fs::read(&registry).unwrap(), bytes);
+        assert!(!home.join("displaced").exists());
+    }
+
+    #[test]
+    fn r295_version_checks_read_committed_wal_and_leave_source_sidecars_unchanged() {
+        let home = temp("r295-version-wal");
+        for (file, accepted, rejected, label) in [
+            ("runtime/personal-assistants/assistants-v1.sqlite3", 3, 4, "personal assistant"),
+            ("runtime/schedules/schedules-v1.sqlite3", 1, 2, "schedules"),
+        ] {
+            let path = home.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0").unwrap();
+            db.pragma_update(None, "user_version", accepted).unwrap();
+            preflight_rollback(&home, "0.2.5").unwrap();
+            db.execute_batch("BEGIN").unwrap();
+            db.pragma_update(None, "user_version", rejected).unwrap();
+            preflight_rollback(&home, "0.2.5").unwrap();
+            db.execute_batch("COMMIT").unwrap();
+            let wal = with_suffix(&path, "-wal");
+            let files = [std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap()];
+            assert!(!files[1].is_empty());
+            let error = preflight_rollback(&home, "0.2.5").unwrap_err().to_string();
+            assert!(error.contains(label), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), files[0]);
+            assert_eq!(std::fs::read(&wal).unwrap(), files[1]);
+            db.pragma_update(None, "user_version", accepted).unwrap();
+            drop(db);
+            assert!(!wal.exists());
+            preflight_rollback(&home, "r295").unwrap();
+            assert!(!wal.exists() && !with_suffix(&path, "-shm").exists());
+        }
+    }
+
+    #[test]
+    fn r295_ordered_publications_block_but_empty_tables_and_windows_pass() {
+        let home = temp("r295-ordered-publications");
+        let path = home.join("runtime/management-v2")
+            .join(crate::management::v2::hot_store::DATABASE_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE automatic_input_windows(id INTEGER);
+             INSERT INTO automatic_input_windows VALUES (1);
+             CREATE TABLE automatic_input_publications(phase INTEGER);"
+        ).unwrap();
+        preflight_rollback(&home, "r295").unwrap();
+        for phase in 0..=3 {
+            db.execute("INSERT INTO automatic_input_publications VALUES (?1)", [phase]).unwrap();
+            let error = preflight_rollback(&home, "r295").unwrap_err().to_string();
+            assert!(error.contains("unresolved ordered input publications"), "{error}");
+            db.execute("DELETE FROM automatic_input_publications", []).unwrap();
+        }
+        preflight_rollback(&home, "r295").unwrap();
+    }
+
+    #[test]
+    fn r295_pinned_claude_inbox_blocks_only_unconsumed_ordered_members() {
+        let home = temp("r295-claude-inbox");
+        let state = home.join("claude-fixture");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join("state.sqlite3");
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE inputs(thread_id TEXT, state TEXT, payload TEXT);
+             CREATE TABLE notes(thread_id TEXT, state TEXT, payload TEXT);"
+        ).unwrap();
+        crate::session::store::with_locked_session_rows(&home.join(SESSIONS), |rows| {
+            let mut record = crate::session::model::CutexSessionRecord::new_at(
+                "cutex.a".into(), None, "devbox".into(), state.to_string_lossy().into(),
+                None, "2026-10-18T00:00:00Z".into(),
+            )?;
+            record.claude_session = Some(serde_json::from_value(json!({
+                "deployment": {"python":"p", "adapter_source":"a", "claude_cli":"c", "claude_home":"h", "tui_binary":"t"},
+                "thread_id":"fixture-thread", "state_dir":state, "model":"m"
+            }))?);
+            rows.insert_session("cutex.a", record);
+            rows.commit().map(|_| ())
+        }).unwrap();
+        db.execute("INSERT INTO inputs VALUES ('other-thread','queued',?1)",
+            [r#"{"metadata":{"automaticInputOrder":["x"]}}"#]).unwrap();
+        preflight_rollback(&home, "r295").unwrap();
+        db.execute("UPDATE inputs SET thread_id='fixture-thread'", []).unwrap();
+        let error = preflight_rollback(&home, "r295").unwrap_err().to_string();
+        assert!(error.contains("pending ordered Claude inputs for cutex.a"), "{error}");
+        db.execute("UPDATE inputs SET state='injected'", []).unwrap();
+        db.execute("INSERT INTO notes VALUES ('fixture-thread','reserved',?1)",
+            [r#"{"metadata":{"automaticBatchMember":true}}"#]).unwrap();
+        assert!(preflight_rollback(&home, "r295").is_err());
+        db.execute("UPDATE notes SET state='injected'", []).unwrap();
+        preflight_rollback(&home, "r295").unwrap();
+
+        let sessions = rusqlite::Connection::open(home.join("cutex-sessions.sqlite3")).unwrap();
+        sessions.pragma_update(None, "user_version", 2_i64).unwrap();
+        let error = preflight_rollback(&home, "r295").unwrap_err();
+        assert!(format!("{error:#}").contains("session SQLite schema version 2"), "{error:#}");
+    }
+
+    #[test]
+    fn r295_preflight_releases_session_snapshot_with_pooling_enabled() {
+        const POOL_ROOT: &str = "CUTEX_TEST_SESSION_POOL_ROOT";
+        if let Some(path) = std::env::var_os(POOL_ROOT) {
+            assert!(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_none());
+            let root = PathBuf::from(path);
+            assert_eq!(std::env::temp_dir().canonicalize().unwrap(), root.canonicalize().unwrap());
+            let home = root.join("fixture");
+            preflight_claude_ordered_inboxes(&home, "r295").unwrap();
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "scratch copy remains");
+            #[cfg(target_os = "linux")]
+            {
+                let root = root.canonicalize().unwrap();
+                for fd in std::fs::read_dir("/proc/self/fd").unwrap() {
+                    if let Ok(path) = std::fs::read_link(fd.unwrap().path()) {
+                        assert!(
+                            !path.strip_prefix(&root).ok().is_some_and(|relative| !relative.starts_with("fixture")),
+                            "snapshot file is still open: {}",
+                            path.display(),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        let temp = RollbackScratch::new().unwrap();
+        let home = temp.0.join("fixture");
+        std::fs::create_dir(&home).unwrap();
+        crate::session::store::with_locked_session_rows(&home.join(SESSIONS), |rows| {
+            let record = crate::session::model::CutexSessionRecord::new_at(
+                "cutex.a".into(), None, "devbox".into(), home.to_string_lossy().into(),
+                None, "2026-10-18T00:00:00Z".into(),
+            )?;
+            rows.insert_session("cutex.a", record);
+            rows.commit().map(|_| ())
+        }).unwrap();
+        let name = concat!(
+            module_path!(), "::r295_preflight_releases_session_snapshot_with_pooling_enabled"
+        );
+        let name = name.split_once("::").unwrap().1;
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .current_dir(&home)
+            .env_remove("CUTEX_TEST_PRIVATE_HOME")
+            .env("CUTEX_TEST_FORBID_REAL_HOME", "1")
+            .env(POOL_ROOT, &temp.0)
+            .env("TEMP", &temp.0)
+            .env("TMP", &temp.0)
+            .env("TMPDIR", &temp.0)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

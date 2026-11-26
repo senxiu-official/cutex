@@ -257,6 +257,9 @@ impl NativeObserved {
 /// The small facts of one stored bus message the ledger depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusFacts {
+    /// Exact current native attempt's audit item and carrying turn. It never
+    /// substitutes for `external_receipt` or `a4`.
+    pub native_timeline: Option<(String, String)>,
     pub state: String,
     pub stale_release_allowed: bool,
     pub projection_failure: Option<Value>,
@@ -372,6 +375,9 @@ pub fn target_of(facts: &BusFacts) -> Target {
         "stale_held" => return Target::Waiting { reason: "staleHeld", details: Some(json!({"staleReleaseAllowed":facts.stale_release_allowed})) },
         _ => {}
     }
+    if facts.error_code.as_deref() == Some(super::agent_bus_state::AUTOMATIC_BINDING_REPLACED) {
+        return Target::Waiting { reason: "nativeHeld", details: Some(json!({"nativeReason":"runtimeGenerationChanged"})) };
+    }
     match &facts.observed {
         Some(NativeObserved::Held(reason)) => {
             return Target::Waiting { reason: "nativeHeld", details: Some(json!({"nativeReason": reason})) };
@@ -475,6 +481,21 @@ pub fn drive(session: &str, id: &str, input: &NewInput, target: &Target) -> Opti
     drive_with_diagnostics(session, id, input, target, None)
 }
 
+/// Compare source facts without the ledger's derived action explanation or
+/// connection overlay. Otherwise the read-only retry marker looks like drift
+/// on every pass, despite no change in the underlying delivery.
+pub(super) fn same_delivery_diagnostics(current: Option<&Value>, source: Option<&Value>) -> bool {
+    let normalize = |value: &Value| {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("retryBlocked");
+            if let Some(waiting) = object.remove("sourceWaitingFor") { object.insert("waitingFor".into(), waiting); }
+        }
+        value
+    };
+    current.map(normalize) == source.map(normalize)
+}
+
 pub fn drive_with_diagnostics(session: &str, id: &str, input: &NewInput, target: &Target, diagnostics: Option<&Value>) -> Option<InputRecord> {
     if !active() {
         return None;
@@ -483,7 +504,7 @@ pub fn drive_with_diagnostics(session: &str, id: &str, input: &NewInput, target:
     let mut last = None;
     let mut steps = plan(existing.as_ref().map(|record| record.state), target, input.intent.timing);
     if steps.is_empty() && diagnostics.is_some() {
-        if let Some(record) = existing.as_ref().filter(|r| !r.state.is_settled() && r.details.get("deliveryDiagnostics") != diagnostics) {
+        if let Some(record) = existing.as_ref().filter(|r| !r.state.is_terminal() && !same_delivery_diagnostics(r.details.get("deliveryDiagnostics"), diagnostics)) {
             let mut next = Next::to(record.state).details(record.details.clone());
             next.reason = record.reason.clone(); next.stage = record.stage;
             steps.push(next);
@@ -591,10 +612,14 @@ pub fn apply_changes(changes: Vec<BusChange>) {
 fn apply_now(changes: Vec<BusChange>) {
     for change in changes {
         let target = target_of(&change.after);
-        if change.before.as_ref().is_some_and(|before| target_of(before) == target && before.delivery_diagnostics == change.after.delivery_diagnostics) {
+        if change.before.as_ref().is_some_and(|before| target_of(before) == target && before.delivery_diagnostics == change.after.delivery_diagnostics
+            && before.native_timeline == change.after.native_timeline) {
             continue;
         }
         drive_with_diagnostics(&change.session, &change.message_id, &change.input, &target, change.after.delivery_diagnostics.as_ref());
+        if let Some((native_id, turn)) = &change.after.native_timeline {
+            native_item_attempt(&change.session, &change.message_id, &change.input, turn, false, native_id);
+        }
     }
 }
 
@@ -612,7 +637,8 @@ pub fn sending(session: &str, id: &str, input: &NewInput) {
 /// timeline as `accepted` with `turnId` and `timelineItemId` = the message
 /// id (`details.readSignal: "nativeItem"`); `inContext` still waits for the
 /// validated receipt. Nothing for a record that is already `inContext`,
-/// `uncertain` or terminal (the receipt / a check decides those).
+/// or terminal. An uncertain row keeps its state but retains this audit fact,
+/// so manual retry cannot duplicate an item already offered to this turn.
 pub fn native_item(session: &str, id: &str, input: &NewInput, turn: &str) -> Option<InputRecord> {
     native_item_with_carry(session, id, input, turn, false)
 }
@@ -626,6 +652,15 @@ pub(super) fn native_item_attempt(session: &str, id: &str, input: &NewInput, tur
         return None;
     }
     let record = current(session, id);
+    if let Some(record) = record.as_ref().filter(|record| record.state == InputState::Uncertain) {
+        if record.turn_id.as_deref() == Some(turn) && record.timeline_item_id.as_deref() == Some(native_id) { return None; }
+        let next = Next::uncertain(record.reason.as_deref().unwrap_or("outcomeUnknown"))
+            .turn(turn).timeline_item(native_id).details(record.details.clone()).surface(record.surface);
+        let transition = ledger().ok()?.transition(session, id, Expect::rev(record.rev), next).ok()?;
+        let _ = input_ledger::publish(&transition);
+        super::input_ledger_settle::mark_dirty(session);
+        return Some(transition.record);
+    }
     let mut read = Next::accepted().turn(turn).timeline_item(native_id);
     if carried || record.as_ref().is_some_and(|record| record.reason.as_deref() == Some("carriedByOwner")) {
         read = read.reason("carriedByOwner");
@@ -899,6 +934,11 @@ pub fn backfill_batch(items: &[BackfillItem], now: DateTime<Utc>) -> usize {
             for item in chunk.iter().filter(|item| missing.contains(&item.message_id)) {
                 if drive_with_diagnostics(session, &item.message_id, &item.input, &backfill_target(item, now), item.facts.delivery_diagnostics.as_ref()).is_some() {
                     created += 1;
+                }
+            }
+            for item in chunk {
+                if let Some((native_id, turn)) = &item.facts.native_timeline {
+                    native_item_attempt(session, &item.message_id, &item.input, turn, false, native_id);
                 }
             }
         }

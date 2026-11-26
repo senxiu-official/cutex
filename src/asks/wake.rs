@@ -435,7 +435,7 @@ pub fn prune_stale_owner_marks_at_startup() {
     match result {
         Ok(stale) => {
             for (id, why) in stale {
-                println!("asks: cleared the stale owner-stop mark of {id} ({why:?})");
+                eprintln!("asks: cleared the stale owner-stop mark of {id} ({why:?})");
             }
         }
         Err(error) => eprintln!("asks: owner-stop mark cleanup warning: {error:#}"),

@@ -847,6 +847,8 @@ mod tests {
             root.join("AppData/Roaming/Microsoft/Protect/test.key"),
             config.join("profiles/test/auth.json"),config.join("claude-accounts/test/.credentials.json"),
             config.join("profile-keys/test.json"),config.join("accounts.v2.backup.json"),
+            config.join(crate::management::v2::feature_profiles::DIR)
+                .join("fp-00000000-0000-4000-8000-000000000000.json"),
             config.join("claude-home/.credentials.json"),
         ];
         for file in &samples {std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(file,"synthetic credential").unwrap();}

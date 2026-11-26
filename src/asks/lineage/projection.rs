@@ -2,6 +2,20 @@ use super::*;
 use crate::asks::store::AskState;
 use serde_json::{json,Value};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResumeContinuationBlocker {
+    NotPending,
+    NoApprovalAuthority,
+    HandlerUnavailable,
+    GenerationMismatch,
+    HandlerOffline,
+    HandlerBusy,
+    LeaseHeld,
+    ProjectPaused,
+    AdmissionBlocked,
+}
+
 /// Parent builds this from current authenticated per-resource permissions.
 /// A ref is never itself a visibility or mutation credential.
 #[derive(Clone, Debug, Default)]
@@ -12,6 +26,8 @@ pub struct NodeAccess {
     pub stop:bool,
     pub stop_jobs:bool,
     pub resume_continuation:bool,
+    pub resume_continuation_blocker:Option<ResumeContinuationBlocker>,
+    pub continuation_approval:Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +177,8 @@ impl TreeSnapshot {
                 "state":c.state,"revision":c.revision,"budgetEpoch":c.budget_epoch,
                 "roundNumber":c.round_number,"startedAt":c.started_at,"deadlineAt":c.deadline_at,
                 "nextWakeAt":c.next_wake_at,"limitReason":c.limit_reason,"cancelReason":c.cancel_reason,
-                "reconciling":c.reconciling,
+                "reconciling":c.reconciling,"blockedReason":crate::asks::continuation::runtime::waiting_blocker(ask),
+                "approval":own_access.continuation_approval,
                 "maxRounds":crate::asks::continuation::MAX_ROUNDS,"maxElapsedSeconds":crate::asks::continuation::MAX_ELAPSED_SECONDS,
                 "waitingFor":if visible_wait{serde_json::to_value(&c.declaration.wake).unwrap()}else{Value::Null},
                 "sourceAttemptId":own_access.read_attempts.then_some(&c.declaration.source.attempt_id),
@@ -189,7 +206,9 @@ impl TreeSnapshot {
                 "parentAttemptId":parent_attempt,"redactedParent":parent.state=="redacted",
                 "lineageState":if verified {"verified"} else {"legacyUnknown"},
                 "allowedActions":{"readAttempts":own_access.read_attempts,"stop":own_access.stop,"stopSelf":own_access.stop,
-                    "stopJobs":own_access.stop&&own_access.stop_jobs,"declareContinuation":false,"resumeContinuation":own_access.resume_continuation},
+                    "stopJobs":own_access.stop&&own_access.stop_jobs,"declareContinuation":false,"resumeContinuation":own_access.resume_continuation,
+                    "resumeContinuationBlockedReason":(!own_access.resume_continuation).then(|| own_access.resume_continuation_blocker
+                        .unwrap_or(ResumeContinuationBlocker::NoApprovalAuthority))},
             });
             let details=json!({
                 "closed":ask.closed,"createdAt":ask.created_at,"updatedAt":ask.updated_at,"revision":ask.revision,

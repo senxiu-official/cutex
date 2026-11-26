@@ -485,13 +485,18 @@ pub fn queued_reason(state: &AskState, ask: &AskRecord) -> (&'static str, Option
 /// Native IO for the current attempt happened: a receipt (or a later
 /// state), or a submit whose outcome is unknown (`submit_retry`).
 fn submitted(ask: &AskRecord) -> bool {
-    ask.current_attempt().is_some_and(|attempt| {
+    current_occurrence_attempt(ask).is_some_and(|attempt| {
         !matches!(attempt.state, AttemptState::Submitting | AttemptState::Refused)
     }) || ask.submit_retry.is_some()
 }
 
+fn current_occurrence_attempt(ask:&AskRecord)->Option<&AttemptRecord> {
+    ask.current_attempt().filter(|attempt|attempt.admission_occurrence==ask.admission_occurrence)
+}
+
 /// The ASK reached a turn (the turn started with it as its input).
 fn ran(before: Option<&AskRecord>, ask: &AskRecord) -> bool {
+    if current_occurrence_attempt(ask).is_none() {return false;}
     before.is_some_and(|before| before.execution == ExecutionState::Running
             && before.current_attempt().zip(ask.current_attempt()).is_some_and(|(old, new)|
                 old.n == new.n && old.native_message_id == new.native_message_id && old.turn_id == new.turn_id))
@@ -531,7 +536,7 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
     }
     let input = request_input(ask);
     let n = |next: Next| next.create(input.clone());
-    let turn = ask.current_attempt().and_then(|attempt| attempt.turn_id.clone());
+    let turn = current_occurrence_attempt(ask).and_then(|attempt| attempt.turn_id.clone());
     let started = |next: Next| match &turn {
         Some(turn) => n(next).turn(turn.clone()),
         None => n(next),
@@ -543,7 +548,7 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
     // rebinds a newer one.
     let in_context = || {
         let next = started(Next::in_context(Evidence::TurnStartInput));
-        match ask.current_attempt().and_then(attempt_item) {
+        match current_occurrence_attempt(ask).and_then(attempt_item) {
             Some(item) if turn.is_some() => next.timeline_item(item),
             _ => next,
         }
@@ -655,7 +660,9 @@ pub fn pending_reason(state: &AskState, delivery: &DeliveryRecord, session: &str
 
 fn event_evidence(state: &AskState, event_id: Option<&str>) -> (Evidence, Option<String>) {
     match event_id.and_then(|id| state.events.get(id)) {
-        Some(event) if super::returns::is_next_step_event(&event.native_message_id) || super::returns::is_owner_note(&event.native_message_id) => {
+        Some(event) if event.automatic_batch_id.is_some()
+            || super::returns::is_next_step_event(&event.native_message_id)
+            || super::returns::is_owner_note(&event.native_message_id) => {
             (Evidence::ExternalInputPersisted, event.turn_id.clone())
         }
         Some(event) => (Evidence::TurnStartInput, event.turn_id.clone()),
@@ -683,6 +690,7 @@ pub fn delivery_job(
     delivery: &DeliveryRecord,
 ) -> Option<Job> {
     let settled_pending = delivery.state == DeliveryState::Pending
+        && !super::terminal_notices::is_critical(delivery)
         && after_state.asks.get(&delivery.ask_id).is_some_and(|ask| super::delivery::settled_for_requester(ask));
     // A moved delivery has no prior projection in its new recipient. Preserve
     // its source state, but use the normal initial-admission path there.
@@ -804,6 +812,12 @@ pub fn delivery_job(
             // These source deliveries are already acknowledged, so neither
             // an explicit read nor a wait can claim them later.
             Some("closed" | "followUpEnded") => steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN])),
+            Some("selfCaused" | "recipientRetired") => {
+                // No native IO: retain the source fact without inventing
+                // context or leaving a never-created notification waiting.
+                steps.push(step(created.surface(il::Surface::None), &[ABSENT]));
+                steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN]));
+            }
             Some("notices_read") => {
                 // A pending source can outpace a prior native projection in
                 // another process. Retire it without claiming model context.
@@ -1408,6 +1422,7 @@ pub fn dismiss(store: &AskStore, record: &InputRecord, now: DateTime<Utc>) -> Re
                 return;
             }
             if cancel_unsubmitted {
+                super::terminal_notices::set_cause(state,ask_id,super::terminal_notices::Actor::Owner,"ownerDiscarded");
                 state.update_ask(ask_id,now,|ask| {
                     ask.execution=ExecutionState::Cancelled;
                     ask.closed=Some(CloseOutcome::Stopped);
@@ -1432,6 +1447,7 @@ fn close_disposed_terminal(state:&mut AskState,ask_id:&str,request:bool,now:Date
         && !ask.resume_pending() && matches!(ask.execution,ExecutionState::Interrupted|ExecutionState::Failed)
         && (request || ask.current_attempt().is_some_and(|attempt|attempt.interrupt_reason==Some(InterruptReason::OutcomeUnknown))));
     if close {
+        super::terminal_notices::set_cause(state,ask_id,super::terminal_notices::Actor::Owner,"ownerDiscarded");
         state.update_ask(ask_id,now,|ask| {
             ask.closed=Some(CloseOutcome::Stopped);ask.closed_at=Some(super::now_rfc3339(now));
         });
@@ -1454,6 +1470,7 @@ pub fn dismiss_input_id(store:&AskStore,session:&str,id:&str,now:DateTime<Utc>)-
             let cancel=matches!(ask.execution,ExecutionState::PendingReview|ExecutionState::Queued);
             let resume=ask.resume_pending();
             if cancel||resume {
+                super::terminal_notices::set_cause(state,&ask_id,super::terminal_notices::Actor::Owner,"ownerDiscarded");
                 state.update_ask(&ask_id,now,|ask| {
                     ask.resume=None;ask.hold=None;
                     if resume {ask.execution=ExecutionState::Interrupted;}

@@ -14,6 +14,14 @@ mod report;
 mod runtime_context;
 mod store;
 
+pub(super) use index::ArchiveTotals;
+
+pub(super) fn read_archive_usage<'a>(ids: impl IntoIterator<Item = &'a str>)
+    -> anyhow::Result<std::collections::HashMap<&'a str, ArchiveTotals>>
+{
+    index::read_archive_totals(&runtime_dir()?.join("management-v2"), ids)
+}
+
 use std::path::Path;
 
 use crate::config::paths::runtime_dir;
@@ -305,7 +313,18 @@ fn visit_usage_samples_for_days_at(
 /// Build or catch up the usage index now (kit migration step); reports do
 /// this themselves on every read.
 pub fn sync_usage_index() -> anyhow::Result<UsageIndexSync> {
-    store::sync_usage_index_at(&runtime_dir()?.join("management-v2"))
+    let root = runtime_dir()?.join("management-v2");
+    let synced = store::sync_usage_index_at(&root)?;
+    let index = index::UsageIndex::open(&root)?;
+    for attempt in 0..8 {
+        if index.backfill_archives(&root)? {
+            return Ok(synced);
+        }
+        if attempt < 7 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    anyhow::bail!("archive usage backfill was overtaken by ledger changes")
 }
 
 /// Compare the index with the old full reader (kit verification after
@@ -364,8 +383,20 @@ pub fn start_index_catch_up() {
     let spawned = std::thread::Builder::new()
         .name("cutex-usage-index".to_string())
         .spawn(|| {
-            if let Err(error) = sync_usage_index() {
-                eprintln!("usage index: startup catch-up failed: {error:#}");
+            let catch_up = || -> anyhow::Result<bool> {
+                let root = runtime_dir()?.join("management-v2");
+                store::sync_usage_index_at(&root)?;
+                index::UsageIndex::open(&root)?.backfill_archives(&root)
+            };
+            let mut delay_secs = 1;
+            loop {
+                match catch_up() {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => eprintln!("usage index: startup catch-up will retry: {error:#}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+                delay_secs = (delay_secs * 2).min(60);
             }
         });
     if let Err(error) = spawned {

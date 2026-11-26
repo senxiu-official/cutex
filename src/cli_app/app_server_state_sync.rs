@@ -162,13 +162,17 @@ fn apply_durable_notification(
                 };
                 changed |= replace_if_changed(&mut record.managed_cwd, managed);
             }
-            if let Some(model) = settings.get("model").and_then(Value::as_str) {
-                changed |= replace_if_changed(&mut record.model_defaults, Some(model.to_string()));
-            }
-            if let Some(effort) = settings.get("effort").and_then(Value::as_str) {
-                changed |=
-                    replace_if_changed(&mut record.reasoning_defaults, Some(effort.to_string()));
-            }
+            let model_changed = settings["model"].as_str().is_some_and(|model| {
+                replace_if_changed(&mut record.model_defaults, Some(model.to_string()))
+            });
+            // Tracked Codex snapshots report effective effort. The successful
+            // owner request separately commits any explicit effort selection.
+            let tracked_codex = record.runtime_backend == cutex::session::model::CutexSessionRuntimeBackend::Host
+                && record.reasoning_resolution.is_some();
+            let effort_changed = !tracked_codex && settings["effort"].as_str().is_some_and(|effort| {
+                replace_if_changed(&mut record.reasoning_defaults, Some(effort.to_owned()))
+            });
+            changed |= model_changed || effort_changed;
             // session-fast-mode: the native forgets the tier on resume, so the
             // record keeps the last one (null = standard / profile config).
             match settings.get("serviceTier") {
@@ -238,6 +242,14 @@ fn apply_durable_notification(
                     record,
                     cutex::runtime::args::PermissionWrite::Sandbox,
                 );
+            }
+            if model_changed && tracked_codex {
+                match cutex::launch::stock::fresh_effort_resolution(record) {
+                    Ok(Some(resolution)) => record.reasoning_resolution = Some(resolution),
+                    Ok(None) => {}
+                    Err(error) => eprintln!("Could not refresh reasoning defaults for {}: {error:#}",
+                        record.cutex_session_id),
+                }
             }
             changed
         }
@@ -367,6 +379,23 @@ mod tests {
         agent.display_name_hint = Some("Worker".into());
         assert!(apply_durable_notification(&mut agent, 7, &thread_name_notification("Generated"), "t").unwrap());
         assert_eq!(agent.display_name_hint.as_deref(), Some("Worker"));
+    }
+
+    #[test]
+    fn tracked_native_notifications_do_not_change_configured_effort() {
+        use cutex::profiles::reasoning::{self, SessionEffort};
+        use cutex::session::model::CutexSessionRuntimeBackend;
+        let mut record = record();
+        record.runtime_backend = CutexSessionRuntimeBackend::Host;
+        record.reasoning_resolution = Some(SessionEffort {
+            requested_model: "fixture".into(),
+            resolved_model: None,
+            resolution: reasoning::resolve(None, None, Some("medium"), None, None).unwrap(),
+        });
+        let notice = settings_updated(serde_json::json!({"effort":"high"}));
+        assert!(!apply_durable_notification(&mut record, 7, &notice, "t").unwrap());
+        assert!(record.reasoning_defaults.is_none());
+        assert_eq!(record.reasoning_resolution.unwrap().resolution.value.as_deref(), Some("medium"));
     }
 
     #[test]

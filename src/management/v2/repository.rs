@@ -72,6 +72,19 @@ pub fn publish_background_work(context: &crate::app_server::manager::AppServerRu
     if let Some(repository) = repository { repository.publish_background_work(context, work); }
 }
 
+pub fn publish_claude_diagnostics(context: &crate::app_server::manager::AppServerRuntimeEventContext,
+    diagnostics: crate::app_server::claude_diagnostics::ClaudeDiagnostics) {
+    let repository = *DIAGNOSTIC_REPOSITORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(repository) = repository {
+        repository.live_deltas.publish_session_status(&context.cutex_session_id, &repository.host_id,
+            context.runtime_generation, &context.thread_id, "claudeDiagnostics",
+            crate::app_server::claude_diagnostics::METHOD, serde_json::json!({
+                "cutexSessionId": context.cutex_session_id, "runtimeGeneration": context.runtime_generation,
+                "claudeDiagnostics": diagnostics,
+            }));
+    }
+}
+
 /// Never opens storage or waits for a repository operation to finish.
 pub(crate) fn queue_diagnostics() -> serde_json::Value {
     let repository = match DIAGNOSTIC_REPOSITORY.try_lock() {
@@ -79,6 +92,13 @@ pub(crate) fn queue_diagnostics() -> serde_json::Value {
         Err(_) => return serde_json::json!({"available":false}),
     };
     repository.map_or_else(|| serde_json::json!({"available":false}), EventRepository::queue_diagnostics)
+}
+
+pub(super) fn trim_subscriptions_under_pressure() -> bool {
+    let Ok(slot) = DIAGNOSTIC_REPOSITORY.try_lock() else { return false; };
+    let repository = *slot;
+    drop(slot);
+    repository.is_some_and(EventRepository::trim_subscriptions_under_pressure)
 }
 
 /// Retention of the event journal (owner rule: the stream keeps at least
@@ -253,6 +273,16 @@ type Subscriber = (mpsc::SyncSender<QueuedEvent>, Arc<AtomicBool>, Weak<()>, Arc
 // slow reader. These encoded-byte budgets complement the bounded channel.
 const SUBSCRIBER_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SUBSCRIBERS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const PRESSURE_SUBSCRIBER_BYTES: u64 = 2 * 1024 * 1024;
+const PRESSURE_SUBSCRIBERS_BYTES: u64 = 16 * 1024 * 1024;
+
+fn subscription_byte_limits() -> (u64, u64) {
+    if super::memory_pressure::active() {
+        (PRESSURE_SUBSCRIBER_BYTES, PRESSURE_SUBSCRIBERS_BYTES)
+    } else {
+        (SUBSCRIBER_MAX_BYTES, SUBSCRIBERS_MAX_BYTES)
+    }
+}
 
 #[derive(Default)]
 struct SubscriptionMetrics {
@@ -2497,6 +2527,40 @@ impl EventRepository {
         )
     }
 
+    // Called under the subscriber lock so a concurrent publisher cannot
+    // replenish a queue we are about to discard. Receivers may still drain.
+    fn retire_largest_queue(&self, threshold: u64) -> bool {
+        let mut queues = self.subscription_metrics.queues.lock().unwrap_or_else(|e| e.into_inner());
+        queues.retain(|entry| entry.queue.strong_count() > 0);
+        let Some((_, queue, holder)) = queues.iter().filter_map(|holder| {
+            let queue = holder.queue.upgrade()?;
+            let bytes = holder.bytes.upgrade()?.load(Ordering::Relaxed);
+            (bytes > threshold).then_some((bytes, queue, holder))
+        }).max_by_key(|(bytes, _, _)| *bytes) else { return false; };
+        if let Some(lagged) = holder.lagged.upgrade() { lagged.store(true, Ordering::SeqCst); }
+        queue.discard();
+        if let Some(wake) = holder.wake.upgrade() { wake.notify(); }
+        true
+    }
+
+    fn trim_subscriptions_under_pressure(&self) -> bool {
+        let Ok(mut subscribers) = self.subscribers.try_lock() else { return false; };
+        let mut retired = false;
+        loop {
+            let threshold = if self.subscription_metrics.bytes.load(Ordering::Relaxed) > PRESSURE_SUBSCRIBERS_BYTES {
+                0
+            } else {
+                PRESSURE_SUBSCRIBER_BYTES
+            };
+            if !self.retire_largest_queue(threshold) { break; }
+            retired = true;
+        }
+        if retired {
+            subscribers.retain(|sub| !sub.1.load(Ordering::SeqCst));
+        }
+        retired
+    }
+
     fn publish(&self, envelope: &EventEnvelope, encoded_bytes: Option<usize>) {
         let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::EventFanout);
         timing.stage(super::control_timing::Stage::Fanout);
@@ -2512,23 +2576,18 @@ impl EventRepository {
         // Make room by retiring holders of existing bytes, not whichever
         // healthy subscriber happens to be visited when the budget fills.
         subscribers.retain(|(_, _, live, _, _, _)| live.strong_count() > 0);
+        let (subscriber_limit, global_limit) = subscription_byte_limits();
         loop {
-            let admissions = subscribers.iter().filter(|sub| !sub.1.load(Ordering::SeqCst) && sub.4.load(Ordering::Relaxed).saturating_add(bytes as u64) <= SUBSCRIBER_MAX_BYTES).count();
-            if self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add((bytes as u64).saturating_mul(admissions as u64)) <= SUBSCRIBERS_MAX_BYTES { break; }
-            let mut queues = self.subscription_metrics.queues.lock().unwrap_or_else(|e| e.into_inner());
-            queues.retain(|entry| entry.queue.strong_count() > 0);
-            let Some(holder) = queues.iter().max_by_key(|entry| entry.bytes.upgrade().map_or(0, |bytes| bytes.load(Ordering::Relaxed))) else { break; };
-            if holder.bytes.upgrade().map_or(0, |bytes| bytes.load(Ordering::Relaxed)) == 0 { break; }
-            if let Some(lagged) = holder.lagged.upgrade() { lagged.store(true, Ordering::SeqCst); }
-            if let Some(queue) = holder.queue.upgrade() { queue.discard(); }
-            if let Some(wake) = holder.wake.upgrade() { wake.notify(); }
+            let admissions = subscribers.iter().filter(|sub| !sub.1.load(Ordering::SeqCst) && sub.4.load(Ordering::Relaxed).saturating_add(bytes as u64) <= subscriber_limit).count();
+            let projected = self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add((bytes as u64).saturating_mul(admissions as u64));
+            if projected <= global_limit || !self.retire_largest_queue(0) { break; }
         }
         subscribers.retain(|(sender, lagged, live, wake, subscriber_bytes, queue)| {
             if live.strong_count() == 0 || lagged.load(Ordering::SeqCst) { return false; }
             // This mutex serializes all enqueues; concurrent dequeue/drop only
             // reduces the charges. Test the budget before cloning the payload.
-            if subscriber_bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > SUBSCRIBER_MAX_BYTES
-                || self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > SUBSCRIBERS_MAX_BYTES {
+            if subscriber_bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > subscriber_limit
+                || self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > global_limit {
                 lagged.store(true, Ordering::SeqCst);
                 wake.notify();
                 if let Some(queue) = queue.upgrade() { queue.closed.store(true, Ordering::Release); queue.notify(); }
@@ -3113,6 +3172,69 @@ mod tests {
         drop(page);
         drop(sub);
         drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_pressure_trims_only_backlogged_subscriptions_and_replays() {
+        let root = test_root("subscription-memory-pressure");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let first = repo.append(pending("s", 1)).unwrap();
+        let slow = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        let healthy = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        let second = repo.append(pending("s", 2)).unwrap();
+        assert_eq!(healthy.receiver.try_recv().unwrap(), second);
+        // Use an explicit charge to reproduce backlog pressure with a small
+        // journal and leave the healthy subscriber at the current cursor.
+        repo.publish(&second, Some(PRESSURE_SUBSCRIBER_BYTES as usize));
+        assert_eq!(healthy.receiver.try_recv().unwrap(), second);
+        assert!(repo.trim_subscriptions_under_pressure());
+        assert!(slow.lagged.load(Ordering::SeqCst));
+        assert!(!healthy.lagged.load(Ordering::SeqCst));
+        assert!(matches!(slow.receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), 0);
+        let page = repo.page(ReplayQuery {
+            stream_id: Some(first.stream_id.clone()),
+            after: Some(first.cursor),
+            ..ReplayQuery::default()
+        }).unwrap();
+        assert_eq!(page.events, vec![second]);
+        let third = repo.append(pending("other-session", 3)).unwrap();
+        assert_eq!(healthy.receiver.try_recv().unwrap(), third);
+        drop((slow, healthy, repo));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_pressure_publish_applies_both_smaller_limits_then_recovers() {
+        use super::super::memory_pressure::with_test_pressure;
+
+        const MIB: usize = 1024 * 1024;
+        let root = test_root("publish-memory-pressure");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let event = repo.append(pending("s", 1)).unwrap();
+        let slow = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        with_test_pressure(true, || {
+            for _ in 0..3 { repo.publish(&event, Some(MIB)); }
+        });
+        assert!(slow.lagged.load(Ordering::SeqCst));
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), (2 * MIB) as u64);
+        drop(slow);
+
+        let subscribe = || repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        let subs: Vec<_> = (0..17).map(|_| subscribe()).collect();
+        with_test_pressure(true, || repo.publish(&event, Some(MIB)));
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), (16 * MIB) as u64);
+        assert_eq!(subs.iter().filter(|sub| sub.lagged.load(Ordering::SeqCst)).count(), 1);
+        drop(subs);
+
+        let subs: Vec<_> = (0..17).map(|_| subscribe()).collect();
+        with_test_pressure(false, || {
+            for _ in 0..3 { repo.publish(&event, Some(MIB)); }
+        });
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), (51 * MIB) as u64);
+        assert!(subs.iter().all(|sub| !sub.lagged.load(Ordering::SeqCst)));
+        drop((subs, repo));
         fs::remove_dir_all(root).unwrap();
     }
 

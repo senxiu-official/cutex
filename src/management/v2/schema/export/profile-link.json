@@ -70,6 +70,7 @@
       "properties": {
         "color": { "$ref": "#/$defs/appearanceRevision" }, "avatarThemes": { "$ref": "#/$defs/appearanceRevision" },
         "avatarStyle": { "$ref": "#/$defs/appearanceRevision" },
+        "planLabel": { "$ref": "#/$defs/appearanceRevision" },
         "introGreeting": { "$ref": "#/$defs/appearanceRevision" }, "avatar": { "$ref": "#/$defs/appearanceRevision" },
         "introPortrait": { "$ref": "#/$defs/appearanceRevision" }
       },
@@ -81,6 +82,7 @@
         "id": { "type": "string" }, "link": { "$ref": "#/$defs/profileLink" },
         "accountLink": { "$ref": "#/$defs/manualSetting" }, "accountLinkState": { "enum": ["auto", "disabled", "manual"] },
         "appearanceRevisions": { "$ref": "#/$defs/appearanceRevisions" },
+        "planLabelManual": { "type": ["string", "null"], "maxLength": 40, "description": "Explicit manual label for linked Profile sync. Null means cleared. Absent if not supported or not portable." },
         "appearance": { "type": "object", "properties": { "avatarStyle": { "$ref": "#/$defs/avatarStyle" } }, "additionalProperties": true }
       },
       "additionalProperties": true

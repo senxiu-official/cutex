@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub mod overlength;
+pub mod automatic_batch;
 pub mod size;
 pub mod view;
 
@@ -620,9 +621,13 @@ fn occurrence_in(
         "ingress Ready occurrence ambiguous"
     );
     let binding = ExternalInputBinding::from_review(ready);
-    binding.verify(Path::new(&runtime.runtime_dir))?;
+    crate::management::v2::stock_temp::ingress_directory(
+        Path::new(&runtime.runtime_dir), ready,
+    )?;
     Ok((binding, runtime.clone()))
 }
+const STATUS_CHANGED: &str = "thread/externalInput/statusChanged";
+
 impl ExternalInputClient {
     /// Persistent RPC-only control connection. The managed runtime owner still
     /// processes the authoritative event/approval stream; this connection must
@@ -660,7 +665,7 @@ impl ExternalInputClient {
         let client = if control {
             AppServerClient::connect_rpc_only(options)?
         } else {
-            AppServerClient::connect(options)?
+            AppServerClient::connect_with_hints(options, STATUS_CHANGED)?
         };
         crate::launch::stock::validate_ingress_capability(
             artifacts.bundle.common_ingress(),
@@ -984,7 +989,7 @@ impl ExternalInputClient {
         self.fence()?;
         match event {
             Some(AppServerEvent::Notification(n))
-                if n.method == "thread/externalInput/statusChanged" =>
+                if n.method == STATUS_CHANGED =>
             {
                 let hint: StatusChanged =
                     serde_json::from_value(n.params.context("missing statusChanged params")?)?;
@@ -1013,7 +1018,7 @@ impl ExternalInputClient {
                     return Ok(());
                 }
                 Some(AppServerEvent::Notification(n))
-                    if n.method == "thread/externalInput/statusChanged" =>
+                    if n.method == STATUS_CHANGED =>
                 {
                     let hint: StatusChanged =
                         serde_json::from_value(n.params.context("missing ingress hint")?)?;

@@ -29,6 +29,8 @@ impl Facts for LibraryFacts {
         names
             .iter()
             .map(|name| {
+                use crate::management::v2::feature_profiles::{require_agent_id, AGENT_REFUSAL_CODE};
+                require_agent_id(name).map_err(|error| RunError { code: AGENT_REFUSAL_CODE.into(), message: error.to_string() })?;
                 let account = crate::profiles::lookup::find_account(&store, name)
                     .ok()
                     .flatten()

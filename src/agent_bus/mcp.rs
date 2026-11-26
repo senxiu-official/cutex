@@ -100,6 +100,12 @@ fn normalize_bus_rejection(result: Value) -> Value {
         return json!({"ok":false,"status":"response_uncertain","code":"outcome_unknown","detail":OUTCOME_UNKNOWN_DETAIL});
     }
     let error = &result["error"];
+    // Some control routes wrap the business error inside the HTTP body.
+    let error = if error["code"].is_null() && error["error"]["code"].is_string() {
+        &error["error"]
+    } else {
+        error
+    };
     let code = ["code", "error"]
         .iter()
         .find_map(|key| error[*key].as_str())
@@ -163,6 +169,8 @@ fn listed_tools(port: u16, token: &str, runtime: &RuntimeAgentId) -> Value {
     }
     // Fail closed for opt-in tools when the Bus cannot say.
     super::mcp_browser::filter_listing(&mut list, None);
+    crate::agent_bus::tool_policy::retain_tools_except(&mut list, crate::personal_assistants::tools::ASSISTANT);
+    crate::agent_bus::tool_policy::retain_tools_except(&mut list, crate::personal_assistants::tools::DIRECTOR);
     crate::agent_bus::tool_policy::retain_tools_except(&mut list, &[super::web_search::TOOL]);
     list
 }
@@ -174,6 +182,7 @@ const SCHEDULE_LIST: &str = "schedule_list"; // r290 P5 own-target read only.
 
 pub fn tools() -> Value {
     let mut tools = crate::agent_bus::alarms::tools();
+    tools.extend(crate::personal_assistants::tools::definitions());
     tools.push(crate::profile_quota_agents::tool()); // r290 P12.
     tools.extend(crate::schedules::runtime::agent_tools()); // r290 P5.
     tools.extend(management::tools().into_iter().filter(|t| t["name"] != "agent_archive"));
@@ -564,7 +573,9 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 }
                 if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::Dispatch); }
-                let mut result = if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::owner_pins::tool::is_tool(name) || crate::workflows::tools::is_tool(name) {
+                let mut result = if crate::personal_assistants::tools::is_tool(name) {
+                    crate::agent_bus::client::submit_mcp_control(port,&token,&runtime,&fence,crate::personal_assistants::tools::PATH,&json!({"tool":name,"arguments":args}))?
+                } else if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::owner_pins::tool::is_tool(name) || crate::workflows::tools::is_tool(name) {
                     let action_id = args["action_id"].as_str().map(str::to_owned).unwrap_or_else(||
                         derive_action_id(&message["params"], &rpc_call_key(&process, id), &runtime, generation, &fence.thread_id, name, &args));
                     action_reply(&action_id, crate::agent_bus::client::submit_mcp_control(
@@ -1108,6 +1119,13 @@ mod tests {
         let rejected = normalize_bus_rejection(json!({"http_status":403,"error":{"ok":false,"code":"recipient_outside_boundary","message":"outside"}}));
         assert_eq!(rejected["status"], "no_write");
         assert_eq!(rejected["code"], "recipient_outside_boundary");
+        let capacity = crate::personal_assistants::error_message("open_request_limit");
+        let clarification = normalize_bus_rejection(json!({"http_status":409,"error":{"error":{
+            "code":"open_request_limit","message":capacity
+        }}}));
+        assert_eq!(clarification["code"], "open_request_limit");
+        assert_eq!(clarification["status"], "no_write");
+        assert!(clarification["detail"].as_str().unwrap().contains(capacity));
         let odd = normalize_bus_rejection(json!({"http_status":400,"error":{"code":"has space"}}));
         assert_eq!(odd["code"], "rejected");
         let server = normalize_bus_rejection(json!({"http_status":502,"error":{"message":"internal path C:/x"}}));

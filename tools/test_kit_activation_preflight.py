@@ -9,6 +9,8 @@ from unittest import mock
 import subprocess
 import threading
 import shutil
+import sqlite3
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,75 @@ class ActivationFixes(unittest.TestCase):
     def write(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value), encoding='utf-8')
+
+    def test_ordered_downgrade_checks_daemon_and_pinned_inbox(self):
+        management = self.root / 'runtime/management-v2'
+        management.mkdir(parents=True)
+        external = self.root / 'custom-claude-state'
+        external.mkdir()
+        with closing(sqlite3.connect(management / 'management-state.sqlite3')) as daemon, closing(
+                sqlite3.connect(external / 'state.sqlite3')) as adapter:
+            daemon.execute('CREATE TABLE automatic_input_publications(batch TEXT)')
+            daemon.execute("INSERT INTO automatic_input_publications VALUES ('ordered-auto-fixture')")
+            daemon.commit()
+            adapter.execute('CREATE TABLE notes(thread_id, message_id, state, payload)')
+            adapter.execute("INSERT INTO notes VALUES ('thread-a','note-a','pending',?)",
+                            (json.dumps({'metadata': {'automaticNoteBatch': 'ordered-auto-fixture'}}),))
+            adapter.commit()
+            records = [{'cutex_session_id': 'agent-a',
+                        'claude_session': {'state_dir': str(external), 'thread_id': 'thread-a'}}]
+            d = types.SimpleNamespace(home=self.root, session_records=records, persisted=lambda: None,
+                                      plan={'orderedAutomaticInput': {'target': True, 'previous': False}})
+            preflight.ordered_input_preflight(d)
+            with self.assertRaisesRegex(RuntimeError, 'ordered-auto-fixture.*agent-a: note-a'):
+                preflight.ordered_input_preflight(d, previous=True)
+            daemon.execute('DELETE FROM automatic_input_publications')
+            daemon.commit()
+            with self.assertRaisesRegex(RuntimeError, 'agent-a: note-a'):
+                preflight.ordered_input_preflight(d, previous=True)
+            adapter.execute("UPDATE notes SET state='injected'")
+            adapter.commit()
+            preflight.ordered_input_preflight(d, previous=True)
+
+    def test_ordered_rollback_reads_committed_wal_without_source_writes(self):
+        database = self.root / 'management-state.sqlite3'
+        with closing(sqlite3.connect(database)) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE automatic_input_publications(batch TEXT)')
+            db.execute('CREATE TABLE notes(thread_id, message_id, state, payload)')
+            db.commit()
+
+        def snapshot():
+            files = {}
+            for path in self.root.glob('management-state.sqlite3*'):
+                # SQLite holds Windows byte-range locks on the live SHM.
+                if path.name.endswith('-shm'):
+                    info = path.stat()
+                    files[path.name] = info.st_size, info.st_mtime_ns
+                else:
+                    files[path.name] = path.read_bytes()
+            return files
+
+        before = snapshot()
+        self.assertEqual(list(before), [database.name])
+        self.assertEqual(preflight._ordered_manifest_ids(database), [])
+        self.assertEqual(preflight._ordered_inbox_ids(database, 'thread-a'), [])
+        self.assertEqual(snapshot(), before)
+
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute("INSERT INTO automatic_input_publications VALUES ('ordered-auto-fixture')")
+            writer.execute("INSERT INTO notes VALUES ('thread-a','note-a','pending',?)",
+                           (json.dumps({'metadata': {'automaticNoteBatch': 'ordered-auto-fixture'}}),))
+            before = snapshot()
+            self.assertEqual(preflight._ordered_manifest_ids(database), [])
+            self.assertEqual(preflight._ordered_inbox_ids(database, 'thread-a'), [])
+            self.assertEqual(snapshot(), before)
+            writer.commit()
+            before = snapshot()
+            self.assertEqual(preflight._ordered_manifest_ids(database), ['ordered-auto-fixture'])
+            self.assertEqual(preflight._ordered_inbox_ids(database, 'thread-a'), ['note-a'])
+            self.assertEqual(snapshot(), before)
 
     def test_retry_inherits_confirmed_offline_provenance(self):
         old = self.root / 'operations' / 'failed'

@@ -11,6 +11,10 @@ use std::path::Path;
 #[path = "copied_state_tests.rs"]
 mod copied_state_tests;
 
+#[cfg(test)]
+#[path = "steer_start_context_tests.rs"]
+mod steer_start_context_tests;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Evidence { Unknown, Persisted(String), FailedUnconfirmed(String) }
 
@@ -70,12 +74,16 @@ pub(super) fn observe(path: &Path, expected: &Envelope, owner: Option<&str>) -> 
     let Some(owner) = owner else { return Ok(Evidence::Unknown); };
     use sha2::{Digest, Sha256};
     let suffix = if owner.len() <= 200 { owner.to_string() } else { format!("{:x}",Sha256::digest(owner.as_bytes())) };
-    let carrier_id = format!("owner-{suffix}");
     let note: Value = serde_json::from_str(&raw_note)?;
-    if note["metadata"]["ownerCarrier"] != carrier_id { return Ok(Evidence::Unknown); }
+    let Some(carrier_id) = note["metadata"]["ownerCarrier"].as_str().filter(|id|
+        *id == format!("owner-{suffix}") || *id == format!("steer-{suffix}"))
+    else { return Ok(Evidence::Unknown); };
     ensure!(note["source"] == expected_json["message"]["source"]
         && note["eventType"] == expected.message.event_type && note["text"] == expected.message.text
         && note.get("view") == expected_json.get("view"), "durable injected note content mismatch");
+    // A steer may miss the busy turn and start its own queued turn. Its key
+    // stays steer-*, but it has the same start-input proof as owner-*. The
+    // exact input turn below excludes a hook injected into an older turn.
     let carrier: Option<(String, String)> = tx.query_row(
         "SELECT payload,state FROM inputs WHERE thread_id=?1 AND message_id=?2 AND turn_id=?3",
         rusqlite::params![expected.thread_id, carrier_id, turn], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
@@ -106,11 +114,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    struct Fixture { path: std::path::PathBuf, envelope: Envelope }
+    pub(super) struct Fixture { pub(super) path: std::path::PathBuf, pub(super) envelope: Envelope }
     impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); } }
     impl Fixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("owner-proof-{}.sqlite3", uuid::Uuid::new_v4()));
             let submission = super::super::Submission {
                 message_id: "cutex-ask-owner-proof".into(), source_agent: None,
                 event_type: "ANSWER", text: "original answer\n第二个结果".into(),
@@ -118,6 +125,10 @@ mod tests {
                 view: Some(json!({"schema":"cutex.delegation-results.v1","data":{"items":[]}})),
             };
             let envelope = super::super::owner_note_envelope("cutex.private", "thread-original", 31, &submission).unwrap();
+            Self::with_envelope(envelope)
+        }
+        pub(super) fn with_envelope(envelope: Envelope) -> Self {
+            let path = std::env::temp_dir().join(format!("owner-proof-{}.sqlite3", uuid::Uuid::new_v4()));
             let db = Connection::open(&path).unwrap();
             // Actual existing adapter schema/shape, deliberately no receipt.
             db.execute_batch("CREATE TABLE external_inputs(thread_id TEXT,message_id TEXT,envelope TEXT,receipt TEXT,last_status TEXT,PRIMARY KEY(thread_id,message_id));
@@ -137,7 +148,36 @@ mod tests {
             db.execute("INSERT INTO items(turn_id,id,payload) VALUES('carrier-turn','model-proof',?1)", [json!({"type":"mcpToolCall","id":"model-proof"}).to_string()]).unwrap();
             Self { path, envelope }
         }
-        fn change(&self, sql: &str) { Connection::open(&self.path).unwrap().execute_batch(sql).unwrap(); }
+        pub(super) fn change(&self, sql: &str) { Connection::open(&self.path).unwrap().execute_batch(sql).unwrap(); }
+        pub(super) fn steer_start(&self) {
+            self.change("UPDATE notes SET payload=json_set(payload,'$.metadata.ownerCarrier','steer-carrier');
+                UPDATE inputs SET message_id='steer-carrier',state='processing';
+                UPDATE turns SET state='inProgress';");
+        }
+    }
+
+    #[test]
+    fn queued_steer_start_is_read_before_turn_end_without_a_receipt() {
+        let f=Fixture::new();f.steer_start();
+        let before=std::fs::read(&f.path).unwrap();
+        assert_eq!(persisted_turn(&f.path,&f.envelope,Some("carrier")).unwrap(),Some("carrier-turn".into()));
+        assert_eq!(std::fs::read(&f.path).unwrap(),before,"evidence is read-only");
+        f.change("DELETE FROM items WHERE id='model-proof'");
+        assert_eq!(persisted_turn(&f.path,&f.envelope,Some("carrier")).unwrap(),None,"a staged item is not model context");
+    }
+
+    #[test]
+    fn busy_steer_and_wrong_carrier_never_borrow_the_start_proof() {
+        for mutation in [
+            "UPDATE inputs SET turn_id='reserved-next-turn'",
+            "UPDATE inputs SET payload=json_set(payload,'$.clientId','different-owner')",
+            "UPDATE notes SET payload=json_set(payload,'$.metadata.ownerCarrier','steer-different-owner')",
+            "UPDATE turns SET reverted=1",
+            "DELETE FROM items WHERE id='model-proof'",
+        ] {
+            let f=Fixture::new();f.steer_start();f.change(mutation);
+            assert!(!matches!(persisted_turn(&f.path,&f.envelope,Some("carrier")),Ok(Some(_))),"{mutation}");
+        }
     }
 
     #[test]
@@ -182,6 +222,7 @@ mod tests {
     fn busy_hook_with_later_completion_is_unknown_without_a_typed_receipt() {
         let f=Fixture::new();
         f.change("UPDATE inputs SET message_id='steer-carrier',turn_id='reserved-steer-turn';
+            UPDATE turns SET state='inProgress';
             UPDATE notes SET payload=json_set(payload,'$.metadata.ownerCarrier','steer-carrier');
             UPDATE items SET payload=json_set(payload,'$.type','commandExecution') WHERE id='model-proof';");
         assert_eq!(persisted_turn(&f.path,&f.envelope,Some("carrier")).unwrap(),None);

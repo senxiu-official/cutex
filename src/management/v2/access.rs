@@ -46,6 +46,7 @@ pub enum Class {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scoped {
     SessionList,
+    SessionSearch,
     SessionRead,
     SessionBootstrap,
     SessionHistory,
@@ -131,6 +132,7 @@ fn bootstrap_shape(path: &str) -> bool {
 fn history_shape(path: &str) -> bool {
     super::server::history_session_id_from_path(path).is_some()
         || super::agent_bus_state::history::parse_path(path).is_some()
+        || super::interaction_history::session_id_from_path(path).is_some()
 }
 fn history_turn_shape(path: &str) -> bool {
     super::server::history_turn_path(path).is_some()
@@ -192,8 +194,12 @@ macro_rules! owner_prefixes {
 /// Ordered: the first matching rule wins. Scoped rules use the exact path
 /// parsers of the handlers they guard; `OwnerOnly` prefix rules follow.
 const SCOPED_RULES: &[Rule] = &[
+    Rule { methods: ANY, matcher: Matcher::Exact(super::archive::batch::PATH), class: Class::OwnerOnly },
     Rule {methods:ANY,matcher:Matcher::Prefix("/v2/pairing/"),class:Class::OwnerOnly},
     Rule {methods:POST,matcher:Matcher::Exact("/v2/job-service/close-follow-up"),class:Class::OwnerOnly},
+    Rule {methods:ANY,matcher:Matcher::Shape(super::feature_profiles::is_path),class:Class::OwnerOnly},
+    Rule { methods: ANY, matcher: Matcher::Shape(|path| super::service_notifications::parse_route(path).is_some()), class: Class::OwnerOnly },
+    Rule {methods:ANY,matcher:Matcher::Exact(super::text_rewrite::PATH),class:Class::OwnerOnly},
     Rule {methods:ANY,matcher:Matcher::Exact(crate::agent_bus::native_subagent::PROOF_PATH),class:Class::OwnerOnly},
     Rule { methods: GET_PUT_DELETE, matcher: Matcher::Shape(super::user_layout_api::is_path), class: Class::Scoped(Scoped::UserLayout) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/page"), class: Class::OwnerOnly },
@@ -208,6 +214,7 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Exact("/v2/host"), class: Class::HostRead },
     Rule { methods: GET, matcher: Matcher::Exact(super::identity_api::CHALLENGE_PATH), class: Class::AnyPrincipal },
     Rule { methods: POST, matcher: Matcher::Exact(super::identity_api::CLAIM_PATH), class: Class::AnyPrincipal },
+    Rule { methods: GET, matcher: Matcher::Exact(super::session_search::PATH), class: Class::Scoped(Scoped::SessionSearch) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions"), class: Class::Scoped(Scoped::SessionList) },
     Rule { methods: GET, matcher: Matcher::Shape(workspace_read_shape), class: Class::Scoped(Scoped::WorkspaceRead) },
     Rule { methods: POST, matcher: Matcher::Shape(attachment_shape), class: Class::Scoped(Scoped::AttachmentUpload) },
@@ -264,6 +271,7 @@ const OWNER_RULES: &[Rule] = owner_prefixes![
     // r290 P10 (A1): receipt lookups and settlements belong to the owner.
     "/v2/project-actions",
     "/v2/schedules", // r290 P5 schedules: owner-only configuration and history.
+    "/v2/personal-assistants",
     "/v2/admission", "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approval-rules", "/v2/approvals",
     "/v2/artifact-store", "/v2/artifacts", "/v2/asks", "/v2/browser", "/v2/capabilities",
     "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
@@ -290,6 +298,7 @@ fn rule_matches(rule: &Rule, method: &str, path: &str) -> bool {
 /// The explicit class of a route, `None` when no rule covers it (treated as
 /// `OwnerOnly`).
 pub fn classify(method: &str, path: &str) -> Option<Class> {
+    if path == super::project_batch::PATH { return Some(Class::OwnerOnly); }
     if path == "/v2" {
         return Some(Class::OwnerOnly);
     }
@@ -537,6 +546,7 @@ fn scoped_gate(
         (!scope.sees_session(id)).then(|| session_not_found(stream, id))
     };
     Ok(match scoped {
+        Scoped::SessionSearch => Gate::Handled(super::session_search::handle(stream, request, context, Some(scope))),
         Scoped::SessionList => {
             if query("includeHidden").is_some_and(|v| v != "false")
                 || query("lifecycle").is_some_and(|v| v != "active")
@@ -569,7 +579,10 @@ fn scoped_gate(
             session_gate(stream, &id).unwrap_or(Gate::Continue)
         }
         Scoped::SessionHistory => {
-            let id = srv::history_session_id_from_path(path).or_else(|| super::agent_bus_state::history::parse_path(path)).unwrap_or_default();
+            let id = srv::history_session_id_from_path(path)
+                .or_else(|| super::agent_bus_state::history::parse_path(path))
+                .or_else(|| super::interaction_history::session_id_from_path(path))
+                .unwrap_or_default();
             session_gate(stream, &id).unwrap_or(Gate::Continue)
         }
         Scoped::SessionHistoryTurn => {
@@ -786,7 +799,7 @@ fn scoped_gate(
         Scoped::Summary => {
             let repository = super::repository::management_v2_repository()?;
             srv::materialize_active_stream_reset(repository, context)?;
-            let mut value = super::summary::summary_resource(context, repository)?;
+            let mut value = super::summary::summary_resource_with_table(context, repository, super::project_table::enabled(&request.path))?;
             filter_summary(&mut value, scope);
             Gate::Handled(write_json_response(stream, 200, "OK", &value))
         }
@@ -822,6 +835,7 @@ fn scoped_gate(
             match (context.list_management_projects)(&principal) {
                 Ok(response) => {
                     let mut value = serde_json::to_value(response)?;
+                    if super::project_table::enabled(&request.path) { super::project_table::enrich_collection(&mut value, context.load_runtime_status); }
                     filter_projects(&mut value, scope);
                     Gate::Handled(write_json_response(stream, 200, "OK", &value))
                 }
@@ -846,6 +860,13 @@ fn scoped_gate(
                     "forbidden", "cleanup pagination requires the owner credential", false, json!({}))));
             }
             let store = crate::asks::store::AskStore::open_default()?;
+            match super::asks::short_id_route(&store, &request.path, |ask| ask_record_visible(ask, scope)) {
+                Ok(Some(value)) => return Ok(Gate::Handled(write_json_response(stream, 200, "OK", &value))),
+                Err(error) => return Ok(Gate::Handled(write_v2_error(stream, error.status,
+                    super::server::http_reason_for(error.status), error.code, &error.message,
+                    error.status >= 500, json!({})))),
+                Ok(None) => {}
+            }
             // Filter the newest asks the owner could list, then apply the limit.
             let limit = query("limit").and_then(|v| v.parse::<usize>().ok()).filter(|l| (1..=super::asks::MAX_LIMIT).contains(l)).unwrap_or(super::asks::DEFAULT_LIMIT);
             let full = rewrite_query(&request.path, "limit", &super::asks::MAX_LIMIT.to_string());
@@ -1059,7 +1080,7 @@ fn retain_array(value: &mut Value, key: &str, mut keep: impl FnMut(&Value) -> bo
 
 /// Query names the scoped gate decides on (r290 P1: refused when repeated).
 const GATE_QUERY_NAMES: &[&str] = &[
-    "includeHidden", "lifecycle", "updatedBefore", "cursor", "limit", "project", "session", "forSession",
+    "includeHidden", "lifecycle", "updatedBefore", "cursor", "idPrefix", "limit", "project", "session", "forSession",
 ];
 
 fn rewrite_query(full_path: &str, key: &str, value: &str) -> String {
@@ -1076,9 +1097,10 @@ fn rewrite_query(full_path: &str, key: &str, value: &str) -> String {
 /// An ask is visible when both ends are local agents the user sees (or the
 /// owner asked) and no peer is involved (§2.4: a peer's agents never appear).
 pub fn ask_visible(state: &crate::asks::store::AskState, ask_id: &str, scope: &Scope) -> bool {
-    let Some(ask) = state.asks.get(ask_id) else {
-        return false;
-    };
+    state.asks.get(ask_id).is_some_and(|ask| ask_record_visible(ask, scope))
+}
+
+fn ask_record_visible(ask: &crate::asks::model::AskRecord, scope: &Scope) -> bool {
     if ask.remote.is_some() || ask.peer_inbound.is_some() {
         return false;
     }

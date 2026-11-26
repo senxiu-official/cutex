@@ -555,6 +555,9 @@ pub struct CodezConfig {
     /// accept only client / device tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub management_listen: Option<Vec<String>>,
+    /// Host-local override for the Management heavy-read pool, applied on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy_read_concurrency: Option<usize>,
     /// CORS allow-list for the Management API; absent = localhost origins
     /// of Capacitor / WebView shells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,6 +668,7 @@ impl Default for CodezConfig {
             documents: Default::default(),
             usage: Default::default(),
             management_listen: None,
+            heavy_read_concurrency: None,
             management_cors_origins: None,
             owner_notify: Default::default(),
             notification_levels: Default::default(),

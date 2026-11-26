@@ -102,6 +102,7 @@ fn clear_input_hold(state: &mut AskState, ask_id: &str, now: DateTime<Utc>) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Responder {
     Owner,
+    Human(crate::management::v2::interaction_history::Actor),
     Agent(String),
 }
 
@@ -170,14 +171,18 @@ pub fn resolve(
     crate::management::v2::question_answers::validate_answers(&question.questions, answers)
         .map_err(|message| AskError::new("invalid_arguments", &message))?;
     let by = match responder {
-        Responder::Owner => "owner".to_string(),
+        Responder::Owner | Responder::Human(_) => "owner".to_string(),
         Responder::Agent(session) => session.clone(),
     };
     let record = state.questions.get_mut(question_id).expect("exists");
     record.state = QuestionState::Resolved;
     record.resolution = Some(QuestionResolution { by, answers: answers.clone(), at: now_rfc3339(now) });
     let resolved = record.clone();
-    super::control::queue_command(state, RuntimeCommand::RespondQuestion { question_id: question_id.to_string() }, now);
+    let human_actor = match responder {
+        Responder::Human(actor) => Some(actor.clone()),
+        _ => None,
+    };
+    super::control::queue_command(state, RuntimeCommand::RespondQuestion { question_id: question_id.to_string(), human_actor }, now);
     clear_input_hold(state, &question.ask_id, now);
     state.notice(
         "cutex/ask/question",

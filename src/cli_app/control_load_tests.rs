@@ -25,6 +25,7 @@ pub(super) fn http_context() -> cutex::management::server::ManagementRequestCont
     context.load_runtime_status = |id| {
         Ok(Some(
             cutex::app_server::manager::AppServerManagedRuntimeStatus {
+                claude_diagnostics: None,
                 background_work: Default::default(),
                 cutex_session_id: id.into(),
                 thread_id: id.trim_start_matches("cutex.").into(),

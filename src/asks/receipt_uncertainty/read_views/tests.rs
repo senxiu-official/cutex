@@ -398,8 +398,8 @@ fn production_view_entry_points_keep_full_original_revision_fields() {
     state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     let context = context(input());
     let before = serde_json::to_vec(&state).unwrap();
-    let summary = crate::asks::view::summary_with_receipts(&state, &ask, &context);
-    let owner = crate::asks::view::owner_view_with_receipts(&state, &ask, &context);
+    let summary = crate::asks::view::summary_with_receipts(&state, &ask, None, &context);
+    let owner = crate::asks::view::owner_view_with_receipts(&state, &ask, None, &context);
     let requester = crate::asks::view::requester_view_with_receipts(&state, &ask, &context);
     for value in [&summary, &owner, &requester] {
         assert_eq!(

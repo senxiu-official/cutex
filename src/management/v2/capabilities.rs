@@ -6,6 +6,10 @@ use serde_json::Value;
 /// Additive Management features beyond the frozen v2 baseline. Clients
 /// feature-detect on these strings (and the boolean `features` map).
 pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
+    ("service-notifications-v1", "serviceNotificationsV1"),
+    (super::service_notification_receivers::FEATURE, "serviceNotificationReceiversV1"),
+    (super::project_table::FEATURE, "projectTableSummaryV1"),
+    (super::project_batch::FEATURE, "projectLifecycleBatchV1"),
     // r290 P6
     ("project-board-summary-v1","projectBoardSummaryV1"),
     ("delegation-steps-v1","delegationStepsV1"),
@@ -13,6 +17,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("project-director-progress-v1","projectDirectorProgressV1"),
     // r290 P5 schedules.
     (crate::schedules::CAPABILITY, "recurringSchedulesV1"),
+    (crate::personal_assistants::CAPABILITY, "personalAssistantsLocalV1"),
+    ("personal-assistants-recurring-v1", "personalAssistantsRecurringV1"),
+    ("personal-assistants-qualified-project-refs-v1", "personalAssistantsQualifiedProjectRefsV1"),
+    ("personal-assistants-owner-views-v1", "personalAssistantsOwnerViewsV1"),
     (super::agent_bus_state::history::CAPABILITY, "bootstrapBoundedBus"),
     (super::session_paths::CAPABILITY, "sessionPathReapproval"),
     ("agent-memory-injection", "agentMemoryInjection"),
@@ -33,6 +41,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("delegation-tree-stop-v1", "delegationTreeStopV1"),
     ("project-run-control-v1", "projectRunControlV1"),
     ("delegation-continuation-v1", "delegationContinuationV1"),
+    ("delegation-continuation-approval-v1", "delegationContinuationApprovalV1"),
     ("agent-activity-v1", "agentActivityV1"),
     // r290 P10 (A1): GET /v2/project-actions/{actionId}?kind=&entity= and
     // POST .../settle: one owner receipt lookup for every project-panel
@@ -46,6 +55,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
         "agentBusStaleAckSettlementV1",
     ),
     (super::question_answers::FEATURE, "userInputOptionsV1"),
+    (super::interaction_history::FEATURE, "sessionInteractionHistoryV1"),
     ("image-input-steering", "imageInputSteering"),
     ("live-text-deltas", "liveTextDeltas"),
     // Dedicated home TLS entry and owner-local CSR registry.
@@ -63,6 +73,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // cutex/session/metadata/update + note/avatar/displayNameOverride.
     ("session-metadata", "sessionMetadata"),
     ("session-background-work", "sessionBackgroundWork"),
+    ("claude-runtime-diagnostics-v1", "claudeRuntimeDiagnosticsV1"),
     // Project workspace_root (set_workspace_root mutation, summaries).
     ("project-workspace-root", "projectWorkspaceRoot"),
     // POST /v2/human/agents.
@@ -200,6 +211,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // services are not reclaimed with their archived registrant and do not
     // block deleting it (the delete clears the registrant).
     ("services-project-scope", "servicesProjectScope"),
+    // Owner PATCH /v2/services/{slug} {remoteAccess: bool}; list/view field.
+    ("services-remote-access-v1", "servicesRemoteAccessV1"),
     ("service-idle-presets-v1", "serviceIdlePresetsV1"),
     ("services-workers-v1", "servicesWorkersV1"),
     // Owner Management GET /v2/services/{slug}/eligible-owners: all known
@@ -402,6 +415,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // stored label. Order since r221: profile-plan-label-override; Claude
     // profiles: profile-plan-label-claude.
     ("profile-plan-label", "profilePlanLabel"),
+    ("profile-plan-label-sync", "profilePlanLabelSync"),
     // Codex profile modelReasoningSummary ("auto" | "concise" | "detailed" |
     // "none" | null = not set, model default) in /v2/profiles items + detail
     // config + PATCH (null clears); detail.editable.modelReasoningSummary is
@@ -440,6 +454,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // requests; cutex/userInput/submit `auto` on a busy Claude agent queues;
     // offline-history and offline-submit cover Claude sessions.
     ("claude-runtime-features", "claudeRuntimeFeatures"),
+    ("resolved-reasoning-effort", "resolvedReasoningEffort"),
     // claude-r28+: the component ships the version-matched Claude Code CLI.
     // GET|PATCH /v2/settings `claudeCli` chooses bundled (default) or system;
     // CUTEX_CLAUDE_CLI remains the highest-priority override. Component
@@ -494,6 +509,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Older turns: GET /v2/sessions/{id}/history?cursor=<nextCursor>, live or
     // offline. Without turnLimit the bootstrap is unchanged (every turn).
     ("history-pages", "historyPages"),
+    (super::session_search::FEATURE, "sessionSearchV1"),
     ("history-turn-read", "historyTurnRead"),
     ("history-turn-ordinals", "historyTurnOrdinals"),
     // Agent messaging v2 (r208): note/wake deliveryKind, AgentParty sender/recipient,
@@ -514,6 +530,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // cutex/asks/pauseChanged {asksPaused, reason: paused|resumed|ownerMessage}.
     ("asks-pause-v2", "asksPauseV2"),
     ("agent-pause", "agentPause"),
+    ("feature-profiles", "featureProfiles"),
+    ("text-rewrite-v1", "textRewriteV1"),
     // Mobile API phase A (cutex-desktop docs/research/cutex-mobile-api.md):
     // config `management_listen` / repeated `--bind` incl. `tailscale`;
     // non-loopback listeners accept only client / device tokens (401
@@ -629,6 +647,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("agent-bus-message-content-v1", "agentBusMessageContentV1"),
     ("admission-hidden-receipts-v1", "admissionHiddenReceiptsV1"),
     ("health-check", "healthCheck"),
+    ("health-review-v1", "healthReviewV1"),
     // Input overflow (cutex-desktop docs/research/input-overflow-documents.md):
     // delegation / result / bus texts are fitted to the receiver's byte
     // policy (render levels; long parts → structured overlength notices with
@@ -878,6 +897,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Independent wire DTOs and negotiated features (P0.1).
     ("peers-v2", "peersV2"),
     ("cross-host-asks", "crossHostAsks"),
+    (crate::peers::receipt::MANAGEMENT_FEATURE, "peerDeliveryReceiptsV1"),
     // agent_tell to name@host: an FYI note to an agent a paired host exports
     // (POST /peer/v1/tells, optional hello feature tells.v1; notes only, no
     // wake / attachments / revisions; receipts runtime/peers/tell-receipts.json).
@@ -1491,6 +1511,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("session-created-by", "sessionCreatedBy"),
     // Owner's per-user/per-host answered-through desktop guide version.
     ("guides.preferences", "guidesPreferences"),
+    ("archived-agents-v1", "archivedAgentsV1"),
     ("profile-account-link", "profileAccountLink"),
     // 2026-10-19: import Profiles from CC Switch (farion1231/cc-switch; owner
     // only, crate::profiles::cc_switch, read-only). GET
@@ -1666,7 +1687,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
 ];
 
 pub fn capabilities_resource() -> Value {
-    capabilities_with_jobs(super::human_jobs::cached_capabilities())
+    let mut value = capabilities_with_jobs(super::human_jobs::cached_capabilities());
+    if crate::asks::store::AskStore::open_default().is_ok_and(|store| store.short_id_lookup_ready()) {
+        value["features"]["asksShortIdLookupV1"] = Value::Bool(true);
+        if let Some(list) = value["featureList"].as_array_mut() {
+            list.push(Value::String("asks-short-id-lookup-v1".into()));
+        }
+    }
+    value
 }
 
 fn capabilities_with_jobs(jobs: super::human_jobs::JobCapabilities) -> Value {
@@ -1721,6 +1749,14 @@ fn capabilities_with_optional_dsh(jobs: super::human_jobs::JobCapabilities, dsh_
         features.insert((*key).to_string(), Value::Bool(true));
     }
     let mut feature_list = MANAGEMENT_FEATURES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let cross_host_scope = crate::personal_assistants::CROSS_HOST_SCOPE_AVAILABLE;
+    features.insert(
+        "personalAssistantsCrossHostScopeV1".into(),
+        Value::Bool(cross_host_scope),
+    );
+    if cross_host_scope {
+        feature_list.push(crate::personal_assistants::CROSS_HOST_SCOPE_FEATURE);
+    }
     // An optional runtime is offered only after installation. Its component
     // status separately explains a missing/broken Node without hiding repair.
     if dsh_installed {
@@ -1837,6 +1873,26 @@ mod tests {
     }
 
     #[test]
+    fn personal_assistants_cross_host_scope_feature_is_reserved() {
+        let name = "personal-assistants-cross-host-scope-v1";
+        assert_eq!(crate::personal_assistants::CROSS_HOST_SCOPE_FEATURE, name);
+        let capabilities = capabilities_with_optional_dsh(Default::default(), false);
+        assert!(!capabilities["featureList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|flag| flag == name));
+        assert_eq!(
+            capabilities["features"]["personalAssistantsCrossHostScopeV1"],
+            false
+        );
+        assert_eq!(
+            crate::personal_assistants::capabilities()["crossHostProjectScope"],
+            false
+        );
+    }
+
+    #[test]
     fn capabilities_advertise_registry_and_features() {
         // r290 P6
         let board=capabilities_resource();
@@ -1858,6 +1914,7 @@ mod tests {
             ("delegation-tree-stop-v1", "delegationTreeStopV1"),
             ("project-run-control-v1", "projectRunControlV1"),
             ("delegation-continuation-v1", "delegationContinuationV1"),
+    ("delegation-continuation-approval-v1", "delegationContinuationApprovalV1"),
             ("agent-activity-v1", "agentActivityV1"),
             ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
             (

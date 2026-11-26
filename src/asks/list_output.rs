@@ -9,13 +9,19 @@ pub(super) fn pending_notices(state: &AskState, authorized: &[&DeliveryRecord]) 
     }
     let mut ordered = authorized.to_vec();
     ordered.sort_by_key(|d| (&d.created_at, &d.delivery_id));
-    let entries: Vec<_> = ordered.into_iter().take(50).map(|delivery| json!({
+    let entries: Vec<_> = ordered.into_iter().take(50).map(|delivery| {
+        let ask = state.asks.get(&delivery.ask_id);
+        let mut entry = json!({
         "delivery_id":delivery.delivery_id, "delegation":delivery.ask_id, "kind":delivery.kind,
         "ref_id":delivery.ref_id, "passive":delivery.passive, "created_at":delivery.created_at,
-        "title":state.asks.get(&delivery.ask_id).map(|ask| ask.title.chars().take(512).collect::<String>()),
-        "read_action":{"tool":"delegation_read","arguments":{"delegation":delivery.ask_id}},
+        "title":ask.map(|ask| ask.title.chars().take(512).collect::<String>()),
+        "notice":ask.and_then(|ask|super::super::terminal_notices::for_delivery(ask,delivery)),
+        "read_action":{"tool":"delegation_read","arguments":{"delegation":crate::short_ids::agent_id(&delivery.ask_id)}},
         "claim_action":{"tool":"delegation_notices_read","arguments":{"delivery_ids":[delivery.delivery_id]}}
-    })).collect();
+        });
+        crate::peers::receipt::insert(&mut entry, ask.and_then(|ask| crate::peers::receipt::delegation(ask)));
+        entry
+    }).collect();
     json!({"total":authorized.len(), "counts":counts, "entries":entries,
         "more":authorized.len() > 50,
         "detail":"Pending notices include answers, questions and state changes. unclaimed_results is the total of all three kinds. Read a delegation with delegation_read; delegation_notices_read marks pending notices read without waiting."})
@@ -165,7 +171,7 @@ mod tests {
         assert_eq!(projected["counts"], json!({"answer":1,"question":1,"state":53}));
         assert_eq!(projected["entries"].as_array().unwrap().len(), 50);
         assert_eq!(projected["more"], true);
-        assert_eq!(projected["entries"][0]["read_action"]["arguments"]["delegation"], ask.ask_id);
+        assert_eq!(projected["entries"][0]["read_action"]["arguments"]["delegation"], crate::short_ids::agent_id(&ask.ask_id));
         assert!(state.deliveries.values().all(|row| row.state == DeliveryState::Pending));
     }
 

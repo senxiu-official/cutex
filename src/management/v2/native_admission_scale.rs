@@ -69,7 +69,7 @@ fn native_turn_scale() {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while if class == WorkClass::HeavyRead {
-        HEAVY.counts() != (1, 31) || active.load(Ordering::SeqCst) != 1
+        heavy_pool().counts() != (1, 31) || active.load(Ordering::SeqCst) != 1
     } else {
         active.load(Ordering::SeqCst) != 32
     } {
@@ -79,7 +79,7 @@ fn native_turn_scale() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    let waiting = HEAVY.counts().1;
+    let waiting = heavy_pool().counts().1;
     let started = Instant::now();
     let control = admit_request(&request("turn/interrupt"), None).unwrap();
     let control_ns = started.elapsed().as_nanos();
@@ -95,5 +95,5 @@ fn native_turn_scale() {
         serde_json::to_vec_pretty(&result).unwrap(),
     )
     .unwrap();
-    assert_eq!(HEAVY.counts(), (0, 0));
+    assert_eq!(heavy_pool().counts(), (0, 0));
 }

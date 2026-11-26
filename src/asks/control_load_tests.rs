@@ -186,7 +186,7 @@ impl AskRuntime for LoadRuntime {
         _generation: u64,
         _response_id: &str,
         _request_id: &Value,
-        _result: &Value,
+        _response: crate::asks::scheduler::QuestionResponse<'_>,
     ) -> RespondOutcome {
         RespondOutcome::AlreadyResolved
     }

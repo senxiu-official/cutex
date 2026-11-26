@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, fs::OpenOptions, path::Path};
 
+mod agenda;
+pub(crate) use agenda::self_reminders_for_day;
+
 pub const ALARM_SYSTEM_SENDER: &str = "Cutex Alarm";
 pub const ALARM_VIEW_SCHEMA: &str = "cutex.alarm.v1";
 
@@ -440,6 +443,22 @@ pub fn cancel(owner: Option<&str>, id: &str) -> anyhow::Result<Value> {
         Ok(json!(a))
     })
 }
+/// Called under the assistant's lifecycle transaction. A reminder already
+/// queued on the Bus keeps its durable delivery receipt.
+pub(crate) fn cancel_pending_self_reminders(session: &str) -> anyhow::Result<()> {
+    let path = path()?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    locked(&path, |alarms| {
+        for alarm in alarms.values_mut() {
+            if alarm.owner == session && alarm.to == session && alarm.state == "scheduled" {
+                alarm.state = "cancelled".into();
+            }
+        }
+        Ok(())
+    })
+}
 pub fn resolve_local(target: &str) -> anyhow::Result<String> {
     ensure!(!target.trim().eq_ignore_ascii_case("director"),"director_alias_unsupported: Director alarms require an authenticated agent project; use alarm_set");
     let store = crate::session::store::load_cutex_session_store_shared()?;
@@ -499,11 +518,15 @@ fn tick(
             .collect();
         due.sort_by_cached_key(|a| (timestamp(&a.at).map(|t| t.timestamp_nanos_opt().unwrap_or(i64::MAX)).unwrap_or(i64::MAX), a.message_id.clone()));
         for a in due {
-            match super::runtime_gate_notice::obsolete(a) {
+            let obsolete = super::runtime_gate_notice::obsolete(a).and_then(|expired| {
+                if expired || a.owner != a.to { return Ok(expired); }
+                crate::personal_assistants::host::self_reminders_disabled(&a.owner)
+            });
+            match obsolete {
                 Ok(true) => { a.state = "cancelled".into(); continue; }
                 Ok(false) => {}
                 Err(error) => {
-                    eprintln!("warning: runtime gate notice expiry check failed: {error:#}");
+                    eprintln!("warning: alarm expiry check failed: {error:#}");
                     a.next_attempt = now.saturating_add(30);
                     a.last_error = Some(format!("notice expiry check failed: {error:#}").chars().take(2048).collect());
                     continue;
@@ -518,6 +541,13 @@ fn tick(
                     a.last_error = None;
                 }
                 Err(error) => {
+                    if a.owner == crate::personal_assistants::host::NOTICE_OWNER
+                        && crate::personal_assistants::host::notice_recipient_gone(&a.to, a.attempts) {
+                        a.state = "cancelled".into();
+                        a.last_error = Some("recipient_missing: the destination session no longer exists".into());
+                        eprintln!("Dropped scheduled Personal Assistant notice {} for missing recipient {} after {} attempts", a.alarm_id, a.to, a.attempts);
+                        continue;
+                    }
                     a.next_attempt = now.saturating_add(30);
                     a.last_error = Some(format!("{error:#}").chars().take(2048).collect());
                 },
@@ -567,7 +597,9 @@ fn prune_removed_role_routes_at(path: &Path, store: &crate::director_address::St
     })
 }
 pub fn spawn() -> anyhow::Result<()> {
-    std::thread::Builder::new().name("cutex-alarms".into()).spawn(||loop {
+    let mut assistants = None;
+    std::thread::Builder::new().name("cutex-alarms".into()).spawn(move ||loop {
+        crate::personal_assistants::host::deliver_pending_notices(&mut assistants);
         let result=(|| -> anyhow::Result<()> {
             let config=crate::config::store::load_codez_config_checked()?;
             let alarm_path = path()?;
@@ -703,6 +735,83 @@ mod tests {
         assert_eq!(read_all_at(&path).unwrap().len(), 1);
         assert!(set_system_notice_at(&path, to, "x", to, "m", now).is_err(), "a session id is not a system owner");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn due_self_reminder_observes_disable_while_cleanup_is_pending() {
+        use crate::config::instance::{scoped_test_selection, Selection};
+        use crate::personal_assistants::{Config, Store, Update};
+        let _home = crate::config::paths::test_home_env_lock();
+        let root = std::env::temp_dir().join(format!("disabled-reminders-{}", uuid::Uuid::new_v4()));
+        let _selection = scoped_test_selection(Selection::Custom(root));
+        let store = Store::open_default().unwrap();
+        let owner = format!("cutex.{}", uuid::Uuid::new_v4());
+        let other = format!("cutex.{}", uuid::Uuid::new_v4());
+        let cfg = Config {
+            name: "Reminder test".into(), profile: "fixture".into(),
+            home_instance_id: crate::management::instance::instance_id(), project_ids: Default::default(),
+        };
+        let row = store.begin("owner", "create", cfg, |_| Ok(())).unwrap();
+        let row = store.bind(&row.id, &owner).unwrap();
+        let now = Utc::now();
+        let path = path().unwrap();
+        let set_at = |session: &str, id: &str, seconds| {
+            set(session, SetArgs {
+                alarm_id: id.into(), to: session.into(), message: "test".into(),
+                at: Some((now + chrono::Duration::seconds(seconds)).to_rfc3339()), delay_seconds: None,
+            }).unwrap();
+        };
+        set_at(&owner, "previous", 60);
+        set_at(&owner, "pending", 120);
+        set_at(&other, "ordinary", 120);
+        tick(&path, now.timestamp() + 61, |a| {
+            assert_eq!(a.alarm_id, "previous");
+            Ok(json!({"queued":true}))
+        }).unwrap();
+        let lock = OpenOptions::new().write(true).read(true).open(path.with_extension("lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        store.configure("owner", &row.id, "disable", row.revision, &Update::Enabled { enabled:false }, |_| Ok(())).unwrap();
+        drop(lock);
+        let mut sent = Vec::new();
+        tick(&path, now.timestamp() + 121, |a| {
+            sent.push(a.alarm_id.clone());
+            Ok(json!({"queued":true}))
+        }).unwrap();
+        assert_eq!(sent, ["ordinary"]);
+        let rows = read_all_at(&path).unwrap();
+        assert!(rows.iter().any(|a| a.alarm_id == "pending" && a.state == "cancelled"));
+        assert!(rows.iter().any(|a| a.alarm_id == "previous" && a.state == "queued" && a.receipt == Some(json!({"queued":true}))));
+    }
+
+    #[test]
+    fn missing_personal_assistant_notice_stops_retrying_after_alarm_handoff() {
+        use crate::config::instance::{scoped_test_selection, Selection};
+        use crate::personal_assistants::host::{NOTICE_OWNER,MISSING_NOTICE_ATTEMPTS};
+        use crate::session::model::{CutexSessionRecord, CutexSessionStore};
+        let _home = crate::config::paths::test_home_env_lock();
+        let root = std::env::temp_dir().join(format!("missing-pa-notice-{}",uuid::Uuid::new_v4()));
+        let _selection = scoped_test_selection(Selection::Custom(root));
+        let offline = format!("cutex.{}", uuid::Uuid::new_v4());
+        let mut catalog = CutexSessionStore::default();
+        catalog.sessions.insert(offline.clone(), CutexSessionRecord::new(offline.clone(), None, "local".into(), ".".into(), None).unwrap());
+        crate::session::store::save_cutex_session_store(&catalog).unwrap();
+        let path = path().unwrap();
+        let now = Utc::now();
+        let missing = format!("cutex.{}",uuid::Uuid::new_v4());
+        for owner in [NOTICE_OWNER, APPROVAL_NOTICE_OWNER] {
+            set_system_notice_at(&path,owner,"transition",&missing,"fixture",now).unwrap();
+        }
+        set_system_notice_at(&path, NOTICE_OWNER, "offline-transition", &offline, "fixture", now).unwrap();
+        for n in 1..=MISSING_NOTICE_ATTEMPTS {
+            tick(&path,now.timestamp()+31*n as i64, |_| anyhow::bail!("fixture delivery deferred")).unwrap();
+        }
+        let alarms = read_all_at(&path).unwrap();
+        let dropped = alarms.iter().find(|a| a.owner == NOTICE_OWNER && a.to == missing).unwrap();
+        assert_eq!(dropped.state,"cancelled");
+        assert_eq!(dropped.attempts,MISSING_NOTICE_ATTEMPTS);
+        assert!(dropped.last_error.as_deref().unwrap().contains("recipient_missing"));
+        assert!(alarms.iter().any(|a| a.owner == APPROVAL_NOTICE_OWNER && a.state=="scheduled"));
+        assert!(alarms.iter().any(|a| a.to == offline && a.state=="scheduled"));
     }
 
     #[test]

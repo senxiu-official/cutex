@@ -427,6 +427,9 @@ pub fn profile_tools(profile: Option<&str>) -> anyhow::Result<(bool, bool)> {
 /// wins, otherwise the profile's current rule (a session without profile
 /// keeps its stored values: nothing to follow).
 pub fn effective_tools(record: &CutexSessionRecord, session: &ClaudeSession) -> anyhow::Result<(bool, bool)> {
+    if crate::personal_assistants::host::is_assistant(record) {
+        return Ok((false, false));
+    }
     let profile = match record.profile.as_deref() {
         Some(name) if !(session.write_explicit && session.exec_explicit) => profile_tools(Some(name))?,
         _ => (session.allow_write, session.allow_exec),
@@ -519,6 +522,11 @@ pub fn create_profile_with_creator(name:&str,cwd:&Path,model:&str,allow_write:Op
     record.registration_class = if managed {crate::agent_bus::model::AgentRegistrationClass::Persistent} else {crate::agent_bus::model::AgentRegistrationClass::LocalOnly};
     record.model_defaults = Some(model.into());
     record.reasoning_defaults = effort.map(|v|v.as_str().into());
+    let effort_profile = record.profile.as_deref()
+        .map(crate::profiles::store::account_by_key).transpose()?.flatten();
+    record.reasoning_resolution = Some(crate::profiles::reasoning::resolve_claude(
+        effort_profile.as_ref(), model, effort.map(|value| value.as_str()), None,
+    )?);
     let profile_tools = profile_tools(record.profile.as_deref())?;
     record.claude_session = Some(ClaudeSession {
         deployment,
@@ -942,12 +950,16 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     }
     command.args(tool_args(record, session)?);
     let features = native_schema(session)["capabilities"]["features"].clone();
+    let assistant = crate::personal_assistants::host::is_assistant(record);
+    if assistant {
+        command.arg("--personal-assistant");
+    }
     if features["externalInput"] == true {
         command.arg("--external-owner-id").arg(&record.cutex_session_id)
             .arg("--external-runtime-generation")
             .arg(record.runtime_generation.checked_add(1).context("generation overflow")?.to_string());
     }
-    if features["managedSkills"] == true {
+    if !assistant && features["managedSkills"] == true {
         for path in structure::managed_skill_roots(record)? {
             command.arg("--managed-skills-root").arg(path);
         }
@@ -985,17 +997,21 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     // claude-code-sources: Claude Code settings sources, claude.ai connectors
     // and the host's MCP layers (secret values only in this env). A broken MCP
     // store must not block the agent: warn and launch without these flags.
-    let code_plan = match code_sources::prepare_launch(record, &session.state_dir, &features) {
-        Ok((plan, args)) => {
-            command.args(args);
-            for (key, value) in &plan.envs {
-                command.env(key, value);
+    let code_plan = if assistant {
+        None
+    } else {
+        match code_sources::prepare_launch(record, &session.state_dir, &features) {
+            Ok((plan, args)) => {
+                command.args(args);
+                for (key, value) in &plan.envs {
+                    command.env(key, value);
+                }
+                Some(plan)
             }
-            Some(plan)
-        }
-        Err(error) => {
-            eprintln!("claude: Claude Code sources / MCP layers skipped for {}: {error:#}", record.cutex_session_id);
-            None
+            Err(error) => {
+                eprintln!("claude: Claude Code sources / MCP layers skipped for {}: {error:#}", record.cutex_session_id);
+                None
+            }
         }
     };
     if let Some(path) = write_system_append(record, session, &features)? {
@@ -1163,6 +1179,82 @@ fn validate_status(session: &ClaudeSession, status: &Value) -> anyhow::Result<()
     Ok(())
 }
 
+fn resolve_running_effort(
+    handle: &crate::app_server::client::AppServerHandle,
+    session: &ClaudeSession,
+    profile: Option<&crate::profiles::model::StoredAccount>,
+    status: &Value,
+    handshake: Option<&crate::profiles::claude_models::ModelHandshake>,
+    supported: bool,
+) -> anyhow::Result<crate::profiles::reasoning::SessionEffort> {
+    let model = status["model"].as_str().unwrap_or(&session.model);
+    let configured = if supported {
+        status["effort"].as_str()
+    } else {
+        session.effort.map(|value| value.as_str())
+    };
+    let resolution = crate::profiles::reasoning::resolve_claude(profile, model, configured, handshake)?;
+    if supported && configured.is_none() {
+        let applied = handle.request_with_timeout("claude/effort/applyInherited", json!({
+            "threadId": session.thread_id, "model": model, "connectionId": status["connectionId"],
+            "generation": status["nativeConnectionGeneration"],
+            "effort": resolution.resolution.value,
+        }), Duration::from_secs(5)).context("apply resolved Claude reasoning effort")?;
+        ensure!(applied["requestedModel"] == model
+            && applied["resolvedModel"] == json!(resolution.resolved_model)
+            && applied["effort"] == json!(resolution.resolution.value),
+            "Claude reasoning effort acknowledgement changed");
+    }
+    Ok(resolution)
+}
+
+/// Persist an explicit next-start selection while the adapter is offline.
+/// Current and old pins keep their own state authority and native identity.
+pub fn apply_offline_launch_selection(
+    record: &mut CutexSessionRecord,
+    model: Option<&str>,
+    effort: Option<Option<&str>>,
+) -> anyhow::Result<()> {
+    use crate::profiles::appearance::ClaudeEffort;
+    ensure!(record.runtime_pid.is_none(), "take the Claude agent offline before changing its saved model");
+    let session = record.claude_session.as_mut().context("Claude session missing")?;
+    let model = model.unwrap_or(&session.model).trim().to_owned();
+    ensure!(!model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control),
+        "Claude model must be a nonempty identifier");
+    let previous = session.effort;
+    let chosen = match effort {
+        Some(Some(value)) => ClaudeEffort::parse(value)?.context("choose an offered Claude effort or clear it explicitly")?.into(),
+        Some(None) => None,
+        None => previous,
+    };
+    let features = adapter_features(&session.deployment.adapter_source);
+    let atomic = features["offlineLaunchSelection"] == true;
+    if !atomic && !(effort.is_none() && features["launchModelUpdate"] == true) {
+        return Err(crate::profiles::pinned_selection::UpgradeRequired.into());
+    }
+    let changed_model = model != session.model;
+    let profile = record.profile.as_deref().map(crate::profiles::store::account_by_key).transpose()?.flatten();
+    let reference = profile.as_ref().is_none_or(crate::profiles::reasoning::uses_claude_reference);
+    if reference {
+        crate::profiles::claude_models::validate_pinned_selection(session, &model, chosen.map(|v| v.as_str()), changed_model)?;
+    }
+    let reasoning = if record.reasoning_resolution.is_some() {
+        Some(crate::profiles::reasoning::resolve_claude(
+            profile.as_ref(), &model, chosen.map(|value| value.as_str()), None,
+        )?)
+    } else {
+        None
+    };
+    session.model = model.clone();
+    session.effort = chosen;
+    record.model_defaults = Some(model);
+    record.reasoning_defaults = chosen.map(|value| value.as_str().into());
+    record.claude_model_handshake = None;
+    record.claude_launch_selection_pending |= atomic;
+    record.reasoning_resolution = reasoning;
+    Ok(())
+}
+
 pub fn start(id: &str) -> anyhow::Result<Value> {
     start_expected(id, None)
 }
@@ -1187,8 +1279,42 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         .claude_session
         .as_ref()
         .context("Claude session missing")?;
-    let (client, ready) = ensure_server(&record)?;
-    client.handle().request("claude/thread/ensure", json!({"threadId":session.thread_id,"cwd":record.cwd,"model":session.model,"instructions":session.instructions}))?;
+    let features = adapter_features(&session.deployment.adapter_source);
+    if record.claude_launch_selection_pending && features["offlineLaunchSelection"] != true {
+        return Err(crate::profiles::pinned_selection::UpgradeRequired.into());
+    }
+    let pinned_profile = record.profile.as_deref().map(crate::profiles::store::account_by_key).transpose()?.flatten();
+    if pinned_profile.as_ref().is_none_or(crate::profiles::reasoning::uses_claude_reference) {
+        crate::profiles::claude_models::validate_pinned_selection(
+            session, &session.model, session.effort.map(|value| value.as_str()), false,
+        )?;
+    }
+    let supports_effort_resolution = features["resolvedReasoningEffort"] == true;
+    let effort_profile = if record.reasoning_resolution.is_some() {
+        record.profile.as_deref().map(crate::profiles::store::account_by_key).transpose()?.flatten()
+    } else {
+        None
+    };
+    let mut launch_record = record.clone();
+    if record.reasoning_resolution.is_some() && session.effort.is_none() && !supports_effort_resolution {
+        // Older adapters only accept a launch flag. Fix Profile inheritance for new
+        // agents on those pins without changing how an existing session starts.
+        let resolved = crate::profiles::reasoning::resolve_claude(effort_profile.as_ref(), &session.model, None, None)?;
+        if let Some(value) = resolved.resolution.value.as_deref() {
+            launch_record.claude_session.as_mut().unwrap().effort = crate::profiles::appearance::ClaudeEffort::parse(value)?;
+        }
+    }
+    let (client, ready) = ensure_server(&launch_record)?;
+    let mut ensure_thread = json!({"threadId":session.thread_id,"cwd":record.cwd,"model":session.model,"instructions":session.instructions});
+    if record.claude_launch_selection_pending {
+        if let Some(expected) = &session.native_session_id {
+            let saved = client.handle().request("claude/thread/inspect", json!({"threadId":session.thread_id}))?;
+            ensure!(saved["nativeSession"]["session_id"].as_str() == Some(expected),
+                "Claude native history mapping is missing or changed; restore its saved adapter state before changing its selection");
+        }
+        ensure_thread["launchSelection"] = json!({"effort": session.effort.map(|value| value.as_str())});
+    }
+    client.handle().request("claude/thread/ensure", ensure_thread)?;
     if let Some(mode) = &session.initial_permission_mode {
         // Before claude/runtime/start: the adapter stores the mode and the
         // native session connects in it.
@@ -1220,6 +1346,23 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
     let connection = status["connectionId"]
         .as_str()
         .context("Claude connection identity missing")?;
+    let handshake = crate::profiles::claude_models::ModelHandshake::from_runtime_status(&status);
+    let mut effort_resolution = None;
+    if record.reasoning_resolution.is_some() {
+        let handle = client.handle();
+        match resolve_running_effort(&handle, session, effort_profile.as_ref(), &status, handshake.as_ref(), supports_effort_resolution) {
+            Ok(resolution) => effort_resolution = Some(resolution),
+            Err(error) => {
+                // Do not leave a new, unregistered SDK writer running after
+                // a failed setting application.
+                if record.runtime_pid.is_none() {
+                    let _ = handle.request_with_timeout("claude/runtime/close",
+                        json!({"threadId": session.thread_id}), Duration::from_secs(5));
+                }
+                return Err(error);
+            }
+        }
+    }
     let path = cutex_sessions_path()?;
     crate::session::store::update_session_row(&path, id, |current| {
         ensure!(
@@ -1237,6 +1380,11 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         binding.native_session_id = Some(native.into());
         // Applied above; from now on the adapter keeps the thread's mode.
         binding.initial_permission_mode = None;
+        current.claude_launch_selection_pending = false;
+        current.claude_model_handshake = handshake;
+        if let Some(resolution) = effort_resolution {
+            current.reasoning_resolution = Some(resolution);
+        }
         current.current_runtime_agent_id = Some(format!("claude.{connection}"));
         current.runtime_pid = Some(ready.pid);
         current.updated_at = chrono::Utc::now().to_rfc3339();
@@ -1393,9 +1541,8 @@ pub(crate) fn clear_dead_adapter_claim(
     if pid == 0 || (running(pid) && !claim_predates_boot(observed).unwrap_or(false)) {
         return Ok(false);
     }
-    #[cfg(target_os = "linux")]
     if let Some(session) = observed.claude_session.as_ref() {
-        if !linux_scope::is_empty(observed, session)? {
+        if !adapter_scope_is_empty(observed, session)? {
             return Ok(false);
         }
     }
@@ -1417,6 +1564,19 @@ pub(crate) fn clear_dead_adapter_claim(
         rows.commit()?;
         Ok(true)
     })
+}
+
+pub(crate) fn adapter_scope_is_empty(
+    record: &CutexSessionRecord,
+    session: &ClaudeSession,
+) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    return linux_scope::is_empty(record, session);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (record, session);
+        Ok(true)
+    }
 }
 
 /// Observer reconciliation (management's Claude observer, every 5 s): a
@@ -1696,7 +1856,113 @@ pub fn observe_connected(record: &CutexSessionRecord, handle: &crate::app_server
     let status = handle.request_with_timeout("claude/runtime/status", json!({"threadId":session.thread_id}), Duration::from_secs(3))?;
     validate_status(session, &status)?;
     validate_observation_occurrence(session.connection_id.as_deref(), record.runtime_pid,
-        record.runtime_pid.context("Claude adapter PID missing")?, &status)
+        record.runtime_pid.context("Claude adapter PID missing")?, &status)?;
+    if let Err(error) = refresh_observed_model_resolution(record, handle, &status) {
+        eprintln!("Claude effort evidence for {} was not refreshed: {error:#}", record.cutex_session_id);
+    }
+    Ok(())
+}
+
+fn refresh_observed_model_resolution(
+    record: &CutexSessionRecord,
+    handle: &crate::app_server::client::AppServerHandle,
+    status: &Value,
+) -> anyhow::Result<()> {
+    let handshake = crate::profiles::claude_models::ModelHandshake::from_runtime_status(status);
+    let Some(handshake) = handshake else { return Ok(()) };
+    let session = record.claude_session.as_ref().context("Claude session missing")?;
+    let current_model = status["model"].as_str().unwrap_or(&session.model);
+    let configured = status["effort"].as_str();
+    let changed = record.claude_model_handshake.as_ref() != Some(&handshake);
+    let saved = record.reasoning_resolution.as_ref();
+    let observed = &status["reasoningResolution"];
+    let effort_changed = saved.is_some_and(|saved| {
+        saved.requested_model != current_model || saved.resolution.configured.as_deref() != configured
+            || (configured.is_none() && observed["requestedModel"].as_str() == Some(current_model)
+                && observed["effort"].as_str() != saved.resolution.value.as_deref())
+    });
+    let awaiting_host = configured.is_none() && (status["reasoningResolutionPending"] == true
+        || status["reasoningResolutionUnreported"] == true);
+    if !changed && !effort_changed && !awaiting_host {
+        return Ok(());
+    }
+
+    let updated_record = if saved.is_some() && awaiting_host {
+        // Withdraw the old target's effort even if profile reads fail or the
+        // fallback is already streaming. This update needs only SDK evidence.
+        let unreported = unreported_claude_effort(current_model, &handshake);
+        if changed || saved != Some(&unreported) {
+            if !persist_observed_model_resolution(record, &handshake, Some(&unreported))? {
+                return Ok(());
+            }
+            let mut updated = record.clone();
+            updated.claude_model_handshake = Some(handshake.clone());
+            updated.reasoning_resolution = Some(unreported);
+            Some(updated)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if saved.is_some() && status["state"] != "waiting" {
+        // A new setting can only be applied while the native child is idle.
+        return Ok(());
+    }
+
+    let resolution = if saved.is_some() && adapter_features(&session.deployment.adapter_source)["resolvedReasoningEffort"] == true {
+        let profile = record.profile.as_deref()
+            .map(crate::profiles::store::account_by_key).transpose()?.flatten();
+        Some(resolve_running_effort(handle, session, profile.as_ref(), status, Some(&handshake), true)?)
+    } else {
+        None
+    };
+    persist_observed_model_resolution(updated_record.as_ref().unwrap_or(record), &handshake, resolution.as_ref())?;
+    Ok(())
+}
+
+fn unreported_claude_effort(
+    model: &str,
+    handshake: &crate::profiles::claude_models::ModelHandshake,
+) -> crate::profiles::reasoning::SessionEffort {
+    use crate::profiles::reasoning::{EffortResolution, EffortSource, SessionEffort};
+    SessionEffort {
+        requested_model: model.to_owned(),
+        resolved_model: handshake.resolved_models.get(model).cloned(),
+        resolution: EffortResolution {
+            configured: None,
+            value: None,
+            source: EffortSource::Unreported,
+            source_version: None,
+            skipped: Vec::new(),
+        },
+    }
+}
+
+fn persist_observed_model_resolution(
+    expected: &CutexSessionRecord,
+    handshake: &crate::profiles::claude_models::ModelHandshake,
+    resolution: Option<&crate::profiles::reasoning::SessionEffort>,
+) -> anyhow::Result<bool> {
+    let path = cutex_sessions_path()?;
+    let wrote = crate::session::store::update_session_row(&path, &expected.cutex_session_id, |current| {
+        // This exact runtime generation and metadata still own the update.
+        if current.runtime_generation != expected.runtime_generation
+            || current.runtime_pid != expected.runtime_pid
+            || current.claude_session != expected.claude_session
+            || current.profile != expected.profile
+            || current.claude_model_handshake != expected.claude_model_handshake
+            || current.reasoning_resolution != expected.reasoning_resolution
+        {
+            return Ok(false);
+        }
+        current.claude_model_handshake = Some(handshake.clone());
+        if let Some(resolution) = resolution {
+            current.reasoning_resolution = Some(resolution.clone());
+        }
+        Ok(true)
+    })?;
+    Ok(wrote.unwrap_or(false))
 }
 
 pub fn observation(id: &str) -> anyhow::Result<ClaudeObservation> {
@@ -1830,6 +2096,27 @@ pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_projects_unreported_effort_with_the_new_alias_target() {
+        use super::*;
+        let handshake = crate::profiles::claude_models::ModelHandshake {
+            resolved_models: [("opus".into(), "claude-opus-5-5".into())].into(),
+            ..Default::default()
+        };
+        let mut record = CutexSessionRecord::new(
+            "cutex.fixture".into(), None, "host".into(), "/workspace".into(), None,
+        ).unwrap();
+        record.model_defaults = Some("opus".into());
+        record.reasoning_resolution = Some(unreported_claude_effort("opus", &handshake));
+        record.claude_model_handshake = Some(handshake);
+        let defaults = crate::management::v2::session::runtime_defaults_resource(&record);
+        let effort = &defaults["reasoningResolution"];
+        assert_eq!(effort["source"], "unreported");
+        assert!(effort["value"].is_null());
+        assert!(effort["configured"].is_null());
+        assert_eq!(effort["resolvedModel"], "claude-opus-5-5");
+    }
+
     #[test]
     fn observer_retries_transient_recovery_without_losing_the_occurrence_fence() {
         use super::*;

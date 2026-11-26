@@ -69,6 +69,8 @@
         "runtimeAgentId": { "type": ["string", "null"] },
         "activeTurnId": { "type": ["string", "null"] },
         "backgroundWork": { "anyOf": [{ "$ref": "#/$defs/backgroundWork" }, { "type": "null" }], "description": "session-background-work: process-local own background work, including Codex descendant terminals. Null when disconnected or unsupported; independent of turn activity." },
+        "claudeDiagnostics": { "anyOf": [{ "$ref": "#/$defs/claudeDiagnostics" }, { "type": "null" }],
+          "description": "Connection-local Claude startup warnings and active hook observations. Null when unavailable." },
         "turnState": { "enum": ["unknown", "running", "idle"], "description": "Disconnected observation is unknown; reconnect derives turn state from the runtime resume snapshot." },
         "activeTurnObservedAt": { "type": ["string", "null"] },
         "threadStatus": {},
@@ -98,6 +100,18 @@
             "pendingRelease": { "type": ["string", "null"], "description": "A deferred repin's release (applies at the next fresh runtime start); null when none." }
           }
         }
+      }
+    },
+    "claudeDiagnostics": {
+      "type": "object", "additionalProperties": false, "required": ["warnings", "activeHooks"],
+      "properties": {
+        "warnings": { "type": "array", "maxItems": 4, "items": {
+          "enum": ["configurationNotApplied", "managedHooksNotLoaded", "mcpConnectionFailed", "mcpAuthenticationRequired"]
+        } },
+        "activeHooks": { "type": "array", "maxItems": 32, "items": {
+          "type": "object", "additionalProperties": false, "required": ["event", "startedAtMs"],
+          "properties": { "event": { "type": "string" }, "startedAtMs": { "type": "integer", "minimum": 1 } }
+        } }
       }
     },
     "backgroundWork": {

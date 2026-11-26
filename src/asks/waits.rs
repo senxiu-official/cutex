@@ -224,7 +224,12 @@ pub fn finish(
     let items: Vec<Value> = claimed
         .iter()
         .filter_map(|delivery| super::returns::return_item(store, &state, delivery))
-        .map(|item| super::returns::item_json(&item))
+        .map(|item| {
+            let ask = state.asks.get(super::returns::return_ask_id(&item));
+            let mut value = super::returns::item_json(&item);
+            crate::peers::receipt::insert(&mut value, ask.and_then(|ask| crate::peers::receipt::delegation(ask)));
+            value
+        })
         .collect();
     let asks: Vec<Value> = wait
         .asks

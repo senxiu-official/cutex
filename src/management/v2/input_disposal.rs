@@ -370,20 +370,40 @@ pub(super) fn check_at<'a>(
     session: &str,
     ids: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !any_requested_at(path, session, ids)?,
+        "input disposed by owner; further delivery is disabled"
+    );
+    Ok(())
+}
+
+pub(super) fn any_requested_at<'a>(
+    path: &Path,
+    session: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<bool> {
+    Ok(!requested_ids_at(path, session, ids)?.is_empty())
+}
+
+pub(super) fn requested_ids_at<'a>(
+    path: &Path,
+    session: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut requested = std::collections::BTreeSet::new();
     if !parent(path)
         .join("input-dispositions.sqlite3")
         .try_exists()?
     {
-        return Ok(());
+        return Ok(requested);
     }
     let guard = Guard::open(path, false)?;
     for id in ids {
-        anyhow::ensure!(
-            guard.get(session, id)?.is_none(),
-            "input disposed by owner; further delivery is disabled"
-        );
+        if guard.get(session, id)?.is_some() {
+            requested.insert(id.into());
+        }
     }
-    Ok(())
+    Ok(requested)
 }
 
 pub fn check_submission(

@@ -530,6 +530,11 @@ pub fn needs_by_agent(sources: &NeedSources) -> BTreeMap<String, Vec<Value>> {
             needs.entry(id.clone()).or_default().push(json!({
                 "kind": kind,
                 "id": format!("native:{}", native["id"]),
+                "activityLink": {
+                    "blocker": kind,
+                    "next": "openNativeRequest",
+                    "target": {"kind": "nativeRequest", "sessionId": id, "requestId": native["id"]},
+                },
                 "title": title,
                 "at": crate::management::instance::normalize_utc(at),
                 "level": decision.level,
@@ -547,6 +552,11 @@ pub fn needs_by_agent(sources: &NeedSources) -> BTreeMap<String, Vec<Value>> {
         needs.entry(id.to_string()).or_default().push(json!({
             "kind": "ownerApproval",
             "id": approval["approvalId"],
+            "activityLink": {
+                "blocker": "approval",
+                "next": "openApproval",
+                "target": {"kind":"ownerApproval", "approvalId":approval["approvalId"]},
+            },
             "title": title(approval["summary"].as_str().unwrap_or_default()),
             "at": approval["createdAt"].as_str().map(crate::management::instance::normalize_utc),
             "level": decision.level,
@@ -565,6 +575,7 @@ pub fn needs_by_agent(sources: &NeedSources) -> BTreeMap<String, Vec<Value>> {
         needs.entry(target.to_string()).or_default().push(json!({
             "kind": kind,
             "id": ask["askId"],
+            "activityLink": ask.get("activityLink"),
             "title": title(ask["title"].as_str().unwrap_or_default()),
             "at": ask["createdAt"].as_str().map(crate::management::instance::normalize_utc),
             "level": level,
@@ -615,7 +626,7 @@ pub fn agent_row(
     projection: Option<&AgentProjection>,
 ) -> Option<Value> {
     let id = session["cutexSessionId"].as_str()?;
-    if session["lifecycle"].as_str() == Some("retired") {
+    if matches!(session["lifecycle"].as_str(), Some("retired" | "archived")) {
         return None;
     }
     let runtime = &session["runtime"];
@@ -716,6 +727,11 @@ pub fn synthesize(
         if let Some(project) = row["projectId"].as_str().and_then(|id| projects.get(id)) {
             used_projects.insert(project["id"].as_str().unwrap_or_default().to_string(), project.clone());
         }
+    }
+    let memberships = agents.iter().filter_map(|row| Some((row["id"].as_str()?.to_owned(), row["projectId"].as_str()?.to_owned()))).collect();
+    let table_stats = super::project_table::from_sessions(&memberships, sessions);
+    for (id, project) in &mut used_projects {
+        table_stats.get(id).cloned().unwrap_or_default().apply(project);
     }
     let unlisted_needs = needs
         .iter()
@@ -1190,6 +1206,18 @@ fn hub() -> Option<&'static Arc<Hub>> {
     HUB.get()
 }
 
+/// Publish only the locator. Owner devices fetch notification content from its bounded store.
+pub(super) fn service_notification_ready(entry: &crate::services::notifications::Entry) {
+    let Some(hub) = hub() else { return };
+    let notice = &entry.notice;
+    if hub.append(&HashMap::new(), None, &[], &[(
+        "cutex/summary/serviceNotification".into(),
+        json!({"id": notice.id, "slug": notice.slug, "desktop": notice.desktop, "phone": notice.phone}),
+    )]).is_err() {
+        eprintln!("service notification summary receipt could not be journaled");
+    }
+}
+
 /// Owner read the session (`/v2/notifications/ack` on its thread). Only
 /// queued: the summary thread is the single writer of projections, so a
 /// read cannot be overwritten by a tick that loaded them earlier.
@@ -1517,10 +1545,13 @@ fn tick(hub: &Hub, context: ManagementRequestContext, state: &mut TickState) -> 
 /// `GET /v2/summary`.
 pub fn handle_summary(
     stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
     context: ManagementRequestContext,
     repository: &EventRepository,
 ) -> anyhow::Result<()> {
-    let value = summary_resource(context, repository)?;
+    let value = if super::project_table::enabled(&request.path) {
+        summary_resource_with_table(context, repository, true)?
+    } else { summary_resource(context, repository)? };
     write_json_response(stream, 200, "OK", &value)
 }
 
@@ -1528,6 +1559,14 @@ pub fn handle_summary(
 pub(super) fn summary_resource(
     context: ManagementRequestContext,
     repository: &EventRepository,
+) -> anyhow::Result<Value> {
+    summary_resource_with_table(context, repository, false)
+}
+
+pub(super) fn summary_resource_with_table(
+    context: ManagementRequestContext,
+    repository: &EventRepository,
+    include_table: bool,
 ) -> anyhow::Result<Value> {
     let (projections, stream_id, latest) = match hub() {
         Some(hub) => {
@@ -1540,7 +1579,12 @@ pub(super) fn summary_resource(
         }
         None => (HashMap::new(), String::new(), None),
     };
-    let synthesis = collect(context, repository, &projections)?;
+    let mut synthesis = collect(context, repository, &projections)?;
+    if !include_table {
+        for project in &mut synthesis.projects {
+            if let Some(row) = project.as_object_mut() { row.remove("last_activity_at"); row.remove("online_member_count"); }
+        }
+    }
     let host = crate::platform::host::current_host_name();
     let capabilities = super::capabilities::capabilities_resource()["featureList"].clone();
     Ok(json!({
@@ -1570,7 +1614,8 @@ fn write_summary_event(stream: &mut impl Write, event: &JournalEvent) -> anyhow:
 
 /// `GET /v2/summary/events`.
 pub fn handle_events(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
-    handle_events_filtered(stream, request, &mut |_| true)
+    let full_device = crate::management::listeners::current_client_token().is_none_or(|token| token.scope.is_full());
+    handle_events_filtered(stream, request, &mut |event| full_device || event.name != "cutex/summary/serviceNotification")
 }
 
 /// `handle_events` writing only the journal events `visible` accepts (a
@@ -1619,6 +1664,10 @@ pub(super) fn handle_events_filtered(
         let backlog = journal.page_after(after, 10_000)?;
         (receiver, lagged, backlog)
     };
+    if super::service_notification_receivers::advertises_to_summary_caller() {
+        let headers = crate::http::server::extra_response_headers();
+        crate::http::server::set_extra_response_headers(format!("{headers}X-Cutex-Service-Receiver: 1\r\n"));
+    }
     stream.write_all(crate::http::server::sse_response_head().as_bytes())?;
     stream.flush()?;
     let watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;

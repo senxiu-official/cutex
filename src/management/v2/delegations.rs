@@ -9,7 +9,7 @@ use crate::asks::{operations::{self,EffectState},project_control as control,rout
 use crate::http::server::{SimpleHttpRequest,write_json_response};
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum Route { Tree(String), Attempts(String), Stop(String), Policy(String), Grants(String), Approvals(String), Approval(String), Revoke(String), Decision(String), ResumeContinuation(String), RunControl(String), Pause(String), Resume(String), Operation(String),
+pub enum Route { Tree(String), Attempts(String), Stop(String), Policy(String), Grants(String), Approvals(String), Approval(String), Revoke(String), Decision(String), ResumeContinuation(String), UnscopedContinuationApprovals, RunControl(String), Pause(String), Resume(String), Operation(String),
     /// r290 P10 (A1): owner receipt lookup (false) / settle (true) for every panel action.
     ProjectAction(String,bool) }
 pub fn parse_path(path:&str)->Option<Route>{
@@ -27,6 +27,7 @@ pub fn parse_path(path:&str)->Option<Route>{
         ["","v2","delegation-grants",id,"revoke"] if valid(id)=>Some(Route::Revoke((*id).into())),
         ["","v2","delegation-approvals",id,"decision"] if valid(id)=>Some(Route::Decision((*id).into())),
         ["","v2","delegation-approvals",id] if valid(id)=>Some(Route::Approval((*id).into())),
+        ["","v2","delegations","continuation-approvals"]=>Some(Route::UnscopedContinuationApprovals),
         ["","v2","delegations",id,"resume-continuation"] if valid(id)=>Some(Route::ResumeContinuation((*id).into())),
         ["","v2","delegations",id,"attempts"] if valid(id)=>Some(Route::Attempts((*id).into())),
         ["","v2","delegations",id,"stop"] if valid(id)=>Some(Route::Stop((*id).into())),
@@ -48,19 +49,23 @@ pub fn owner_context(snapshot:&crate::agent_management::AgentManagementSnapshot,
 
 pub fn membership(snapshot:&crate::agent_management::AgentManagementSnapshot,project:&str)->control::Membership{
     let mut members=std::collections::BTreeSet::new();
-    for agent in snapshot.agents.values().filter(|a|a.retired_at.is_none()){
+    for agent in snapshot.agents.values().filter(|a|a.retired_at.is_none()
+        && snapshot.reversible_archive_projection.get(&a.cutex_session_id) != Some(&true)){
         if crate::agent_management::current_project_id(snapshot,agent).is_some_and(|p|p.as_str()==project){members.insert(agent.cutex_session_id.as_str().to_owned());}
     }
     for (id,m) in &snapshot.current_project_memberships{
         if m.project_id.as_ref().is_some_and(|p|p.as_str()==project)
-            && !snapshot.agents.get(id).is_some_and(|a|a.retired_at.is_some()) {members.insert(id.as_str().into());}
+            && !snapshot.agents.get(id).is_some_and(|a|a.retired_at.is_some())
+            && snapshot.reversible_archive_projection.get(id) != Some(&true) {members.insert(id.as_str().into());}
     }
     // r271: a deleted session (roster row pending cleanup) is not a member.
     let deleted=crate::agent_management::pending_forget::pending();
     members.retain(|id|!deleted.contains(id));
     let mut excluded=std::collections::BTreeSet::new();
     if let Some(authority)=snapshot.projects.values().find(|a|a.project_id.as_str()==project){
-        members.insert(authority.authorized_director_session.as_str().into());
+        if snapshot.reversible_archive_projection.get(&authority.authorized_director_session) != Some(&true) {
+            members.insert(authority.authorized_director_session.as_str().into());
+        }
         excluded.insert(authority.authorized_director_session.as_str().into());
     }
     for (_,grants) in snapshot.operator_grants.iter().filter(|(p,_)|p.as_str()==project){
@@ -73,6 +78,33 @@ fn grant_view(grant:&routing::DelegationGrant)->Value{
     let mut result=serde_json::to_value(grant).expect("grant serializes");
     result.as_object_mut().unwrap().remove("consumption");
     result["allowedActions"]=json!({"revoke":grant.revoked_at.is_none()});result
+}
+
+fn approval_list_state(path: &str) -> Result<Option<String>, AskError> {
+    let filter = crate::http::query::query_value(path, "state");
+    if filter.as_deref().is_some_and(|value| !matches!(value, "pending" | "all")) {
+        return Err(invalid("state must be pending or all"));
+    }
+    Ok(filter)
+}
+
+fn decide_owner_continuation(store: &AskStore, id: &str, path: &str, body: &Value) -> Result<Value, AskError> {
+    use crate::asks::continuation::approval::{self, OwnerDecision};
+    let input: OwnerDecision = parse(body)?;
+    let digest = json!({"operation":"continuation.resume","path":path,"body":body});
+    routing::integration::with_authority(|snapshot| {
+        let host = routing::integration::local_host_id();
+        let now = Utc::now();
+        store.with_records(&[id], |state| {
+            let ask = state.asks.get(id)
+                .ok_or_else(|| AskError::new("ask_not_found", "No such delegation"))?;
+            let ctx = ask.project_id.as_deref().map(|project| approval::owner_context(snapshot, project, &host));
+            operations::execute(state, "owner", "continuation.resume", input.action_id(), &digest, now, |state| {
+                approval::decide_owner(state, id, ctx.as_ref(), &input, now)
+                    .map(|result| (result, EffectState::Committed))
+            })
+        }).map_err(unavailable)?
+    })
 }
 
 /// Invoked only after the root AND human-principal checks in server.rs.
@@ -99,30 +131,56 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
             if request.method!="GET"{return Err(invalid("GET required"));}
             return store.inspect(|s|operations::lookup(s,"owner",action)).map_err(unavailable);
         }
+        if matches!(&route, Route::UnscopedContinuationApprovals) {
+            if request.method != "GET" { return Err(invalid("GET required")); }
+            let filter = approval_list_state(&request.path)?;
+            return store.inspect(|s| json!({"routingApprovals":[],
+                "continuationApprovals": crate::asks::continuation::approval::list(s, None, filter.as_deref() != Some("all"))}))
+                .map_err(unavailable);
+        }
+        if let Route::ResumeContinuation(id) = &route {
+            if request.method != "POST" { return Err(invalid("POST required")); }
+            return decide_owner_continuation(&store, id, &request.path, &body);
+        }
         routing::integration::with_authority(|snapshot|{
-            let controllers=routing::integration::ControllerView::load(snapshot)?;
             let project=match &route{
-                Route::Tree(p)|Route::Policy(p)|Route::Grants(p)|Route::Approvals(p)|Route::RunControl(p)|Route::Pause(p)|Route::Resume(p)=>p.clone(),
-                Route::Revoke(id)=>store.inspect(|s|s.routing.grants.get(id).map(|g|g.project_id.clone())).map_err(unavailable)?
-                    .ok_or_else(||AskError::new("grant_not_found","no such grant"))?,
-                Route::Decision(id)|Route::Approval(id)=>store.inspect(|s|s.routing.approvals.get(id).map(|a|a.project_id.clone())).map_err(unavailable)?
-                    .ok_or_else(||AskError::new("approval_not_found","no such approval"))?,
-                Route::ResumeContinuation(id)=>store.inspect(|s|s.asks.get(id).and_then(|a|a.project_id.clone())).map_err(unavailable)?
-                    .ok_or_else(||AskError::new("ask_not_found","no such project delegation"))?,
-                Route::Operation(_)|Route::Attempts(_)|Route::Stop(_)|Route::ProjectAction(..)=>unreachable!(),
+                Route::Policy(p)|Route::Grants(p)|Route::Approvals(p)|Route::RunControl(p)|Route::Pause(p)|Route::Resume(p)|Route::Tree(p)=>p.clone(),
+                Route::Approval(id)|Route::Decision(id)=>store.inspect(|s|s.routing.approvals.get(id).map(|a|a.project_id.clone()))
+                    .map_err(unavailable)?.ok_or_else(||AskError::new("approval_not_found","no such approval"))?,
+                Route::Revoke(id)=>store.inspect(|s|s.routing.grants.get(id).map(|g|g.project_id.clone()))
+                    .map_err(unavailable)?.ok_or_else(||AskError::new("grant_not_found","no such grant"))?,
+                Route::Operation(_)|Route::Attempts(_)|Route::Stop(_)|Route::ProjectAction(..)
+                |Route::ResumeContinuation(_)|Route::UnscopedContinuationApprovals=>unreachable!(),
             };
-            let ctx=owner_context(snapshot,&project)?;
             let host=routing::integration::local_host_id();
+            let routing_context = owner_context(snapshot, &project);
+            if matches!(&route, Route::Tree(_)) && request.method == "GET" {
+                let history = store.history_snapshot().map_err(unavailable)?;
+                if !history.asks.values().any(|a| a.project_id.as_deref() == Some(project.as_str())) {
+                    routing_context?;
+                }
+                let directory = crate::asks::directory::Directory::load().ok();
+                return super::delegation_tree::page(&history, &project, snapshot, directory.as_ref(), &request.path);
+            }
+            let ctx = match routing_context {
+                Ok(ctx) => ctx,
+                Err(err) if matches!(&route, Route::Approvals(_)) && request.method == "GET" => {
+                    let ctx = crate::asks::continuation::approval::owner_context(snapshot, &project, &host);
+                    let filter = approval_list_state(&request.path)?;
+                    return store.inspect(|s| {
+                        if !s.asks.values().any(|a| a.project_id.as_deref() == Some(project.as_str())) {
+                            return Err(err);
+                        }
+                        Ok(json!({"routingApprovals":[],
+                            "continuationApprovals":crate::asks::continuation::approval::list(s,Some(&ctx),filter.as_deref()!=Some("all"))}))
+                    }).map_err(unavailable)?;
+                }
+                Err(err) => return Err(err),
+            };
+            let controllers=routing::integration::ControllerView::load(snapshot)?;
             let membership=membership(snapshot,&project);
             let now=Utc::now();
             if request.method=="GET"{
-                if matches!(&route,Route::Tree(_)) {
-                    // Include retained cold asks and build/cache the owned
-                    // projection after releasing the AskStore file guard.
-                    let history=store.history_snapshot().map_err(unavailable)?;
-                    let directory=crate::asks::directory::Directory::load().ok();
-                    return super::delegation_tree::page(&history,&project,snapshot,directory.as_ref(),&request.path);
-                }
                 let approval_view=|s:&crate::asks::store::AskState,a:&routing::RoutingApproval|{
                     let mut value=serde_json::to_value(a).expect("approval serializes");
                     let actions=s.asks.get(a.delegation_ref.id()).and_then(|ask|routing::integration::request_and_root(s,ask,&host,&controllers).ok())
@@ -134,11 +192,9 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
                     Route::Policy(_)=>{let mut p=serde_json::to_value(s.routing.policy(&project)).unwrap();p["allowedActions"]=json!({"update":true});Ok(p)},
                     Route::Grants(_)=>Ok(json!({"grants":s.routing.grants.values().filter(|g|g.project_id==project).map(grant_view).collect::<Vec<_>>(),"allowedActions":{"create":true}})),
                     Route::Approvals(_)=>{
-                        let filter=crate::http::query::query_value(&request.path,"state");
-                        if filter.as_deref().is_some_and(|value| !matches!(value,"pending"|"all")) {
-                            return Err(invalid("state must be pending or all"));
-                        }
-                        Ok(json!({"routingApprovals":s.routing.approvals.values()
+                        let filter=approval_list_state(&request.path)?;
+                        Ok(json!({"continuationApprovals":crate::asks::continuation::approval::list(s,Some(&ctx),filter.as_deref()!=Some("all")),
+                            "routingApprovals":s.routing.approvals.values()
                             .filter(|a|a.project_id==project)
                             .filter(|a|filter.as_deref()!=Some("pending")||a.state==routing::ApprovalState::Pending)
                             .map(|a|approval_view(s,a)).collect::<Vec<_>>()}))
@@ -153,14 +209,9 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
                 (Route::Policy(_),"PUT")=>"policy.update",(Route::Grants(_),"POST")=>"grant.create",
                 (Route::Revoke(_),"POST")=>"grant.revoke",(Route::Pause(_),"POST")=>"project.pause",
                 (Route::Resume(_),"POST")=>"project.resume",(Route::Decision(_),"POST")=>"approval.decide",
-                (Route::ResumeContinuation(_),"POST")=>"continuation.resume",_=>return Err(invalid("unsupported method")),
+                _=>return Err(invalid("unsupported method")),
             };
             let digest_input=json!({"operation":operation,"path":request.path,"body":body});
-            // Directory discovery can touch other stores; finish it before
-            // acquiring the asks transaction lock.
-            let continuation_directory=if matches!(&route,Route::ResumeContinuation(_)){
-                Some(crate::asks::directory::Directory::load()?)
-            }else{None};
             store.with_state(|s|operations::execute(s,"owner",operation,action,&digest_input,now,|s|{
                 match &route{
                     Route::Policy(_)=>{
@@ -188,32 +239,12 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
                         let ask=s.asks.get(approval.delegation_ref.id()).ok_or_else(||AskError::new("ask_not_found","no such delegation"))?;
                         let (routing_request,root)=routing::integration::request_and_root(s,ask,&host,&controllers)?;
                         let decision=s.routing.decide_approval(id,&ctx,&routing_request,&root,&parse(&body)?,now).map_err(route_error)?;
+                        routing::integration::complete_approved_review(s,snapshot,routing_request.delegation_ref.id(),&host,now,&controllers)?;
                         let mut recipients=vec![super::services::HOST_EVENT_SESSION_ID.to_owned()];
                         if let Some(director)=&ctx.current_director{recipients.push(director.id().to_owned());}
                         s.notice(routing::integration::ROUTING_CHANGED,recipients,
                             json!({"projectId":project,"resourceId":decision.id,"revision":decision.revision}));
                         Ok((json!({"routingApproval":decision,"delegationId":routing_request.delegation_ref.id()}),EffectState::Committed))
-                    },
-                    Route::ResumeContinuation(id)=>{
-                        let actor=crate::asks::continuation::Actor::Owner;
-                        let director=ctx.current_director.as_ref().map(|r|r.id());
-                        let authority=crate::asks::continuation::Authority{actor:&actor,current_director:director};
-                        let ask=s.asks.get(id).ok_or_else(||AskError::new("ask_not_found","no such delegation"))?;
-                        let directory=continuation_directory.as_ref().expect("continuation directory loaded before transaction");
-                        let target=directory.get(&ask.target_cutex_session_id);
-                        let presence=s.presence.get(&ask.target_cutex_session_id);
-                        let guards=crate::asks::continuation::Guards{
-                            archived:target.is_none_or(|t|t.archived),
-                            paused:crate::asks::pause_admission::is_paused_in(s,snapshot,&ask.target_cutex_session_id),
-                            online:presence.is_some_and(|p|p.online)&&!s.owner_offline.contains(&ask.target_cutex_session_id),
-                            permission_valid:ctx.management_authority().is_ok(),
-                            occurrence_valid:target.is_some_and(|t|ask.current_attempt().is_some_and(|a|a.runtime_generation==t.runtime_generation)),
-                            running_turn:presence.is_some_and(|p|p.busy),
-                            submission_unknown:ask.bounded_continuation.current.as_ref().is_some_and(|r|r.reconciling),
-                            ..Default::default()
-                        };
-                        let result=crate::asks::continuation::runtime::resume_limited(s,id,authority,&parse(&body)?,guards,now)?;
-                        Ok((result,EffectState::Committed))
                     },
                     Route::Pause(_)=>{
                         let input:control::PauseRequest=parse(&body)?;
@@ -229,6 +260,8 @@ pub fn handle(stream:&mut TcpStream,request:&SimpleHttpRequest,route:Route)->any
     });
     match result{
         Ok(value)=>write_json_response(stream,200,"OK",&value),
+        Err(error) if error.code=="approval_changed"=>super::server::write_v2_error(
+            stream,409,"Conflict",error.code,&error.detail,false,json!({"refresh":"continuationApprovals"})),
         Err(error)=>super::server::write_v2_error(stream,409,"Conflict",error.code,&error.detail,false,json!({})),
     }
 }
